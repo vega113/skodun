@@ -6,6 +6,13 @@ from pathlib import Path
 EFFORTS = {"none", "low", "medium", "high", "max"}
 ROLES = {"finder", "refuter", "security", "triager", "integrator"}
 
+# Generic default for the security pass. Deliberately stack-agnostic: these
+# segments name concerns, not one project's directory layout. A concrete repo
+# layout belongs in that repo's own config (see examples/).
+SECURITY_PATH_SEGMENTS: tuple[str, ...] = (
+    "auth", "secret", "credential", "token", "webhook", "payment", "billing",
+)
+
 @dataclass(frozen=True)
 class Defaults:
     severity_gate: str = "high"
@@ -20,6 +27,88 @@ class Defaults:
     checklist_dir: str = "docs/review/checklists"
     rules_json: str = "docs/review/code-rules.json"
     untracked_max: int = 100
+
+    # --- Repo-layout tables (configuration, never code literals) ------------
+    # skodun ships generic defaults so committed code carries no project's
+    # layout. Users describe their own tree in `.skodun.toml`; a worked example
+    # lives in examples/.
+    #
+    # Ordered path-prefix -> checklist-section mapping; first match wins.
+    # Default empty: only the `core` section is selected.
+    checklist_map: tuple[tuple[str, str], ...] = ()
+    # Test-path patterns; a match selects the `tests` section. Default empty.
+    test_path_patterns: tuple[str, ...] = ()
+    # Path segments that trigger the security pass. Default: the generic set.
+    security_path_segments: tuple[str, ...] = SECURITY_PATH_SEGMENTS
+    # Basename/glob patterns that trigger the security pass. Default empty.
+    security_basename_patterns: tuple[str, ...] = ()
+
+# Matching semantics for the four tables above (how a prefix/pattern is
+# compared against a path) are deliberately NOT defined here — they belong to
+# the consuming modules (`checklist.py`, `passes.py`), which own the parity
+# tests that pin them. This module defines schema, defaults, and validation.
+
+# Validation posture, on purpose — do not "fix" this to fail soft:
+#   * Loading a MALFORMED table is LOUD (ValueError naming the key). It is a
+#     typo in the user's own config file and must not be silently swallowed.
+#   * CONSUMING a well-formed table is FAIL-SOFT. A table that loads fine but
+#     matches nothing — or points at a directory that does not exist — must
+#     never crash a review; the consumer degrades to generic behavior with a
+#     diagnostic note. The two rules govern different moments and do not
+#     conflict.
+
+def _str_tuple(key: str, value: object) -> tuple[str, ...]:
+    """Normalize a TOML array of strings into a tuple, or raise naming `key`."""
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"[defaults] {key}: expected an array of strings, got "
+            f"{type(value).__name__}")
+    out: list[str] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            raise ValueError(
+                f"[defaults] {key}: entry {i} must be a string, got "
+                f"{type(item).__name__}")
+        if not item.strip():
+            raise ValueError(f"[defaults] {key}: entry {i} must not be empty")
+        out.append(item)
+    return tuple(out)
+
+def _pair_tuple(key: str, value: object) -> tuple[tuple[str, str], ...]:
+    """Normalize a TOML array of 2-element string arrays, or raise naming `key`."""
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"[defaults] {key}: expected an array of 2-element arrays, got "
+            f"{type(value).__name__}")
+    out: list[tuple[str, str]] = []
+    for i, pair in enumerate(value):
+        if isinstance(pair, str) or not isinstance(pair, (list, tuple)):
+            raise ValueError(
+                f"[defaults] {key}: entry {i} must be a 2-element array, got "
+                f"{type(pair).__name__}")
+        if len(pair) != 2:
+            raise ValueError(
+                f"[defaults] {key}: entry {i} must be a 2-element array, got "
+                f"{len(pair)} elements")
+        for item in pair:
+            if not isinstance(item, str):
+                raise ValueError(
+                    f"[defaults] {key}: entry {i} must contain strings, got "
+                    f"{type(item).__name__}")
+            if not item.strip():
+                raise ValueError(f"[defaults] {key}: entry {i} must not be empty")
+        out.append((pair[0], pair[1]))
+    return tuple(out)
+
+# key -> normalizer. Values arrive from TOML as lists; Defaults is frozen and
+# instances must stay hashable, so everything becomes (nested) tuples — the way
+# Reviewer.dimensions is already handled.
+_DEFAULTS_NORMALIZERS = {
+    "checklist_map": _pair_tuple,
+    "test_path_patterns": _str_tuple,
+    "security_path_segments": _str_tuple,
+    "security_basename_patterns": _str_tuple,
+}
 
 @dataclass(frozen=True)
 class Reviewer:
@@ -83,6 +172,9 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     unknown = set(dvals) - known
     if unknown:
         raise ValueError(f"unknown [defaults] keys: {sorted(unknown)}")
+    for key, normalize in _DEFAULTS_NORMALIZERS.items():
+        if key in dvals:
+            dvals[key] = normalize(key, dvals[key])
     rknown = {f.name for f in fields(Reviewer)}
     reviewers = []
     for name in order:

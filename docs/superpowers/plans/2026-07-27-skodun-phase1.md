@@ -23,6 +23,8 @@
 - Grok reviewer runs tool-less: `--disallowed-tools bash,read,write,edit,web_search,web_fetch`, `--max-turns 40`, no `--always-approve` needed.
 - Verdict banner is always the **last line of stdout**, values read back from the persisted record, never recomputed.
 - Store path: `~/.local/share/skodun/skodun.db` (override: `SKODUN_DB`). Config: `~/.config/skodun/config.toml` overridden by `<repo>/.skodun.toml` (deep merge, project wins).
+- **Porting method — vendor-and-adapt, not re-derive:** where a task ports an existing oracle module (Tasks 8, 9, 14 in particular), the implementer starts from the oracle's *actual source* and adapts it into the package — type hints, `pathlib`, this project's error and fail-soft conventions, the repo-layout tables lifted out to config — rather than re-deriving the algorithm from this plan's prose. Prose in those tasks is a *specification of intent for review*, not a substitute for the source. Parity tests remain the check that the adaptation did not drift.
+- **Generic code / example config split:** repo-layout-specific tables (which path prefixes map to which checklist section, which paths count as tests, which paths trigger the security pass) are **configuration, not code**. Committed code ships generic defaults only — an empty mapping, or a stack-agnostic set of concern words. A concrete stack's tables live in a committed example config under `examples/` (e.g. `examples/scala-angular-monorepo.toml`, named for a stack, never for a company or project) that a user copies into their `<repo>/.skodun.toml`. Parity tests **load the example config** and feed its tables to the code under test, so oracle parity is still asserted end-to-end without an owner-specific default ever entering committed code. The relevant `[defaults]` keys are `checklist_map`, `test_path_patterns`, `security_path_segments`, `security_basename_patterns` (Task 2).
 - Porting oracle: the tubescribes checkout — each task cites its source file under its `scripts/` directory. Where this plan's code and the oracle's observable behavior disagree, the oracle wins; add a parity test. **The repo is public/open-source — committed code is generic:** no machine-specific paths, no owner-specific defaults, no tubescribes-specific behavior outside clearly-labeled parity tests. Test code locates the oracle solely via the `SKODUN_ORACLE_DIR` env var (no fallback default) and skips parity tests when unset. Shared test helper: `tests/conftest.py` defines `oracle_dir() -> Path | None` returning `Path(os.environ["SKODUN_ORACLE_DIR"])` when set and existing, else `None`. (Docs may reference the owner's local context; code may not.)
 - Out of scope for Phase 1 (fail closed where relevant): batched review of oversized diffs (diff over budget ⇒ `diff_truncated=true` ⇒ not trustworthy ⇒ gate exit 2 — never a silent pass); pre-push dispatcher **and with it the dedup probe** (foreground `--now` never dedups in the oracle — every `skodun review` runs a fresh review; the 3-way diff/context dedup probe is dispatcher machinery, Phase 3 — the store nonetheless preserves the `context_hash` NULL-vs-`""` distinction for forward compatibility); same-branch supersede (legacy retires only *prepush*-mode workers, which don't exist in Phase 1); rules-registry authoring/generation/sync (`generate-review-rules.mjs` + `check-review-rules-sync.sh` stay in tubescribes; skodun only *consumes* the generated `docs/review/checklists/*.md` + `code-rules.json`); MCP server; scheduling; non-grok adapters; cloud-bot embed generation; SessionStart delivery hook; macOS notifications; retention/pruning; the legacy `-p` prompt fallback (see Grok binary resolution above).
 
@@ -51,19 +53,22 @@ skodun/
 │   └── adapters/
 │       ├── __init__.py      # Adapter protocol + registry
 │       └── grok.py          # grok CLI adapter: cmd build, envelope parse, degraded detection
+├── examples/
+│   └── scala-angular-monorepo.toml   # drop-in repo-layout tables (T8 creates, T14 extends)
 └── tests/                   # mirrors src/ (test_config.py, test_store.py, ...)
 ```
 
-Porting source map (tubescribes → skodun):
+Porting source map (tubescribes → skodun). **Method** is either *vendor-and-adapt* (start from the oracle source file, adapt in place) or *rewrite* (no directly reusable source — bash, or logic spread across a shell script):
 
-| Source (scripts/) | Target | Notes |
-|---|---|---|
-| `grok_review_triage.py` | `textnorm.py`, `triage.py` | keys, reason validation, artifact validation, gate |
-| `grok-checklist-select.py` | `checklist.py` | prefix mapping, 18 KiB budget, drop order |
-| `grok-context-pack.py` | `contextpack.py` | selection, budgets, symlink/traversal hardening |
-| `grok-extra-passes.py` | `passes.py` | should-run logic, prompts, merge/demotion |
-| `grok-prepush-review.sh` (`write_prompt`, `run_grok_with_timeout`, `detect_degraded`, envelope parse, banner) | `promptbuild.py`, `runner.py`, `adapters/grok.py`, `trust.py` | bash → Python rewrite |
-| `grok-review-now.sh` (fg lock) | `pipeline.py` | same lock path + protocol for shadow coexistence |
+| Source (scripts/) | Target | Method | Notes |
+|---|---|---|---|
+| `grok_review_triage.py` | `textnorm.py`, `triage.py` | vendor-and-adapt | keys, reason validation, artifact validation, gate (done: T5–T7) |
+| `grok-checklist-select.py` | `checklist.py` | vendor-and-adapt | 18 KiB budget, drop order kept as code; **prefix map + test-path patterns read from config** (`checklist_map`, `test_path_patterns`) |
+| `grok-context-pack.py` | `contextpack.py` | vendor-and-adapt | selection, budgets, symlink/traversal hardening — **all constants generic, no config work** |
+| `grok-extra-passes.py` | `passes.py` | vendor-and-adapt | should-run logic, prompts, merge/demotion; **security triggers read from config** (`security_path_segments`, `security_basename_patterns`) |
+| `grok-prepush-review.sh` (`write_prompt`, `run_grok_with_timeout`, `detect_degraded`, envelope parse, banner) | `promptbuild.py`, `runner.py`, `adapters/grok.py`, `trust.py` | rewrite | bash → Python |
+| `grok-review-now.sh` (fg lock) | `pipeline.py` | rewrite | same lock path + protocol for shadow coexistence |
+| oracle's inlined repo-layout tables | `examples/scala-angular-monorepo.toml` | extract to config | committed example, loaded by T8/T14 parity tests; never a default in code |
 
 ---
 
@@ -148,8 +153,28 @@ def entry() -> None:
 - Produces: `load_config(repo_root: Path | None, global_path: Path | None = None) -> Config`;
   `Config(defaults: Defaults, reviewers: tuple[Reviewer, ...])`;
   `Reviewer(name, provider, model, effort, role, dimensions, persona, max_cost_usd, enabled)`;
-  `Defaults(severity_gate="high", confidence_threshold=7, max_diff_bytes=400_000, timeout_sec=420, timeout_retries=1, degraded_retries=1, max_turns=40, deny_tools="bash,read,write,edit,web_search,web_fetch", context_pack=True, checklist_dir="docs/review/checklists", rules_json="docs/review/code-rules.json")`.
+  `Defaults(severity_gate="high", confidence_threshold=7, max_diff_bytes=400_000, timeout_sec=420, timeout_retries=1, degraded_retries=1, max_turns=40, deny_tools="bash,read,write,edit,web_search,web_fetch", context_pack=True, checklist_dir="docs/review/checklists", rules_json="docs/review/code-rules.json", untracked_max=100)`.
 - Effort is a canonical enum: `none|low|medium|high|max` or `None` (unset).
+- **Amended after Task 2 shipped (see Global Constraints → generic code / example config split).** `Defaults` also carries the four repo-layout tables consumed by Tasks 8 and 14. They are already implemented in `src/skodun/config.py` and covered by `tests/test_config.py`; this entry records the schema so plan and committed code agree.
+
+  | Key | Type | Default | Consumer |
+  |---|---|---|---|
+  | `checklist_map` | ordered `tuple[tuple[str, str], ...]` — `(path-prefix, checklist-section)` pairs, first match wins | `()` (only `core` selected) | T8 |
+  | `test_path_patterns` | `tuple[str, ...]` — test-path detection, selects the `tests` section | `()` | T8 |
+  | `security_path_segments` | `tuple[str, ...]` — path segments triggering the security pass | `("auth", "secret", "credential", "token", "webhook", "payment", "billing")` | T14 |
+  | `security_basename_patterns` | `tuple[str, ...]` — basename/glob matching for the security pass | `()` | T14 |
+
+  TOML shape (arrays; `checklist_map` is an array of two-element arrays so order and first-match-wins are explicit):
+
+  ```toml
+  [defaults]
+  checklist_map = [["db/changelog/", "migrations"], ["backend/", "backend"]]
+  test_path_patterns = ["*.spec.ts", "src/test/"]
+  security_path_segments = ["auth", "webhook"]
+  security_basename_patterns = ["*RouteService*"]
+  ```
+
+  Values are normalized into (nested) tuples at load so `Defaults` stays frozen and hashable, exactly as `Reviewer.dimensions` is handled. **Validation posture, deliberately two-sided:** a *malformed* table is loud — `ValueError` naming the key, because it is a typo in the user's own config; a *well-formed but non-matching* table is fail-soft in the consumer (T8/T14), which degrades to generic behavior and never crashes a review. `config.py` defines schema/defaults/validation only — **matching semantics belong to T8 and T14**, which own the parity tests that pin them.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -227,6 +252,9 @@ class Defaults:
     checklist_dir: str = "docs/review/checklists"
     rules_json: str = "docs/review/code-rules.json"
     untracked_max: int = 100
+    # + the four repo-layout tables added by the amendment above
+    # (checklist_map, test_path_patterns, security_path_segments,
+    #  security_basename_patterns) — see the shipped src/skodun/config.py.
 
 @dataclass(frozen=True)
 class Reviewer:
@@ -1187,28 +1215,41 @@ Wire into `cli.py`: subcommand `gate` with `--repo` (default cwd) loads config+s
 
 ---
 
-### Task 8: Checklist selection (port)
+### Task 8: Checklist selection (vendor-and-adapt)
 
 **Files:**
-- Create: `src/skodun/checklist.py`, `tests/test_checklist.py`
+- Create: `src/skodun/checklist.py`, `tests/test_checklist.py`, `examples/scala-angular-monorepo.toml`
+
+**Method: vendor-and-adapt.** Start from the oracle file `grok-checklist-select.py` (136 lines) and adapt it — type hints, `pathlib`, this project's fail-soft convention, and the repo-layout tables lifted out to config. Do **not** re-derive the algorithm from the prose below; the prose states intent for review, the source is the specification.
 
 **Interfaces:**
-- Consumes: repo-relative `docs/review/checklists/*.md` and `docs/review/code-rules.json` (paths from `Defaults`).
-- Produces: `select(files: list[str], mode: str, checklist_dir: Path, rules_json: Path) -> Selection(sections: list[str], bytes_total: int, over_budget: bool, dropped: list[str], body: str, note: str = "")` — `note` carries fail-soft diagnostics (e.g. `"checklist selection failed: <err>; continuing without path-scoped rules"`); the pipeline surfaces it on stderr and in the artifact.
-- **Oracle:** `grok-checklist-select.py` (136 lines). Semantics to port exactly:
-  - Longest-exclusive-prefix mapping: `src/main/resources/db/changelog/`→`migrations`, `src/main/`→`backend`, `ui/`→`frontend`, `scripts/`|`.github/`→`tooling`; test-path detection (`*.spec.ts`, `*.test.sh`, `*.test.mjs`, `test-utils`+`.ts`, `src/test/`, `integration-tests/src/test/`, `ui/src/app/testing/`) → `tests`.
+- Consumes: repo-relative `docs/review/checklists/*.md` and `docs/review/code-rules.json` (paths from `Defaults`), plus the repo-layout tables `Defaults.checklist_map` and `Defaults.test_path_patterns`.
+- Produces: `select(files: list[str], mode: str, checklist_dir: Path, rules_json: Path, checklist_map: Sequence[tuple[str, str]] = (), test_path_patterns: Sequence[str] = ()) -> Selection(sections: list[str], bytes_total: int, over_budget: bool, dropped: list[str], body: str, note: str = "")` — `note` carries fail-soft diagnostics (e.g. `"checklist selection failed: <err>; continuing without path-scoped rules"`); the pipeline surfaces it on stderr and in the artifact. The pipeline passes `cfg.defaults.checklist_map` / `cfg.defaults.test_path_patterns` through.
+- **Repo-layout tables are configuration, not code (Global Constraints).** `checklist_map` is an ordered `(path-prefix, checklist-section)` sequence, first match wins; `test_path_patterns` selects the `tests` section. Both default to **empty** — with no config, only `core` (plus `cross-file`, which is rules-driven) is ever selected. No path prefix of any particular project appears in `checklist.py`.
+- **This task owns the matching semantics** for both tables (prefix comparison, and whether a test pattern is a glob, a substring, or a path-segment test) — mirror the oracle exactly and pin it with the parity test below.
+- **This task creates** `examples/scala-angular-monorepo.toml` carrying the oracle's *exact* `checklist_map` and `test_path_patterns`, transcribed from the oracle source. The parity test loads that file via `load_config`, so the oracle's tables are asserted end-to-end while committed code stays generic.
+- Semantics to keep as code (genuinely generic):
   - `core` always included. `cross-file` only when a changed path matches a `crossFile` rule's globs read live from `code-rules.json`.
   - Modes: `full` (everything eligible), `batch` (never cross-file), `integration` (core + cross-file only).
   - Budget 18 KiB (18432 bytes); drop order lowest-first: `tooling, frontend, tests, backend, migrations, cross-file` — `core` never dropped.
-  - **Fail-soft:** any exception ⇒ return empty `Selection` with a note; the caller proceeds without rules.
+  - **Fail-soft:** any exception ⇒ return empty `Selection` with a note; the caller proceeds without rules. An empty or non-matching `checklist_map` is **not** an error — it yields `core` only, silently. (Malformed config is rejected loudly earlier, at load time, by Task 2.)
 
-- [ ] **Step 1: Write the failing test** (fixtures: write small checklist files + a minimal `code-rules.json` with one `crossFile` rule globbing `src/main/**`)
+- [ ] **Step 1: Write the failing test** (fixtures: write small checklist files + a minimal `code-rules.json` with one `crossFile` rule globbing `app/backend/**`; tables come from the test's own `checklist_map` argument, never from a code default)
 
 ```python
 # tests/test_checklist.py
 import json
 from pathlib import Path
+
+import pytest
+
 from skodun.checklist import select
+from skodun.config import load_config
+from tests.conftest import oracle_dir   # plain helper, not a fixture
+
+# Test-local layout tables — the code under test ships NO project's layout.
+MAP = (("app/backend/", "backend"), ("app/web/", "frontend"), ("tools/", "tooling"))
+TESTS = ("*.spec.ts", "src/test/")
 
 def _fixtures(tmp_path: Path):
     cdir = tmp_path / "checklists"; cdir.mkdir()
@@ -1218,49 +1259,90 @@ def _fixtures(tmp_path: Path):
                                          encoding="utf-8")
     rules = tmp_path / "code-rules.json"
     rules.write_text(json.dumps({"version": 1, "rules": [
-        {"id": "x-callers", "crossFile": True, "paths": ["src/main/**"],
+        {"id": "x-callers", "crossFile": True, "paths": ["app/backend/**"],
          "doForm": "d", "flagForm": "f", "rationale": "docs/x.md",
          "layer": "guideline+checklist"}]}), encoding="utf-8")
     return cdir, rules
 
 def test_selection_by_prefix_and_crossfile(tmp_path):
     cdir, rules = _fixtures(tmp_path)
-    sel = select(["src/main/scala/App.scala", "ui/src/thing.ts"], "full", cdir, rules)
+    sel = select(["app/backend/App.scala", "app/web/thing.ts"], "full", cdir, rules,
+                 checklist_map=MAP, test_path_patterns=TESTS)
     assert set(sel.sections) == {"core", "backend", "frontend", "cross-file"}
     assert "rule for backend" in sel.body
 
+def test_empty_map_selects_core_only_and_does_not_crash(tmp_path):
+    # Default (unconfigured) behavior is generic, not an error.
+    cdir, rules = _fixtures(tmp_path)
+    sel = select(["app/backend/App.scala"], "full", cdir, rules)
+    assert sel.sections == ["core"] and sel.note == ""
+
+def test_first_match_wins_in_map_order(tmp_path):
+    cdir, rules = _fixtures(tmp_path)
+    ordered = (("app/backend/db/", "migrations"), ("app/backend/", "backend"))
+    sel = select(["app/backend/db/V1.sql"], "full", cdir, rules,
+                 checklist_map=ordered)
+    assert "migrations" in sel.sections and "backend" not in sel.sections
+
+def test_test_path_patterns_select_tests_section(tmp_path):
+    cdir, rules = _fixtures(tmp_path)
+    sel = select(["app/web/x.spec.ts"], "full", cdir, rules,
+                 checklist_map=MAP, test_path_patterns=TESTS)
+    assert "tests" in sel.sections
+
 def test_batch_mode_never_includes_crossfile(tmp_path):
     cdir, rules = _fixtures(tmp_path)
-    sel = select(["src/main/scala/App.scala"], "batch", cdir, rules)
+    sel = select(["app/backend/App.scala"], "batch", cdir, rules, checklist_map=MAP)
     assert "cross-file" not in sel.sections
 
 def test_budget_drop_order_never_drops_core(tmp_path):
     cdir, rules = _fixtures(tmp_path)
     (cdir / "tooling.md").write_text("x" * 20000, encoding="utf-8")  # blows budget
-    sel = select(["scripts/a.sh", "src/main/A.scala"], "full", cdir, rules)
+    sel = select(["tools/a.sh", "app/backend/A.scala"], "full", cdir, rules,
+                 checklist_map=MAP)
     assert "tooling" in sel.dropped and "core" in sel.sections
 
 def test_fail_soft_on_missing_dir(tmp_path):
     sel = select(["a"], "full", tmp_path / "nope", tmp_path / "nope.json")
     assert sel.sections == [] and sel.body == "" and "failed" in sel.note
+
+EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "scala-angular-monorepo.toml"
+
+@pytest.mark.skipif(oracle_dir() is None, reason="SKODUN_ORACLE_DIR unset")
+def test_example_config_reproduces_oracle_selection(tmp_path):
+    # Oracle parity end-to-end: tables come from the committed example config,
+    # never from a default in committed code.
+    repo = tmp_path / "repo"; repo.mkdir()
+    (repo / ".skodun.toml").write_text(EXAMPLE.read_text(encoding="utf-8"),
+                                       encoding="utf-8")
+    d = load_config(repo, global_path=tmp_path / "absent.toml").defaults
+    cdir, rules = _fixtures(tmp_path)
+    for paths, expected in _oracle_cases(oracle_dir()):   # drive the oracle script
+        sel = select(paths, "full", cdir, rules,
+                     checklist_map=d.checklist_map,
+                     test_path_patterns=d.test_path_patterns)
+        assert set(sel.sections) == expected
 ```
 
 - [ ] **Step 2: Run to verify FAIL**
-- [ ] **Step 3: Implementation** — port `grok-checklist-select.py` into `select()`; keep constants `BUDGET = 18 * 1024`, `DROP_ORDER = ["tooling", "frontend", "tests", "backend", "migrations", "cross-file"]`; use `fnmatch`-on-`/`-segments for `crossFile` globs matching the oracle's glob semantics (check whether the oracle uses `fnmatch` or `pathlib.match` — mirror it). The whole body is wrapped in `try/except Exception as e: return Selection([], 0, False, [], "", note=f"checklist selection failed: {e}; continuing without path-scoped rules")`.
+- [ ] **Step 3: Implementation** — vendor `grok-checklist-select.py` and adapt it into `select()`. Keep the generic constants as code: `BUDGET = 18 * 1024`, `DROP_ORDER = ["tooling", "frontend", "tests", "backend", "migrations", "cross-file"]`; use `fnmatch`-on-`/`-segments for `crossFile` globs matching the oracle's glob semantics (check whether the oracle uses `fnmatch` or `pathlib.match` — mirror it). **Replace the oracle's inlined prefix table and test-path table with lookups over the `checklist_map` / `test_path_patterns` arguments**, preserving the oracle's matching rule (the oracle picks the *longest exclusive* prefix; the config expresses the same outcome by ordering, first match wins — order the example file so the two agree, and assert it in the parity test). The whole body is wrapped in `try/except Exception as e: return Selection([], 0, False, [], "", note=f"checklist selection failed: {e}; continuing without path-scoped rules")`.
+- [ ] **Step 3b: Create `examples/scala-angular-monorepo.toml`** — a `[defaults]` block with `checklist_map` and `test_path_patterns` transcribed from the oracle source, ordered so first-match-wins reproduces longest-prefix-wins. Head the file with a comment saying it is a drop-in example for a Scala/Angular monorepo, to be copied to `<repo>/.skodun.toml` and edited.
 - [ ] **Step 4: Run to verify PASS**
-- [ ] **Step 5: Commit** — `git commit -am "feat: path-scoped checklist selection with budget and fail-soft (port)"`
+- [ ] **Step 5: Commit** — `git commit -am "feat: config-driven checklist selection with budget and fail-soft (vendor-and-adapt)"`
 
 ---
 
-### Task 9: Context packing (port)
+### Task 9: Context packing (vendor-and-adapt)
 
 **Files:**
 - Create: `src/skodun/contextpack.py`, `tests/test_contextpack.py`
 
+**Method: vendor-and-adapt.** Start from the oracle file `grok-context-pack.py` (467 lines) and adapt it — type hints, `pathlib`, this project's error conventions — rather than re-deriving 467 lines from the prose below. **No config work:** every constant in this module is genuinely generic — the 16 KiB already-in-diff threshold, the binary-detection heuristic, the omission-reason vocabulary, the traversal/symlink hardening, and the `----- BEGIN FILE CONTEXT: <path> -----` markers describe file content and prompt format, not any project's repo layout. Nothing here reads `checklist_map` or the security tables.
+
 **Interfaces:**
 - Produces: `pack(repo: Path, files: list[str], statuses: dict[str, str], headroom: int, source: str = "wt", per_file_cap: int | None = None) -> Pack(body: bytes, bytes_total: int, included: list[str], omitted: list[tuple[str, str]], sha256: str)` — `statuses` is `Diff.statuses` from Task 4 (path → `A`/`M`/`D`/…); the packer needs it to classify `deleted` (status `D`) and `already-in-diff` (status `A` and file < 16 KiB — its full content is already in the diff); a path absent from `statuses` is treated as `M`.
 - Omission reasons (verbatim vocabulary): `deleted | binary | already-in-diff | missing | over-file-cap | over-headroom`.
-- **Oracle:** `grok-context-pack.py` (467 lines). Port exactly:
+- **Oracle:** `grok-context-pack.py` (467 lines). Behavior to preserve while adapting:
   - Selection: candidates sorted descending by size, path ascending as tie-break; inclusion all-or-nothing per file.
   - `added` files < 16 KiB are `already-in-diff`.
   - **Security:** reject absolute paths, `..`, Windows drive prefixes, any symlink component; re-verify resolved path is under the worktree; open with `O_NOFOLLOW`.
@@ -1310,7 +1392,7 @@ def test_binary_omitted(tmp_path):
 ```
 
 - [ ] **Step 2: Run to verify FAIL**
-- [ ] **Step 3: Implementation** — port from the oracle. The path-validation function ports as:
+- [ ] **Step 3: Implementation** — vendor the oracle module and adapt it. The path-validation function adapts as:
 
 ```python
 def _safe_open(repo: Path, rel: str):
@@ -1343,7 +1425,7 @@ def _safe_open(repo: Path, rel: str):
 Body assembly mirrors the oracle **byte-for-byte**: header line listing omissions, then per-file sections framed with the oracle's exact markers — `----- BEGIN FILE CONTEXT: <path> -----\n<bytes>\n----- END FILE CONTEXT -----\n` (not any invented `FILE:` marker — prompt parity is the point); recompute and drop trailing sections until the omission header fits inside `headroom`; `sha256` over the final body bytes. Add a byte-level fixture test asserting the exact marker lines. `_safe_open` additionally verifies the opened fd is a **regular file** via `stat.S_ISREG(os.fstat(fd).st_mode)` (checked post-open, so a FIFO or device swapped in cannot block the review process; close and return `None` otherwise).
 
 - [ ] **Step 4: Run to verify PASS**
-- [ ] **Step 5: Commit** — `git commit -am "feat: hardened working-tree context packing (port)"`
+- [ ] **Step 5: Commit** — `git commit -am "feat: hardened working-tree context packing (vendor-and-adapt)"`
 
 ---
 
@@ -1803,13 +1885,17 @@ def test_banner_reads_recorded_values():
 ### Task 14: Extra passes — security & skeptic
 
 **Files:**
-- Create: `src/skodun/passes.py`, `tests/test_passes.py`
+- Create: `src/skodun/passes.py`, `tests/test_passes.py`; Modify: `examples/scala-angular-monorepo.toml` (created by Task 8)
+
+**Method: vendor-and-adapt.** Start from the oracle file `grok-extra-passes.py` and adapt `should_run_security`, `should_run_skeptic`, `merge_extra_pass` (lines 162–273) and the two prompt writers into the module — do not re-derive them from the prose below. The one substantive change is that the **security trigger tables move to config**.
 
 **Interfaces:**
-- Consumes: `promptbuild` prompt shell, `Reviewer` roles from config.
+- Consumes: `promptbuild` prompt shell, `Reviewer` roles from config, and the repo-layout tables `Defaults.security_path_segments` / `Defaults.security_basename_patterns`.
 - Produces:
-  `should_run_security(mode: str, files: list[str]) -> bool` — `mode == "now"` AND any path risky: a path segment in `{auth, billing, credits, dao, db, webhook}`, or compacted basename containing `telegramwebhook`/`webhookrouteservice`, or matching `api/services/*RouteService*`;
-  `should_run_skeptic(mode: str, trustworthy: bool, findings_total: int) -> bool` — `mode == "now" and trustworthy and findings_total == 0`;
+  `should_run_security(mode: str, files: list[str], path_segments: Sequence[str] = SECURITY_PATH_SEGMENTS, basename_patterns: Sequence[str] = ()) -> bool` — `mode == "now"` AND any changed path is risky: a path segment matching `path_segments`, or a basename matching `basename_patterns`. **Both tables are configuration, not code (Global Constraints).** The committed default for `path_segments` is the generic, stack-agnostic set `auth, secret, credential, token, webhook, payment, billing` (`skodun.config.SECURITY_PATH_SEGMENTS`); `basename_patterns` defaults to **empty**. No project's service names or directory conventions appear in `passes.py`. **This task owns the matching semantics** (segment comparison — case folding? exact segment vs substring? — and whether basename patterns are `fnmatch` globs, applied to the raw or the compacted basename); mirror the oracle exactly and pin it with the parity test.
+- **This task extends** `examples/scala-angular-monorepo.toml` (created by Task 8) with `security_path_segments` and `security_basename_patterns` transcribed from the oracle source, so the oracle's real trigger set stays asserted end-to-end via a parity test that loads the example config through `load_config` — while committed code stays generic.
+- **Fail-soft on consumption:** empty or non-matching tables simply mean "no security pass", never an error. (A malformed table is rejected loudly at config-load time by Task 2 — the two rules govern different moments.)
+- `should_run_skeptic(mode: str, trustworthy: bool, findings_total: int) -> bool` — `mode == "now" and trustworthy and findings_total == 0`;
   `security_prompt(...) -> bytes`, `skeptic_prompt(...) -> bytes` (oracle: `grok-extra-passes.py` `write-security-prompt` / `write-skeptic-prompt` — port the prompt texts verbatim, including the skeptic framing *"A previous reviewer cleared this pull-request diff (0 findings). Your job is the ADVERSARIAL CLEAN-CHECK: prove them wrong if you can."*);
   `merge_extra_pass(primary: dict, extra: dict | None, pass_name: str) -> dict` — findings merged with title prefix `(security) ` / `(skeptic) ` (if a title starts with `[rule-id]`, prepend `(extra-pass: <name>) ` to `detail` instead — never pollute `rule_ids` extraction). **Demotion keeps the two axes independent (oracle `merge_extra_pass`, lines 162–273):** a *failed* pass (`extra is None` or `extra["parse_ok"]` false) sets the primary's `parse_ok=False` and appends to `failure_reason`; a *degraded* pass sets the primary's `degraded=True` and appends to `degraded_reason` — it does **not** touch `parse_ok`. Either way `trustworthy` recomputes to False on save. A size-capped pass sets `partial_coverage=True` without demotion.
 - Kill switches: env `SKODUN_SECURITY_PASS=0`, `SKODUN_SKEPTIC_PASS=0`.
@@ -1818,14 +1904,44 @@ def test_banner_reads_recorded_values():
 
 ```python
 # tests/test_passes.py
+from pathlib import Path
+
+import pytest
+
+from skodun.config import load_config
 from skodun.passes import (should_run_security, should_run_skeptic,
                            merge_extra_pass)
+from tests.conftest import oracle_dir   # plain helper, not a fixture
 
-def test_security_trigger_paths():
-    assert should_run_security("now", ["src/main/scala/auth/Login.scala"])
-    assert should_run_security("now", ["api/services/FooRouteService.scala"])
-    assert not should_run_security("now", ["ui/src/button.ts"])
-    assert not should_run_security("prepush", ["src/auth/x.scala"])  # now-mode only
+EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "scala-angular-monorepo.toml"
+
+def test_security_trigger_uses_generic_defaults():
+    # Committed default: concern words, no project's layout.
+    assert should_run_security("now", ["app/auth/Login.scala"])
+    assert should_run_security("now", ["svc/billing/Invoice.kt"])
+    assert not should_run_security("now", ["web/src/button.ts"])
+    assert not should_run_security("prepush", ["app/auth/x.scala"])  # now-mode only
+
+def test_security_trigger_tables_come_from_config():
+    assert should_run_security("now", ["svc/vault/Key.scala"],
+                               path_segments=("vault",))
+    assert should_run_security("now", ["api/services/FooRouteService.scala"],
+                               path_segments=(), basename_patterns=("*RouteService*",))
+    # Empty tables are well-formed and simply never trigger — not an error.
+    assert not should_run_security("now", ["app/auth/Login.scala"],
+                                   path_segments=(), basename_patterns=())
+
+@pytest.mark.skipif(oracle_dir() is None, reason="SKODUN_ORACLE_DIR unset")
+def test_example_config_reproduces_oracle_security_triggers(tmp_path):
+    repo = tmp_path / "repo"; repo.mkdir()
+    (repo / ".skodun.toml").write_text(EXAMPLE.read_text(encoding="utf-8"),
+                                       encoding="utf-8")
+    d = load_config(repo, global_path=tmp_path / "absent.toml").defaults
+    for paths, expected in _oracle_security_cases(oracle_dir()):  # drive the oracle
+        assert should_run_security(
+            "now", paths,
+            path_segments=d.security_path_segments,
+            basename_patterns=d.security_basename_patterns) is expected
 
 def test_skeptic_only_on_clean_trustworthy_now():
     assert should_run_skeptic("now", True, 0)
@@ -1875,9 +1991,10 @@ def test_rule_id_title_not_polluted():
 ```
 
 - [ ] **Step 2: Run to verify FAIL**
-- [ ] **Step 3: Implementation** — port decision + merge logic from `grok-extra-passes.py` (`should_run_security`, `should_run_skeptic`, `merge_extra_pass` at lines 162–273); prompts as module-level templates ported verbatim from `write-security-prompt`/`write-skeptic-prompt`. Severity recount happens after merge; empty/`other` category on a security finding is rewritten to `security`.
+- [ ] **Step 3: Implementation** — vendor and adapt the decision + merge logic from `grok-extra-passes.py` (`should_run_security`, `should_run_skeptic`, `merge_extra_pass` at lines 162–273); prompts as module-level templates transcribed verbatim from `write-security-prompt`/`write-skeptic-prompt`. **Replace the oracle's inlined risky-path table with lookups over the `path_segments` / `basename_patterns` arguments**, preserving the oracle's matching rule. Severity recount happens after merge; empty/`other` category on a security finding is rewritten to `security`.
+- [ ] **Step 3b: Extend `examples/scala-angular-monorepo.toml`** — add `security_path_segments` and `security_basename_patterns` with the oracle's exact values to the same `[defaults]` block Task 8 created.
 - [ ] **Step 4: Run to verify PASS**
-- [ ] **Step 5: Commit** — `git commit -am "feat: security and skeptic extra passes with demotion semantics (port)"`
+- [ ] **Step 5: Commit** — `git commit -am "feat: security and skeptic extra passes with demotion semantics (vendor-and-adapt)"`
 
 ---
 
@@ -2239,9 +2356,10 @@ def test_union_surfaces_one_sided_hashes_and_newest_row_wins(tmp_path):
 
 ## Self-Review Notes
 
-- Spec coverage: diff identity (T4, legacy-compatible trailing-newline semantics + oracle parity test), checklists (T8), context packing (T9, status-aware), prompt (T10), watchdog/retries/timeout-output-discard (T11, T15), grok envelope + degraded detection (T12, case-insensitive), trust computed-on-write (T3) + banner (T13), security/skeptic with independent demotion axes (T14), gate 0/1/2 with empty-diff PASS, artifact↔index re-assertion, and recorded `SKODUN_GATE_SKIP` bypass (T7), triage ledger + parity keys + negative-index guard (T5, T6), SQLite + gate_events (T3), stale-record recovery (T15), legacy import with artifact-backed trust (T16), union shadow compare (T17), ≥5-change-set acceptance (T18), fg-lock byte-format interop (T15).
+- Spec coverage: diff identity (T4, legacy-compatible trailing-newline semantics + oracle parity test), config-driven repo-layout tables (T2 amendment: schema, generic defaults, loud validation — consumed fail-soft by T8/T14, oracle values shipped as `examples/scala-angular-monorepo.toml`), checklists (T8), context packing (T9, status-aware), prompt (T10), watchdog/retries/timeout-output-discard (T11, T15), grok envelope + degraded detection (T12, case-insensitive), trust computed-on-write (T3) + banner (T13), security/skeptic with independent demotion axes (T14), gate 0/1/2 with empty-diff PASS, artifact↔index re-assertion, and recorded `SKODUN_GATE_SKIP` bypass (T7), triage ledger + parity keys + negative-index guard (T5, T6), SQLite + gate_events (T3), stale-record recovery (T15), legacy import with artifact-backed trust (T16), union shadow compare (T17), ≥5-change-set acceptance (T18), fg-lock byte-format interop (T15).
 - Explicitly out of scope (Global Constraints): batching (fail-closed truncation tested in T15), pre-push dispatcher + dedup probe (`--now` never dedups — tested in T15), same-branch supersede, rules-registry generation/sync (stays in tubescribes), the legacy `-p` re-shell fallback, MCP/scheduling/other adapters/retention.
 - Known intentional deviations from legacy: SQLite instead of JSONL sprawl; explicit `-m` model flag; `SKODUN`-prefixed banner/gate lines (cutover-compat shims are a later phase); phase-1 extra passes reuse the finder model (cross-provider refuter is Phase 2); no `-p` ARG_MAX fallback.
+- Known intentional deviation from legacy — **repo-layout tables are config-driven, not code literals (Tasks 8 and 14)**: the oracle inlines one specific monorepo's layout directly in its source — path prefixes mapping to checklist sections, its test-path conventions, and a security trigger list naming that project's own services. skodun cannot: this is a public open-source repo, and the Global Constraints forbid owner-specific defaults in committed code. So those four tables became `[defaults]` config keys (`checklist_map`, `test_path_patterns`, `security_path_segments`, `security_basename_patterns`, added to Task 2's `config.py` after it shipped). Committed code ships generic defaults — empty mappings, plus a stack-agnostic concern-word set for the security pass — so an unconfigured skodun selects `core` only and triggers the security pass on universally risky words rather than on one company's directory names. **Parity is preserved, not weakened:** the oracle's exact tables ship as a committed example config, `examples/scala-angular-monorepo.toml` (named for a stack, never for a project), and the T8/T14 parity tests load that file through `load_config` and feed its tables to the code under test — so the oracle's real selection and trigger behavior is still asserted end-to-end. The deviation is in *where the table lives*, not in what it says. Validation is deliberately two-sided and must not be "simplified": a malformed table is loud at config-load time (`ValueError` naming the key — it is the user's own typo), while a well-formed table that matches nothing is fail-soft in the consumer (degrade to generic behavior, never crash a review).
 - Known intentional deviation from legacy — **untracked files with non-ASCII names (Task 4)**: the oracle lists untracked files in *text* mode, so under git's default `core.quotepath=true` a brand-new file named e.g. `ä-new.txt` reaches its `[ -f "$_uf" ]` guard as the literal string `"\303\244-new.txt"`, the guard fails, and the file is dropped from the reviewed diff entirely — i.e. **it is silently never reviewed**. That is an oracle bug, and skodun does not reproduce it: it reads NUL-delimited names and includes the file, so for exactly this input class skodun's diff bytes are a *superset* of the oracle's and the two `diff_hash`es differ. The direction is fail-safe — a legacy record for such a change simply fails to join, so skodun asks for one extra review; it can never turn a missed join into a wrong gate PASS. Reproducing the bug instead would mean emulating git's `quote_c_style` in Python, a new and larger source of divergence. Pinned by `test_known_divergence_untracked_nonascii_name`, which pins `core.quotepath=true` repo-locally so it documents *which* configuration exhibits the bug rather than inheriting the runner's.
 - Known intentional deviation from legacy — **artifact validation is strict by design (Task 6)**: the oracle's `load_review` (`grok_review_triage.py:176-230`) is lenient about absent keys — a missing/`None` `findings` is coerced to `[]`, and the `findings_total != len(findings)` check is skipped entirely when `findings_total` is missing/`None`. It also never inspects `id`, `branch`, or `base_sha`, which `dismiss` reads immediately after validation and which the ledger key is built from. `load_valid_artifact` rejects all of those shapes instead — the four missing/`None` ones, plus a missing or non-string identity field. That leniency is safe at the oracle's own call sites, which re-derive `review.get("findings") or []` for display; it is not safe here, because in skodun this function is the fail-closed validator the **gate (Task 7)** runs before a stored review may certify a push, and the check the **legacy importer (Task 16)** explicitly leans on to stop a findings-less index row from satisfying the gate. Under the lenient rule an artifact carrying no `findings` key reads as "zero findings" — i.e. clean — and the gate can PASS a review whose findings were never recorded, inverting the project's central fail-closed posture. "The oracle wins" pins keys and review semantics to the legacy archive; it does not require importing the oracle's *weaker* validation into the gate path, and being stricter is fail-safe in this direction (worst case: a malformed artifact forces one fresh review). Pinned from both sides by `test_load_valid_artifact_divergence_from_legacy_is_deliberate`, which asserts the oracle really does accept each shape and that skodun raises `ArtifactError` for it; `test_load_valid_artifact_parity_with_legacy_on_fully_specified_artifacts` confirms the divergence has not leaked into artifacts that assert both keys.
 - Known intentional deviation from legacy — **the gate does not short-circuit on the artifact's stored `trustworthy` field (Task 7)**: the oracle's `is_trustworthy(row)` (`grok_review_triage.py:255-272`) returns the row's own `trustworthy` field whenever it is present and recomputes from the axes only when it is absent — a fallback that exists solely for pre-2026-07-14 rows written before the field did. Consequence: an artifact carrying `trustworthy: true` alongside `degraded: true` (a crashed writer, a partial rewrite, a hand-edited archive) satisfies the oracle's own re-assertion. skodun has no pre-field rows — `Store.save_review` computes the field from the three axes on every write — so the gate recomputes **unconditionally** and additionally requires the stored field to agree with the recomputation; a record that contradicts itself certifies nothing. The direction is fail-safe in the same way as the Task 6 divergence: the worst case is one extra review, never a wrong gate PASS, and the field is a derived summary of the axes rather than an independent fact about the review. Pinned from both sides by the oracle-gated `test_gate_divergence_from_oracle_on_a_self_contradicting_artifact`, which asserts the oracle really does accept such an artifact and that skodun's gate returns 2 for it — so the rationale in `gate.py` cannot go stale while quietly being wrong about what the oracle does. If it ever fails because the oracle dropped its short-circuit, the fix is to delete the divergence note, never to loosen skodun.

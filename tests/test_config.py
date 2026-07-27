@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from skodun.config import Defaults, load_config
+from skodun.config import SECURITY_PATH_SEGMENTS, Defaults, load_config
 
 
 def _write(p: Path, s: str) -> Path:
@@ -127,4 +127,165 @@ model = "m"
 role = "finder"
 """)
     with pytest.raises(ValueError, match="missing its required 'name'"):
+        load_config(None, global_path=g)
+
+
+# --- repo-layout tables: defaults, round-trip, layering, validation ---------
+
+def test_repo_layout_tables_default_to_generic_behavior():
+    d = Defaults()
+    assert d.checklist_map == ()              # only `core` gets selected
+    assert d.test_path_patterns == ()
+    assert d.security_basename_patterns == ()
+    assert d.security_path_segments == (
+        "auth", "secret", "credential", "token", "webhook", "payment", "billing")
+    assert d.security_path_segments == SECURITY_PATH_SEGMENTS
+
+
+def test_defaults_stay_hashable_with_configured_tables(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[defaults]
+checklist_map = [["a/", "backend"]]
+test_path_patterns = ["*.spec.ts"]
+""")
+    cfg = load_config(None, global_path=g)
+    hash(cfg.defaults)                        # frozen + hashable: no list fields
+    assert isinstance(cfg.defaults.checklist_map[0], tuple)
+
+
+def test_repo_layout_tables_round_trip_from_global_layer(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[defaults]
+checklist_map = [
+  ["db/changelog/", "migrations"],
+  ["backend/", "backend"],
+  ["web/", "frontend"],
+]
+test_path_patterns = ["*.spec.ts", "src/test/"]
+security_path_segments = ["auth", "vault"]
+security_basename_patterns = ["*RouteService*"]
+""")
+    d = load_config(None, global_path=g).defaults
+    assert d.checklist_map == (
+        ("db/changelog/", "migrations"), ("backend/", "backend"), ("web/", "frontend"))
+    assert d.test_path_patterns == ("*.spec.ts", "src/test/")
+    assert d.security_path_segments == ("auth", "vault")
+    assert d.security_basename_patterns == ("*RouteService*",)
+
+
+def test_repo_layout_tables_round_trip_from_project_layer(tmp_path):
+    g = _write(tmp_path / "g.toml", "[defaults]\ntimeout_sec = 420\n")
+    repo = tmp_path / "repo"; repo.mkdir()
+    _write(repo / ".skodun.toml", """
+[defaults]
+checklist_map = [["svc/", "backend"]]
+test_path_patterns = ["*_test.py"]
+security_path_segments = ["crypto"]
+security_basename_patterns = ["*Handler*"]
+""")
+    d = load_config(repo, global_path=g).defaults
+    assert d.checklist_map == (("svc/", "backend"),)
+    assert d.test_path_patterns == ("*_test.py",)
+    assert d.security_path_segments == ("crypto",)
+    assert d.security_basename_patterns == ("*Handler*",)
+
+
+def test_project_layer_overrides_global_repo_layout_tables(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[defaults]
+checklist_map = [["global/", "backend"]]
+test_path_patterns = ["global.spec.ts"]
+security_path_segments = ["global-seg"]
+security_basename_patterns = ["global*"]
+""")
+    repo = tmp_path / "repo"; repo.mkdir()
+    _write(repo / ".skodun.toml", """
+[defaults]
+checklist_map = [["project/", "frontend"]]
+test_path_patterns = ["project.spec.ts"]
+security_path_segments = ["project-seg"]
+security_basename_patterns = ["project*"]
+""")
+    d = load_config(repo, global_path=g).defaults
+    assert d.checklist_map == (("project/", "frontend"),)
+    assert d.test_path_patterns == ("project.spec.ts",)
+    assert d.security_path_segments == ("project-seg",)
+    assert d.security_basename_patterns == ("project*",)
+
+
+def test_empty_repo_layout_tables_are_accepted(tmp_path):
+    # An explicitly empty table is well-formed — it means "match nothing".
+    g = _write(tmp_path / "g.toml", """
+[defaults]
+checklist_map = []
+security_path_segments = []
+""")
+    d = load_config(None, global_path=g).defaults
+    assert d.checklist_map == () and d.security_path_segments == ()
+
+
+@pytest.mark.parametrize("key", [
+    "test_path_patterns", "security_path_segments", "security_basename_patterns"])
+def test_string_table_rejects_scalar(tmp_path, key):
+    g = _write(tmp_path / "g.toml", f'[defaults]\n{key} = "auth"\n')
+    with pytest.raises(ValueError,
+                       match=rf"\[defaults\] {key}: expected an array of strings, got str"):
+        load_config(None, global_path=g)
+
+
+@pytest.mark.parametrize("key", [
+    "test_path_patterns", "security_path_segments", "security_basename_patterns"])
+def test_string_table_rejects_non_string_entry(tmp_path, key):
+    g = _write(tmp_path / "g.toml", f'[defaults]\n{key} = ["ok", 7]\n')
+    with pytest.raises(ValueError,
+                       match=rf"\[defaults\] {key}: entry 1 must be a string, got int"):
+        load_config(None, global_path=g)
+
+
+@pytest.mark.parametrize("key", [
+    "test_path_patterns", "security_path_segments", "security_basename_patterns"])
+def test_string_table_rejects_blank_entry(tmp_path, key):
+    g = _write(tmp_path / "g.toml", f'[defaults]\n{key} = ["ok", "  "]\n')
+    with pytest.raises(ValueError,
+                       match=rf"\[defaults\] {key}: entry 1 must not be empty"):
+        load_config(None, global_path=g)
+
+
+def test_checklist_map_rejects_scalar(tmp_path):
+    g = _write(tmp_path / "g.toml", '[defaults]\nchecklist_map = "src/"\n')
+    with pytest.raises(
+            ValueError,
+            match=r"\[defaults\] checklist_map: expected an array of 2-element arrays, got str"):
+        load_config(None, global_path=g)
+
+
+def test_checklist_map_rejects_flat_string_list(tmp_path):
+    g = _write(tmp_path / "g.toml", '[defaults]\nchecklist_map = ["src/", "backend"]\n')
+    with pytest.raises(
+            ValueError,
+            match=r"\[defaults\] checklist_map: entry 0 must be a 2-element array, got str"):
+        load_config(None, global_path=g)
+
+
+def test_checklist_map_rejects_wrong_arity(tmp_path):
+    g = _write(tmp_path / "g.toml",
+               '[defaults]\nchecklist_map = [["a/", "backend"], ["b/"]]\n')
+    with pytest.raises(
+            ValueError,
+            match=r"\[defaults\] checklist_map: entry 1 must be a 2-element array, got 1 elements"):
+        load_config(None, global_path=g)
+
+
+def test_checklist_map_rejects_non_string_member(tmp_path):
+    g = _write(tmp_path / "g.toml", '[defaults]\nchecklist_map = [["a/", 3]]\n')
+    with pytest.raises(
+            ValueError,
+            match=r"\[defaults\] checklist_map: entry 0 must contain strings, got int"):
+        load_config(None, global_path=g)
+
+
+def test_checklist_map_rejects_blank_member(tmp_path):
+    g = _write(tmp_path / "g.toml", '[defaults]\nchecklist_map = [["a/", ""]]\n')
+    with pytest.raises(
+            ValueError, match=r"\[defaults\] checklist_map: entry 0 must not be empty"):
         load_config(None, global_path=g)
