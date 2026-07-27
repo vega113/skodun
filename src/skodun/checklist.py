@@ -34,11 +34,11 @@ pins it for the shipped example, whose own table is ordered accordingly.
 and in addition to `checklist_map`. Each pattern is read one of two ways:
 
 * ends with `/` → an anchored path-prefix test (`path.startswith(pattern)`),
-  for whole test trees;
+  for whole test trees (e.g. `spec/`);
 * otherwise → an `fnmatch.fnmatchcase` glob over the **whole** path, in which
   `*` crosses `/`. That single form expresses both of the oracle's remaining
-  shapes: `*.spec.ts` is "ends with .spec.ts", and `*test-utils*.ts` is
-  "contains test-utils AND ends with .ts".
+  shapes: `*.golden` is "ends with .golden", and `*fixtures*.py` is
+  "contains fixtures AND ends with .py".
 
 `crossFile` rule globs read from `code-rules.json` use neither of the above:
 they keep the oracle's own minimal matcher (`_glob_match`) — `*` alone matches
@@ -60,6 +60,12 @@ path-scoped rules and reviews anyway. An empty or non-matching layout table is
 NOT an error — it silently yields `core` only. A missing or malformed
 `code-rules.json` is a partial degradation: selection proceeds, `cross-file` is
 simply unavailable, and the reason lands in `note`.
+
+`note` alone conflates those two severities, so `Selection.degraded`
+disambiguates: total failure leaves `sections` empty and `degraded` False;
+partial degradation leaves `sections` non-empty (everything else that could be
+selected) and `degraded` True. When `note` is empty, `degraded` is always
+False.
 """
 
 from __future__ import annotations
@@ -67,7 +73,7 @@ from __future__ import annotations
 import fnmatch
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 #: Injection budget for all checklist sections combined, in bytes.
@@ -86,14 +92,40 @@ DROP_ORDER: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class Selection:
-    """What to inject, what it costs, and what had to go."""
+    """What to inject, what it costs, and what had to go.
 
-    sections: list[str]
+    `sections` and `dropped` are tuples, not lists: `select` builds them as
+    lists while iterating and mutating (dropping entries under budget), then
+    freezes the result here, so `frozen=True` is not just skin deep.
+
+    `note` and `degraded` together describe why a selection is imperfect,
+    disambiguating two severities that would otherwise share one string:
+
+    * total failure — selection raised before choosing anything. `sections`
+      is empty, `degraded` is False, and `note` explains what failed.
+    * partial degradation — selection succeeded but something it depends on
+      (currently: an unreadable `code-rules.json`) was unavailable. `sections`
+      still carries everything that WAS selected, `degraded` is True, and
+      `note` explains what's missing.
+
+    When `note` is empty, `degraded` is always False.
+    """
+
+    sections: tuple[str, ...]
     bytes_total: int
     over_budget: bool
-    dropped: list[str] = field(default_factory=list)
+    dropped: tuple[str, ...] = ()
     body: str = ""
     note: str = ""
+    degraded: bool = False
+
+    def __post_init__(self) -> None:
+        # Accept list arguments (from `select`'s internal working lists, or
+        # from callers/tests passing list literals) and coerce them to tuples
+        # so every `Selection` in the wild is actually immutable, regardless
+        # of what was handed to the constructor.
+        object.__setattr__(self, "sections", tuple(self.sections))
+        object.__setattr__(self, "dropped", tuple(self.dropped))
 
 
 def _section_for(path: str, checklist_map: Sequence[tuple[str, str]]) -> str | None:
@@ -194,11 +226,13 @@ def select(
                 if section:
                     selected.add(section)
 
-        # cross-file: single-shot/full or the integration pass, never per-batch.
-        if mode in ("full", "integration"):
+        # cross-file: single-shot/full consults the registry; the integration
+        # pass already set cross-file unconditionally above and never touches
+        # the registry, so it must not pick up a note about it; batch never
+        # includes cross-file at all.
+        if mode == "full":
             globs, note = _cross_file_globs(rules_json)
-            wanted = mode == "integration" or any(
-                _glob_match(p, g) for p in paths for g in globs)
+            wanted = any(_glob_match(p, g) for p in paths for g in globs)
             if wanted:
                 selected.add("cross-file")
             else:
@@ -206,9 +240,11 @@ def select(
 
         ordered = [s for s in PRIORITY if s in selected]
         bodies: dict[str, str] = {}
-        # DIVERGENCE: iterate over a copy. The oracle mutates the list it is
-        # iterating, so two sections missing from disk at adjacent priorities
-        # leave a section in `ordered` with no body and it dies on KeyError.
+        # Iterate over a copy so removing an entry from `ordered` inside the
+        # loop body can't skip the next one. The oracle's own loop rebinds
+        # `ordered = [x for x in ordered if x != s]` instead of mutating it in
+        # place, so its `for` loop keeps iterating the original list object
+        # and still visits every entry; behavior is identical either way.
         for s in list(ordered):
             f = checklist_dir / f"{s}.md"
             if f.is_file():
@@ -241,10 +277,16 @@ def select(
             dropped=dropped,
             body="".join(parts),
             note=note,
+            # Selection succeeded (we're past every raise site above); a
+            # non-empty note here can only mean the crossFile registry was
+            # unavailable, i.e. partial degradation, not total failure.
+            degraded=bool(note),
         )
     except Exception as e:
         return Selection(
             sections=[], bytes_total=0, over_budget=False, dropped=[], body="",
             note=f"checklist selection failed: {e}; "
                  f"continuing without path-scoped rules",
+            # Total failure, not degradation: nothing was selected at all.
+            degraded=False,
         )

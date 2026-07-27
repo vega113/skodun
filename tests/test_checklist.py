@@ -69,14 +69,14 @@ def test_selection_by_prefix_and_crossfile(tmp_path):
     assert set(sel.sections) == {"core", "backend", "frontend", "cross-file"}
     assert "rule for backend" in sel.body
     assert sel.note == ""
-    assert sel.bytes_total > 0 and sel.dropped == [] and sel.over_budget is False
+    assert sel.bytes_total > 0 and sel.dropped == () and sel.over_budget is False
 
 
 def test_sections_are_emitted_in_priority_order(tmp_path):
     cdir, rules = _fixtures(tmp_path)
     sel = select(["tools/a.sh", "app/web/b.ts", "app/backend/C.scala"], "full",
                  cdir, rules, checklist_map=MAP)
-    assert sel.sections == ["core", "cross-file", "backend", "frontend", "tooling"]
+    assert sel.sections == ("core", "cross-file", "backend", "frontend", "tooling")
 
 
 def test_empty_map_selects_core_only_and_does_not_crash(tmp_path):
@@ -84,13 +84,13 @@ def test_empty_map_selects_core_only_and_does_not_crash(tmp_path):
     cdir, rules = _fixtures(tmp_path)
     sel = select(["app/backend/App.scala", "app/web/x.spec.ts", "tools/a.sh"],
                  "batch", cdir, rules)
-    assert sel.sections == ["core"] and sel.note == ""
+    assert sel.sections == ("core",) and sel.note == ""
     # `full` adds only the rules-driven cross-file section, still no layout sections.
     sel_full = select(["app/backend/App.scala"], "full", cdir, rules)
-    assert sel_full.sections == ["core", "cross-file"] and sel_full.note == ""
+    assert sel_full.sections == ("core", "cross-file") and sel_full.note == ""
     # A path matching no crossFile glob leaves core alone.
     sel_plain = select(["docs/notes.md"], "full", cdir, rules)
-    assert sel_plain.sections == ["core"]
+    assert sel_plain.sections == ("core",)
 
 
 def test_first_match_wins_in_map_order(tmp_path):
@@ -163,7 +163,26 @@ def test_integration_mode_is_core_plus_crossfile_only(tmp_path):
     sel = select(["app/web/thing.ts", "app/web/x.spec.ts"], "integration", cdir,
                  rules, checklist_map=MAP, test_path_patterns=TESTS)
     # cross-file is unconditional in integration mode, even with no glob match.
-    assert sel.sections == ["core", "cross-file"]
+    assert sel.sections == ("core", "cross-file")
+
+
+def test_integration_mode_never_notes_a_missing_registry(tmp_path):
+    # Integration mode sets cross-file unconditionally and never consults
+    # code-rules.json, so a missing/unreadable registry must not surface a
+    # note (or `degraded`) — there was nothing to be degraded about.
+    cdir, rules = _fixtures(tmp_path)
+    rules.unlink()
+    sel = select(["app/web/thing.ts"], "integration", cdir, rules,
+                 checklist_map=MAP)
+    assert sel.sections == ("core", "cross-file")
+    assert sel.note == "" and sel.degraded is False
+
+    # Same for a malformed registry.
+    rules.write_text("{ this is not json", encoding="utf-8")
+    sel2 = select(["app/web/thing.ts"], "integration", cdir, rules,
+                  checklist_map=MAP)
+    assert sel2.sections == ("core", "cross-file")
+    assert sel2.note == "" and sel2.degraded is False
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +207,8 @@ def test_budget_drops_lowest_priority_first(tmp_path):
                  cdir, rules, checklist_map=MAP)
     # 27000 bytes of sections: tooling then frontend go, and the *largest*
     # section survives because eviction follows priority, not size.
-    assert sel.dropped == ["tooling", "frontend"]
-    assert sel.sections == ["core", "backend"]
+    assert sel.dropped == ("tooling", "frontend")
+    assert sel.sections == ("core", "backend")
     assert sel.bytes_total <= BUDGET
 
 
@@ -197,7 +216,7 @@ def test_over_budget_when_core_alone_exceeds_it(tmp_path):
     cdir, rules = _fixtures(tmp_path)
     (cdir / "core.md").write_text("x" * (BUDGET + 1), encoding="utf-8")
     sel = select(["docs/x.md"], "batch", cdir, rules, checklist_map=MAP)
-    assert sel.sections == ["core"] and sel.over_budget is True and sel.dropped == []
+    assert sel.sections == ("core",) and sel.over_budget is True and sel.dropped == ()
 
 
 def test_drop_order_is_priority_order_reversed_minus_core():
@@ -212,7 +231,7 @@ def test_missing_section_file_is_skipped_not_fatal(tmp_path):
     (cdir / "tooling.md").unlink()   # two adjacent-in-priority holes
     sel = select(["app/web/a.ts", "tools/b.sh", "app/backend/C.scala"], "batch",
                  cdir, rules, checklist_map=MAP)
-    assert sel.sections == ["core", "backend"] and sel.note == ""
+    assert sel.sections == ("core", "backend") and sel.note == ""
 
 
 # ---------------------------------------------------------------------------
@@ -220,9 +239,16 @@ def test_missing_section_file_is_skipped_not_fatal(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_fail_soft_on_missing_dir(tmp_path):
-    sel = select(["a"], "full", tmp_path / "nope", tmp_path / "nope.json")
-    assert sel.sections == [] and sel.body == "" and "failed" in sel.note
-    assert sel.bytes_total == 0 and sel.dropped == [] and sel.over_budget is False
+    missing = tmp_path / "nope"
+    sel = select(["a"], "full", missing, tmp_path / "nope.json")
+    assert sel.sections == () and sel.body == "" and "failed" in sel.note
+    assert sel.bytes_total == 0 and sel.dropped == () and sel.over_budget is False
+    # Pin the exact fail-soft message shape, not just "failed" appearing
+    # somewhere in it, so a silent reword is caught.
+    assert sel.note == (
+        f"checklist selection failed: checklist dir not found: {missing}; "
+        "continuing without path-scoped rules"
+    )
 
 
 def test_malformed_rules_json_fails_soft(tmp_path):
@@ -230,7 +256,7 @@ def test_malformed_rules_json_fails_soft(tmp_path):
     rules.write_text("{ this is not json", encoding="utf-8")
     sel = select(["app/backend/App.scala"], "full", cdir, rules, checklist_map=MAP)
     # Selection still happens; only the rules-driven section is unavailable.
-    assert sel.sections == ["core", "backend"]
+    assert sel.sections == ("core", "backend")
     assert "cross-file" not in sel.sections
     assert "cross-file" in sel.note and "code-rules.json" in sel.note
 
@@ -239,13 +265,42 @@ def test_missing_rules_json_notes_and_skips_crossfile(tmp_path):
     cdir, rules = _fixtures(tmp_path)
     rules.unlink()
     sel = select(["app/backend/App.scala"], "full", cdir, rules, checklist_map=MAP)
-    assert sel.sections == ["core", "backend"] and "cross-file" in sel.note
+    assert sel.sections == ("core", "backend") and "cross-file" in sel.note
 
 
 def test_selection_is_a_dataclass_with_the_documented_fields():
-    sel = Selection(["core"], 3, False, [], "x")
+    # Construct with list arguments: `Selection` must coerce them to tuples
+    # itself (frozen=True is not just skin deep), and `degraded` defaults to
+    # False.
+    sel = Selection(["core"], 3, False, ["x"], "body", "note text")
     assert (sel.sections, sel.bytes_total, sel.over_budget, sel.dropped,
-            sel.body, sel.note) == (["core"], 3, False, [], "x", "")
+            sel.body, sel.note, sel.degraded) == (
+        ("core",), 3, False, ("x",), "body", "note text", False)
+    assert isinstance(sel.sections, tuple) and isinstance(sel.dropped, tuple)
+
+
+# ---------------------------------------------------------------------------
+# Selection.degraded: disambiguating total failure from partial degradation
+# ---------------------------------------------------------------------------
+
+def test_selection_clean_state_has_no_note_and_is_not_degraded(tmp_path):
+    cdir, rules = _fixtures(tmp_path)
+    sel = select(["app/backend/App.scala"], "full", cdir, rules, checklist_map=MAP)
+    assert sel.note == "" and sel.degraded is False
+    assert sel.sections == ("core", "cross-file", "backend")
+
+
+def test_selection_degraded_state_has_full_sections_note_and_degraded_true(tmp_path):
+    cdir, rules = _fixtures(tmp_path)
+    rules.unlink()  # cross-file registry unavailable, but selection proceeds
+    sel = select(["app/backend/App.scala"], "full", cdir, rules, checklist_map=MAP)
+    assert sel.sections == ("core", "backend")  # everything else still selected
+    assert sel.note != "" and sel.degraded is True
+
+
+def test_selection_failed_state_has_empty_sections_note_and_not_degraded(tmp_path):
+    sel = select(["a"], "full", tmp_path / "nope", tmp_path / "nope.json")
+    assert sel.sections == () and sel.note != "" and sel.degraded is False
 
 
 # ---------------------------------------------------------------------------
@@ -269,12 +324,12 @@ def test_example_config_orders_longest_prefix_first(tmp_path):
     sel = select(["src/main/resources/db/changelog/001-init.xml"], "batch",
                  cdir, rules, checklist_map=d.checklist_map,
                  test_path_patterns=d.test_path_patterns)
-    assert sel.sections == ["core", "migrations"]
+    assert sel.sections == ("core", "migrations")
     assert "backend" not in sel.sections
     # ...and the shorter prefix still works on its own.
     sel2 = select(["src/main/scala/App.scala"], "batch", cdir, rules,
                   checklist_map=d.checklist_map)
-    assert sel2.sections == ["core", "backend"]
+    assert sel2.sections == ("core", "backend")
 
 
 def test_example_config_tables_are_well_formed(tmp_path):
@@ -322,7 +377,7 @@ ORACLE_CASES: tuple[tuple[list[str], str], ...] = (
 
 
 def _run_oracle(oracle: Path, cdir: Path, paths: list[str], mode: str,
-                tmp: Path) -> tuple[list[str], int, bool, list[str], str]:
+                tmp: Path) -> tuple[tuple[str, ...], int, bool, tuple[str, ...], str]:
     """Drive `scripts/grok-checklist-select.py` through its env interface."""
     script = oracle / ORACLE_SCRIPT
     assert script.is_file(), f"oracle script not found: {script}"
@@ -335,8 +390,10 @@ def _run_oracle(oracle: Path, cdir: Path, paths: list[str], mode: str,
     head, marker, body = out.partition("----- BEGIN CHECKLIST META END -----\n")
     assert marker, f"oracle emitted no meta marker: {out[:200]!r}"
     lines = head.split("\n")
-    return ([s for s in lines[0].split(",") if s], int(lines[1]),
-            lines[2] == "1", [s for s in lines[3].split(",") if s], body)
+    # `sections`/`dropped` are tuples to match `Selection`'s own frozen
+    # (tuple-typed) fields, so callers can compare directly against `sel`.
+    return (tuple(s for s in lines[0].split(",") if s), int(lines[1]),
+            lines[2] == "1", tuple(s for s in lines[3].split(",") if s), body)
 
 
 @pytest.mark.skipif(oracle_dir() is None, reason="SKODUN_ORACLE_DIR unset")
@@ -363,15 +420,24 @@ def test_example_config_reproduces_oracle_selection(tmp_path):
 
 @pytest.mark.skipif(oracle_dir() is None, reason="SKODUN_ORACLE_DIR unset")
 def test_example_config_reproduces_oracle_budget_drops(tmp_path):
+    # Sizes are deliberately uneven (not "drop one 9000B section and you're
+    # done" for any budget in range): dropping just `tooling` leaves ~19060
+    # bytes, which is over the real 18 KiB budget (so `frontend` must also
+    # go) but under a hypothetical 20 KiB budget (so it wouldn't). That makes
+    # the drop *count*, not just the drop set, sensitive to the `BUDGET`
+    # constant — mutating BUDGET to 20 * 1024 flips this fixture from a
+    # 2-section drop to a 1-section drop, which the real oracle (whose budget
+    # is hardcoded to 18 KiB in the script) will never do, so parity fails
+    # and the drift is actually caught.
     d = _example_defaults(tmp_path)
     cdir, rules = _fixtures(tmp_path, root="budget", cross_paths=("src/main/**",))
-    for name in ("tooling", "frontend", "backend"):
-        (cdir / f"{name}.md").write_text("x" * 9000, encoding="utf-8")
+    for name, size in (("tooling", 5000), ("backend", 9000), ("frontend", 10000)):
+        (cdir / f"{name}.md").write_text("x" * size, encoding="utf-8")
     paths = ["scripts/b.sh", "ui/src/app/a.ts", "src/main/scala/A.scala"]
     want = _run_oracle(oracle_dir(), cdir, paths, "full", tmp_path)
     sel = select(paths, "full", cdir, rules, checklist_map=d.checklist_map,
                  test_path_patterns=d.test_path_patterns)
     assert (sel.sections, sel.bytes_total, sel.over_budget, sel.dropped,
             sel.body) == want
-    assert sel.dropped, "fixture must actually blow the budget"
+    assert sel.dropped == ("tooling", "frontend"), "fixture must drop exactly these"
     assert "core" in sel.sections
