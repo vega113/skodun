@@ -253,15 +253,24 @@ def _cmd_import_legacy(args) -> int:
     """One-shot migration of a legacy `.grok-reviews` archive.
 
     Not part of the gate contract, so the exit codes are the ordinary ones:
-    `0` the import ran, `2` it could not run at all. It deliberately does NOT
-    emit a verdict banner -- nothing was gated and nothing was reviewed, and a
-    banner here would give a pre-push hook a line it is entitled to read as a
-    verdict.
+    `0` the import ran, `2` it could not run -- or could not finish what it
+    claimed. It deliberately does NOT emit a verdict banner -- nothing was
+    gated and nothing was reviewed, and a banner here would give a pre-push
+    hook a line it is entitled to read as a verdict.
 
     A missing archive is a `0` with `reviews=0`: on a machine that never used
     the legacy tool there is simply nothing to import, and `import_legacy`
     already reports every unusable line through `skipped_lines` rather than by
     failing.
+
+    `store_failures` is the one counter that changes the exit code.
+    `import_legacy` never raises, so a store that stopped accepting writes
+    halfway -- a full disk, an I/O error -- comes back as an ordinary result
+    object with a nonzero count in it. Exiting 0 on that would tell a migration
+    script that history it does not have was preserved. Every counter the
+    importer produces is printed, because a counter an operator cannot see is
+    a counter that does not exist: `findings_reconciled` in particular is how
+    many rows were imported on the ARTIFACT's word rather than the index's.
     """
     try:
         from .legacy_import import import_legacy
@@ -275,10 +284,16 @@ def _cmd_import_legacy(args) -> int:
         stats = import_legacy(store, archive)
     except BaseException as e:
         return _emit(f"skodun import-legacy: FAILED on {archive}: {e!r}", 2)
+    failed = stats.store_failures > 0
     return _emit(
-        f"skodun import-legacy: {archive} -> reviews={stats.reviews} "
+        f"skodun import-legacy: {'FAILED' if failed else 'ok'} {archive} -> "
+        f"reviews={stats.reviews} "
         f"triage={stats.triage} skipped_lines={stats.skipped_lines} "
-        f"demoted_no_artifact={stats.demoted_no_artifact}", 0)
+        f"demoted_no_artifact={stats.demoted_no_artifact} "
+        f"demoted_untrustworthy={stats.demoted_untrustworthy} "
+        f"findings_reconciled={stats.findings_reconciled} "
+        f"triage_unauditable={stats.triage_unauditable} "
+        f"store_failures={stats.store_failures}", 2 if failed else 0)
 
 
 def main(argv: list[str] | None = None) -> int:

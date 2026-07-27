@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 
 import pytest
 
@@ -27,7 +28,7 @@ from skodun.gate import run_gate
 from skodun.legacy_import import ImportStats, import_legacy
 from skodun.store import Store
 from skodun.textnorm import ledger_key
-from skodun.triage import load_valid_artifact
+from skodun.triage import load_valid_artifact, validate_reason
 from tests.conftest import oracle_dir
 from tests.test_gitio import _git, _mkrepo
 
@@ -83,6 +84,17 @@ def _artifact(row=ROW, **over):
 
 def _store(tmp_path) -> Store:
     return Store.open(tmp_path / "s.db")
+
+
+def _disk_full(rec):
+    """A store that has stopped accepting writes.
+
+    `sqlite3.OperationalError` is what sqlite actually raises for "database or
+    disk is full" and for an I/O error, and it is a `sqlite3.DatabaseError`,
+    which is the family the importer classifies as the STORE failing rather
+    than the record being unusable.
+    """
+    raise sqlite3.OperationalError("database or disk is full")
 
 
 # --------------------------------------------------------------------------
@@ -268,6 +280,63 @@ def test_artifact_reporting_more_findings_than_the_index_row_is_trusted(tmp_path
     assert [f["title"] for f in imported["findings"]] == ["T1", "T2"]
 
 
+def test_artifact_out_reporting_a_NONZERO_index_count_is_trusted(tmp_path):
+    """The relaxed check is `artifact < row`, not `row == 0`.
+
+    A summary appended after the first pass found one finding, with two more
+    merged in later, is the same shape as the 0 -> 2 case above and must be
+    read the same way. Pinned separately because a mutation narrowing the rule
+    to "only when the row said zero" passes the 0 -> 2 test untouched.
+    """
+    finds = [dict(file="a.py", line=1, severity="high", title="T1"),
+             dict(file="b.py", line=2, severity="low", title="T2"),
+             dict(file="c.py", line=3, severity="low", title="T3")]
+    row = {**ROW, "findings_total": 1,
+           "severity": {"high": 1, "medium": 0, "low": 0}}
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, rows=[row],
+        artifacts={"loop_1": _artifact(row, findings=finds, findings_total=3)}))
+    assert stats.reviews == 1 and stats.demoted_no_artifact == 0
+    assert stats.findings_reconciled == 1
+    imported = st.latest_trustworthy_for("d" * 40)
+    assert imported is not None
+    load_valid_artifact(imported)
+    assert imported["findings_total"] == 3
+    assert [f["title"] for f in imported["findings"]] == ["T1", "T2", "T3"]
+
+
+def test_reconciled_and_demoted_are_disjoint_buckets(tmp_path):
+    """One archive, one of each shape, and the counters must not double-book.
+
+    The smoke test can only assert the inequality `demoted + reconciled <=
+    reviews`, which a double-booked row can satisfy by accident. Here the exact
+    values are known, so a row counted in both buckets is visible.
+    """
+    reconciled_row = {**ROW, "id": "recon"}
+    demoted_row = {**ROW, "id": "demo"}                  # no artifact on disk
+    agreeing_row = {**ROW, "id": "agree"}
+    denied_row = {**ROW, "id": "denied"}
+    finds = [dict(file="a.py", line=1, severity="high", title="T1")]
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, index_tail="", triage_rows=None,
+        rows=[reconciled_row, demoted_row, agreeing_row, denied_row],
+        artifacts={
+            "recon": _artifact(reconciled_row, findings=finds, findings_total=1),
+            "agree": _artifact(agreeing_row),
+            "denied": _artifact(denied_row, degraded=True)}))
+    assert stats.reviews == 4, "every row is still preserved as history"
+    assert stats.findings_reconciled == 1
+    assert stats.demoted_no_artifact == 1
+    assert stats.demoted_untrustworthy == 1
+    assert stats.skipped_lines == 0 and stats.store_failures == 0
+    # ... and the buckets sum to strictly less than `reviews`: the fourth row
+    # ("agree") is in none of them.
+    assert (stats.findings_reconciled + stats.demoted_no_artifact
+            + stats.demoted_untrustworthy) == 3
+
+
 def test_artifact_reporting_fewer_findings_than_the_index_row_is_demoted(tmp_path):
     """The direction the check exists for: an artifact that HIDES findings.
 
@@ -413,6 +482,140 @@ def test_trustworthy_null_falls_back_to_the_axes(tmp_path):
     assert st.latest_trustworthy_for("d" * 40) is not None
 
 
+def test_a_row_demoted_by_its_recorded_verdict_is_counted(tmp_path):
+    """A demotion nobody can see in the stats is a demotion nobody audits."""
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, rows=[{**ROW, "trustworthy": False}],
+        artifacts={"loop_1": _artifact()}))
+    assert stats.reviews == 1
+    assert stats.demoted_untrustworthy == 1
+    assert stats.demoted_no_artifact == 0, "the artifact was fine; the row was not"
+    assert stats.skipped_lines == 1, "only the corrupt index tail"
+
+
+# --------------------------------------------------------------------------
+# THE ARTIFACT'S OWN TRUST DENIAL CANNOT BE OVERRIDDEN BY ITS INDEX SUMMARY
+#
+# The index row is a derived summary; the artifact is the record the review
+# actually produced, and the module's stated merge rule is that the artifact
+# wins every field it defines. Trust axes are not an exception to that rule --
+# they are the fields where breaking it costs the most, because a clean-reading
+# summary laundering an artifact's own `degraded: true` into a stored
+# `trustworthy=1` is a gate PASS on a review the archive itself disowned.
+#
+# This is not a contrived shape. Rows written before `diff_truncated` and
+# `trustworthy` existed carry neither field, so "the row reads clean" is the
+# ordinary case across a large part of a real archive.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("denial", [
+    dict(degraded=True),
+    dict(parse_ok=False),
+    dict(diff_truncated=True),
+    dict(trustworthy=False),
+])
+def test_artifact_denying_its_own_trust_is_never_imported_trustworthy(tmp_path,
+                                                                      denial):
+    """Each of the four shapes an artifact can use to disown itself.
+
+    The index ROW is clean in every case, which is exactly the situation where
+    deriving trust from the row and stapling it onto the merged record would
+    produce a trustworthy store row -- and `run_gate` would then pass on it.
+    """
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, artifacts={"loop_1": _artifact(**denial)}))
+    assert stats.reviews == 1, "history is still preserved"
+    assert stats.demoted_untrustworthy == 1
+    assert stats.demoted_no_artifact == 0, "the artifact loaded fine"
+    assert st.latest_trustworthy_for("d" * 40) is None, (
+        f"an artifact recording {denial} imported as trustworthy")
+    kept = st.get_review("loop_1")
+    assert kept["trustworthy"] is False and kept["parse_ok"] is False
+    assert kept["source"] == "legacy"
+    # The demotion is a demotion, not a rewrite: what the artifact claimed is
+    # still on the record for an auditor to read.
+    assert kept["legacy_trust"] == {
+        "parse_ok": denial.get("parse_ok", True),
+        "degraded": denial.get("degraded", False),
+        "diff_truncated": denial.get("diff_truncated", False),
+        "trustworthy": denial.get("trustworthy")}
+
+
+def test_artifact_denial_survives_a_row_that_predates_the_trust_fields(tmp_path):
+    """The reachable shape: the row has no `diff_truncated`, no `trustworthy`.
+
+    An absent axis reads False and an absent verdict falls back to the axes, so
+    the row derives trustworthy on its own. Only the artifact knows better.
+    """
+    row = {k: v for k, v in ROW.items() if k != "diff_truncated"}
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, rows=[row],
+        artifacts={"loop_1": _artifact(row, diff_truncated=True)}))
+    assert stats.reviews == 1 and stats.demoted_untrustworthy == 1
+    assert st.latest_trustworthy_for("d" * 40) is None
+
+
+@pytest.mark.parametrize("denial", [
+    dict(degraded=1),
+    dict(diff_truncated="yes"),
+    dict(parse_ok="false"),
+])
+def test_non_boolean_axes_on_the_artifact_also_fail_closed(tmp_path, denial):
+    """The coercion is applied to the merged record, not only to the row.
+
+    `bool("false")` is True, so reading an artifact's axis without the
+    `_UNSAFE_AXIS` coercion would launder these into trust.
+    """
+    st = _store(tmp_path)
+    import_legacy(st, _archive(tmp_path, artifacts={"loop_1": _artifact(**denial)}))
+    assert st.latest_trustworthy_for("d" * 40) is None
+    kept = st.get_review("loop_1")
+    assert kept["trustworthy"] is False
+    for k in ("parse_ok", "degraded", "diff_truncated"):
+        assert isinstance(kept[k], bool), f"{k} stored as {kept[k]!r}"
+
+
+@pytest.mark.parametrize("value", [1, "true", "yes"])
+def test_non_boolean_trustworthy_on_the_artifact_is_not_trust(tmp_path, value):
+    """ORACLE PARITY, applied to the artifact: the test is `is True`."""
+    st = _store(tmp_path)
+    import_legacy(st, _archive(tmp_path,
+                               artifacts={"loop_1": _artifact(trustworthy=value)}))
+    assert st.latest_trustworthy_for("d" * 40) is None
+
+
+def test_a_clean_artifact_beside_a_clean_row_is_still_trusted(tmp_path):
+    """The control: re-reading trust off the merged record must not tighten
+    anything that was legitimately trustworthy before."""
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, artifacts={"loop_1": _artifact(trustworthy=True)}))
+    assert stats.demoted_untrustworthy == 0
+    assert st.latest_trustworthy_for("d" * 40) is not None
+
+
+def test_an_artifact_denial_beats_a_stale_summary_reconciliation(tmp_path):
+    """A demoted row is never also counted as reconciled.
+
+    The artifact out-reports its index row AND disowns itself. Its count is not
+    the one anything will act on, so `findings_reconciled` -- which exists to
+    say "this row was imported on the artifact's word" -- must not claim it.
+    """
+    finds = [dict(file="a.py", line=1, severity="high", title="T1")]
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, artifacts={"loop_1": _artifact(findings=finds, findings_total=1,
+                                                 degraded=True)}))
+    assert stats.reviews == 1
+    assert stats.demoted_untrustworthy == 1
+    assert stats.findings_reconciled == 0
+    assert st.latest_trustworthy_for("d" * 40) is None
+
+
 # --------------------------------------------------------------------------
 # The triage ledger
 # --------------------------------------------------------------------------
@@ -441,7 +644,6 @@ def test_triage_uses_the_recorded_finding_key_never_a_recomputed_one(tmp_path):
     {**TRIAGE_ROW, "finding_key": ""},
     {**TRIAGE_ROW, "finding_key": None},
     {k: v for k, v in TRIAGE_ROW.items() if k != "id"},          # no review id
-    {k: v for k, v in TRIAGE_ROW.items() if k != "dismissed_reason"},
     {k: v for k, v in TRIAGE_ROW.items() if k != "branch"},
 ])
 def test_unusable_triage_rows_are_skipped_and_counted(tmp_path, bad):
@@ -450,7 +652,103 @@ def test_unusable_triage_rows_are_skipped_and_counted(tmp_path, bad):
                                        artifacts={"loop_1": _artifact()}))
     assert stats.triage == 0
     assert stats.skipped_lines == 2      # the corrupt index tail + this row
+    assert stats.triage_unauditable == 0, "unusable, not merely unauditable"
     assert st.triage_for("b", "s" * 40) == {}
+
+
+# --------------------------------------------------------------------------
+# THE AUDIT FLOOR APPLIES TO IMPORTED DISMISSALS
+#
+# `Store.add_triage` only requires `dismissed_reason` to be PRESENT. The rules
+# that make a dismissal auditable -- MIN_REASON_CHARS and PLACEHOLDER_REASONS,
+# enforced by `triage.validate_reason` on every dismissal skodun records itself
+# -- live one layer above it, so without an explicit call the import path would
+# be the one way into the ledger that has no floor at all. A row dismissing a
+# finding as "fp" would then move the gate from 1 to 0.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("reason, why", [
+    ("fp", "placeholder"),
+    ("false positive", "placeholder"),
+    ("Not A Bug", "placeholder, normalized"),
+    ("too short", "under MIN_REASON_CHARS"),
+    ("", "empty"),
+    ("   \n  ", "whitespace only"),
+    (None, "absent (explicit null)"),
+    (17, "not even a string"),
+])
+def test_imported_dismissals_must_clear_the_audit_floor(tmp_path, reason, why):
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, artifacts={"loop_1": _artifact()},
+        triage_rows=[{**TRIAGE_ROW, "dismissed_reason": reason}]))
+    assert stats.triage == 0, why
+    assert stats.triage_unauditable == 1
+    assert stats.skipped_lines == 1, "the corrupt index tail only"
+    assert st.triage_for("b", "s" * 40) == {}, (
+        f"a {why} reason was honoured as a dismissal")
+
+
+def test_a_missing_dismissed_reason_is_unauditable_not_merely_unusable(tmp_path):
+    bad = {k: v for k, v in TRIAGE_ROW.items() if k != "dismissed_reason"}
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(tmp_path, triage_rows=[bad],
+                                       artifacts={"loop_1": _artifact()}))
+    assert (stats.triage, stats.triage_unauditable) == (0, 1)
+    assert st.triage_for("b", "s" * 40) == {}
+
+
+def test_a_real_reason_still_imports(tmp_path):
+    """The floor must not eat the dismissals the migration exists to preserve."""
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(tmp_path, artifacts={"loop_1": _artifact()}))
+    assert stats.triage == 1 and stats.triage_unauditable == 0
+    assert set(st.triage_for("b", "s" * 40)) == {"ab" * 8}
+
+
+def test_one_unauditable_dismissal_does_not_lose_the_auditable_ones(tmp_path):
+    good = {**TRIAGE_ROW, "finding_key": "cd" * 8}
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, artifacts={"loop_1": _artifact()},
+        triage_rows=[{**TRIAGE_ROW, "dismissed_reason": "fp"}, good]))
+    assert (stats.triage, stats.triage_unauditable) == (1, 1)
+    assert set(st.triage_for("b", "s" * 40)) == {"cd" * 8}
+
+
+def test_e2e_a_rubber_stamp_dismissal_cannot_clear_a_finding(tmp_path):
+    """END TO END, the reason this matters: gate 1 must not become gate 0.
+
+    The finding is real and open. A legacy ledger row dismissing it as "fp"
+    says nothing a human could audit; honouring it on import would silently
+    clear the finding and hand the push a PASS.
+    """
+    repo = _mkrepo(tmp_path)
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    base = gitio.resolve_base(repo)
+    diff = gitio.capture_diff(repo, base.sha, 100)
+    branch = gitio.current_branch(repo)
+    from skodun.textnorm import finding_key
+    finding = dict(file="a.txt", line=1, severity="high", title="T")
+    row = dict(id="legacy_3", reviewed_at="2026-07-01T00:00:00Z", branch=branch,
+               head=gitio.head_sha(repo), base_ref=base.ref, base_sha=base.sha,
+               diff_hash=gitio.diff_identity(diff.data), mode="prepush",
+               parse_ok=True, degraded=False, diff_truncated=False,
+               findings_total=1, severity={"high": 1, "medium": 0, "low": 0})
+    art = {**row, "summary": "s", "findings": [finding]}
+    tri = dict(finding_key=finding_key("a.txt", "T"), id="legacy_3", branch=branch,
+               base_sha=base.sha, file="a.txt", line=1, severity="high", title="T",
+               dismissed_reason="fp", dismissed_at="2026-07-01T00:00:00Z")
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, rows=[row], artifacts={"legacy_3": art}, triage_rows=[tri],
+        index_tail="", name="arch-stamp"))
+    assert (stats.triage, stats.triage_unauditable) == (0, 1)
+    r = run_gate(st, repo, load_config(repo))
+    assert r.code == 1, f"a rubber stamp cleared a finding: {r.message}"
+    assert "1 finding(s) open" in r.message
 
 
 def test_one_bad_triage_row_does_not_lose_the_good_ones(tmp_path):
@@ -493,6 +791,92 @@ def test_blank_lines_are_not_counted_as_corruption(tmp_path):
     stats = import_legacy(st, _archive(
         tmp_path, artifacts={"loop_1": _artifact()}, index_tail="\n\n   \n"))
     assert stats.reviews == 1 and stats.skipped_lines == 0
+
+
+# --------------------------------------------------------------------------
+# What the counters actually count
+# --------------------------------------------------------------------------
+
+
+def test_reviews_counts_index_lines_not_distinct_ids(tmp_path):
+    """`reviews` is a count of LINES, and `ImportStats` says so in those words.
+
+    A real archive repeats an id once per re-review of the same loop, and
+    `save_review` upserts on `reviews.id`, so the store legitimately holds
+    fewer rows than `reviews` reports. Pinned here because the counter reads
+    like a count of preserved history and an operator will compare it against
+    `SELECT COUNT(*)`.
+    """
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, index_tail="", triage_rows=None,
+        rows=[ROW, {**ROW, "reviewed_at": "2026-07-02T00:00:00Z"}],
+        artifacts={"loop_1": _artifact()}))
+    assert stats.reviews == 2, "two lines were read and persisted"
+    assert st._c.execute("SELECT COUNT(*) c FROM reviews").fetchone()["c"] == 1
+    # The docstring is the operator-facing half of this fix, so it is pinned
+    # too: it must not go back to promising a count of preserved history.
+    assert "upper bound" in ImportStats.__doc__
+    assert "always answers" not in ImportStats.__doc__
+
+
+def test_triage_counts_ledger_lines_not_distinct_ledger_keys(tmp_path):
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, index_tail="", artifacts={"loop_1": _artifact()},
+        triage_rows=[TRIAGE_ROW,
+                     {**TRIAGE_ROW, "dismissed_at": "2026-07-02T00:00:00Z"}]))
+    assert stats.triage == 2
+    assert st._c.execute("SELECT COUNT(*) c FROM triage").fetchone()["c"] == 1
+
+
+# --------------------------------------------------------------------------
+# A store that stops accepting writes is not a corrupt input line
+# --------------------------------------------------------------------------
+
+
+def test_a_store_write_failure_is_counted_apart_from_a_bad_line(tmp_path,
+                                                                monkeypatch):
+    """A full disk mid-import must not read as "the archive was garbage".
+
+    Counted as `skipped_lines`, a disk failure produces `reviews=0
+    skipped_lines=N` and an exit 0 -- a migration script is told the archive
+    was junk and that the run succeeded, when in fact nothing was preserved.
+    """
+    st = _store(tmp_path)
+    monkeypatch.setattr(st, "save_review", _disk_full)
+    stats = import_legacy(st, _archive(tmp_path, artifacts={"loop_1": _artifact()}))
+    assert stats.reviews == 0
+    assert stats.store_failures == 1
+    assert stats.skipped_lines == 1, "the corrupt index tail, and nothing else"
+
+
+def test_a_ledger_write_failure_is_counted_apart_from_a_bad_line(tmp_path,
+                                                                 monkeypatch):
+    st = _store(tmp_path)
+    monkeypatch.setattr(st, "add_triage", _disk_full)
+    stats = import_legacy(st, _archive(tmp_path, artifacts={"loop_1": _artifact()}))
+    assert stats.triage == 0 and stats.store_failures == 1
+    assert stats.reviews == 1, "the index half still went in"
+
+
+def test_an_unbindable_record_is_a_skipped_line_not_a_store_failure(tmp_path):
+    """The other side of the split, so it cannot degenerate into "any error".
+
+    A `branch` that is a list makes sqlite refuse the BINDING -- sqlite's own
+    "the caller handed me something I cannot bind" error, which is the record
+    being unusable, not the store being broken. Counting it as a store failure
+    would make the CLI exit nonzero -- i.e. report a failed migration -- over
+    one malformed line, which is the same confusion this split exists to end,
+    only pointing the other way.
+    """
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, index_tail="", triage_rows=None,
+        rows=[{**ROW, "branch": ["not", "a", "string"]}]))
+    assert stats.reviews == 0
+    assert stats.store_failures == 0
+    assert stats.skipped_lines == 1
 
 
 # --------------------------------------------------------------------------
@@ -695,6 +1079,50 @@ def test_cli_import_legacy_reports_a_store_failure_as_nonzero(tmp_path, monkeypa
     assert main(["import-legacy", "--dir", str(tmp_path)]) == 2
 
 
+def test_cli_import_legacy_prints_every_counter(tmp_path, monkeypatch, capsys):
+    """The CLI is the only operator-facing seam, so a counter it omits is one
+    nobody will ever read.
+
+    `findings_reconciled` exists precisely so that "imported on the artifact's
+    word rather than the index's" is visible; printing the demotion counters
+    but not that one shows the operator the losses and hides the overrides.
+    """
+    from skodun.cli import main
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "cli.db"))
+    finds = [dict(file="a.py", line=1, severity="high", title="T1")]
+    d = _archive(tmp_path, index_tail="",
+                 rows=[ROW, {**ROW, "id": "denied"}],
+                 artifacts={"loop_1": _artifact(findings=finds, findings_total=1),
+                            "denied": _artifact({**ROW, "id": "denied"},
+                                                degraded=True)},
+                 triage_rows=[TRIAGE_ROW,
+                              {**TRIAGE_ROW, "finding_key": "cd" * 8,
+                               "dismissed_reason": "fp"}])
+    assert main(["import-legacy", "--dir", str(d)]) == 0
+    out = capsys.readouterr().out
+    for expected in ("reviews=2", "triage=1", "skipped_lines=0",
+                     "demoted_no_artifact=0", "demoted_untrustworthy=1",
+                     "findings_reconciled=1", "triage_unauditable=1",
+                     "store_failures=0"):
+        assert expected in out, f"{expected!r} missing from {out!r}"
+
+
+def test_cli_import_legacy_exits_nonzero_when_the_store_refused_a_write(
+        tmp_path, monkeypatch, capsys):
+    """`import_legacy` never raises, so a half-written import comes back as an
+    ordinary result object. Exiting 0 on it would tell a migration script that
+    history it does not have was preserved."""
+    from skodun.cli import main
+    from skodun.store import Store as _Store
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "cli.db"))
+    monkeypatch.setattr(_Store, "save_review", lambda self, rec: _disk_full(rec))
+    d = _archive(tmp_path, artifacts={"loop_1": _artifact()})
+    assert main(["import-legacy", "--dir", str(d)]) == 2
+    out = capsys.readouterr().out
+    assert "store_failures=1" in out and "reviews=0" in out
+    assert "FAILED" in out
+
+
 # --------------------------------------------------------------------------
 # Oracle-gated smoke test against the real archive
 # --------------------------------------------------------------------------
@@ -744,9 +1172,21 @@ def test_real_archive_smoke(tmp_path):
     assert 0 <= stats.demoted_no_artifact <= stats.reviews
     assert 0 <= stats.findings_reconciled <= stats.reviews
     # Disjoint buckets: a row is either demoted or imported, never counted as
-    # both, so the two subsets cannot exceed the whole.
-    assert stats.demoted_no_artifact + stats.findings_reconciled <= stats.reviews
+    # both, so the subsets cannot exceed the whole. (The exact-value version of
+    # this, on synthetic data where a double-booking would be visible rather
+    # than merely possible, is `test_reconciled_and_demoted_are_disjoint_buckets`.)
+    assert (stats.demoted_no_artifact + stats.findings_reconciled
+            + stats.demoted_untrustworthy) <= stats.reviews
     assert stats.triage > 0, "a real ledger imported no dismissals"
+    # Nothing was lost to the STORE. A real archive exercising this path with a
+    # nonzero count here means the import silently failed to preserve history.
+    assert stats.store_failures == 0
+
+    # The audit floor costs a real archive nothing: every dismissal a human
+    # actually wrote clears it, so `triage` is not being propped up by rows
+    # that would be rubber stamps.
+    for row in st._c.execute("SELECT dismissed_reason FROM triage").fetchall():
+        validate_reason(row["dismissed_reason"])
 
     # Every row the import called trustworthy must be a real, valid artifact --
     # this is the property whose violation jams the gate at 2.
