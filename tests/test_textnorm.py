@@ -19,7 +19,7 @@ import sys
 
 import pytest
 
-from skodun.textnorm import finding_key, ledger_key, norm
+from skodun.textnorm import collapse_ws, finding_key, ledger_key, norm
 
 from tests.conftest import oracle_dir
 
@@ -46,6 +46,25 @@ def test_norm_basic():
     assert norm(None) == ""
     assert norm("") == ""
     assert norm("MiXeD CaSe") == "mixed case"
+
+
+def test_collapse_ws_basic():
+    assert collapse_ws("  Hello   World  ") == "Hello World"
+    assert collapse_ws("\tTabs\nand\r\nnewlines\t") == "Tabs and newlines"
+    assert collapse_ws("  leading and trailing  ") == "leading and trailing"
+    assert collapse_ws("") == ""
+    assert collapse_ws(None) == ""
+
+
+def test_collapse_is_the_pre_lowercase_half_of_norm():
+    # `collapse_ws` exists only because `triage.validate_reason` must measure
+    # its length floor before case folding. It must stay the exact
+    # pre-lowercase half of the single `norm` definition here -- if the two
+    # ever drift, the placeholder lookup and the length check stop describing
+    # the same string.
+    for s in ["", "   ", "a b", "  FALSE   POSITIVE  ", "İ" * 3, "Straße",
+              "a\t\nb  c", None, 42]:
+        assert norm(s) == collapse_ws(s).lower(), repr(s)
 
 
 def test_finding_key_excludes_line():

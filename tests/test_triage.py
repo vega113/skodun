@@ -21,14 +21,12 @@ import sys
 import pytest
 
 from skodun.store import Store
-from skodun.textnorm import finding_key
-from skodun.textnorm import norm
+from skodun.textnorm import collapse_ws, finding_key, norm
 from skodun.triage import (
     MIN_REASON_CHARS,
     PLACEHOLDER_REASONS,
     ArtifactError,
     TriageError,
-    _collapse,
     dismiss,
     load_valid_artifact,
     open_findings,
@@ -111,16 +109,6 @@ def test_reason_length_boundary_exact():
         validate_reason("a" * (MIN_REASON_CHARS - 1))
 
 
-def test_collapse_is_the_pre_lowercase_half_of_norm():
-    # `_collapse` exists only because the length floor must be measured before
-    # case folding. It must stay the exact pre-lowercase half of the single
-    # `norm` definition in textnorm -- if the two ever drift, the placeholder
-    # lookup and the length check stop describing the same string.
-    for s in ["", "   ", "a b", "  FALSE   POSITIVE  ", "İ" * 3, "Straße",
-              "a\t\nb  c", None, 42]:
-        assert norm(s) == _collapse(s).lower(), repr(s)
-
-
 @pytest.mark.parametrize("reason", ["İ" * 10, "ABCDEFGHIJİABCDEFGH"])
 def test_reason_length_measured_before_lowercasing(reason):
     # U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE) lowercases to TWO
@@ -130,7 +118,7 @@ def test_reason_length_measured_before_lowercasing(reason):
     # measured on the collapsed-not-lowercased form, exactly as the oracle
     # measures it, so both of these must be rejected.
     assert len(norm(reason)) >= MIN_REASON_CHARS   # lenient form would accept
-    assert len(_collapse(reason)) < MIN_REASON_CHARS
+    assert len(collapse_ws(reason)) < MIN_REASON_CHARS
     with pytest.raises(TriageError):
         validate_reason(reason)
 

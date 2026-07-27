@@ -17,6 +17,21 @@ import hashlib
 import re
 
 
+def collapse_ws(s) -> str:
+    r"""Whitespace-collapsed but NOT lowercased form of `s`.
+
+    This is the pre-lowercase half of `norm`: `norm(s) == collapse_ws(s).lower()`
+    holds for every input. It exists as its own public function because
+    `triage.validate_reason` measures a dismissal reason's length floor on
+    this collapsed-but-not-lowercased form, while matching placeholder
+    reasons on the fully normalized (lowercased) form -- the two checks are
+    NOT interchangeable, since `str.lower()` can *lengthen* a string (U+0130
+    lowercases to two codepoints), so measuring the length on the lowercased
+    form would let a 10-character reason clear a 20-character floor.
+    """
+    return re.sub(r"\s+", " ", str(s or "")).strip()
+
+
 def norm(s) -> str:
     r"""Lowercase, whitespace-collapsed form used for both keys and validation.
 
@@ -26,7 +41,7 @@ def norm(s) -> str:
         def _norm(text):
             return re.sub(r"\s+", " ", str(text or "")).strip().lower()
     """
-    return re.sub(r"\s+", " ", str(s or "")).strip().lower()
+    return collapse_ws(s).lower()
 
 
 def finding_key(file: str, title: str) -> str:

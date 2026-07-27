@@ -811,9 +811,16 @@ Note: the legacy module's public function names may differ (`finding_key` vs `_f
 from __future__ import annotations
 import hashlib, re
 
+def collapse_ws(s) -> str:
+    # Whitespace-collapsed but NOT lowercased. Public because triage's reason
+    # length floor must be measured on this pre-lowercase form (see Task 6):
+    # str.lower() can LENGTHEN a string (U+0130 -> two codepoints), so
+    # measuring the floor on the lowercased form is not equivalent.
+    return re.sub(r"\s+", " ", str(s or "")).strip()
+
 def norm(s) -> str:
     # PARITY-CRITICAL: byte-for-byte the oracle's _norm (grok_review_triage.py:70-72).
-    return re.sub(r"\s+", " ", str(s or "")).strip().lower()
+    return collapse_ws(s).lower()
 
 def finding_key(file: str, title: str) -> str:
     h = hashlib.sha256()
@@ -891,9 +898,8 @@ def test_dismiss_and_open(tmp_path):
 ```python
 # src/skodun/triage.py
 from __future__ import annotations
-import re
 from .store import Store
-from .textnorm import finding_key, ledger_key, norm
+from .textnorm import collapse_ws, finding_key, ledger_key, norm
 
 class TriageError(ValueError): ...
 class ArtifactError(ValueError): ...
@@ -910,17 +916,16 @@ PLACEHOLDER_REASONS = {
 }
 MIN_REASON_CHARS = 20
 
-def _collapse(s) -> str:            # the oracle's `cleaned`: whitespace-collapsed,
-    return re.sub(r"\s+", " ", str(s or "")).strip()   # NOT lowercased
-
 def validate_reason(reason: str) -> None:
     # ORACLE ORDER — empty, then placeholder, then length. Checking length
     # first makes the placeholder branch unreachable (every placeholder is
     # <= 14 chars) and swaps the actionable message for "too short".
-    # The floor is measured on _collapse(), not norm(): str.lower() can
-    # LENGTHEN a string (U+0130 -> two codepoints), so measuring on the
-    # lowercased form lets a 10-char reason clear the 20-char floor.
-    cleaned = _collapse(reason)
+    # The floor is measured on collapse_ws() (textnorm), not norm(): str.lower()
+    # can LENGTHEN a string (U+0130 -> two codepoints), so measuring on the
+    # lowercased form lets a 10-char reason clear the 20-char floor. There is
+    # exactly one whitespace-collapse definition, in textnorm; triage never
+    # re-derives it.
+    cleaned = collapse_ws(reason)
     if not cleaned:
         raise TriageError("a dismissal reason is required (it was empty)")
     if norm(cleaned) in PLACEHOLDER_REASONS:

@@ -14,10 +14,8 @@ above that function.
 
 from __future__ import annotations
 
-import re
-
 from .store import Store
-from .textnorm import finding_key, ledger_key, norm
+from .textnorm import collapse_ws, finding_key, ledger_key, norm
 
 
 class TriageError(ValueError):
@@ -40,25 +38,6 @@ PLACEHOLDER_REASONS = {
 MIN_REASON_CHARS = 20
 
 
-def _collapse(s) -> str:
-    r"""Whitespace-collapsed but NOT lowercased form of `s`.
-
-    PARITY-CRITICAL: this is the oracle's `cleaned` in `validate_reason`
-    (grok_review_triage.py:95), which measures the reason's length *before*
-    case folding::
-
-        cleaned = re.sub(r"\s+", " ", str(reason or "")).strip()
-
-    It is exactly the pre-lowercase half of `textnorm.norm` — the identity
-    `norm(s) == _collapse(s).lower()` holds for every input and is pinned by
-    `test_collapse_is_the_pre_lowercase_half_of_norm`. The two forms are NOT
-    interchangeable for the length check: `str.lower()` can *lengthen* a
-    string (U+0130 lowercases to two codepoints), so measuring on the
-    lowercased form lets a 10-character reason clear the 20-character floor.
-    """
-    return re.sub(r"\s+", " ", str(s or "")).strip()
-
-
 def validate_reason(reason: str) -> None:
     """Raise TriageError unless `reason` clears the audit floor.
 
@@ -73,9 +52,10 @@ def validate_reason(reason: str) -> None:
       than MIN_REASON_CHARS, so checking length first would make this branch
       unreachable and replace the actionable message with "too short";
     * the length floor is measured on the whitespace-collapsed but NOT
-      lowercased form, exactly as the oracle measures it. See `_collapse`.
+      lowercased form, exactly as the oracle measures it. See
+      `textnorm.collapse_ws`.
     """
-    cleaned = _collapse(reason)
+    cleaned = collapse_ws(reason)
     if not cleaned:
         raise TriageError("a dismissal reason is required (it was empty)")
     if norm(cleaned) in PLACEHOLDER_REASONS:
