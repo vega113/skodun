@@ -23,7 +23,7 @@
 - Grok reviewer runs tool-less: `--disallowed-tools bash,read,write,edit,web_search,web_fetch`, `--max-turns 40`, no `--always-approve` needed.
 - Verdict banner is always the **last line of stdout**, values read back from the persisted record, never recomputed.
 - Store path: `~/.local/share/skodun/skodun.db` (override: `SKODUN_DB`). Config: `~/.config/skodun/config.toml` overridden by `<repo>/.skodun.toml` (deep merge, project wins).
-- Porting oracle: `/Users/vega/devroot/tubescribes/scripts/` — each task cites its source file. Where this plan's code and the oracle's observable behavior disagree, the oracle wins; add a parity test.
+- Porting oracle: the tubescribes checkout — each task cites its source file under its `scripts/` directory. Where this plan's code and the oracle's observable behavior disagree, the oracle wins; add a parity test. **The repo is public/open-source:** test code locates the oracle via the `SKODUN_ORACLE_DIR` env var (defaulting to `~/devroot/tubescribes` expanded at runtime) and skips parity tests when it is absent — never a hardcoded machine-specific absolute path in committed code. Shared test helper: `tests/conftest.py` defines `oracle_dir() -> Path | None`.
 - Out of scope for Phase 1 (fail closed where relevant): batched review of oversized diffs (diff over budget ⇒ `diff_truncated=true` ⇒ not trustworthy ⇒ gate exit 2 — never a silent pass); pre-push dispatcher **and with it the dedup probe** (foreground `--now` never dedups in the oracle — every `skodun review` runs a fresh review; the 3-way diff/context dedup probe is dispatcher machinery, Phase 3 — the store nonetheless preserves the `context_hash` NULL-vs-`""` distinction for forward compatibility); same-branch supersede (legacy retires only *prepush*-mode workers, which don't exist in Phase 1); rules-registry authoring/generation/sync (`generate-review-rules.mjs` + `check-review-rules-sync.sh` stay in tubescribes; skodun only *consumes* the generated `docs/review/checklists/*.md` + `code-rules.json`); MCP server; scheduling; non-grok adapters; cloud-bot embed generation; SessionStart delivery hook; macOS notifications; retention/pruning; the legacy `-p` prompt fallback (see Grok binary resolution above).
 
 ## File Structure
@@ -594,7 +594,8 @@ def test_diff_identity_strips_trailing_newlines_like_shell():
     from skodun.gitio import diff_identity
     assert diff_identity(b"diff --git a b\n+x\n\n\n") == diff_identity(b"diff --git a b\n+x")
 
-ORACLE = Path("/Users/vega/devroot/tubescribes/scripts/grok-prepush-review.sh")
+from tests.conftest import oracle_dir
+ORACLE = (oracle_dir() / "scripts" / "grok-prepush-review.sh") if oracle_dir() else None
 
 def _oracle_hash(repo: Path) -> str:
     import subprocess as sp
@@ -603,8 +604,8 @@ def _oracle_hash(repo: Path) -> str:
 
 def test_diff_identity_parity_with_oracle(tmp_path):
     import pytest
-    if not ORACLE.exists():
-        pytest.skip("tubescribes checkout not present")
+    if ORACLE is None or not ORACLE.exists():
+        pytest.skip("oracle checkout not present (set SKODUN_ORACLE_DIR)")
     from skodun.gitio import resolve_base, capture_diff, diff_identity
     repo = _mkrepo(tmp_path)
     _git(repo, "checkout", "-b", "feat")
@@ -616,8 +617,8 @@ def test_diff_identity_parity_with_oracle(tmp_path):
 
 def test_diff_identity_parity_untracked_only(tmp_path):
     import pytest
-    if not ORACLE.exists():
-        pytest.skip("tubescribes checkout not present")
+    if ORACLE is None or not ORACLE.exists():
+        pytest.skip("oracle checkout not present (set SKODUN_ORACLE_DIR)")
     from skodun.gitio import resolve_base, capture_diff, diff_identity
     repo = _mkrepo(tmp_path)
     _git(repo, "checkout", "-b", "feat")
@@ -768,7 +769,8 @@ import importlib.util, sys
 from pathlib import Path
 from skodun.textnorm import finding_key, ledger_key, norm
 
-LEGACY = Path("/Users/vega/devroot/tubescribes/scripts/grok_review_triage.py")
+from tests.conftest import oracle_dir
+LEGACY = (oracle_dir() / "scripts" / "grok_review_triage.py") if oracle_dir() else None
 
 def _load_legacy():
     spec = importlib.util.spec_from_file_location("legacy_triage", LEGACY)
@@ -783,8 +785,8 @@ def test_key_shape():
     assert finding_key("src/foo.scala", "missing null check") == k  # normalized
 
 def test_parity_with_legacy_module():
-    if not LEGACY.exists():
-        import pytest; pytest.skip("tubescribes checkout not present")
+    if LEGACY is None or not LEGACY.exists():
+        import pytest; pytest.skip("oracle checkout not present (set SKODUN_ORACLE_DIR)")
     legacy = _load_legacy()
     cases = [("src/A.scala", "NPE in handler"),
              ("ui/x.ts", "  race   condition  IN effect "),
