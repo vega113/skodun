@@ -41,3 +41,35 @@ test_path_patterns = [
   "integration-tests/src/test/",
   "ui/src/app/testing/",
 ]
+
+# Path segments that make a change "risky" and schedule the extra security
+# pass. Matched WHOLE-SEGMENT and case-insensitively against the "/"-separated
+# parts of each changed path, so "auth" fires on `app/auth/Login.scala` but not
+# on `app/authentication/` or `app/reauth/`. Keep this list tight: every
+# false positive costs a whole extra review call.
+security_path_segments = [
+  "auth",
+  "billing",
+  "credits",
+  "dao",
+  "db",
+  "webhook",
+]
+
+# Name-shape patterns that also mark a path risky. Each is an fnmatch glob,
+# matched case-insensitively against the path with every non-alphanumeric
+# character removed — so one pattern covers `TelegramWebhookRouteService.scala`,
+# `telegram-webhook.service.ts`, and `telegram_webhook.py` alike.
+#
+# A pattern with NO "/" is matched against the whole path compacted flat
+# (separators removed too), i.e. a pure name test. A pattern CONTAINING "/" is
+# matched against the path with each segment compacted but the "/" separators
+# kept and a leading "/" prepended, so directory context can be anchored: "*"
+# still crosses "/", so the third entry below reads as "under a real
+# api/services/ directory, something named like a route service" and does not
+# fire on `xapi/services/`.
+security_basename_patterns = [
+  "*telegramwebhook*",
+  "*webhookrouteservice*",
+  "*/api/services/*routeservice*",
+]
