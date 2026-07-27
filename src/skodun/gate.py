@@ -65,7 +65,7 @@ from . import gitio
 from .config import Config
 from .store import Store
 from .triage import ArtifactError, load_valid_artifact, open_findings
-from .trust import is_trustworthy
+from .trust import flatten_lines, is_trustworthy
 
 _OUTCOMES = {0: "pass", 1: "open-findings", 2: "no-review"}
 
@@ -184,12 +184,11 @@ def run_gate(store: Store, repo: Path, cfg: Config, env=os.environ) -> GateResul
                 repo=str(repo), branch=branch, diff_hash=result.diff_hash,
                 outcome=outcome, code=result.code,
                 # EVERY line of the verdict, joined into the single-line
-                # `note` column. Recording only the last line dropped the
-                # `identity note:` lines the gate prefixes to its message, so
-                # an auditor reading `gate_events` could not tell that the
-                # decision was made against an under-scoped identity -- which
-                # is precisely what those notes exist to make loud.
-                note=" | ".join(result.message.splitlines())))
+                # `note` column. ONE definition of that convention, shared
+                # with `cli._record_setup_failure`, which writes the same
+                # column for the decisions taken above this function --
+                # see `trust.flatten_lines`.
+                note=flatten_lines(result.message)))
         except BaseException as e:
             # A gate that cannot write its own record is running on a broken
             # store and must not certify anything -- including a bypass, which

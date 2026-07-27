@@ -75,6 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="compare skodun's verdicts against the legacy .grok-reviews archive")
     shadow.add_argument("--dir", type=Path, default=None, dest="dir",
                         help=f"archive directory (default: ./{_LEGACY_DIR})")
+    shadow.add_argument("--diff-hash", default=None, dest="diff_hash",
+                        help="restrict the comparison to one diff_hash "
+                             "(default: every hash on either side)")
 
     log = sub.add_parser("log", help="show recent reviews, newest first")
     log.add_argument("--branch", default=None,
@@ -93,16 +96,32 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _flatten(message: str) -> str:
-    """One line, with every line of the message kept.
+def _repo_root(repo: Path) -> Path:
+    """The worktree root containing `repo`. Raises `GitError` if there is none.
 
-    The recorded note used to be the LAST line only, which silently dropped
-    the `identity note:` lines the gate prefixes to its verdict -- so an
-    auditor reading `gate_events` could not see that the decision was made
-    against an under-scoped identity. `gate_events.note` is a single-line
-    column by convention, so the lines are joined rather than truncated.
+    ONE directory decides both halves of a gate decision, and it has to be the
+    same one. `gitio.capture_diff` normalises to the worktree root before any
+    git call -- see its docstring for why that is load-bearing -- so the diff
+    identity is a property of the worktree, not of the cwd. The config was not:
+    `load_config` reads `<its argument>/.skodun.toml`, and `--repo` defaults to
+    `.`, so the same working tree produced a DIFFERENT `diff_hash` depending on
+    which directory the command was run from.
+
+    Everything downstream of that followed the split. `untracked_max` read from
+    the root but not from a subdirectory, so a review taken from the root could
+    never satisfy a gate run from a subdirectory -- and pre-push hooks and
+    manual runs routinely differ. The `identity note: untracked scan capped at
+    N` warning, whose whole job is to make an under-scoped identity loud at the
+    enforcement point, silently vanished with the config that set the cap. And
+    `skodun review` from a subdirectory refused with "no enabled reviewer with
+    role 'finder' is configured", blaming the user's reviewer table for their
+    cwd.
+
+    So both seams resolve this first and pass the ROOT everywhere: to
+    `load_config`, and on to `run_gate`/`run_review`.
     """
-    return " | ".join(message.splitlines())
+    from . import gitio
+    return gitio._worktree_root(repo)
 
 
 def _record_setup_failure(store, repo: Path, note: str) -> None:
@@ -120,6 +139,7 @@ def _record_setup_failure(store, repo: Path, note: str) -> None:
     lenient verdict trustworthy.)
     """
     try:
+        from .trust import flatten_lines
         branch = None
         try:
             from . import gitio
@@ -129,7 +149,9 @@ def _record_setup_failure(store, repo: Path, note: str) -> None:
         store.log_gate_event(dict(
             at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             repo=str(repo), branch=branch, diff_hash=None,
-            outcome="error", code=2, note=_flatten(note)))
+            # The same `gate_events.note` convention `run_gate._record` uses,
+            # from the same definition -- two spellings of it could drift.
+            outcome="error", code=2, note=flatten_lines(note)))
     except BaseException:
         pass
 
@@ -186,8 +208,12 @@ def _cmd_gate(args) -> int:
         return _emit(f"SKODUN GATE: FAIL(2) could not open the store: {e!r}", 2)
 
     try:
-        cfg = load_config(repo)
-        result = run_gate(store, repo, cfg)   # records its own event; never raises
+        # The ROOT, not `--repo`: the config and the diff identity must be
+        # resolved against the same directory or the gate decides about a
+        # different change depending on the cwd. See `_repo_root`.
+        root = _repo_root(repo)
+        cfg = load_config(root)
+        result = run_gate(store, root, cfg)   # records its own event; never raises
     except BaseException as e:
         note = f"SKODUN GATE: FAIL(2) could not run the gate: {e!r}"
         _record_setup_failure(store, repo, note)
@@ -235,14 +261,23 @@ def _cmd_review(args) -> int:
         # No store means no record, which is exactly what 4 says.
         return _emit(banner_failure(f"could not open the review store: {e!r}"), 4)
     try:
-        cfg = load_config(repo)
+        # Before the config, and for the same reason the gate does it: the
+        # config has to be read from the same directory the diff identity is
+        # computed against. See `_repo_root`. A `--repo` that is not inside a
+        # worktree at all raises here, which is a preflight refusal -- nothing
+        # ran -- and lands on the same 2 the `GitError` handler below gives.
+        root = _repo_root(repo)
+    except BaseException as e:
+        return _emit(banner_failure(f"{e}; no review ran"), 2)
+    try:
+        cfg = load_config(root)
     except BaseException as e:
         # A config that will not load is a refusal before anything ran, not a
         # review that came back badly: 2, the preflight code.
         return _emit(banner_failure(f"could not load the config: {e!r}"), 2)
 
     try:
-        rec = run_review(repo, cfg, store)
+        rec = run_review(root, cfg, store)
     except PreflightRefused as e:
         return _emit(banner_failure(str(e)), 2)
     except LockTimeout as e:
@@ -325,16 +360,14 @@ def _fmt_side(row: dict | None) -> str:
     displays the same verdict that `shadow.compare` used to decide `match`.
     """
     from .shadow import effective_trustworthy
+    from .trust import coerce_count
 
     if row is None:
         return "-"
     sev = row.get("severity") if isinstance(row.get("severity"), dict) else {}
-
-    def _n(v: object) -> int:
-        return v if isinstance(v, int) and not isinstance(v, bool) else 0
-
     mark = "t" if effective_trustworthy(row) else "f"
-    return f"{mark}/{_n(sev.get('high'))}-{_n(sev.get('medium'))}-{_n(sev.get('low'))}"
+    return (f"{mark}/{coerce_count(sev.get('high'))}"
+            f"-{coerce_count(sev.get('medium'))}-{coerce_count(sev.get('low'))}")
 
 
 def _cmd_shadow_compare(args) -> int:
@@ -351,6 +384,16 @@ def _cmd_shadow_compare(args) -> int:
     silently becoming "findings remain open". Every line below goes through
     `_emit`, the same broken-pipe guard `gate` and `review` use, for exactly
     that reason.
+
+    Each row is `<hash> | <skodun> | <legacy> | <label>`, where a side reads
+    `t/H-M-L`. A row the two sides disagree about carries a second, indented
+    `deltas:` line: `match` is coarse by design -- both sides present, both
+    agreeing on trust, both agreeing on clean-vs-dirty -- because two LLM runs
+    over one diff are not expected to tally the same counts. The counts are
+    exactly what a human deciding whether the new reviewer is *worse* needs,
+    which is why `compare` carries them, so they are printed for the rows where
+    they can mean something and suppressed for the rows where they cannot
+    (a MATCH, or a side that is simply absent).
     """
     try:
         from .legacy_import import INDEX_NAME
@@ -381,9 +424,13 @@ def _cmd_shadow_compare(args) -> int:
     except BaseException:
         pass   # a notice is a courtesy; it may never become the failure itself
 
+    # `--diff-hash` reaches `compare`'s own filter rather than filtering the
+    # result here: it also decides what "nothing to report" means (a hash on
+    # neither side yields an empty list, and the summary below then says
+    # `0 compared` instead of inventing an empty row for it).
     try:
         store = Store.open(_store_path())
-        comparisons = compare(store, archive, None)
+        comparisons = compare(store, archive, args.diff_hash)
     except BaseException as e:
         return _emit(f"skodun shadow-compare: FAILED on {archive}: {e!r}", 0)
 
@@ -402,9 +449,28 @@ def _cmd_shadow_compare(args) -> int:
             label = "MISMATCH"
         _emit(f"{c.diff_hash[:12]} | {_fmt_side(c.skodun)} | {_fmt_side(c.legacy)} "
               f"| {label}", 0)
+        if label == "MISMATCH":
+            _emit(f"{'':12} | deltas (skodun vs legacy): "
+                  + ", ".join(f"{k}={v[0]}/{v[1]}"
+                              for k, v in _deltas(c).items()), 0)
 
     return _emit(f"shadow: {len(comparisons)} compared, {matched} matched, "
                  f"{skodun_only} skodun-only, {legacy_only} legacy-only", 0)
+
+
+def _deltas(c) -> dict:
+    """`Comparison.deltas` as a plain `{name: (skodun, legacy)}` mapping.
+
+    Defensive rather than trusting: `deltas` is data off a dataclass this
+    command only reads, and shadow mode may never fail a workflow, so a shape
+    it does not recognise renders as no deltas at all instead of raising
+    inside the table.
+    """
+    deltas = getattr(c, "deltas", None)
+    if not isinstance(deltas, dict):
+        return {}
+    return {k: v for k, v in deltas.items()
+            if isinstance(v, (tuple, list)) and len(v) == 2}
 
 
 def _cmd_log(args) -> int:
@@ -427,13 +493,11 @@ def _cmd_log(args) -> int:
             f"skodun log: -n must be a positive row count, got {args.limit}", 2)
     try:
         from .store import Store
+        from .trust import coerce_count, one_line
         store = Store.open(_store_path())
         rows = store.list_reviews(args.branch, args.limit)
     except BaseException as e:
         return _emit(f"skodun log: could not read the store: {e!r}", 2)
-
-    def _n(v: object) -> int:
-        return v if isinstance(v, int) and not isinstance(v, bool) else 0
 
     for rec in rows:
         trustworthy = rec.get("trustworthy") is True
@@ -441,11 +505,15 @@ def _cmd_log(args) -> int:
         files = rec.get("files_changed")
         nfiles = len(files) if isinstance(files, list) else 0
         # A summary carrying a stray newline must not be able to fake a second
-        # row in what is meant to be a one-line-per-review listing.
-        summary = str(rec.get("summary") or "").replace("\r", " ").replace("\n", " ")
+        # row in what is meant to be a one-line-per-review listing. Same
+        # definition the banner uses -- see `trust.one_line`.
+        summary = one_line(rec.get("summary") or "")
         mark = "!" if not trustworthy else " "
+        # Counts read by THE project's single count rule, so `log` and `banner`
+        # can never disagree about the same stored row.
         _emit(f"{mark}{rec.get('reviewed_at')} | {rec.get('branch')} | {nfiles} | "
-              f"{_n(sev.get('high'))}-{_n(sev.get('medium'))}-{_n(sev.get('low'))} | "
+              f"{coerce_count(sev.get('high'))}-{coerce_count(sev.get('medium'))}"
+              f"-{coerce_count(sev.get('low'))} | "
               f"{rec.get('status')} | {summary}", 0)
     return 0
 

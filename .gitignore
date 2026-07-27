@@ -4,3 +4,9 @@ __pycache__/
 .pytest_cache/
 dist/
 *.egg-info/
+
+# Per-machine Claude Code settings. Local-only by design and it records
+# absolute paths from the machine that wrote it, so it must never be committed
+# to a public repo. Ignored here rather than relying on a contributor's global
+# gitignore, which is exactly what a fresh clone does not have.
+.claude/settings.local.json

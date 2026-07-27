@@ -126,6 +126,69 @@ def test_index_row_without_artifact_is_imported_demoted(tmp_path):
     assert kept["failure_reason"] == "legacy import: artifact missing/invalid"
 
 
+def test_an_artifact_missing_diff_hash_demotes_its_row_and_spares_the_import(
+        tmp_path):
+    """ONE malformed artifact must not destroy the whole migration.
+
+    `triage.load_valid_artifact` validates `id`/`branch`/`base_sha`/`findings`/
+    `findings_total` but NOT `diff_hash`, so an artifact that omits only that
+    key passes the validator and reaches the identity cross-check. Reading it
+    with a subscript raised `KeyError` straight out of `import_legacy` -- a
+    function documented to never raise and to abort on nothing -- so
+    `skodun import-legacy` exited 2, every index row after the bad one was
+    lost, and because `_import_ledger` runs AFTER `_import_index`, not a single
+    dismissal was imported. Ledger continuity is half of what this module is
+    for. The import is idempotent, so a re-run hit the same line and the
+    operator had no way forward.
+
+    Three rows, only the middle artifact malformed: the import completes, the
+    middle row is demoted (one re-review), the rows on either side keep their
+    trust, and the ledger is imported.
+    """
+    rows = [dict(ROW, id=f"loop_{i}", diff_hash=dh * 40)
+            for i, dh in enumerate("abc", start=1)]
+    artifacts = {r["id"]: _artifact(r) for r in rows}
+    del artifacts["loop_2"]["diff_hash"]        # the ONLY thing wrong with it
+
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(tmp_path, rows=rows, artifacts=artifacts,
+                                       index_tail="\n"))
+
+    assert stats.reviews == 3                    # nothing was lost
+    assert stats.demoted_no_artifact == 1        # exactly the bad one
+    assert stats.store_failures == 0
+    demoted = st.get_review("loop_2")
+    assert demoted["parse_ok"] is False and demoted["trustworthy"] is False
+    assert demoted["failure_reason"] == "legacy import: artifact missing/invalid"
+    assert st.latest_trustworthy_for("b" * 40) is None   # never gate-eligible
+    # Its neighbours are untouched, and importable as real artifacts.
+    for dh in ("a" * 40, "c" * 40):
+        load_valid_artifact(st.latest_trustworthy_for(dh))
+    # ...and the ledger, which only runs once the index is through.
+    assert stats.triage == 1
+    assert "ab" * 8 in st.triage_for("b", "s" * 40)
+
+
+def test_an_artifact_missing_diff_hash_does_not_abort_the_cli(tmp_path,
+                                                              monkeypatch,
+                                                              capsys):
+    """The same failure at the seam an operator actually runs: exit 0, not 2."""
+    from skodun.cli import main
+
+    rows = [dict(ROW, id=f"loop_{i}", diff_hash=dh * 40)
+            for i, dh in enumerate("abc", start=1)]
+    artifacts = {r["id"]: _artifact(r) for r in rows}
+    del artifacts["loop_2"]["diff_hash"]
+    d = _archive(tmp_path, rows=rows, artifacts=artifacts, index_tail="\n")
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "cli" / "s.db"))
+
+    assert main(["import-legacy", "--dir", str(d)]) == 0
+    out = capsys.readouterr().out
+    assert "KeyError" not in out
+    assert "reviews=3" in out and "triage=1" in out
+    assert "demoted_no_artifact=1" in out
+
+
 # --------------------------------------------------------------------------
 # Corrupt input is counted, never fatal
 # --------------------------------------------------------------------------

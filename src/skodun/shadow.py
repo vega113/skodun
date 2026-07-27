@@ -43,7 +43,7 @@ from pathlib import Path
 
 from .legacy_import import INDEX_NAME, _axis, _iter_records, _recorded_denies_trust
 from .store import Store
-from .trust import is_trustworthy
+from .trust import coerce_count, is_trustworthy
 
 _AXES = ("parse_ok", "degraded", "diff_truncated")
 
@@ -99,17 +99,14 @@ def effective_trustworthy(row: dict | None) -> bool:
     return is_trustworthy(**axes)
 
 
-def _int(value: object) -> int:
-    """A persisted count, coerced to `int`, or `0` for anything unusable.
-
-    Both sides here are untrusted data by the time this module sees them: a
-    legacy row is unvalidated JSON, and even a skodun row could in principle
-    have been hand-edited on disk. `bool` is rejected explicitly because
-    `isinstance(True, int)` is `True` in Python.
-    """
-    if isinstance(value, bool) or not isinstance(value, int):
-        return 0
-    return value
+#: A persisted count, coerced to `int`, or `0` for anything unusable. Both
+#: sides here are untrusted data by the time this module sees them: a legacy
+#: row is unvalidated JSON, and even a skodun row could in principle have been
+#: hand-edited on disk. THE project's single count rule, imported rather than
+#: restated -- `trust.coerce_count` says why, including why `bool` has to be
+#: rejected explicitly, and this module is the reason it matters beyond
+#: display: `_findings_total` feeds `match`.
+_int = coerce_count
 
 
 def _findings_total(row: dict | None) -> int:

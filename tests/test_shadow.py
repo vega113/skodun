@@ -430,6 +430,56 @@ def test_cli_shadow_compare_exits_0_even_when_everything_mismatches(tmp_path,
     assert "shadow: 1 compared, 0 matched, 0 skodun-only, 0 legacy-only" in out
 
 
+def test_cli_shadow_compare_diff_hash_restricts_the_table(tmp_path, monkeypatch,
+                                                          capsys):
+    """`compare`'s `diff_hash` filter reaches the CLI, which is what it is for.
+
+    It was specified in the plan's Task 17 interface and implemented, but the
+    CLI always passed `None`, so no invocation could ever use it -- and the
+    obvious question during a shadow run ("what did the two sides say about
+    THIS change?") had no answer short of grepping the table.
+    """
+    from skodun.cli import main
+    dbpath = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(dbpath))
+    st = Store.open(dbpath)
+    st.save_review(REC)                                   # diff_hash = "d"*40
+    st.save_review({**REC, "id": "r2", "diff_hash": "e"*40})
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, _legacy_row(trustworthy=True))
+
+    assert main(["shadow-compare", "--dir", str(d), "--diff-hash", "d"*40]) == 0
+    out = capsys.readouterr().out
+    assert "shadow: 1 compared, 1 matched, 0 skodun-only, 0 legacy-only" in out
+    assert ("e"*40)[:12] not in out
+
+    # A hash on neither side is not an error and not an empty row: it is
+    # nothing to report, and the summary says exactly that.
+    assert main(["shadow-compare", "--dir", str(d), "--diff-hash", "z"*40]) == 0
+    assert ("shadow: 0 compared, 0 matched, 0 skodun-only, 0 legacy-only"
+            in capsys.readouterr().out)
+
+
+def test_cli_shadow_compare_prints_no_deltas_for_an_agreeing_row(
+        tmp_path, monkeypatch, capsys):
+    """Deltas are for the rows where they can mean something.
+
+    `match` is coarse on purpose -- two LLM runs over one diff are not expected
+    to tally the same counts -- so the counts are printed exactly where a human
+    needs them (a MISMATCH) and suppressed where they would be noise.
+    """
+    from skodun.cli import main
+    dbpath = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(dbpath))
+    Store.open(dbpath).save_review(REC)
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, _legacy_row(trustworthy=True))
+
+    assert main(["shadow-compare", "--dir", str(d)]) == 0
+    out = capsys.readouterr().out
+    assert "MATCH" in out and "deltas" not in out
+
+
 def test_cli_shadow_compare_table_column_order_is_skodun_then_legacy(
         tmp_path, monkeypatch, capsys):
     """The two sides are interchangeable-looking; the ORDER is the meaning.
@@ -452,7 +502,13 @@ def test_cli_shadow_compare_table_column_order_is_skodun_then_legacy(
 
     assert main(["shadow-compare", "--dir", str(d)]) == 0
     lines = [x for x in capsys.readouterr().out.splitlines() if "|" in x]
-    assert lines == [f"{('d'*40)[:12]} | t/1-0-0 | f/0-0-3 | MISMATCH"]
+    assert lines == [
+        f"{('d'*40)[:12]} | t/1-0-0 | f/0-0-3 | MISMATCH",
+        # The counts `match` deliberately ignores, printed for the human the
+        # comparison is for -- and in the SAME order as the columns above.
+        "             | deltas (skodun vs legacy): findings_total=1/3, "
+        "sev_high=1/0, sev_medium=0/0, sev_low=0/3",
+    ]
 
 
 def test_cli_shadow_compare_missing_archive_says_so_and_still_exits_0(

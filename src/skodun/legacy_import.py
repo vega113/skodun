@@ -109,6 +109,10 @@ _STORE_BROKEN = (sqlite3.DatabaseError, OSError, MemoryError)
 # takes the stricter one; the worst case is one extra review.
 _UNSAFE_AXIS = {"parse_ok": False, "degraded": True, "diff_truncated": True}
 
+# "The artifact did not carry this key at all", distinguishable from every JSON
+# value it could have carried -- including `null`. See `_load_artifact`.
+_MISSING = object()
+
 
 @dataclass(frozen=True)
 class ImportStats:
@@ -290,8 +294,9 @@ def _load_artifact(archive: Path, row: dict, review_id: str) -> dict | None:
       * an artifact naming a different review `id` than the row that pointed
         at it -- it would be stored under the artifact's id and the index row's
         history would silently vanish;
-      * a `diff_hash` disagreement -- the gate selects on `diff_hash`, so this
-        is the exact field whose corruption would certify the wrong content;
+      * a `diff_hash` disagreement, an artifact that omits `diff_hash`
+        included -- the gate selects on `diff_hash`, so this is the exact
+        field whose corruption would certify the wrong content;
       * an artifact reporting FEWER findings than its index row, including a
         row that fails to state a count at all: unverifiable is not the same as
         verified. An artifact reporting MORE is accepted -- see below.
@@ -314,7 +319,25 @@ def _load_artifact(archive: Path, row: dict, review_id: str) -> dict | None:
         return None
     if art["id"] != review_id:
         return None
-    if art["diff_hash"] != row.get("diff_hash"):
+    # A SENTINEL LOOKUP, never a subscript. `load_valid_artifact` validates
+    # `id`, `branch`, `base_sha`, `findings` and `findings_total`; `diff_hash`
+    # is deliberately NOT in its schema (the gate re-asserts it separately,
+    # against the hash it has just computed), so an artifact that simply omits
+    # the key reaches here. Subscripting it raised `KeyError` straight out of
+    # `import_legacy` -- a function whose contract is that it never raises and
+    # that nothing aborts on bad input -- so ONE malformed file destroyed the
+    # whole migration: every later index row was lost, and `_import_ledger`
+    # runs after `_import_index`, so not a single dismissal was imported
+    # either. Ledger continuity is half this module's purpose.
+    #
+    # The sentinel rather than a plain `.get()` keeps the demote-on-mismatch
+    # semantics exact: `None` is a value a row can legitimately carry, and an
+    # artifact that omits the field entirely must not be able to "agree" with
+    # it. A missing `diff_hash` is therefore a disagreement like any other --
+    # the row imports demoted, costing one re-review, which is precisely what
+    # the rest of this function already does with an artifact whose identity
+    # cannot be confirmed.
+    if art.get("diff_hash", _MISSING) != row.get("diff_hash"):
         return None
     total = row.get("findings_total")
     if isinstance(total, bool) or not isinstance(total, int):

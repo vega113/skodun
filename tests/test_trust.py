@@ -151,21 +151,48 @@ def test_banner_findings_total_non_numeric_string_renders_zero():
 
 
 def test_banner_findings_total_float_renders_without_raising():
+    """A float is not a count, and `coerce_count` is the ONE rule that says so.
+
+    `triage.load_valid_artifact` rejects a non-`int` `findings_total` outright,
+    so a record carrying `2.9` can never certify anything; rendering `2` from
+    it would put a number on screen that no other part of the system accepts.
+    """
     rec = dict(id="loop_11", head="i" * 40, trustworthy=True,
                findings_total=2.9, degraded=False,
                stop_reason="EndTurn", severity={"high": 0, "medium": 0, "low": 0})
     b = banner(rec)
     assert len(b.splitlines()) == 1
-    assert "findings=2" in b
+    assert "findings=0" in b
 
 
 def test_banner_findings_total_bool_renders_without_raising():
+    """`isinstance(True, int)` is True in Python, so `bool` needs its own guard.
+
+    Same rule as `shadow._int`, because it IS that rule now: reading
+    `findings_total: true` as ONE finding is what once made `shadow.compare`
+    report a MISMATCH that never happened.
+    """
     rec = dict(id="loop_12", head="j" * 40, trustworthy=True,
                findings_total=True, degraded=False,
                stop_reason="EndTurn", severity={"high": 0, "medium": 0, "low": 0})
     b = banner(rec)
     assert len(b.splitlines()) == 1
-    assert "findings=1" in b
+    assert "findings=0" in b
+
+
+def test_the_count_rule_is_one_definition_shared_by_banner_log_and_shadow():
+    """Finding 6 of the whole-branch review: three rules for one persisted
+    count, so `banner` and `log` could print different numbers for the same
+    stored row (`findings=3 severity=2/0/0` vs `0-0-0`). One definition now,
+    and every renderer imports it rather than re-spelling it."""
+    from skodun import shadow
+    from skodun.trust import coerce_count
+
+    assert shadow._int is coerce_count
+    assert coerce_count(3) == 3
+    assert coerce_count("3") == 0 and coerce_count(2.9) == 0
+    assert coerce_count(True) == 0 and coerce_count(False) == 0
+    assert coerce_count(None) == 0 and coerce_count([1]) == 0
 
 
 def test_banner_severity_as_list_renders_without_raising():

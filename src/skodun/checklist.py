@@ -98,6 +98,11 @@ class Selection:
     lists while iterating and mutating (dropping entries under budget), then
     freezes the result here, so `frozen=True` is not just skin deep.
 
+    `dropped` and `over_budget` are the budget's half of that story, and they
+    are read by `pipeline.run_review`, which reports both to the operator on
+    stderr. Without them, eviction is invisible: the review runs with fewer
+    rules than the config asked for and nothing says so.
+
     `note` and `degraded` together describe why a selection is imperfect,
     disambiguating two severities that would otherwise share one string:
 
@@ -206,10 +211,24 @@ def select(
         rules_json = Path(rules_json)
         # DIVERGENCE: the oracle is invoked only after its wrapper has already
         # checked the directory exists, and silently emits an empty selection
-        # otherwise. Checking here turns a misconfigured path into a visible
-        # fail-soft note rather than a silently rule-less review.
+        # otherwise. Reporting it here turns a misconfigured path into a
+        # visible fail-soft note rather than a silently rule-less review.
+        #
+        # Returned rather than raised into the handler below, and the wording
+        # is the point: a repo with no `docs/review/checklists` is the DEFAULT
+        # and by far the commonest case -- checklists are opt-in -- so every
+        # run of an ordinary repo used to log `checklist selection failed`.
+        # "Failed" describes a broken thing; this is an unconfigured one, and a
+        # message that cries wolf on every single run is a message nobody reads
+        # when something really does break. The classification is unchanged:
+        # nothing was selected, so `sections` is empty and `degraded` is False
+        # (see the `Selection` docstring). Only the sentence changed.
         if not checklist_dir.is_dir():
-            raise NotADirectoryError(f"checklist dir not found: {checklist_dir}")
+            return Selection(
+                sections=[], bytes_total=0, over_budget=False, dropped=[],
+                body="", degraded=False,
+                note=f"no checklist directory at {checklist_dir} -- "
+                     f"continuing with generic review rules")
 
         paths = [f.strip() for f in files if f and f.strip()]
         note = ""

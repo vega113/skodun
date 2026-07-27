@@ -86,9 +86,11 @@ def _outgoing(repo: Path) -> Path:
 
 
 def _reviewed(store: Store, repo: Path, *, findings=(), trustworthy=True,
-              review_id="r1", base_sha=None):
+              review_id="r1", base_sha=None, untracked_max=100):
+    # `untracked_max` must match what the gate will read out of the repo's
+    # config, or the recorded identity is not the one the gate computes.
     base = gitio.resolve_base(repo)
-    diff = gitio.capture_diff(repo, base.sha, 100)
+    diff = gitio.capture_diff(repo, base.sha, untracked_max)
     store.save_review(dict(
         id=review_id, reviewed_at="2026-07-27T10:00:00Z",
         branch=gitio.current_branch(repo), head=gitio.head_sha(repo),
@@ -607,6 +609,115 @@ def test_cli_gate_defaults_repo_to_cwd(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(repo)
     assert main(["gate"]) == 2
     assert "SKODUN GATE:" in capsys.readouterr().out
+
+
+def _five_untracked_capped_at_three(repo: Path) -> None:
+    """A repo whose identity depends on a config value, and visibly so.
+
+    With `untracked_max = 3` and five untracked files the gate must both hash a
+    CAPPED capture and say so in an `identity note:` line. Read the config from
+    the wrong directory and both disappear silently: the cap reverts to the
+    100-file default (a different, larger capture and therefore a different
+    `diff_hash`) and the note that exists to make an under-scoped identity loud
+    at the enforcement point is never printed.
+    """
+    (repo / ".skodun.toml").write_text("[defaults]\nuntracked_max = 3\n",
+                                       encoding="utf-8")
+    for i in range(5):
+        (repo / f"u{i}.txt").write_text(f"u{i}\n", encoding="utf-8")
+
+
+def test_cli_gate_from_a_subdirectory_decides_exactly_as_from_the_root(
+        tmp_path, monkeypatch, capsys):
+    """The config and the diff identity must resolve against ONE directory.
+
+    `gitio.capture_diff` normalises to the worktree root before any git call --
+    its docstring explains at length why that is load-bearing -- but the CLI
+    used to hand `load_config` the raw `--repo`, which defaults to `.`. So
+    `skodun gate` computed a different `diff_hash` depending on which directory
+    it was run from: a review taken from the root could never satisfy a gate
+    run from a subdirectory, and pre-push hooks and manual runs routinely
+    differ. The cap note vanished with the config that set it.
+    """
+    from skodun.cli import main
+
+    repo = _outgoing(_mkrepo(tmp_path))
+    _five_untracked_capped_at_three(repo)
+    sub = repo / "sub"
+    sub.mkdir()
+    db = tmp_path / "cli" / "s.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+
+    monkeypatch.chdir(repo)
+    from_root_code = main(["gate"])
+    from_root = capsys.readouterr().out
+
+    monkeypatch.chdir(sub)
+    from_sub_code = main(["gate"])
+    from_sub = capsys.readouterr().out
+
+    assert from_root_code == from_sub_code == 2
+    assert from_root == from_sub                     # byte for byte
+    assert "identity note: untracked scan capped at 3" in from_root
+    # ...and the two recorded decisions are about the same content.
+    events = _events(Store.open(db))
+    assert len(events) == 2
+    assert events[0]["diff_hash"] == events[1]["diff_hash"]
+    assert "untracked scan capped at 3" in events[1]["note"]
+
+
+def test_cli_gate_from_a_subdirectory_accepts_a_review_taken_from_the_root(
+        tmp_path, monkeypatch, capsys):
+    """The consequence that actually stops a push, asserted end to end."""
+    from skodun.cli import main
+
+    repo = _outgoing(_mkrepo(tmp_path))
+    _five_untracked_capped_at_three(repo)
+    sub = repo / "sub"
+    sub.mkdir()
+    db = tmp_path / "cli" / "s.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+
+    # A review recorded against the identity computed at the ROOT, under the
+    # repo's own cap -- exactly what `skodun review` from the root produces.
+    st = Store.open(db)
+    _reviewed(st, repo, untracked_max=3)
+    monkeypatch.chdir(repo)
+    assert main(["gate"]) == 0
+    # ...must still satisfy the gate run from a subdirectory.
+    monkeypatch.chdir(sub)
+    assert main(["gate"]) == 0
+    capsys.readouterr()
+
+
+def test_severity_gate_high_still_blocks_on_a_low_finding(tmp_path):
+    """`severity_gate` is DECLARED but has NO EFFECT in Phase 1.
+
+    It is accepted and validated so a forward-looking config loads, and a user
+    writing `severity_gate = "high"` will reasonably conclude that `low`
+    findings do not block a push. They do: `gate.open_findings` returns every
+    untriaged finding regardless of severity, and the only way to clear one is
+    to triage it with an audited reason. `config.Defaults` says so in its
+    docstring and beside the field; this test is what tells whoever implements
+    the feature to update both.
+    """
+    repo = _outgoing(_mkrepo(tmp_path))
+    (repo / ".skodun.toml").write_text(
+        "[defaults]\nseverity_gate = \"high\"\nconfidence_threshold = 9\n",
+        encoding="utf-8")
+    st = Store.open(tmp_path / "s.db")
+    cfg = _cfg(repo)
+    assert cfg.defaults.severity_gate == "high"      # it really did load
+    assert cfg.defaults.confidence_threshold == 9
+    _reviewed(st, repo, findings=[dict(_FINDING, severity="low")])
+
+    r = run_gate(st, repo, cfg, env={})
+    assert r.code == 1                               # not 0
+    assert "1 finding(s) open" in r.message
+
+    # ...and triage, not severity, is what clears it.
+    triage.dismiss(st, _artifact(st), 0, _REASON, "2026-07-27T11:00:00Z")
+    assert run_gate(st, repo, cfg, env={}).code == 0
 
 
 def test_cli_gate_never_touches_the_real_store_path(tmp_path, monkeypatch):

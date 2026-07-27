@@ -34,7 +34,29 @@ SECURITY_PROMPT_SLOT_NAMES: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class Defaults:
+    """The `[defaults]` table of `.skodun.toml`.
+
+    NO EFFECT IN PHASE 1: `severity_gate` and `confidence_threshold`. Both are
+    accepted and validated so a config written for a later phase loads today
+    without an "unknown [defaults] keys" error, but **nothing reads either
+    one**. In particular, `severity_gate` does NOT filter what blocks a push:
+    `gate.open_findings` returns every untriaged finding regardless of
+    severity, so a single `low` finding is exit 1 even under
+    `severity_gate = "high"`. The only way to clear a finding is to triage it
+    with an audited reason. `test_config.py` pins that documented no-effect
+    behavior end to end, so whoever implements these will be told to update
+    this docstring.
+    """
+
+    #: DECLARED FOR A LATER PHASE, NO EFFECT IN PHASE 1. Nothing reads this.
+    #: The gate blocks on ANY untriaged finding, whatever its severity --
+    #: setting this to "high" does not let `low` findings through. See the
+    #: class docstring.
     severity_gate: str = "high"
+    #: DECLARED FOR A LATER PHASE, NO EFFECT IN PHASE 1. Nothing reads this;
+    #: no finding is ever filtered by a confidence score. It appears in
+    #: `_DEFAULTS_MINIMUMS` only so a nonsensical value is still rejected at
+    #: load time, which is bounds-checking, not consumption.
     confidence_threshold: int = 7
     max_diff_bytes: int = 400_000
     timeout_sec: int = 420
@@ -207,13 +229,12 @@ class Reviewer:
 
 @dataclass(frozen=True)
 class Config:
+    # Reviewers are selected by ROLE, never by name: `pipeline._reviewer_for`
+    # takes the first enabled reviewer whose `role` matches. A lookup-by-name
+    # helper lived here and had no caller outside its own test; it is gone
+    # rather than kept as a second, unused selection rule.
     defaults: Defaults
     reviewers: tuple[Reviewer, ...]
-    def reviewer(self, name: str) -> Reviewer:
-        for r in self.reviewers:
-            if r.name == name:
-                return r
-        raise KeyError(name)
 
 def _read(path: Path | None) -> dict:
     if path is None or not path.exists():

@@ -730,6 +730,18 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
             kind = ("cross-file rules unavailable" if selection.degraded
                     else "path-scoped rules dropped")
             _note(f"checklist: {kind} -- {selection.note}")
+        # Budget eviction is otherwise SILENT: `select` quietly drops the
+        # least-valuable sections until the injection budget is met, so a
+        # review can run with rules the operator believes are in the prompt and
+        # nothing anywhere says otherwise. `dropped`/`over_budget` are the two
+        # fields that know, and this is where they are read.
+        if selection.dropped:
+            _note(f"checklist: dropped {', '.join(selection.dropped)} to fit "
+                  f"the {checklist.BUDGET}-byte injection budget")
+        if selection.over_budget:
+            _note(f"checklist: {selection.bytes_total} bytes still exceeds the "
+                  f"{checklist.BUDGET}-byte budget after eviction; only "
+                  f"undroppable sections remain")
 
         pack = None
         pack_body = None
@@ -766,6 +778,17 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
             checklist_sections=list(selection.sections),
             checklist_bytes=selection.bytes_total,
             checklist_note=selection.note,
+            # READS BACKWARDS UNLESS YOU KNOW `Selection`'s two severities, so:
+            # `checklist_degraded` is TRUE for a PARTIAL degradation (sections
+            # were selected, but something they depend on -- currently the
+            # cross-file rules registry -- was unavailable) and FALSE for a
+            # TOTAL selection failure (nothing was selected at all, including
+            # the ordinary "this repo has no checklist directory" case). It is
+            # not a severity dial: `checklist_note` carries the reason, this
+            # field says only which of the two shapes produced it, and
+            # `checklist_sections` distinguishes them on its own (empty for a
+            # total failure). Nothing about the review's trust rides on it --
+            # checklist selection is fail-soft by design.
             checklist_degraded=selection.degraded,
             context_bytes=pack.bytes_total if pack is not None else 0,
             context_files=list(pack.included) if pack is not None else [],

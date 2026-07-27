@@ -160,7 +160,10 @@ SKEPTIC_PASS_ENV = "SKODUN_SKEPTIC_PASS"
 DEFAULT_MAX_DIFF_BYTES: int = Defaults.max_diff_bytes
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]")
-#: `[kebab-rule-id]` citations, as `trust`/triage read them out of a title.
+#: `[kebab-rule-id]` citations, as `_rule_ids` reads them out of a finding's
+#: title. The extracted list is persisted telemetry on the review record
+#: (`rule_ids`) and nothing else consumes it: no module keys, filters or gates
+#: on a rule id.
 _RULE_ID = re.compile(r"\[([a-z0-9]+(?:-[a-z0-9]+)*)\]")
 
 

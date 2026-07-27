@@ -106,8 +106,10 @@ def resolve_grok_bin() -> str:
     """`SKODUN_GROK_BIN` -> `~/.grok/bin/grok` if executable -> `grok` on PATH.
 
     There is deliberately no legacy `-p` re-shell fallback (global constraint):
-    a run with empty stdout is a failed attempt and is retried as a fresh
-    session, never re-invoked with the prompt as a CLI argument.
+    a run with empty stdout is simply a failed attempt (`parse_ok=False`), and
+    the prompt is never re-invoked as a CLI argument. It is not retried either
+    -- `pipeline._run_reviewer` retries only a `timed_out` attempt or a
+    `degraded` one, and empty stdout with a clean stderr is neither.
     """
     override = os.environ.get("SKODUN_GROK_BIN")
     if override:

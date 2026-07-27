@@ -305,6 +305,13 @@ def pack(
     remainder, so `headroom <= 0` is a normal outcome and yields an empty body
     with every candidate reported as `over-headroom`.
 
+    `per_file_cap` has no Phase 1 caller and is kept deliberately: it is the
+    oracle's `GROK_CONTEXT_FILE_BYTES` knob, and `test_oracle_parity_with_
+    per_file_cap` drives the real oracle with that variable set to assert the
+    packed bytes still match. Removing the parameter would remove a parity
+    assertion, not dead weight. `None` (the default, and anything below 1)
+    means no per-file limit, so the shipped behaviour is unaffected.
+
     `pack_large_added` decides what happens to an added (`A`) file of at least
     `ALREADY_IN_DIFF_MAX` bytes. Smaller adds are always `already-in-diff`: the
     diff carries their full content, so packing them spends headroom to say the

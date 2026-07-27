@@ -720,13 +720,22 @@ def test_single_shot_does_not_repack_a_large_added_file(tmp_path, capsys):
     assert "a.txt" in rec["context_files"]
 
 
-def test_a_failed_checklist_selection_is_noted_but_never_untrustworthy(
+def test_an_unconfigured_checklist_is_noted_but_never_untrustworthy(
         tmp_path, capsys):
+    """The DEFAULT repo shape: no checklist directory at all.
+
+    Fail-soft, and it must not read as a failure either -- this branch is hit
+    on every run of every repo that has not opted into checklists.
+    """
     _fake_grok(tmp_path, _emit(CLEAN))
     repo = _repo(tmp_path)          # no docs/review/checklists directory
     rec = _run(repo, _store(tmp_path))
     assert rec["checklist_sections"] == []
-    assert "checklist selection failed" in rec["checklist_note"]
+    assert rec["checklist_note"].startswith("no checklist directory at ")
+    assert "fail" not in rec["checklist_note"].lower()
+    # `checklist_degraded` is FALSE for a total selection and TRUE only for a
+    # partial degradation. It reads backwards; the record comment says so.
+    assert rec["checklist_degraded"] is False
     assert rec["trustworthy"] is True     # fail-soft: rules dropped, not the review
 
 
@@ -1167,6 +1176,99 @@ def test_cli_uses_the_pinned_store(tmp_path, capsys):
     assert _cli(repo, capsys)[0] == 0
     st = Store.open(Path(os.environ["SKODUN_DB"]))
     assert len(st.list_reviews(None, 10)) == 1
+
+
+def test_cli_review_from_a_subdirectory_behaves_as_from_the_root(tmp_path,
+                                                                 capsys):
+    """`--repo` may name any directory inside the worktree.
+
+    `load_config` reads `<its argument>/.skodun.toml`, so pointing `--repo` at
+    a subdirectory used to load an EMPTY config -- no reviewers at all -- and
+    the run was refused with "no enabled reviewer with role 'finder' is
+    configured", blaming the user's reviewer table for their cwd. The identity
+    was never in question (the pipeline normalises to the worktree root before
+    capturing a diff); the config was, and the two must agree.
+    """
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path)
+    sub = repo / "sub"
+    sub.mkdir()
+
+    assert main(["review", "--repo", str(sub)]) == 0
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    assert last.startswith("SKODUN VERDICT: trustworthy=true findings=0")
+
+    st = Store.open(Path(os.environ["SKODUN_DB"]))
+    (rec,) = st.list_reviews(None, 10)
+    # The record is rooted, not cwd-scoped: same identity a root run produces.
+    base = resolve_base(repo)
+    assert rec["diff_hash"] == diff_identity(capture_diff(repo, base.sha, 100).data)
+    assert rec["model"] == "grok-4.20-0309-reasoning"   # the ROOT's config
+
+
+# --------------------------------------------------------------------------
+# review -> gate: the one seam nothing else spans
+# --------------------------------------------------------------------------
+
+
+def _gate(repo: Path, capsys) -> int:
+    code = main(["gate", "--repo", str(repo)])
+    capsys.readouterr()
+    return code
+
+
+def _banner_id(out: str) -> str:
+    """The review id off the banner the run just printed.
+
+    Deliberately NOT "the newest row in the store": `reviewed_at` has
+    second resolution, so two reviews in the same test can tie and
+    `ORDER BY reviewed_at DESC LIMIT 1` then picks arbitrarily -- which showed
+    up as this test passing with the oracle present (slow enough to straddle a
+    second) and failing without it.
+    """
+    m = re.search(r"\bid=(\S+)", out.strip().splitlines()[-1])
+    assert m, f"no id= in the banner: {out!r}"
+    return m.group(1)
+
+
+def test_a_review_satisfies_the_gate_it_was_taken_for(tmp_path, capsys):
+    """The bridge: `run_review` writes an identity, `run_gate` recomputes one.
+
+    Every other test in the suite stops on one side of that seam -- the closest
+    goes as far as the artifact validator -- so a divergence between the
+    `diff_hash` the pipeline STORES and the one the gate COMPUTES would pass
+    the whole suite while making the gate unsatisfiable in practice: a review
+    would run, record cleanly, and the very next `skodun gate` would still say
+    "no trustworthy review covers this". Both halves go through the CLI here,
+    so they share the pinned store exactly as a real pre-push hook would.
+
+    All three outcomes of the contract, in the order a developer meets them:
+    clean review -> 0; a finding -> 1 until it is triaged, then 0; and an edit
+    made after the review -> 2, because the gate keys on content, not on HEAD.
+    """
+    repo = _repo(tmp_path)
+
+    # 1. a clean review, and the gate it was taken for accepts it.
+    _fake_grok(tmp_path, _emit(CLEAN))
+    assert main(["review", "--repo", str(repo)]) == 0
+    capsys.readouterr()
+    assert _gate(repo, capsys) == 0
+
+    # 2. an edit AFTER the review changes the content, so nothing covers it.
+    (repo / "a.txt").write_text("three\n", encoding="utf-8")
+    assert _gate(repo, capsys) == 2
+
+    # 3. a review of the NEW content that finds something: 1, not 0...
+    _fake_grok(tmp_path, _emit(DIRTY))
+    assert main(["review", "--repo", str(repo)]) == 1
+    rid = _banner_id(capsys.readouterr().out)
+    assert _gate(repo, capsys) == 1
+
+    # ...and an audited dismissal -- nothing else -- is what clears it.
+    assert main(["triage", rid, "0",
+                 "checked: the caller validates this input two frames up"]) == 0
+    capsys.readouterr()
+    assert _gate(repo, capsys) == 0
 
 
 def test_review_subcommand_is_registered(capsys):

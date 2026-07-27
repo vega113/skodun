@@ -68,9 +68,27 @@ def test_collapse_is_the_pre_lowercase_half_of_norm():
 
 
 def test_finding_key_excludes_line():
-    # finding_key's signature has no line parameter at all -- callers cannot
-    # even pass one, so drift in the reported line can never change the key.
-    assert finding_key("a.py", "bug") == finding_key("a.py", "bug")
+    """A dismissal must survive the finding drifting by a hunk or two.
+
+    Line numbers move between review rounds while the finding stays the same
+    claim about the same code, so `finding_key` deliberately does not take one.
+    Asserted through the behaviour that depends on it rather than on the
+    function's own output: two findings differing ONLY in `line` share a key,
+    so dismissing either closes both, and `open_findings` -- what the gate
+    calls -- reports nothing left open. (This test used to assert
+    `finding_key("a.py", "bug") == finding_key("a.py", "bug")`, which is
+    tautological and, under this name, worse than no test at all.)
+    """
+    from skodun.triage import open_findings
+
+    a = {"file": "a.py", "line": 12, "severity": "high", "title": "bug"}
+    b = {**a, "line": 87}
+    review = {"id": "r1", "branch": "feat", "base_sha": "s" * 40,
+              "findings": [a, b], "findings_total": 2}
+
+    assert open_findings(review, {}) == [a, b]        # both open to begin with
+    dismissed = {finding_key(a["file"], a["title"]): {"dismissed_reason": "x"}}
+    assert open_findings(review, dismissed) == []     # ...and one key closes both
 
 
 def test_ledger_key_shape():

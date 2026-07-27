@@ -238,17 +238,43 @@ def test_missing_section_file_is_skipped_not_fatal(tmp_path):
 # Fail-soft
 # ---------------------------------------------------------------------------
 
-def test_fail_soft_on_missing_dir(tmp_path):
+def test_missing_checklist_dir_is_unconfigured_not_failed(tmp_path):
+    """No checklist directory is the DEFAULT, so it must not read as an error.
+
+    Checklists are opt-in, so the overwhelming majority of repos running skodun
+    have no `docs/review/checklists` and hit this branch on every single run.
+    The message used to be `checklist selection failed: checklist dir not
+    found: ...`, which describes a broken thing rather than an unconfigured
+    one -- and a warning that cries wolf on every run is one nobody reads when
+    something really does break. The CLASSIFICATION is unchanged (total
+    selection: no sections, `degraded` False); only the wording is.
+    """
     missing = tmp_path / "nope"
     sel = select(["a"], "full", missing, tmp_path / "nope.json")
-    assert sel.sections == () and sel.body == "" and "failed" in sel.note
+    assert sel.sections == () and sel.body == ""
     assert sel.bytes_total == 0 and sel.dropped == () and sel.over_budget is False
-    # Pin the exact fail-soft message shape, not just "failed" appearing
-    # somewhere in it, so a silent reword is caught.
+    assert sel.degraded is False
+    # Pin the exact message, so a silent reword is caught either way.
     assert sel.note == (
-        f"checklist selection failed: checklist dir not found: {missing}; "
-        "continuing without path-scoped rules"
+        f"no checklist directory at {missing} -- "
+        "continuing with generic review rules"
     )
+    # ...and specifically not the old "failed" opener. (Asserted on the
+    # message's own leading words, never on the whole string: `tmp_path`
+    # carries the test's name into `sel.note`.)
+    assert not sel.note.lower().startswith("checklist selection failed")
+
+
+def test_a_real_selection_failure_still_says_failed(tmp_path):
+    """Rewording the unconfigured case must not mute the broken one.
+
+    An argument `Path()` cannot even accept reaches the catch-all handler --
+    something genuinely went wrong -- and that one is still allowed to say so.
+    """
+    sel = select(["a"], "full", object(), tmp_path / "nope.json")
+    assert sel.sections == () and sel.degraded is False
+    assert sel.note.startswith("checklist selection failed: ")
+    assert "continuing without path-scoped rules" in sel.note
 
 
 def test_malformed_rules_json_fails_soft(tmp_path):
