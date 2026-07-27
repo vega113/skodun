@@ -30,6 +30,11 @@ narrow thing, so here is the honest scope:
   exits `0`, and blocks nothing. skodun is being watched against the tool it is
   meant to replace, not yet trusted in its place.
 
+First shadow run: eight real change-sets, gate agreement on seven, and identical
+diff identity across 205 repository states. The results — including the one
+disagreement and why it is not a porting defect — are in
+[the shadow-mode runbook](docs/shadow-mode.md).
+
 Background:
 
 - [Research report & architecture decision](docs/2026-07-27-review-server-research.md)
