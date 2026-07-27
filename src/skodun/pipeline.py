@@ -34,8 +34,11 @@ made. Release is guarded by an ABA check: we remove the lock directory only
 while the owner file still names *our* pid, because a peer that legitimately
 reclaimed it after our stale window must not have its lock deleted by us.
 
-The wait cap, poll cadence and stale ceiling default to the same worst-case
-runtime the config implies (`worst_runtime_sec`) and can be overridden with
+The stale ceiling and the wait cap default to `lock_stale_ceiling_sec` — the
+worst-case runtime the config implies for the primary review *plus both extra
+passes*, because those run inside this lock with their own retry budgets. (The
+narrower `worst_runtime_sec` covers a single run and stays where the brief pins
+it: `recover_stale`.) All three, plus the poll cadence, can be overridden with
 `SKODUN_LOCK_WAIT_SECONDS` / `SKODUN_LOCK_POLL_SECONDS` /
 `SKODUN_LOCK_STALE_SECONDS`, mirroring the oracle's `GROK_FG_LOCK_*` knobs — a
 wedged lock has to be survivable without a code change. Junk in any of them
@@ -73,7 +76,6 @@ from __future__ import annotations
 
 import calendar
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -98,10 +100,10 @@ LOCK_WRITE_GRACE_SEC = 30.0
 #: Grace added to the worst-case runtime before a `running` record is swept.
 STALE_RECORD_GRACE_SEC = 60
 
-#: `[kebab-rule-id]` citations in a finding title (closes the rules telemetry
-#: loop). Same shape as `passes._RULE_ID`; spelled here because the record this
-#: module builds is where `rule_ids` is defined for a primary-only review.
-_RULE_ID = re.compile(r"\[([a-z0-9]+(?:-[a-z0-9]+)*)\]")
+#: How many full reviewer runs one held lock can cover: the primary review plus
+#: the security and skeptic passes, each of which runs INSIDE the lock with its
+#: own complete retry budget. See `lock_stale_ceiling_sec`.
+_MAX_PASSES_UNDER_LOCK = 3
 
 #: `Store.list_reviews` passes this straight to SQLite's `LIMIT`, where a
 #: negative value means "no upper bound". `recover_stale` must see EVERY row:
@@ -186,18 +188,45 @@ def _epoch(stamp: object) -> float | None:
         return None
 
 
-def worst_runtime_sec(d: Defaults) -> int:
-    """The longest one foreground review can legitimately take, in seconds.
+def _attempt_budget_sec(d: Defaults) -> int:
+    """The longest ONE reviewer run (all of its retries) can legitimately take.
 
-    The oracle's `GROK_WORST_RUNTIME` arithmetic: each attempt can burn up to
-    2x the timeout (the watchdog's own SIGTERM grace, plus the oracle's
-    doubling for a wedged attempt), and there are `1 + timeout_retries +
-    degraded_retries` attempts, plus a grace. It is the stale ceiling for the
-    lock, the default wait cap, and the age at which a `running` record is
-    swept — all three are the same question, so they are the same number.
+    The oracle's `GROK_WORST_RUNTIME` arithmetic without the grace: each attempt
+    can burn up to 2x the timeout (the watchdog's own SIGTERM grace, plus the
+    oracle's doubling for a wedged attempt), and there are `1 + timeout_retries
+    + degraded_retries` attempts.
     """
-    return (2 * d.timeout_sec * (1 + d.timeout_retries + d.degraded_retries)
-            + STALE_RECORD_GRACE_SEC)
+    return 2 * d.timeout_sec * (1 + d.timeout_retries + d.degraded_retries)
+
+
+def worst_runtime_sec(d: Defaults) -> int:
+    """The longest one *reviewer run* can legitimately take, plus a grace.
+
+    ORACLE PARITY, and the brief pins this formula: it is the age at which
+    `recover_stale` sweeps a `running` record. Deliberately NOT the lock's stale
+    ceiling — see `lock_stale_ceiling_sec` for why the two numbers differ.
+    """
+    return _attempt_budget_sec(d) + STALE_RECORD_GRACE_SEC
+
+
+def lock_stale_ceiling_sec(d: Defaults) -> int:
+    """The age at which a held foreground lock may be reclaimed from its owner.
+
+    Wider than `worst_runtime_sec` on purpose. That function budgets a single
+    reviewer run, but the security and skeptic passes run INSIDE the lock, each
+    with its own full timeout/degraded retry budget — so a legitimate holder can
+    be alive for roughly `_MAX_PASSES_UNDER_LOCK` times as long. Reclaiming on
+    the single-run figure would let a peer take a live holder's lock and put two
+    reviews on one inference backend, which is the exact failure the lock
+    exists to prevent; the cost of the wider ceiling is only that a genuinely
+    wedged lock is tolerated longer, and `SKODUN_LOCK_STALE_SECONDS` exists for
+    that.
+
+    `recover_stale` keeps the narrower figure: a `running` *record* is per-run
+    bookkeeping the final save always rewrites, so sweeping it early costs
+    nothing, while reclaiming a live lock early costs a doubled backend.
+    """
+    return _MAX_PASSES_UNDER_LOCK * _attempt_budget_sec(d) + STALE_RECORD_GRACE_SEC
 
 
 # ---------------------------------------------------------------------------
@@ -504,27 +533,15 @@ def _run_reviewer(reviewer: Reviewer, d: Defaults, prompt: bytes, cwd: Path,
 # ---------------------------------------------------------------------------
 
 
-def _severity_counts(findings: list) -> dict:
-    sev = {"high": 0, "medium": 0, "low": 0}
-    for f in findings:
-        if isinstance(f, dict):
-            s = str(f.get("severity", "")).lower()
-            if s in sev:
-                sev[s] += 1
-    return sev
-
-
-def _rule_ids(findings: list) -> list[str]:
-    ids: list[str] = []
-    seen: set[str] = set()
-    for f in findings:
-        if not isinstance(f, dict):
-            continue
-        for m in _RULE_ID.finditer(str(f.get("title") or "")):
-            if m.group(1) not in seen:
-                seen.add(m.group(1))
-                ids.append(m.group(1))
-    return ids
+# Findings telemetry: ONE definition, imported rather than re-spelled here.
+# `passes._merge` recomputes both from the merged findings, so its versions win
+# on every record that goes through an extra pass — a second definition in this
+# module could therefore only ever drift into disagreeing with the record the
+# gate actually reads. (Both are safe on this module's input: the adapter's
+# validator rejects any payload whose findings are not all dicts, so a
+# `parse_ok` outcome never carries a non-mapping finding.)
+_severity_counts = passes._severity_counts
+_rule_ids = passes._rule_ids
 
 
 def _status_for(rec: dict) -> str:
@@ -549,6 +566,38 @@ def _reviewer_for(cfg: Config, role: str) -> Reviewer | None:
         if r.enabled and r.role == role:
             return r
     return None
+
+
+#: Extra pass -> the configured reviewer role it prefers over the finder, in
+#: the order the passes are scheduled. ONE table: `_pass_reviewer` reads it to
+#: pick the reviewer and preflight reads it to validate every reviewer this run
+#: may reach for, so a new pass cannot be wired up on one side only.
+_EXTRA_PASS_ROLES = {"security": "security", "skeptic": "refuter"}
+
+
+def _pass_reviewer(cfg: Config, pass_name: str, finder: Reviewer) -> Reviewer:
+    """The reviewer an extra pass will use: its role's, else the finder's.
+
+    See `_extra_pass` for why the role-specific preference exists at all.
+    """
+    reviewer = _reviewer_for(cfg, _EXTRA_PASS_ROLES[pass_name])
+    return reviewer if reviewer is not None else finder
+
+
+def _adapter_for(reviewer: Reviewer):
+    """Resolve one reviewer's adapter, or refuse the run before anything ran.
+
+    An unknown provider is a CONFIG error, not a review failure, so it must
+    surface as a `PreflightRefused` (exit 2) and not as the bare `ValueError`
+    the registry raises — which the CLI can only read as "the review failed"
+    (exit 4), a verdict about a review that never happened.
+    """
+    try:
+        return get_adapter(reviewer.provider)
+    except ValueError as e:
+        raise PreflightRefused(
+            f"reviewer {reviewer.name!r} (role {reviewer.role!r}): {e}; "
+            f"no review ran") from e
 
 
 # ---------------------------------------------------------------------------
@@ -584,16 +633,26 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
         raise PreflightRefused(
             "no enabled reviewer with role 'finder' is configured; no review ran")
     # Resolved here, before anything is locked or persisted: an unknown
-    # provider is a config error, not a review failure.
-    adapter = get_adapter(finder.provider)
+    # provider is a config error, not a review failure. EVERY reviewer this run
+    # may reach for is resolved now, not just the finder's — a bad provider on a
+    # configured `security`/`refuter` reviewer used to surface only after the
+    # primary review had already run, demoting it to untrustworthy and spending
+    # a model call to report a config typo as exit 4.
+    adapter = _adapter_for(finder)
+    for pass_name in _EXTRA_PASS_ROLES:
+        _adapter_for(_pass_reviewer(cfg, pass_name, finder))
 
     # --- 2. sweep the wreckage of any SIGKILLed predecessor ---------------
     recover_stale(store, cfg)
 
     # --- 3. the foreground lock -------------------------------------------
-    worst = float(worst_runtime_sec(d))
+    # `lock_stale_ceiling_sec`, NOT `worst_runtime_sec`: the extra passes run
+    # inside this lock with their own retry budgets, so a live holder can
+    # legitimately outlast a single run's worst case. (`recover_stale` above
+    # keeps the narrower figure; the docstrings on both say why.)
+    ceiling = float(lock_stale_ceiling_sec(d))
     stale = lock_stale if lock_stale is not None else _env_seconds(
-        "SKODUN_LOCK_STALE_SECONDS", worst)
+        "SKODUN_LOCK_STALE_SECONDS", ceiling)
     wait = lock_wait if lock_wait is not None else _env_seconds(
         "SKODUN_LOCK_WAIT_SECONDS", stale)
     poll = lock_poll if lock_poll is not None else _env_seconds(
@@ -736,7 +795,7 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                     lambda: passes.security_prompt(
                         branch, base.ref, base.sha, f"{head} (working tree)",
                         diff.data, d.max_diff_bytes, d.security_prompt_slots),
-                    _reviewer_for(cfg, "security") or finder, d, root, scratch)
+                    _pass_reviewer(cfg, "security", finder), d, root, scratch)
 
             if passes.should_run_skeptic(
                     mode,
@@ -748,7 +807,7 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                     lambda: passes.skeptic_prompt(
                         branch, base.ref, base.sha, f"{head} (working tree)",
                         diff.data, d.max_diff_bytes),
-                    _reviewer_for(cfg, "refuter") or finder, d, root, scratch)
+                    _pass_reviewer(cfg, "skeptic", finder), d, root, scratch)
 
         # --- 9. persist the final record, then banner from what was stored
         rec["trustworthy"] = is_trustworthy(
@@ -835,6 +894,17 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
                 d: Defaults, cwd: Path, scratch: Path) -> dict:
     """Run one extra pass and merge it into `rec`, returning the new record.
 
+    `reviewer` is the caller's choice, and the caller makes a DELIBERATE one:
+    a configured, enabled reviewer whose role matches the pass (`security` for
+    the security pass, `refuter` for the skeptic pass) is preferred, and the
+    finder is the fallback. That is slightly more than Phase 1 promised — the
+    brief says the extra passes reuse the finder's adapter — but a config that
+    names a cheaper or differently-specialised model for a lens has said what it
+    wants, and silently ignoring it would be the surprise. The cost of the wider
+    behaviour is one more thing that can be misconfigured, which is why
+    `run_review`'s preflight now resolves those reviewers' adapters too, before
+    the lock and before any model call.
+
     Merge semantics are Task 14's, and the choice between them is made here:
     a pass that produced a record — even an unparseable one — goes through
     `merge_extra_pass`, and a pass that produced nothing at all (timed out,
@@ -885,6 +955,13 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
         "findings": list(p.findings),
         "findings_total": len(p.findings),
         "failure_reason": ("" if p.parse_ok else passes.failed_pass_reason(name)),
-        "attempts": outcome.attempts,
+        # NO `attempts` key: `passes._merge` builds the `extra_passes[<name>]`
+        # meta dict from a fixed set of keys and never copies one, so an
+        # `attempts` list here was built, handed over, and dropped on the floor.
+        # A field that looks like telemetry and records nothing is worse than an
+        # absent one — it invites a reader to trust a number that is not there.
+        # Carrying it through means widening the meta schema `passes` owns; if
+        # that is ever wanted, add it there and populate it from
+        # `outcome.attempts` here.
     }
     return passes.merge_extra_pass(rec, extra, name)

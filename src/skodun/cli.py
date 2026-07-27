@@ -3,8 +3,8 @@
 Everything here exists to make sure the number the shell sees is the number
 the gate decided. The exit contract (0 clean / 1 findings open / 2 no
 trustworthy review) is enforced in `gate.py`; this module's job is to not lose
-it on the way out. Two failure modes are specific to this seam and both are
-guarded below:
+it on the way out. Three failure modes are specific to this seam and all three
+are guarded below:
 
   * An invocation form that runs nothing and exits 0. A silent 0 is
     indistinguishable from a PASS to the pre-push hook that consumes it, so
@@ -14,6 +14,11 @@ guarded below:
     from `skodun gate | head`, a full disk, a closed fd -- and an exception
     escaping the process leaves Python's own exit code of 1, which is the one
     value that means "findings remain open".
+  * A refusal that leaves stdout silent. The last line of stdout is always a
+    verdict, so the two paths that used to exit without one -- an argparse
+    usage error, and an import failure inside `_cmd_review` -- now carry a
+    `banner_failure` line too. The two invocations that legitimately exit 0
+    without gating anything, `--version` and `--help`, deliberately do not.
 """
 
 import argparse
@@ -37,11 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="skodun")
     p.add_argument("--version", action="version", version=f"skodun {__version__}")
     # `required=True`: `skodun` with no subcommand must not exit 0. argparse
-    # reports the usage error as SystemExit(2), which `main` returns unchanged
-    # -- and 2 is also the contract's "no trustworthy review covers this",
-    # i.e. exactly the conservative reading of "nothing ran". `--version` is
-    # unaffected: the version action fires as soon as the option is seen,
-    # before the required-subparser check.
+    # reports the usage error as SystemExit(2), which `main` turns into an
+    # exit 2 carrying a verdict banner -- and 2 is also the contract's "no
+    # trustworthy review covers this", i.e. exactly the conservative reading of
+    # "nothing ran". `--version` is unaffected: the version action fires as soon
+    # as the option is seen, before the required-subparser check, and exits 0,
+    # which `main` passes through with argparse's own output and no banner.
     sub = p.add_subparsers(dest="command", required=True)
 
     gate = sub.add_parser(
@@ -171,10 +177,25 @@ def _cmd_review(args) -> int:
     the invariant: every path that never reached a record still ends with a
     `banner_failure` line as the last line of stdout.
     """
-    from .config import load_config
-    from .pipeline import LockTimeout, PersistenceFailed, PreflightRefused, run_review
-    from .store import Store
+    # Outside the guard below on purpose: it is what RENDERS the banner, so a
+    # failure to import it is the one import failure no banner can report.
     from .trust import banner_failure
+
+    try:
+        # Inside the guard: an import error here -- a partial install, a
+        # syntax error introduced in `pipeline.py`, a missing stdlib module in
+        # a stripped environment -- used to escape to `main`, which reports on
+        # stderr and leaves stdout without the verdict line the contract
+        # promises. 2, not 4: nothing ran, so this is a refusal, not a review
+        # that came back badly.
+        from .config import load_config
+        from .gitio import GitError
+        from .pipeline import (LockTimeout, PersistenceFailed, PreflightRefused,
+                               run_review)
+        from .store import Store
+    except BaseException as e:
+        return _emit(banner_failure(
+            f"could not load the review pipeline: {e!r}; no review ran"), 2)
 
     repo = Path(args.repo)
     try:
@@ -197,6 +218,12 @@ def _cmd_review(args) -> int:
         return _emit(banner_failure(str(e)), 3)
     except PersistenceFailed:
         return _emit(banner_failure("no review was recorded"), 4)
+    except GitError as e:
+        # A directory that is not a git checkout at all, a git that will not
+        # run, a repo with no HEAD: every git call the pipeline makes happens
+        # before the reviewer is launched, so this is a preflight failure --
+        # nothing ran -- and preflight refusals are 2, not "the review failed".
+        return _emit(banner_failure(f"{e}; no review ran"), 2)
     except BaseException as e:
         # Anything else: the review did not complete, so it certifies nothing.
         return _emit(banner_failure(f"the review failed: {e!r}"), 4)
@@ -227,7 +254,24 @@ def main(argv: list[str] | None = None) -> int:
             code = e.code
             if code is None:
                 return 0
-            return code if isinstance(code, int) else 2
+            if not isinstance(code, int) or isinstance(code, bool):
+                # A message-carrying or otherwise unexpected code reads as 2.
+                # `bool` is caught explicitly because it is an `int` subclass
+                # and `SystemExit(False)` would otherwise become a silent 0.
+                code = 2
+            if code == 0:
+                # `--version` / `--help`: argparse already wrote the output the
+                # user asked for, nothing was gated, and no verdict is owed. A
+                # banner here would corrupt exactly the two invocations whose
+                # stdout is meant to be consumed verbatim.
+                return 0
+            # A usage error never reaches a subcommand, so nothing below would
+            # print the verdict line the contract promises as the LAST line of
+            # stdout -- argparse's own message goes to stderr, and a consumer
+            # reading stdout would see silence where a refusal belongs.
+            from .trust import banner_failure
+            return _emit(banner_failure(
+                "usage error; no review ran"), code)
         if args.command == "gate":
             return _cmd_gate(args)
         if args.command == "review":

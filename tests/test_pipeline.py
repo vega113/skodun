@@ -72,9 +72,20 @@ def _isolate(tmp_path, monkeypatch):
     # model calls, and every test that wants one turns it on explicitly.
     monkeypatch.setenv("SKODUN_SECURITY_PASS", "0")
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "0")
-    for key in ("SKODUN_LOCK_WAIT_SECONDS", "SKODUN_LOCK_POLL_SECONDS",
-                "SKODUN_LOCK_STALE_SECONDS"):
-        monkeypatch.delenv(key, raising=False)
+    # A SHORT default wait, and the reason it is not left on the production
+    # default: that default is the config's worst-case runtime for three
+    # reviewer runs -- ~43 minutes with the shipped timeouts -- so a regression
+    # in `_release_fg_lock` (or in the reclaim rules) would not fail a test, it
+    # would HANG the suite for most of an hour and then fail it. There is no
+    # per-test timeout to catch that. Every test that cares about the wait
+    # passes `lock_wait=` explicitly or sets the variable itself; this only
+    # bounds the ones that expect to take the lock uncontended. Production
+    # defaults are untouched: this is an env override, set for tests only.
+    monkeypatch.setenv("SKODUN_LOCK_WAIT_SECONDS", "5")
+    monkeypatch.setenv("SKODUN_LOCK_POLL_SECONDS", "0.05")
+    # The stale ceiling is left unset so the tests exercise the real, computed
+    # one (`pipeline.lock_stale_ceiling_sec`).
+    monkeypatch.delenv("SKODUN_LOCK_STALE_SECONDS", raising=False)
     # Shrink the SIGTERM->SIGKILL grace so the timeout tests cost ~1s, not ~4s.
     monkeypatch.setattr(runner, "_TERM_GRACE_SEC", 0.25)
 
@@ -481,6 +492,37 @@ def test_the_lock_is_released_after_a_normal_run(tmp_path, capsys):
     assert not (git_common_dir(repo) / "grok-reviews-foreground.lock").exists()
 
 
+def test_the_lock_ceiling_covers_the_extra_passes_that_run_inside_it(tmp_path):
+    """A holder part-way through its security and skeptic passes is ALIVE.
+
+    Both run inside the lock with their own full retry budgets, so a ceiling
+    sized for a single reviewer run would let a peer reclaim a live holder's
+    lock and put two reviews on one inference backend — the exact failure the
+    lock exists to prevent. `recover_stale` keeps the narrower figure, which is
+    the one the brief pins.
+    """
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path, "\n[defaults]\ntimeout_sec = 100\n"
+                           "timeout_retries = 0\ndegraded_retries = 0\n")
+    d = load_config(repo).defaults
+    assert pipeline.worst_runtime_sec(d) == 2 * 100 + 60
+    assert pipeline.lock_stale_ceiling_sec(d) == 3 * (2 * 100) + 60
+
+    # One-run-old: `recover_stale` sweeps the record...
+    one_run_old = pipeline.worst_runtime_sec(d) + 5
+    st = _store(tmp_path)
+    _running(st, "sk_one_run_old", one_run_old)
+    assert pipeline.recover_stale(st, load_config(repo)) == 1
+
+    # ...and the lock of the same age is left exactly where it is.
+    lock = git_common_dir(repo) / "grok-reviews-foreground.lock"
+    _write_owner(lock, os.getpid(), int(time.time()) - one_run_old, repo)
+    with pytest.raises(LockTimeout):
+        _run(repo, st, lock_wait=1, lock_poll=0.2)
+    assert lock.is_dir()
+    assert _calls(tmp_path) == 0
+
+
 def test_lock_wait_and_poll_read_env_overrides_and_ignore_junk(monkeypatch):
     monkeypatch.setenv("SKODUN_LOCK_WAIT_SECONDS", "7.5")
     assert pipeline._env_seconds("SKODUN_LOCK_WAIT_SECONDS", 99.0) == 7.5
@@ -726,6 +768,9 @@ def test_security_pass_runs_on_a_risky_path_and_merges(tmp_path, capsys,
     # The title already opens with a [rule-id], so the lens tag goes to detail.
     assert "(extra-pass: security)" in rec["findings"][0]["detail"]
     assert rec["trustworthy"] is True
+    # The pass saw the whole diff, so nothing claims partial coverage.
+    assert "partial_coverage" not in rec["extra_passes"]["security"]
+    assert rec["extra_passes"]["security"]["diff_truncated"] is False
     sec_prompt = (tmp_path / "bin" / "prompt_2.txt").read_text(encoding="utf-8")
     assert "SECURITY-FOCUSED code reviewer" in sec_prompt
     assert "Pass:   security (#3285)" in sec_prompt
@@ -812,20 +857,109 @@ def test_skeptic_eligibility_is_judged_after_the_security_merge(
     assert set(rec["extra_passes"]) == {"security"}
 
 
-def test_a_broken_extra_pass_demotes_the_review_instead_of_destroying_it(
-        tmp_path, capsys, monkeypatch):
-    """The primary already ran. An untrustworthy record the gate can refuse is
-    worth far more than an exception that leaves only a `failed` stub."""
+def test_a_degraded_extra_pass_demotes_the_primary(tmp_path, capsys,
+                                                   monkeypatch):
+    """A Cancelled extra pass must take the primary's clean clear away.
+
+    This is trust wiring nothing else pins END TO END: `_extra_pass` copies the
+    pass's `degraded` flag into the record it hands `merge_extra_pass`, and
+    hardcoding that copy to `False` leaves the rest of the suite green. A
+    cancelled adversarial pass would then leave a clean, trustworthy primary
+    standing — a false clear, which is the one outcome the gate must never be
+    handed.
+    """
+    monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    _fake_grok(tmp_path, _per_call(_emit(CLEAN), _emit(CANCELLED)))
+    repo = _repo(tmp_path, "\n[defaults]\ndegraded_retries = 0\n")
+    rec = _run(repo, _store(tmp_path))
+
+    assert _calls(tmp_path) == 2
+    meta = rec["extra_passes"]["skeptic"]
+    assert meta["ran"] is True and meta["degraded"] is True
+    assert meta["parse_ok"] is True        # it parsed; the RUN was cut short
+    assert rec["degraded"] is True
+    assert "Cancelled" in rec["degraded_reason"]
+    # The demotion rides the degraded axis alone: the pass parsed fine.
+    assert rec["parse_ok"] is True
+    assert rec["trustworthy"] is False and rec["status"] == "degraded"
+    assert rec["summary"].startswith("ok")   # the primary review is still here
+    assert _last_stdout(capsys).startswith(
+        "SKODUN VERDICT: trustworthy=false findings=0 degraded=true")
+
+
+def test_a_size_capped_extra_pass_records_partial_coverage(tmp_path, capsys,
+                                                           monkeypatch):
+    """`partial_coverage` comes from the PASS's own prompt, not the primary's.
+
+    Telemetry only in Phase 1 — a capped pass records what it saw and demotes
+    nothing — but the wiring from `Prompt.diff_truncated` through
+    `merge_extra_pass` has to be pinned, or a later change could silently
+    report full coverage for a pass that only ever saw the first few KB.
+    """
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "1")
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _risky_repo(tmp_path, "\n[defaults]\nmax_diff_bytes = 64\n")
+    rec = _run(repo, _store(tmp_path))
+
+    meta = rec["extra_passes"]["security"]
+    assert meta["ran"] is True and meta["parse_ok"] is True
+    assert meta["diff_truncated"] is True
+    assert meta["partial_coverage"] is True
+    assert "partial coverage" in rec["summary"]
+
+
+@pytest.mark.parametrize("role", ["security", "refuter"])
+def test_a_bad_extra_pass_provider_is_a_preflight_refusal(tmp_path, monkeypatch,
+                                                          role):
+    """Every reviewer this run MAY use is resolved before the lock.
+
+    A typo in an extra pass's provider used to be found only after the primary
+    review had already run, which spent a model call to demote its own result
+    and report a config error as exit 4. It is a config error: refuse at
+    preflight, exit 2, nothing run. Deliberately independent of whether the
+    pass would have been scheduled — that depends on which files the change
+    touches, and a config error should not be discovered by luck of the diff.
+    """
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "1")
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
     _fake_grok(tmp_path, _emit(CLEAN))
     repo = _repo(tmp_path)
     (repo / ".skodun.toml").write_text(
-        CFG + '\n[[reviewers]]\nname = "refuter"\nprovider = "no-such-provider"\n'
-              'model = "m"\nrole = "refuter"\n', encoding="utf-8")
+        CFG + f'\n[[reviewers]]\nname = "extra"\nprovider = "no-such-provider"\n'
+              f'model = "m"\nrole = "{role}"\n', encoding="utf-8")
+
+    with pytest.raises(PreflightRefused) as e:
+        _run(repo, _store(tmp_path))
+    assert "no-such-provider" in str(e.value)
+    assert _calls(tmp_path) == 0        # not one model call was spent on it
+    assert not (git_common_dir(repo) / "grok-reviews-foreground.lock").exists()
+
+
+def test_a_broken_extra_pass_demotes_the_review_instead_of_destroying_it(
+        tmp_path, capsys, monkeypatch):
+    """The primary already ran. An untrustworthy record the gate can refuse is
+    worth far more than an exception that leaves only a `failed` stub.
+
+    The break is injected at RUN time rather than through a bad provider in the
+    config: that is now a preflight refusal (above), so what is left to reach
+    this guard is exactly what it exists for — something that fails only after
+    the primary review is already in hand.
+    """
+    monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path)
+    real = pipeline._run_reviewer
+
+    def only_the_skeptic_explodes(reviewer, d, prompt, cwd, scratch, tag):
+        if tag == "skeptic":
+            raise RuntimeError("adapter exploded mid-pass")
+        return real(reviewer, d, prompt, cwd, scratch, tag)
+
+    monkeypatch.setattr(pipeline, "_run_reviewer", only_the_skeptic_explodes)
     rec = _run(repo, _store(tmp_path))
     assert rec["extra_passes"]["skeptic"]["failed"] is True
     assert rec["parse_ok"] is False and rec["trustworthy"] is False
-    assert "no-such-provider" in rec["failure_reason"]
+    assert "adapter exploded mid-pass" in rec["failure_reason"]
     assert rec["summary"] == "ok"          # the primary review is still here
 
 
@@ -1010,6 +1144,21 @@ def test_cli_a_broken_config_is_a_preflight_refusal(tmp_path, capsys):
     code, last = _cli(repo, capsys)
     assert code == 2
     assert last.startswith("SKODUN VERDICT: trustworthy=false reason=")
+
+
+def test_cli_a_non_git_directory_is_a_preflight_refusal_not_a_failed_review(
+        tmp_path, capsys):
+    """Exit 2, not 4. `gitio` raises `GitError` before anything can run, and 4
+    would report "no trustworthy review exists" about a review that was never
+    attempted — the difference between "your config is wrong" and "the model
+    let you down"."""
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    code, last = _cli(plain, capsys)
+    assert code == 2
+    assert last.startswith("SKODUN VERDICT: trustworthy=false reason=")
+    assert "no review ran" in last
+    assert _calls(tmp_path) == 0
 
 
 def test_cli_uses_the_pinned_store(tmp_path, capsys):
