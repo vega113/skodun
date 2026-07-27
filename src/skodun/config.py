@@ -49,8 +49,10 @@ class Defaults:
 # tests that pin them. This module defines schema, defaults, and validation.
 
 # Validation posture, on purpose — do not "fix" this to fail soft:
-#   * Loading a MALFORMED table is LOUD (ValueError naming the key). It is a
-#     typo in the user's own config file and must not be silently swallowed.
+#   * Loading a MALFORMED value is LOUD (ValueError naming the key) — a
+#     mistyped table, and equally an out-of-range or non-integer count. It is a
+#     typo in the user's own config file and must not be silently swallowed,
+#     nor left to surface as a TypeError from a slice several modules away.
 #   * CONSUMING a well-formed table is FAIL-SOFT. A table that loads fine but
 #     matches nothing — or points at a directory that does not exist — must
 #     never crash a review; the consumer degrades to generic behavior with a
@@ -99,6 +101,41 @@ def _pair_tuple(key: str, value: object) -> tuple[tuple[str, str], ...]:
                 raise ValueError(f"[defaults] {key}: entry {i} must not be empty")
         out.append((pair[0], pair[1]))
     return tuple(out)
+
+def _bounded_int(key: str, value: object, minimum: int) -> int:
+    """Validate a numeric `[defaults]` value, or raise naming `key`.
+
+    `bool` is a subclass of `int`, so `max_diff_bytes = true` would otherwise
+    load as 1. Nobody means that; it is a typo, and it must say so.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"[defaults] {key}: expected an integer, got {type(value).__name__}")
+    if value < minimum:
+        raise ValueError(
+            f"[defaults] {key}: must be >= {minimum}, got {value}")
+    return value
+
+# key -> minimum accepted value. Every integer field of `Defaults` appears here
+# (`test_config.py` pins that, so a new numeric key cannot arrive unguarded).
+# These are the user's own numbers from their own `.skodun.toml`, so a broken
+# one is loud and early rather than a traceback — or, worse, a quietly useless
+# review — thousands of lines into a run. Lower bounds only: an upper bound
+# would be a policy guess this module has no basis for.
+#   >= 1  the value is a capacity, and zero of it means the review cannot
+#         happen at all: no diff bytes, no seconds, no turns, no confidence
+#         level a finding could ever clear.
+#   >= 0  zero is a coherent opt-out: do not retry, do not scan untracked
+#         files. Negative still is not.
+_DEFAULTS_MINIMUMS = {
+    "confidence_threshold": 1,
+    "max_diff_bytes": 1,
+    "timeout_sec": 1,
+    "max_turns": 1,
+    "timeout_retries": 0,
+    "degraded_retries": 0,
+    "untracked_max": 0,
+}
 
 # key -> normalizer. Values arrive from TOML as lists; Defaults is frozen and
 # instances must stay hashable, so everything becomes (nested) tuples — the way
@@ -175,6 +212,9 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     for key, normalize in _DEFAULTS_NORMALIZERS.items():
         if key in dvals:
             dvals[key] = normalize(key, dvals[key])
+    for key, minimum in _DEFAULTS_MINIMUMS.items():
+        if key in dvals:
+            dvals[key] = _bounded_int(key, dvals[key], minimum)
     rknown = {f.name for f in fields(Reviewer)}
     reviewers = []
     for name in order:

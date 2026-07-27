@@ -1,8 +1,11 @@
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
 
-from skodun.config import SECURITY_PATH_SEGMENTS, Defaults, load_config
+from skodun.config import (
+    _DEFAULTS_MINIMUMS, SECURITY_PATH_SEGMENTS, Defaults, load_config,
+)
 
 
 def _write(p: Path, s: str) -> Path:
@@ -128,6 +131,94 @@ role = "finder"
 """)
     with pytest.raises(ValueError, match="missing its required 'name'"):
         load_config(None, global_path=g)
+
+
+# --- numeric [defaults] keys: range and type ------------------------------
+#
+# These land in arithmetic elsewhere (`max_diff_bytes` slices the diff,
+# `timeout_sec` bounds a subprocess). Loading is where a bad one must die: this
+# module knows the offending key's *name*, and the code downstream only ever
+# sees a number that has already lost its provenance.
+
+
+def test_every_integer_defaults_field_has_a_declared_minimum():
+    """A new numeric key must not arrive unguarded — this is the whole point of
+    giving the validation an owner."""
+    numeric = {f.name for f in fields(Defaults) if f.type in ("int", int)}
+    assert numeric, "expected Defaults to have integer fields"
+    assert numeric == set(_DEFAULTS_MINIMUMS)
+
+
+@pytest.mark.parametrize("key", sorted(_DEFAULTS_MINIMUMS))
+def test_numeric_default_accepts_its_minimum(tmp_path, key):
+    g = _write(tmp_path / "g.toml",
+               f"[defaults]\n{key} = {_DEFAULTS_MINIMUMS[key]}\n")
+    assert getattr(load_config(None, global_path=g).defaults, key) \
+        == _DEFAULTS_MINIMUMS[key]
+
+
+@pytest.mark.parametrize("key", sorted(_DEFAULTS_MINIMUMS))
+def test_numeric_default_rejects_below_minimum(tmp_path, key):
+    below = _DEFAULTS_MINIMUMS[key] - 1
+    g = _write(tmp_path / "g.toml", f"[defaults]\n{key} = {below}\n")
+    with pytest.raises(ValueError, match=rf"\[defaults\] {key}: must be >= "
+                                         rf"{_DEFAULTS_MINIMUMS[key]}, got {below}"):
+        load_config(None, global_path=g)
+
+
+@pytest.mark.parametrize("key", sorted(_DEFAULTS_MINIMUMS))
+def test_numeric_default_rejects_a_string(tmp_path, key):
+    g = _write(tmp_path / "g.toml", f'[defaults]\n{key} = "big"\n')
+    with pytest.raises(
+            ValueError,
+            match=rf"\[defaults\] {key}: expected an integer, got str"):
+        load_config(None, global_path=g)
+
+
+@pytest.mark.parametrize("key", sorted(_DEFAULTS_MINIMUMS))
+def test_numeric_default_rejects_a_bool(tmp_path, key):
+    """`bool` is an `int` subclass; `true` would otherwise load as 1."""
+    g = _write(tmp_path / "g.toml", f"[defaults]\n{key} = true\n")
+    with pytest.raises(
+            ValueError,
+            match=rf"\[defaults\] {key}: expected an integer, got bool"):
+        load_config(None, global_path=g)
+
+
+@pytest.mark.parametrize("key", sorted(_DEFAULTS_MINIMUMS))
+def test_numeric_default_rejects_a_float(tmp_path, key):
+    g = _write(tmp_path / "g.toml", f"[defaults]\n{key} = 1.5\n")
+    with pytest.raises(
+            ValueError,
+            match=rf"\[defaults\] {key}: expected an integer, got float"):
+        load_config(None, global_path=g)
+
+
+def test_zero_max_diff_bytes_is_rejected_at_load_not_at_prompt_build(tmp_path):
+    """The specific hole this closes: a zero budget used to reach
+    `promptbuild.build` and raise there, with no mention of the config key that
+    caused it. Nothing downstream should ever see it."""
+    repo = tmp_path / "repo"; repo.mkdir()
+    _write(repo / ".skodun.toml", "[defaults]\nmax_diff_bytes = 0\n")
+    with pytest.raises(ValueError, match=r"\[defaults\] max_diff_bytes"):
+        load_config(repo, global_path=tmp_path / "absent.toml")
+
+
+def test_bad_numeric_in_project_layer_is_rejected_even_if_global_was_fine(tmp_path):
+    g = _write(tmp_path / "g.toml", "[defaults]\nmax_diff_bytes = 400000\n")
+    repo = tmp_path / "repo"; repo.mkdir()
+    _write(repo / ".skodun.toml", "[defaults]\nmax_diff_bytes = -1\n")
+    with pytest.raises(ValueError, match=r"\[defaults\] max_diff_bytes: must be >= 1"):
+        load_config(repo, global_path=g)
+
+
+def test_a_good_project_value_overrides_a_bad_global_one(tmp_path):
+    """Validation runs on the merged result, not per layer: the project layer
+    wins, so a stale global value it replaces must not veto the load."""
+    g = _write(tmp_path / "g.toml", "[defaults]\ntimeout_sec = 0\n")
+    repo = tmp_path / "repo"; repo.mkdir()
+    _write(repo / ".skodun.toml", "[defaults]\ntimeout_sec = 300\n")
+    assert load_config(repo, global_path=g).defaults.timeout_sec == 300
 
 
 # --- repo-layout tables: defaults, round-trip, layering, validation ---------

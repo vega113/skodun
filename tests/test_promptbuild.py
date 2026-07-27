@@ -21,7 +21,10 @@ import subprocess
 import pytest
 
 from skodun.checklist import Selection
-from skodun.promptbuild import Prompt, build
+from skodun.contextpack import pack
+from skodun.promptbuild import (
+    DIFF_BEGIN, DIFF_END, Prompt, build, context_headroom,
+)
 from tests.conftest import oracle_dir
 
 SEL = Selection(sections=["core"], bytes_total=10, over_budget=False,
@@ -318,6 +321,114 @@ def test_prompt_is_a_frozen_dataclass_of_the_declared_shape():
 
 
 # --------------------------------------------------------------------------
+# Context headroom
+# --------------------------------------------------------------------------
+
+def _oracle_headroom(max_diff_bytes: int, diff_len: int, packing: bool) -> int:
+    """The oracle's arithmetic, transcribed line by line from `write_prompt`
+    (`scripts/grok-prepush-review.sh:1883-1913`), taking the `[ -n "$_diff_file" ]`
+    branch — the file form of the diff path, which is the one skodun ports:
+
+        if [ "$_wp_sz" -gt "$MAX_DIFF_BYTES" ]; then
+          _wp_written=$MAX_DIFF_BYTES
+        else
+          _wp_written=$_wp_sz
+        fi
+        _wp_written=$((_wp_written + 1))
+        [ "$_wp_written" -gt "$MAX_DIFF_BYTES" ] && _wp_written=$MAX_DIFF_BYTES
+        _wp_headroom=$((MAX_DIFF_BYTES - _wp_written))
+        [ "$_wp_headroom" -lt 0 ] && _wp_headroom=0
+        if [ "${GROK_REVIEW_CONTEXT:-1}" != "0" ] && [ "$_wp_headroom" -gt 0 ]; then
+          _wp_headroom=$((_wp_headroom - 1))
+        fi
+
+    (The same arithmetic appears a second time in the oracle, at `:3544-3551`,
+    where it sizes the context used for the dual-hash identity.)
+
+    Deliberately a separate transcription rather than a call into the module:
+    the assertion is that two independent readings of the shell agree, which a
+    test that reused the implementation could not make.
+    """
+    written = max_diff_bytes if diff_len > max_diff_bytes else diff_len
+    written = written + 1
+    if written > max_diff_bytes:
+        written = max_diff_bytes
+    headroom = max_diff_bytes - written
+    if headroom < 0:
+        headroom = 0
+    if packing and headroom > 0:
+        headroom = headroom - 1
+    return headroom
+
+
+@pytest.mark.parametrize("max_diff_bytes", [1, 2, 3, 78, 79, 80, 1_000, 400_000])
+@pytest.mark.parametrize("diff_len", [0, 1, 77, 999, 400_000, 900_000])
+@pytest.mark.parametrize("packing", [False, True])
+def test_headroom_matches_the_arithmetic_transcribed_from_the_oracle(
+        max_diff_bytes, diff_len, packing):
+    assert context_headroom(max_diff_bytes, diff_len, packing=packing) \
+        == _oracle_headroom(max_diff_bytes, diff_len, packing)
+
+
+def test_headroom_is_the_envelope_minus_the_diff_and_its_framing():
+    # Diff comfortably inside the envelope: one byte goes to the blank line
+    # before END DIFF, and one more to the blank line before FILE CONTEXT.
+    assert context_headroom(1_000, 100, packing=False) == 899
+    assert context_headroom(1_000, 100, packing=True) == 898
+
+
+def test_headroom_is_zero_once_the_diff_fills_the_envelope():
+    for diff_len in (399_999, 400_000, 400_001, 10_000_000):
+        for packing in (False, True):
+            assert context_headroom(400_000, diff_len, packing=packing) == 0
+
+
+def test_headroom_never_goes_negative_at_the_envelope_boundary():
+    """The oracle's re-cap: the blank line before END DIFF would otherwise push
+    `written` one byte past the envelope for a diff that exactly fills it."""
+    for cap in (1, 2, 10, 400_000):
+        for diff_len in range(max(0, cap - 2), cap + 3):
+            for packing in (False, True):
+                assert context_headroom(cap, diff_len, packing=packing) >= 0
+
+
+def test_packing_costs_exactly_one_byte_of_headroom_when_any_is_left():
+    off = context_headroom(1_000, 100, packing=False)
+    assert context_headroom(1_000, 100, packing=True) == off - 1
+    # ...and nothing at all when there is none to take.
+    assert context_headroom(1_000, 1_000, packing=False) == 0
+    assert context_headroom(1_000, 1_000, packing=True) == 0
+
+
+def test_headroom_rejects_the_same_bad_budget_build_does():
+    for bad in (0, -1):
+        with pytest.raises(ValueError):
+            context_headroom(bad, 10, packing=True)
+    with pytest.raises(ValueError):
+        context_headroom(400_000, -1, packing=True)
+
+
+def test_headroom_leaves_room_for_the_bytes_build_actually_emits():
+    """The contract that makes the arithmetic worth anything: the diff, the two
+    blank lines `build` emits around the END DIFF marker, and a pack body sized
+    to the headroom together fill the envelope exactly — never overrun it.
+
+    The marker lines themselves are outside the oracle's accounting; only the
+    diff bytes and the two blank lines it pays for are inside it."""
+    diff = b"d" * 300
+    h = context_headroom(1_000, len(diff), packing=True)
+    p = build("b", "o/m", "s", "h", diff, 1_000, EMPTY_SEL, b"c" * h)
+    t = p.text
+    i = t.index(DIFF_BEGIN) + len(DIFF_BEGIN)
+    j = t.index(DIFF_END)
+    diff_region = t[i:j]                       # diff + the blank line
+    context_region = t[j + len(DIFF_END):]     # the blank line + pack body
+    assert diff_region == diff + b"\n"
+    assert len(diff_region) + len(context_region) == 1_000
+    assert not p.diff_truncated
+
+
+# --------------------------------------------------------------------------
 # Parity with the oracle
 # --------------------------------------------------------------------------
 
@@ -406,6 +517,79 @@ def test_prompt_parity_with_oracle(tmp_path, context, max_diff_bytes):
     assert len(raw[:cut]) > 600  # never vacuously equal
     # Stronger: the whole prompt matches byte-for-byte.
     assert mine == raw
+
+
+def test_headroom_parity_with_oracle_across_the_inclusion_boundary(tmp_path):
+    """Pin `context_headroom` against the oracle itself.
+
+    The oracle never prints its headroom, but it spends it: the packer includes
+    a candidate file only when the section fits. So drive the oracle at the two
+    envelope sizes that straddle that boundary *according to our own formula* —
+    the smallest `max_diff_bytes` whose headroom admits the file, and one byte
+    less — and let the oracle say whether we were right. It cannot agree by
+    accident: an off-by-one in either direction moves the file to the wrong side
+    of one of the two runs.
+
+    The whole prompt is compared byte-for-byte on both sides, with skodun's own
+    packer filling the headroom, so this covers the composition end to end
+    (`context_headroom` -> `pack` -> `build`) and not just the boundary.
+    """
+    root = oracle_dir()
+    if root is None or not (root / ORACLE_SCRIPT).is_file():
+        pytest.skip("SKODUN_ORACLE_DIR unset or oracle script absent")
+    target = "noop.js"
+    if not (root / target).is_file():
+        pytest.skip(f"oracle checkout has no {target} to pack")
+
+    diff = (f"diff --git a/{target} b/{target}\n"
+            f"--- a/{target}\n+++ b/{target}\n@@ -1 +1 @@\n-x\n+y\n").encode()
+    diff_file = tmp_path / "fix.diff"
+    diff_file.write_bytes(diff)
+    file_list = tmp_path / "files.txt"
+    file_list.write_text(f"{target}\n", encoding="utf-8")
+    statuses = {target: "M"}
+
+    # Smallest headroom that admits the file, found from the packer (whose own
+    # parity with the oracle's packer is pinned in tests/test_contextpack.py).
+    lo, hi = 1, 1 << 20
+    assert target in pack(root, [target], statuses, headroom=hi).included
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if target in pack(root, [target], statuses, headroom=mid).included:
+            hi = mid
+        else:
+            lo = mid + 1
+    fits = lo
+
+    # Smallest envelope whose headroom reaches it, per the formula under test.
+    cap = next(c for c in range(len(diff), len(diff) + fits + 8)
+               if context_headroom(c, len(diff), packing=True) >= fits)
+    assert context_headroom(cap, len(diff), packing=True) == fits
+    assert context_headroom(cap - 1, len(diff), packing=True) == fits - 1
+
+    kw = dict(branch="feat/headroom", base_ref="origin/main",
+              base_sha="a" * 40, head="b" * 40 + " (working tree)")
+    for max_diff_bytes, want_file in ((cap, True), (cap - 1, False)):
+        raw = _run_oracle(root, tmp_path / f"o{max_diff_bytes}.txt", diff_file,
+                          context=True, max_diff_bytes=max_diff_bytes,
+                          file_list=file_list, **kw)
+        marker = f"----- BEGIN FILE CONTEXT: {target} -----".encode()
+        assert (marker in raw) is want_file, (
+            f"oracle disagrees about the headroom at max_diff_bytes="
+            f"{max_diff_bytes}: expected the file "
+            f"{'packed' if want_file else 'omitted'}")
+        assert b"TRUNCATED" not in raw, "fixture must not truncate the diff"
+
+        rules, _ = _split_oracle_prompt(raw)
+        sel = Selection(sections=["core"],
+                        bytes_total=len(rules.encode("utf-8")),
+                        over_budget=False, dropped=[], body=rules)
+        body = pack(root, [target], statuses,
+                    headroom=context_headroom(max_diff_bytes, len(diff),
+                                              packing=True)).body
+        mine = build(diff=diff, max_diff_bytes=max_diff_bytes, selection=sel,
+                     pack_body=body, **kw).text
+        assert mine == raw
 
 
 def test_parity_fixture_exercises_the_paths_it_claims_to(tmp_path):

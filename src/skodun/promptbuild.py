@@ -26,6 +26,18 @@ Everything is `bytes`. Diffs are not decodable in general (they carry whatever
 the files carry), so they are spliced in verbatim rather than round-tripped
 through `str`.
 
+Context headroom
+----------------
+`max_diff_bytes` is not a diff budget, it is the *envelope*: the diff wins it
+outright and the packed FILE CONTEXT sections fill whatever is left over. The
+oracle's `write_prompt` computes that leftover itself, before it calls the
+packer, and `context_headroom` below is that computation. It lives in this
+module because this is the one place that holds all three inputs — the
+envelope, the diff length, and whether packing is on — and because the number
+is a fact about the bytes `build` is going to emit. Callers run
+`context_headroom` first, hand the result to `contextpack.pack`, then pass the
+packed body back into `build` as `pack_body`.
+
 Ported quirks
 -------------
 Two behaviours look like accidents of shell but are load-bearing for parity,
@@ -95,8 +107,54 @@ RULES_BEGIN = b"----- BEGIN REPO RULES (path-scoped) -----\n"
 RULES_END = b"----- END REPO RULES -----\n"
 DIFF_BEGIN = b"----- BEGIN DIFF -----\n"
 DIFF_END = b"----- END DIFF -----\n"
-#: `n` is the *budget*, not the number of diff bytes actually written.
-DIFF_TRUNCATED = "----- DIFF TRUNCATED at {n} bytes -----\n"
+#: `%d` is the *budget*, not the number of diff bytes actually written. Kept as
+#: `bytes` like every other marker here: the prompt is bytes end to end, and a
+#: lone `str` template would be the one constant needing an `.encode()` at the
+#: call site — the sort of asymmetry that invites an encoding bug later.
+DIFF_TRUNCATED = b"----- DIFF TRUNCATED at %d bytes -----\n"
+
+
+def context_headroom(max_diff_bytes: int, diff_len: int, *,
+                     packing: bool) -> int:
+    """Bytes left inside the `max_diff_bytes` envelope for packed file context.
+
+    A direct port of the oracle's own budget arithmetic (`write_prompt`,
+    `scripts/grok-prepush-review.sh:1883-1913`), which reads, for the file form
+    of the diff path — the form this module ports:
+
+        _wp_written = min(diff size, MAX_DIFF_BYTES)
+        _wp_written = _wp_written + 1            # blank line before END DIFF
+        _wp_written = min(_wp_written, MAX_DIFF_BYTES)   # re-cap
+        _wp_headroom = max(0, MAX_DIFF_BYTES - _wp_written)
+        if packing on and _wp_headroom > 0:
+            _wp_headroom = _wp_headroom - 1      # blank line before FILE CONTEXT
+
+    The two `+ 1`/`- 1` terms are not slack: they are the two blank lines
+    `build` emits unconditionally — one before `----- END DIFF -----`, one
+    between it and the first FILE CONTEXT section — so the packed body plus its
+    framing still fits the envelope. The re-cap matters only when the diff
+    exactly fills the envelope, where the blank line would otherwise push
+    `written` one byte past `MAX` and make the headroom negative.
+
+    `packing` is "context packing is enabled", the same thing `build`'s
+    `pack_body is not None` means — not "the pack came back non-empty", which
+    is not yet known when this is called.
+
+    Returns 0 when nothing is left over; that is an ordinary outcome for a diff
+    that fills the envelope, and `contextpack.pack` handles it by omitting every
+    candidate as `over-headroom`.
+    """
+    if max_diff_bytes < 1:
+        raise ValueError(f"max_diff_bytes must be >= 1, got {max_diff_bytes}")
+    if diff_len < 0:
+        raise ValueError(f"diff_len must be >= 0, got {diff_len}")
+
+    written = min(diff_len, max_diff_bytes) + 1
+    written = min(written, max_diff_bytes)
+    headroom = max(0, max_diff_bytes - written)
+    if packing and headroom > 0:
+        headroom -= 1
+    return headroom
 
 
 @dataclass(frozen=True)
@@ -141,7 +199,11 @@ def build(
 
     Raises `ValueError` for a non-positive `max_diff_bytes`: a zero budget would
     silently ship a prompt containing no diff at all, which reads to the model
-    as "nothing changed" rather than as an error.
+    as "nothing changed" rather than as an error. (The oracle instead clamps a
+    junk value back to its own default; failing is the deliberate divergence.)
+    A user-supplied value is already rejected by `config.load_config`, which
+    owns that validation and reports it against the offending `.skodun.toml`
+    key; this guard is defence in depth for a value computed in-process.
     """
     if max_diff_bytes < 1:
         raise ValueError(f"max_diff_bytes must be >= 1, got {max_diff_bytes}")
@@ -166,7 +228,7 @@ def build(
     diff_truncated = len(diff) > max_diff_bytes
     out += diff[:max_diff_bytes]
     if diff_truncated:
-        out += b"\n" + DIFF_TRUNCATED.format(n=max_diff_bytes).encode("utf-8")
+        out += b"\n" + DIFF_TRUNCATED % max_diff_bytes
     out += b"\n"  # unconditional; see "Ported quirks" above
     out += DIFF_END
 
