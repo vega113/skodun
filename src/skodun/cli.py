@@ -30,6 +30,7 @@ from pathlib import Path
 from . import __version__
 
 _DEFAULT_DB = Path(".local/share/skodun/skodun.db")
+_LEGACY_DIR = ".grok-reviews"
 
 
 def _store_path() -> Path:
@@ -59,6 +60,15 @@ def build_parser() -> argparse.ArgumentParser:
         "review", help="review the outgoing change now, in the foreground")
     review.add_argument("--repo", type=Path, default=Path("."),
                         help="repository to review (default: the current directory)")
+
+    imp = sub.add_parser(
+        "import-legacy",
+        help="import a legacy .grok-reviews archive into the skodun store")
+    imp.add_argument("--repo", type=Path, default=Path("."),
+                     help="repository holding the archive (default: the "
+                          "current directory)")
+    imp.add_argument("--dir", type=Path, default=None, dest="dir",
+                     help=f"archive directory (default: <repo>/{_LEGACY_DIR})")
     return p
 
 
@@ -239,6 +249,38 @@ def _cmd_review(args) -> int:
     return 1 if total > 0 else 0
 
 
+def _cmd_import_legacy(args) -> int:
+    """One-shot migration of a legacy `.grok-reviews` archive.
+
+    Not part of the gate contract, so the exit codes are the ordinary ones:
+    `0` the import ran, `2` it could not run at all. It deliberately does NOT
+    emit a verdict banner -- nothing was gated and nothing was reviewed, and a
+    banner here would give a pre-push hook a line it is entitled to read as a
+    verdict.
+
+    A missing archive is a `0` with `reviews=0`: on a machine that never used
+    the legacy tool there is simply nothing to import, and `import_legacy`
+    already reports every unusable line through `skipped_lines` rather than by
+    failing.
+    """
+    try:
+        from .legacy_import import import_legacy
+        from .store import Store
+    except BaseException as e:
+        return _emit(f"skodun import-legacy: FAILED to load the importer: {e!r}", 2)
+
+    archive = Path(args.dir) if args.dir else Path(args.repo) / _LEGACY_DIR
+    try:
+        store = Store.open(_store_path())
+        stats = import_legacy(store, archive)
+    except BaseException as e:
+        return _emit(f"skodun import-legacy: FAILED on {archive}: {e!r}", 2)
+    return _emit(
+        f"skodun import-legacy: {archive} -> reviews={stats.reviews} "
+        f"triage={stats.triage} skipped_lines={stats.skipped_lines} "
+        f"demoted_no_artifact={stats.demoted_no_artifact}", 0)
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         # Inside the guard: building the parser is not inert. argparse probes
@@ -276,6 +318,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_gate(args)
         if args.command == "review":
             return _cmd_review(args)
+        if args.command == "import-legacy":
+            return _cmd_import_legacy(args)
         # Unreachable while the subparsers are `required=True`, and kept as
         # defence in depth: if that ever comes off, an unrecognised command
         # must still not certify a push by exiting 0.
