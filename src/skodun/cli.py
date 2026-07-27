@@ -48,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
         "gate", help="fail closed unless a trustworthy review covers this change")
     gate.add_argument("--repo", type=Path, default=Path("."),
                       help="repository to gate (default: the current directory)")
+
+    review = sub.add_parser(
+        "review", help="review the outgoing change now, in the foreground")
+    review.add_argument("--repo", type=Path, default=Path("."),
+                        help="repository to review (default: the current directory)")
     return p
 
 
@@ -153,6 +158,60 @@ def _cmd_gate(args) -> int:
     return _emit(result.message, result.code)
 
 
+def _cmd_review(args) -> int:
+    """Run one foreground review. Exit codes, and why they are these:
+
+      0  trustworthy and clean            3  gave up waiting for the lock
+      1  trustworthy, findings open       4  no trustworthy review exists
+      2  preflight refusal (nothing ran)
+
+    `run_review` prints the verdict banner itself on every path where a record
+    was persisted, because the banner has to be rendered from that record and
+    not from anything recomputed here. This function's job is the other half of
+    the invariant: every path that never reached a record still ends with a
+    `banner_failure` line as the last line of stdout.
+    """
+    from .config import load_config
+    from .pipeline import LockTimeout, PersistenceFailed, PreflightRefused, run_review
+    from .store import Store
+    from .trust import banner_failure
+
+    repo = Path(args.repo)
+    try:
+        store = Store.open(_store_path())
+    except BaseException as e:
+        # No store means no record, which is exactly what 4 says.
+        return _emit(banner_failure(f"could not open the review store: {e!r}"), 4)
+    try:
+        cfg = load_config(repo)
+    except BaseException as e:
+        # A config that will not load is a refusal before anything ran, not a
+        # review that came back badly: 2, the preflight code.
+        return _emit(banner_failure(f"could not load the config: {e!r}"), 2)
+
+    try:
+        rec = run_review(repo, cfg, store)
+    except PreflightRefused as e:
+        return _emit(banner_failure(str(e)), 2)
+    except LockTimeout as e:
+        return _emit(banner_failure(str(e)), 3)
+    except PersistenceFailed:
+        return _emit(banner_failure("no review was recorded"), 4)
+    except BaseException as e:
+        # Anything else: the review did not complete, so it certifies nothing.
+        return _emit(banner_failure(f"the review failed: {e!r}"), 4)
+
+    # The banner is already out; only the exit code is left, and it is read
+    # back off the persisted record like everything else.
+    if rec.get("trustworthy") is not True:
+        return 4
+    try:
+        total = int(rec.get("findings_total") or 0)
+    except (TypeError, ValueError):
+        total = 1     # an uncountable findings list is not a clean review
+    return 1 if total > 0 else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         # Inside the guard: building the parser is not inert. argparse probes
@@ -171,6 +230,8 @@ def main(argv: list[str] | None = None) -> int:
             return code if isinstance(code, int) else 2
         if args.command == "gate":
             return _cmd_gate(args)
+        if args.command == "review":
+            return _cmd_review(args)
         # Unreachable while the subparsers are `required=True`, and kept as
         # defence in depth: if that ever comes off, an unrecognised command
         # must still not certify a push by exiting 0.
