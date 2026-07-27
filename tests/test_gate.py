@@ -10,16 +10,50 @@ the bug it exists to catch.
 
 from __future__ import annotations
 
+import io
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+import skodun
 from skodun import gitio, triage
 from skodun.config import load_config
 from skodun.gate import GateResult, run_gate
 from skodun.store import Store
 from tests.test_gitio import _git, _mkrepo
+from tests.test_triage import LEGACY, _load_legacy
+
+# `.../src`, so a subprocess started with `python -m skodun` imports the same
+# package pytest is testing. In-process the ini's `pythonpath` handles this; a
+# subprocess inherits nothing of it.
+_SRC = str(Path(skodun.__file__).resolve().parents[1])
+
+
+class _Boom(BaseException):
+    """A `BaseException` that is not `KeyboardInterrupt`.
+
+    The gate's handlers are `except BaseException` by design, and pinning that
+    with a real `KeyboardInterrupt` means a regression aborts the entire pytest
+    session instead of producing one red test.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _never_the_real_store(tmp_path, monkeypatch):
+    """Pin `SKODUN_DB` inside `tmp_path` for EVERY test in this module.
+
+    The CLI seam falls back to `~/.local/share/skodun/skodun.db`, so a test
+    that exercises it without setting `SKODUN_DB` would write gate events into
+    the developer's real store. Individual tests still set it to the exact path
+    they want to read back; this fixture is the floor, so forgetting cannot
+    reach the real one. (`test_cli_gate_never_touches_the_real_store_path`
+    deliberately unsets it again to assert the fallback.)
+    """
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "autouse-store" / "skodun.db"))
 
 
 @pytest.fixture(autouse=True)
@@ -268,6 +302,40 @@ def test_gate_invalid_artifact_is_2(tmp_path):
     assert _events(st)[-1]["outcome"] == "error"
 
 
+def test_gate_divergence_from_oracle_on_a_self_contradicting_artifact(tmp_path):
+    """DELIBERATE DIVERGENCE #1 (see `gate.py`), pinned against the real oracle.
+
+    The oracle's `is_trustworthy(row)` short-circuits on the row's own
+    `trustworthy` field and only recomputes from the axes when the field is
+    absent -- a fallback that exists solely for rows written before the field
+    did. So an artifact carrying `trustworthy: true` alongside `degraded:
+    true` satisfies the oracle. skodun has no pre-field rows (`save_review`
+    computes it on every write), recomputes unconditionally, and additionally
+    requires the stored field to agree: a record that contradicts itself
+    certifies nothing.
+
+    This test pins BOTH halves, so the rationale in `gate.py` cannot go stale
+    while quietly being wrong about what the oracle does. If it fails because
+    the oracle dropped its short-circuit, the fix is to delete the divergence
+    note -- never to make skodun lenient.
+    """
+    if LEGACY is None or not LEGACY.exists():
+        pytest.skip("oracle checkout not present (set SKODUN_ORACLE_DIR)")
+    legacy = _load_legacy()
+
+    repo = _outgoing(_mkrepo(tmp_path))
+    st = Store.open(tmp_path / "s.db")
+    _reviewed(st, repo)
+    _hand_edit(st, "$.degraded", "json('true')")
+    art = _artifact(st)
+    assert art["trustworthy"] is True and art["degraded"] is True
+
+    assert legacy.is_trustworthy(art) is True        # the oracle accepts it
+    r = run_gate(st, repo, _cfg(repo), env={})       # skodun refuses it
+    assert r.code == 2
+    assert "disagree" in r.message
+
+
 # --------------------------------------------------------------------------
 # The recorded bypass
 # --------------------------------------------------------------------------
@@ -377,11 +445,16 @@ def sqlite_error():
 
 def test_gate_base_exception_is_2(tmp_path, monkeypatch):
     """`BaseException`, not `Exception`: a KeyboardInterrupt or a
-    MemoryError mid-gate must not escape as a Python exit code of 1."""
+    MemoryError mid-gate must not escape as a Python exit code of 1.
+
+    `_Boom`, not a real `KeyboardInterrupt`: an actual interrupt escaping the
+    gate would tear down the whole pytest session, so the regression this test
+    exists to catch would show up as an aborted run rather than a failure.
+    """
     repo = _outgoing(_mkrepo(tmp_path))
     st = Store.open(tmp_path / "s.db")
     _reviewed(st, repo, findings=[_FINDING])
-    monkeypatch.setattr(gitio, "capture_diff", _raiser(KeyboardInterrupt()))
+    monkeypatch.setattr(gitio, "capture_diff", _raiser(_Boom("interrupted")))
     assert run_gate(st, repo, _cfg(repo), env={}).code == 2
 
 
@@ -409,6 +482,28 @@ def test_gate_unrecordable_skip_becomes_2(tmp_path, monkeypatch):
     st = Store.open(tmp_path / "s.db")
     monkeypatch.setattr(st, "log_gate_event", _raiser(RuntimeError("disk full")))
     r = run_gate(st, repo, _cfg(repo), env={"SKODUN_GATE_SKIP": "1"})
+    assert r.code == 2
+    assert "could not record gate event" in r.message
+
+
+def test_gate_unrecordable_event_survives_a_base_exception(tmp_path, monkeypatch):
+    """`_record`'s inner handler is `except BaseException`, not `except
+    Exception`, and this is the test that pins the difference.
+
+    A `MemoryError` or an interrupt raised by the store write would otherwise
+    propagate straight out of `run_gate` -- a function whose docstring says it
+    never raises -- and reach the interpreter as exit code 1, the one value
+    that means "findings remain open". Narrowing the handler to `Exception`
+    must turn this red.
+    """
+    repo = _outgoing(_mkrepo(tmp_path))
+    st = Store.open(tmp_path / "s.db")
+    _reviewed(st, repo, findings=[_FINDING])
+    assert run_gate(st, repo, _cfg(repo), env={}).code == 1        # not vacuous
+
+    monkeypatch.setattr(st, "log_gate_event", _raiser(_Boom("out of memory")))
+    r = run_gate(st, repo, _cfg(repo), env={})
+    assert isinstance(r, GateResult)
     assert r.code == 2
     assert "could not record gate event" in r.message
 
@@ -453,6 +548,26 @@ def test_gate_echoes_untracked_cap_note(tmp_path):
     assert cfg.defaults.untracked_max == 1
     r = run_gate(st, repo, cfg, env={})
     assert "SKODUN GATE: identity note: untracked scan capped at 1" in r.message
+
+
+def test_gate_event_note_keeps_the_identity_notes(tmp_path):
+    """The RECORD has to show the identity was under-scoped, not just the
+    terminal output.
+
+    The note used to be the message's last line only, which kept the verdict
+    and dropped every `identity note:` line -- so the one reader who looks at
+    `gate_events` after the fact, an auditor, could not see that the decision
+    was made against a fallback base or a capped untracked scan.
+    """
+    repo = _mkrepo(tmp_path)
+    _git(repo, "branch", "-m", "master")     # no github/main|origin/main|main
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    st = Store.open(tmp_path / "s.db")
+    assert run_gate(st, repo, _cfg(repo), env={}).code == 2
+    (ev,) = _events(st)
+    assert "identity note:" in ev["note"] and "no main ref" in ev["note"]
+    assert "no trustworthy review" in ev["note"]     # the verdict line too
+    assert "\n" not in ev["note"]                    # single-line column
 
 
 def test_gate_result_is_frozen_and_carries_the_hash(tmp_path):
@@ -515,3 +630,171 @@ def test_cli_gate_setup_failure_is_2_not_a_traceback(tmp_path, monkeypatch, caps
     monkeypatch.setenv("SKODUN_DB", str(tmp_path / "cli" / "s.db"))
     assert main(["gate", "--repo", str(repo)]) == 2
     assert "SKODUN GATE: FAIL(2)" in capsys.readouterr().out
+
+
+def test_cli_gate_setup_failure_still_records_a_gate_event(tmp_path, monkeypatch,
+                                                          capsys):
+    """A FAIL(2) decided ABOVE `run_gate` is still a decision, and the contract
+    is that every decision is recorded.
+
+    `load_config` is what fails here, and the store opens perfectly well — so
+    there is somewhere to write the row, and a reported-and-enforced refusal
+    with nothing on the record would leave an auditor unable to see that the
+    push was stopped at all.
+    """
+    from skodun.cli import main
+
+    repo = _outgoing(_mkrepo(tmp_path))
+    (repo / ".skodun.toml").write_text("[defaults]\nnope = 1\n", encoding="utf-8")
+    db = tmp_path / "cli" / "s.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["gate", "--repo", str(repo)]) == 2
+    assert "SKODUN GATE: FAIL(2)" in capsys.readouterr().out
+
+    (ev,) = _events(Store.open(db))
+    assert (ev["outcome"], ev["code"]) == ("error", 2)
+    assert ev["diff_hash"] is None        # no identity was ever computed
+    assert "unknown [defaults] keys" in ev["note"]     # names the failure
+    assert ev["branch"] == "feat"
+
+
+def test_cli_gate_unopenable_store_is_2_and_records_nothing(tmp_path, monkeypatch,
+                                                            capsys):
+    """The one case where a decision legitimately goes unrecorded.
+
+    If the store cannot be opened there is nowhere to put the row, so 2 with
+    no `gate_events` entry is the only option available — and it is the safe
+    one: an unrecordable refusal is still a refusal.
+    """
+    from skodun.cli import main
+
+    repo = _outgoing(_mkrepo(tmp_path))
+    blocker = tmp_path / "blocked"        # a FILE where a directory must be
+    blocker.write_text("not a directory\n", encoding="utf-8")
+    monkeypatch.setenv("SKODUN_DB", str(blocker / "s.db"))
+
+    assert main(["gate", "--repo", str(repo)]) == 2
+    assert "SKODUN GATE: FAIL(2) could not open the store" in capsys.readouterr().out
+    assert blocker.read_text(encoding="utf-8") == "not a directory\n"
+
+
+# --------------------------------------------------------------------------
+# The process boundary — the exit code the shell sees is the gate's own
+# --------------------------------------------------------------------------
+
+
+def _subprocess_env(db: Path) -> dict:
+    env = dict(os.environ)          # carries the autouse SKODUN_CONFIG pin
+    env["SKODUN_DB"] = str(db)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [_SRC] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    return env
+
+
+@pytest.mark.parametrize("module", ["skodun", "skodun.cli"])
+def test_module_invocation_runs_the_gate_and_exits_2(tmp_path, module):
+    """`python -m skodun` and `python -m skodun.cli` are real invocation forms.
+
+    Without `__main__.py` and the `__main__` guard in `cli.py`, both import
+    the module, define `main`, call nothing and exit 0 — a fail-closed
+    component silently certifying an unreviewed push, while the console script
+    on the same repo exits 2. Only a subprocess exercises the interpreter's
+    module-running path, so this cannot be asserted in-process.
+
+    The message is asserted too: an exit 2 that printed nothing would mean the
+    process failed on its way to the gate rather than because of it.
+    """
+    repo = _outgoing(_mkrepo(tmp_path))
+    p = subprocess.run(
+        [sys.executable, "-m", module, "gate", "--repo", str(repo)],
+        capture_output=True, text=True, env=_subprocess_env(tmp_path / "sub" / "s.db"))
+    assert p.returncode == 2, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert "SKODUN GATE: FAIL(2)" in p.stdout
+    assert "no trustworthy review" in p.stdout
+
+
+@pytest.mark.parametrize("module", ["skodun", "skodun.cli"])
+def test_module_invocation_with_no_subcommand_is_not_a_silent_success(tmp_path, module):
+    """Same class of hole, one level up: running the module with no subcommand
+    must not report success either."""
+    p = subprocess.run([sys.executable, "-m", module], capture_output=True, text=True,
+                       env=_subprocess_env(tmp_path / "sub" / "s.db"))
+    assert p.returncode == 2, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert "usage:" in p.stderr
+
+
+@pytest.mark.parametrize("findings, expected, outcome",
+                         [(None, 2, "no-review"), ((_FINDING,), 1, "open-findings")])
+def test_gate_exit_code_survives_a_closed_stdout(tmp_path, findings, expected, outcome):
+    """`skodun gate | head`, `| grep -q`, a full disk, a closed fd.
+
+    stdout's read end is closed before the child writes a byte, so the write
+    raises `BrokenPipeError` deterministically. Escaping, that exception would
+    leave the interpreter's exit code of 1 — turning "no trustworthy review
+    covers this" into "go triage the findings" about a review that does not
+    exist. Both directions are asserted: the 2 must not become a 1, and the
+    real 1 must not become a blanket 2 either.
+
+    The recorded event proves the gate ran and decided for itself, so neither
+    assertion can be satisfied by a process that died on its way there.
+    """
+    repo = _outgoing(_mkrepo(tmp_path))
+    db = tmp_path / "sub" / "s.db"
+    if findings is not None:
+        _reviewed(Store.open(db), repo, findings=list(findings))
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run([sys.executable, "-m", "skodun", "gate", "--repo", str(repo)],
+                           stdout=w_fd, stderr=subprocess.PIPE, text=True,
+                           env=_subprocess_env(db))
+    finally:
+        os.close(w_fd)
+    assert p.returncode == expected, f"stderr={p.stderr!r}"
+    assert [e["outcome"] for e in _events(Store.open(db))] == [outcome]
+
+
+class _DeadStdout:
+    """A stdout whose writes fail, like a pipe whose reader has gone.
+
+    Only the WRITES fail: a broken pipe is still a perfectly valid descriptor,
+    and argparse probes `sys.stdout` for colour support before parsing
+    anything. `fileno` raises `io.UnsupportedOperation` the way an in-memory
+    stream does, which also keeps `_emit`'s devnull redirect from touching a
+    real fd while pytest is capturing one.
+    """
+
+    encoding = "utf-8"
+
+    def write(self, *a):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        raise io.UnsupportedOperation("fileno")
+
+
+@pytest.mark.parametrize("findings, expected", [(None, 2), ((), 0), ((_FINDING,), 1)])
+def test_cli_gate_output_failure_never_edits_the_verdict(tmp_path, monkeypatch,
+                                                         findings, expected):
+    """Printing is delivery, not decision: a failure to deliver returns the
+    gate's own code, all three of them.
+
+    Parametrized across 0/1/2 on purpose — a handler that swallowed the error
+    and returned a constant 2 would satisfy the FAIL case alone.
+    """
+    from skodun.cli import main
+
+    repo = _outgoing(_mkrepo(tmp_path))
+    db = tmp_path / "cli" / "s.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    if findings is not None:
+        _reviewed(Store.open(db), repo, findings=list(findings))
+    monkeypatch.setattr(sys, "stdout", _DeadStdout())
+    assert main(["gate", "--repo", str(repo)]) == expected
