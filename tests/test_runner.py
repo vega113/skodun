@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import signal
 import sys
+import threading
 import time
 
 import pytest
@@ -40,6 +41,7 @@ def _group_exists(pgid: int) -> bool:
 
 
 def test_completes_within_budget(tmp_path):
+    t0 = time.monotonic()
     r = run_with_watchdog(
         [sys.executable, "-c", "print('hi')"],
         10,
@@ -47,9 +49,14 @@ def test_completes_within_budget(tmp_path):
         tmp_path / "out",
         tmp_path / "err",
     )
+    wall_clock_elapsed = time.monotonic() - t0
     assert r.rc == 0 and not r.timed_out
     assert (tmp_path / "out").read_text(encoding="utf-8").strip() == "hi"
-    assert r.duration_sec >= 0.0
+    # `duration_sec >= 0.0` alone is vacuous on a monotonic clock -- it can
+    # never be false. Bound it above by wall clock actually observed around
+    # the call (plus slack for measurement overhead) so a bogus/huge value
+    # would be caught.
+    assert 0.0 <= r.duration_sec <= wall_clock_elapsed + 1.0
 
 
 def test_stderr_is_captured_separately(tmp_path):
@@ -114,19 +121,101 @@ def test_kills_whole_group_even_if_leader_dies_and_grandchild_ignores_term(tmp_p
 
 def test_timeout_leaves_no_stray_process_group(tmp_path):
     # The child is its own process-group leader, so its pid IS the pgid.
+    #
+    # This test is vacuous under a plausible mutation: if `start_new_session`
+    # were dropped, the child would run in *this test's own* process group
+    # instead of forming a new one, so `os.killpg(child_pid, 0)` would raise
+    # ProcessLookupError -- not because the group died, but because no group
+    # with that ID (the child's bare pid) ever existed. `_group_exists` alone
+    # would then trivially report "gone" even though the real child process is
+    # still alive. Guard against that two ways: (1) also check the child pid
+    # directly with `os.kill` (works regardless of grouping), and (2) confirm
+    # the group is observed genuinely alive while the run is still in flight,
+    # from a background thread, so "gone" at the end means something changed.
     pidfile = tmp_path / "child.pid"
     code = f"import os,time; open({str(pidfile)!r},'w').write(str(os.getpid())); time.sleep(60)"
+
+    observed_alive = threading.Event()
+    pid_holder: dict[str, int] = {}
+
+    def _watch_for_liveness() -> None:
+        deadline = time.monotonic() + 5.0
+        while not pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not pidfile.exists():
+            return
+        pid = int(pidfile.read_text(encoding="utf-8").strip())
+        pid_holder["pid"] = pid
+        if _group_exists(pid) and _kill_ok(pid):
+            observed_alive.set()
+
+    watcher = threading.Thread(target=_watch_for_liveness)
+    watcher.start()
+
     r = run_with_watchdog(
         [sys.executable, "-c", code], 1, tmp_path, tmp_path / "out", tmp_path / "err"
     )
+    watcher.join(timeout=5.0)
+
     assert r.timed_out
-    pgid = int(pidfile.read_text(encoding="utf-8").strip())
+    assert "pid" in pid_holder, "child never wrote its pid file"
+    assert observed_alive.is_set(), "process group was never observed alive while the run was in flight"
+
+    pgid = pid_holder["pid"]
     deadline = time.monotonic() + 2.0
-    while _group_exists(pgid) and time.monotonic() < deadline:
+    while (_group_exists(pgid) or _kill_ok(pgid)) and time.monotonic() < deadline:
         time.sleep(0.05)
+    assert not _kill_ok(pgid), f"child {pgid} survived the watchdog"
     assert not _group_exists(pgid), f"process group {pgid} survived the watchdog"
     with pytest.raises(ProcessLookupError):
         os.killpg(pgid, signal.SIGKILL)
+
+
+def test_parent_interrupt_terminates_the_child(tmp_path, monkeypatch):
+    # If the parent is interrupted (an exception in our own code, or a signal
+    # like Ctrl-C) while blocked inside the poll loop, the child must still be
+    # terminated. Without that, start_new_session=True makes things worse, not
+    # better: the child is a detached session/process-group leader outside the
+    # terminal's foreground group, so an interactive SIGINT would not even
+    # reach it on its own -- it would run to completion, orphaned.
+    #
+    # Simulate the interruption by making the loop's own `time.sleep` raise,
+    # rather than actually signalling this test process (which would be racy
+    # to aim precisely and could disrupt the test runner). The first couple of
+    # calls are left alone so the child has time to start and record its pid
+    # before anything is interrupted.
+    import skodun.runner as runner_mod
+
+    real_sleep = time.sleep
+    calls = {"n": 0}
+
+    def _sleep_then_interrupt(seconds):
+        calls["n"] += 1
+        if calls["n"] == 4:
+            raise KeyboardInterrupt
+        real_sleep(seconds)
+
+    monkeypatch.setattr(runner_mod.time, "sleep", _sleep_then_interrupt)
+
+    pidfile = tmp_path / "child.pid"
+    code = f"import os,time; open({str(pidfile)!r},'w').write(str(os.getpid())); time.sleep(60)"
+
+    with pytest.raises(KeyboardInterrupt):
+        run_with_watchdog(
+            [sys.executable, "-c", code], 10, tmp_path, tmp_path / "out", tmp_path / "err"
+        )
+
+    deadline = time.monotonic() + 3.0
+    while not pidfile.exists() and time.monotonic() < deadline:
+        real_sleep(0.05)
+    assert pidfile.exists(), "child never started"
+    pid = int(pidfile.read_text(encoding="utf-8").strip())
+
+    deadline = time.monotonic() + 2.0
+    while (_group_exists(pid) or _kill_ok(pid)) and time.monotonic() < deadline:
+        real_sleep(0.05)
+    assert not _kill_ok(pid), f"child {pid} survived the parent's interruption"
+    assert not _group_exists(pid), f"process group {pid} survived the parent's interruption"
 
 
 def test_timed_out_stdout_is_discarded(tmp_path):

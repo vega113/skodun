@@ -52,7 +52,16 @@ def run_with_watchdog(
     timed out, its duration, and the elapsed seconds to first non-empty stdout
     (`None` if the process never wrote anything -- the oracle's `-1`, which is a
     phase signal: no output by the timeout means the model stalled *before* any
-    inference; output but no completion means it stalled mid-generation).
+    inference; output but no completion means it stalled mid-generation). See
+    `_size` for a caveat on what `None` actually proves.
+
+    Note: if `cmd[0]` does not exist, `subprocess.Popen` raises
+    `FileNotFoundError` before the watchdog loop starts. That exception
+    propagates uncaught out of this function -- `stdout_path`/`stderr_path`
+    are left behind, created (by the `open()` calls above) but empty. Handling
+    a missing binary is out of scope for this module; whatever builds a retry
+    loop around this function needs to decide deliberately whether that case
+    is retryable.
     """
     t0 = time.monotonic()
     first_out: float | None = None
@@ -74,22 +83,40 @@ def run_with_watchdog(
         pg = proc.pid
         deadline = t0 + timeout_sec
 
-        while True:
-            status = proc.poll()
-            if first_out is None and _size(stdout_path) > 0:
-                first_out = time.monotonic() - t0
-            if status is not None:
-                # Checked *before* the deadline, so a run that finishes in the
-                # final tick keeps its valid output instead of being recorded as
-                # a timeout (the oracle re-checks liveness after its last tick
-                # for exactly this reason).
-                rc = status
-                break
-            if time.monotonic() >= deadline:
-                timed_out = True
-                rc = _terminate_group(proc, pg)
-                break
-            time.sleep(_POLL_SEC)
+        try:
+            while True:
+                status = proc.poll()
+                if first_out is None and _size(stdout_path) > 0:
+                    # `_size` swallows OSError and reports 0 on a stat failure,
+                    # same as an empty file. So this branch never firing is not
+                    # proof the child stayed silent -- "never wrote" and "stat
+                    # failed" are indistinguishable in the `None` this function
+                    # returns. See `_size`.
+                    first_out = time.monotonic() - t0
+                if status is not None:
+                    # Checked *before* the deadline, so a run that finishes in the
+                    # final tick keeps its valid output instead of being recorded as
+                    # a timeout (the oracle re-checks liveness after its last tick
+                    # for exactly this reason).
+                    rc = status
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    rc = _terminate_group(proc, pg)
+                    break
+                time.sleep(_POLL_SEC)
+        except BaseException:
+            # The parent was interrupted mid-wait -- an exception raised by our
+            # own code, or a signal such as Ctrl-C. start_new_session=True
+            # makes the child a detached session/process-group leader, so it
+            # is outside the terminal's foreground group: an interactive
+            # SIGINT does not reach it on its own, and nothing else will ever
+            # reap it. Take the group down exactly as a timeout would, then
+            # let the original interruption keep propagating. (Only a SIGKILL
+            # of this process itself is out of reach here; that belongs to
+            # future CLI signal handling, not this function.)
+            _terminate_group(proc, pg)
+            raise
 
     if timed_out:
         # Truncate only after the group is dead, so nothing can re-extend the
@@ -105,7 +132,18 @@ def run_with_watchdog(
 
 
 def _terminate_group(proc: subprocess.Popen, pg: int) -> int:
-    """SIGTERM the group, allow the grace period, then always SIGKILL it."""
+    """SIGTERM the group, allow the grace period, then always SIGKILL it.
+
+    The unconditional final SIGKILL is a deliberate divergence from the
+    oracle, not parity with it. In the oracle, the worker's `wait` on the
+    leader unblocks the instant the leader dies from SIGTERM, and the very
+    next line kills the *watchdog subshell* -- which is mid-`sleep 3` -- so
+    the watchdog's own `kill -KILL -- -$pgid` never runs. A grandchild that
+    ignored SIGTERM and stayed in the group survives the oracle in exactly
+    that scenario. This port always finishes the grace period and always
+    issues the group SIGKILL, so it does not leak that grandchild. Stronger
+    than the oracle, not equivalent to it.
+    """
     _killpg(pg, signal.SIGTERM)
     grace_end = time.monotonic() + _TERM_GRACE_SEC
     while time.monotonic() < grace_end:
@@ -123,6 +161,8 @@ def _terminate_group(proc: subprocess.Popen, pg: int) -> int:
 
     # ALWAYS nuke the group, even when the leader is already gone: a grandchild
     # that ignored SIGTERM lives on in the same PGID and must not survive us.
+    # (This is where this port diverges from -- and strengthens -- the oracle;
+    # see the docstring above.)
     _killpg(pg, signal.SIGKILL)
 
     if proc.poll() is None:
