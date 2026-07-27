@@ -67,6 +67,20 @@ def test_trust_is_computed_never_caller_supplied(tmp_path):
     assert st.get_review("r1")["trustworthy"] is False   # artifact rewritten too
 
 
+def test_trust_is_promoted_when_caller_under_claims(tmp_path):
+    """Pins the promotion direction of the trust invariant: a caller that
+    claims trustworthy=False but whose axes are all clean must still be
+    stored (and reported) as trustworthy. Without this test, save_review
+    could be mutated to let the caller *veto* trust — e.g.
+    `rec["trustworthy"] = bool(rec.get("trustworthy", True)) and
+    is_trustworthy(**axes)` — and the rest of the suite (which only ever
+    exercises demotion) would still pass."""
+    st = Store.open(tmp_path / "s.db")
+    st.save_review({**REC, "trustworthy": False})  # pessimistic caller, clean axes
+    assert st.latest_trustworthy_for("d" * 40)["id"] == "r1"
+    assert st.get_review("r1")["trustworthy"] is True   # artifact rewritten too
+
+
 def test_non_bool_trust_axis_rejected(tmp_path):
     st = Store.open(tmp_path / "s.db")
     with pytest.raises(ValueError):                       # bool("false") is True
@@ -121,6 +135,18 @@ def test_upsert_updates_identity_columns_not_just_trust(tmp_path):
     assert st.list_reviews("b", 30) == []
     assert [r["id"] for r in st.list_reviews("b2", 30)] == ["r1"]
     assert st.get_review("r1")["branch"] == "b2"
+
+
+def test_upsert_updates_source_column(tmp_path):
+    """source is the one indexed column with no upsert assertion elsewhere:
+    deleting `source=excluded.source` from the ON CONFLICT clause would leave
+    the rest of the suite green."""
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    st.save_review({**REC, "source": "acme"})
+    assert _raw_row(db)["source"] == "acme"
+    st.save_review({**REC, "source": "other"})
+    assert _raw_row(db)["source"] == "other"
 
 
 def test_missing_trust_axis_defaults_closed(tmp_path):
@@ -213,6 +239,28 @@ def test_triage_accepts_either_review_id_spelling(tmp_path):
     got = st.triage_for("b", "s"*40)
     assert got["k1"]["review_id"] == "rev-a"
     assert got["k2"]["review_id"] == "rev-b"
+
+
+def test_add_triage_rejects_missing_review_id_and_id(tmp_path):
+    """A record carrying neither `review_id` nor `id` must fail closed
+    (KeyError) rather than silently persisting a triage row with NULL
+    review linkage."""
+    st = Store.open(tmp_path / "s.db")
+    rec = dict(ledger_key="l1", finding_key="k1", branch="b", base_sha="s" * 40,
+               dismissed_reason="wontfix")
+    with pytest.raises(KeyError):
+        st.add_triage(rec)
+    assert st.triage_for("b", "s" * 40) == {}
+
+
+def test_list_reviews_empty_branch_filters_not_all(tmp_path):
+    """An explicitly-passed empty branch ("") must filter on that branch
+    (returning no rows here), not be treated as falsy and silently ignored.
+    None still means 'all branches'."""
+    st = Store.open(tmp_path / "s.db")
+    st.save_review(REC)
+    assert st.list_reviews("", 30) == []
+    assert [r["id"] for r in st.list_reviews(None, 30)] == ["r1"]
 
 
 def test_gate_events_are_durable(tmp_path):

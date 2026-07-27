@@ -122,12 +122,18 @@ class Store:
              rec.get("outcome"), rec.get("code"), rec.get("note")))
 
     def add_triage(self, rec: dict) -> None:
+        # Fail closed on the review_id/id spelling: `rec.get("review_id") or
+        # rec.get("id")` would silently write NULL (no review linkage) when
+        # neither key is present. Require one of the two spellings explicitly
+        # so a malformed record raises KeyError instead of persisting an
+        # orphaned triage row.
+        review_id = rec["review_id"] if "review_id" in rec else rec["id"]
         self._c.execute(
             """INSERT OR REPLACE INTO triage (ledger_key, finding_key, review_id, branch,
                  base_sha, file, line, severity, title, dismissed_reason, dismissed_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (rec["ledger_key"], rec["finding_key"],
-             rec.get("review_id") or rec.get("id"), rec["branch"],
+             review_id, rec["branch"],
              rec["base_sha"], rec.get("file"), rec.get("line"), rec.get("severity"),
              rec.get("title"), rec["dismissed_reason"], rec.get("dismissed_at")))
 
@@ -139,7 +145,7 @@ class Store:
     def list_reviews(self, branch: str | None, limit: int = 30) -> list[dict]:
         q = "SELECT artifact_json FROM reviews"
         args: tuple = ()
-        if branch:
+        if branch is not None:
             q += " WHERE branch=?"
             args = (branch,)
         q += " ORDER BY reviewed_at DESC LIMIT ?"
