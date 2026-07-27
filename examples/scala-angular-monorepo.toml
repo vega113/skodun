@@ -1,0 +1,43 @@
+# Example skodun configuration: a Scala (sbt/Play-style) backend with an
+# Angular frontend in one repository, Liquibase changelogs under
+# src/main/resources/db/changelog/, and CI in scripts/ and .github/.
+#
+# skodun ships NO repo layout of its own: unconfigured, checklist selection
+# only ever picks the `core` section (plus `cross-file`, which is driven by
+# docs/review/code-rules.json). This file is a drop-in starting point — copy it
+# to <your repo>/.skodun.toml and edit the paths to match your tree:
+#
+#     cp examples/scala-angular-monorepo.toml /path/to/repo/.skodun.toml
+#
+# Section names on the right-hand side must match `<name>.md` files in your
+# checklist_dir (default docs/review/checklists). skodun knows these:
+# core, cross-file, migrations, backend, tests, frontend, tooling.
+
+[defaults]
+
+# Ordered path-prefix -> checklist-section map, matched with str.startswith().
+# FIRST MATCH WINS, so entries MUST be ordered longest-prefix-first: a
+# changelog path starts with both "src/main/resources/db/changelog/" and
+# "src/main/", and the more specific `migrations` section has to win.
+checklist_map = [
+  ["src/main/resources/db/changelog/", "migrations"],
+  ["src/main/", "backend"],
+  ["ui/", "frontend"],
+  ["scripts/", "tooling"],
+  [".github/", "tooling"],
+]
+
+# Patterns that mark a path as test code and pull in the `tests` section.
+# A pattern ending in "/" is an anchored path prefix; every other pattern is an
+# fnmatch glob over the whole path, where "*" also matches "/". So
+# "*.spec.ts" means "ends with .spec.ts" and "*test-utils*.ts" means "contains
+# test-utils and ends with .ts".
+test_path_patterns = [
+  "*.spec.ts",
+  "*.test.sh",
+  "*.test.mjs",
+  "*test-utils*.ts",
+  "src/test/",
+  "integration-tests/src/test/",
+  "ui/src/app/testing/",
+]
