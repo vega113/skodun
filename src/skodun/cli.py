@@ -343,15 +343,22 @@ def _cmd_shadow_compare(args) -> int:
     Shadow mode is purely observational: it exists to show a human whether
     skodun agrees with the legacy tool, and a workflow that happens to run it
     must never be failed by what it finds -- or by it failing to run at all.
-    Every failure path below is reported on stdout and still returns 0.
+    Every failure path below is reported on stdout and still returns 0. That
+    "still" has to survive the printing itself, not just the computation: a
+    bare `print` can raise (`skodun shadow-compare | head` closes the pipe
+    partway through the table), and an escaping `BrokenPipeError` would hand
+    the shell the interpreter's own exit code of 1 -- observational output
+    silently becoming "findings remain open". Every line below goes through
+    `_emit`, the same broken-pipe guard `gate` and `review` use, for exactly
+    that reason.
     """
     try:
         from .legacy_import import INDEX_NAME
         from .shadow import compare
         from .store import Store
     except BaseException as e:
-        print(f"skodun shadow-compare: could not load the shadow module: {e!r}")
-        return 0
+        return _emit(
+            f"skodun shadow-compare: could not load the shadow module: {e!r}", 0)
 
     archive = Path(args.dir) if args.dir else Path(_LEGACY_DIR)
 
@@ -366,11 +373,11 @@ def _cmd_shadow_compare(args) -> int:
     # workflow, not even on its own misconfiguration.
     try:
         if not archive.is_dir():
-            print(f"skodun shadow-compare: no archive directory at {archive} "
-                  f"-- nothing on the legacy side to compare against")
+            _emit(f"skodun shadow-compare: no archive directory at {archive} "
+                  f"-- nothing on the legacy side to compare against", 0)
         elif not (archive / INDEX_NAME).is_file():
-            print(f"skodun shadow-compare: no {INDEX_NAME} in {archive} "
-                  f"-- nothing on the legacy side to compare against")
+            _emit(f"skodun shadow-compare: no {INDEX_NAME} in {archive} "
+                  f"-- nothing on the legacy side to compare against", 0)
     except BaseException:
         pass   # a notice is a courtesy; it may never become the failure itself
 
@@ -378,8 +385,7 @@ def _cmd_shadow_compare(args) -> int:
         store = Store.open(_store_path())
         comparisons = compare(store, archive, None)
     except BaseException as e:
-        print(f"skodun shadow-compare: FAILED on {archive}: {e!r}")
-        return 0
+        return _emit(f"skodun shadow-compare: FAILED on {archive}: {e!r}", 0)
 
     matched = skodun_only = legacy_only = 0
     for c in sorted(comparisons, key=lambda c: c.diff_hash):
@@ -394,30 +400,37 @@ def _cmd_shadow_compare(args) -> int:
             label = "MATCH"
         else:
             label = "MISMATCH"
-        print(f"{c.diff_hash[:12]} | {_fmt_side(c.skodun)} | {_fmt_side(c.legacy)} "
-              f"| {label}")
+        _emit(f"{c.diff_hash[:12]} | {_fmt_side(c.skodun)} | {_fmt_side(c.legacy)} "
+              f"| {label}", 0)
 
-    print(f"shadow: {len(comparisons)} compared, {matched} matched, "
-          f"{skodun_only} skodun-only, {legacy_only} legacy-only")
-    return 0
+    return _emit(f"shadow: {len(comparisons)} compared, {matched} matched, "
+                 f"{skodun_only} skodun-only, {legacy_only} legacy-only", 0)
 
 
 def _cmd_log(args) -> int:
-    """Print recent reviews, newest first. `2` if the store cannot be read."""
+    """Print recent reviews, newest first. `2` if the store cannot be read.
+
+    The likeliest way to run this is `skodun log | head`, so every line goes
+    through `_emit` rather than a bare `print`: an early-exiting reader closes
+    the pipe partway through the listing, and a `BrokenPipeError` escaping
+    would hand the shell the interpreter's own exit code of 1 -- a value this
+    command's contract does not even have. The exit code below is always the
+    one the contract promises for the outcome that was already decided (0 or
+    2), never whatever printing happened to return.
+    """
     # `-n` becomes SQLite's LIMIT, where a NEGATIVE value means "no limit" --
     # so `log -n -1` would dump the whole store while reading like a request
     # for fewer rows than the default. Below 1 there is no row count to ask
     # for, so this is a usage error rather than something to clamp silently.
     if args.limit < 1:
-        print(f"skodun log: -n must be a positive row count, got {args.limit}")
-        return 2
+        return _emit(
+            f"skodun log: -n must be a positive row count, got {args.limit}", 2)
     try:
         from .store import Store
         store = Store.open(_store_path())
         rows = store.list_reviews(args.branch, args.limit)
     except BaseException as e:
-        print(f"skodun log: could not read the store: {e!r}")
-        return 2
+        return _emit(f"skodun log: could not read the store: {e!r}", 2)
 
     def _n(v: object) -> int:
         return v if isinstance(v, int) and not isinstance(v, bool) else 0
@@ -431,9 +444,9 @@ def _cmd_log(args) -> int:
         # row in what is meant to be a one-line-per-review listing.
         summary = str(rec.get("summary") or "").replace("\r", " ").replace("\n", " ")
         mark = "!" if not trustworthy else " "
-        print(f"{mark}{rec.get('reviewed_at')} | {rec.get('branch')} | {nfiles} | "
+        _emit(f"{mark}{rec.get('reviewed_at')} | {rec.get('branch')} | {nfiles} | "
               f"{_n(sev.get('high'))}-{_n(sev.get('medium'))}-{_n(sev.get('low'))} | "
-              f"{rec.get('status')} | {summary}")
+              f"{rec.get('status')} | {summary}", 0)
     return 0
 
 
@@ -443,6 +456,11 @@ def _cmd_triage(args) -> int:
     A rejected reason or a missing/invalid review is reported as a clear
     message and a nonzero exit -- never a traceback -- because both are the
     ordinary shape of "a human needs to try again", not an internal failure.
+    `--list` in particular is routinely piped to `head` or `grep -q`, so every
+    message here goes through `_emit`: a bare `print` meeting a closed pipe
+    raises `BrokenPipeError`, and letting that escape would hand the shell the
+    interpreter's own exit code of 1 -- indistinguishable from a real error
+    about a decision that in fact was never even reached.
     """
     from .store import Store
 
@@ -452,20 +470,18 @@ def _cmd_triage(args) -> int:
     # finding was dismissed; they get a listing and a 0. Reject the mixture
     # instead of picking one of the two meanings.
     if args.list_only and not (args.finding_index is None and args.reason is None):
-        print("skodun triage: --list takes only a review id; drop the finding "
-              "index and the reason to list, or drop --list to dismiss")
-        return 2
+        return _emit(
+            "skodun triage: --list takes only a review id; drop the finding "
+            "index and the reason to list, or drop --list to dismiss", 2)
 
     try:
         store = Store.open(_store_path())
     except BaseException as e:
-        print(f"skodun triage: could not open the store: {e!r}")
-        return 2
+        return _emit(f"skodun triage: could not open the store: {e!r}", 2)
 
     review = store.get_review(args.review_id)
     if review is None:
-        print(f"skodun triage: no such review: {args.review_id!r}")
-        return 2
+        return _emit(f"skodun triage: no such review: {args.review_id!r}", 2)
 
     from .textnorm import finding_key
     from .triage import ArtifactError, TriageError, dismiss, load_valid_artifact
@@ -473,33 +489,30 @@ def _cmd_triage(args) -> int:
     try:
         review = load_valid_artifact(review)
     except ArtifactError as e:
-        print(f"skodun triage: invalid review artifact: {e}")
-        return 2
+        return _emit(f"skodun triage: invalid review artifact: {e}", 2)
 
     if args.list_only:
         triaged = store.triage_for(review["branch"], review["base_sha"])
         for i, f in enumerate(review["findings"]):
             fkey = finding_key(f.get("file", ""), f.get("title", ""))
             status = "DISMISSED" if fkey in triaged else "OPEN"
-            print(f"[{i}] {f.get('severity')} {f.get('file')}:{f.get('line')} "
-                  f"{f.get('title')} ({status})")
+            _emit(f"[{i}] {f.get('severity')} {f.get('file')}:{f.get('line')} "
+                  f"{f.get('title')} ({status})", 0)
         return 0
 
     if args.finding_index is None or args.reason is None:
-        print("skodun triage: usage: skodun triage <review-id> <finding-index> "
-              "\"<reason>\"  |  skodun triage --list <review-id>")
-        return 2
+        return _emit(
+            "skodun triage: usage: skodun triage <review-id> <finding-index> "
+            "\"<reason>\"  |  skodun triage --list <review-id>", 2)
 
     try:
         dismiss(store, review, args.finding_index, args.reason,
                 now=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     except (TriageError, ArtifactError) as e:
-        print(f"skodun triage: rejected: {e}")
-        return 2
+        return _emit(f"skodun triage: rejected: {e}", 2)
 
-    print(f"skodun triage: dismissed finding {args.finding_index} on review "
-          f"{args.review_id}")
-    return 0
+    return _emit(f"skodun triage: dismissed finding {args.finding_index} on review "
+                 f"{args.review_id}", 0)
 
 
 def main(argv: list[str] | None = None) -> int:

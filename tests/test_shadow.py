@@ -8,13 +8,32 @@ tolerates it, and that "newest by reviewed_at" is what wins on each side.
 """
 
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
+import skodun
 from skodun.legacy_import import import_legacy
 from skodun.shadow import _int, compare, effective_trustworthy
 from skodun.store import Store
 from tests.test_store import REC
+
+# `.../src`, so a subprocess started with `python -m skodun` imports the same
+# package pytest is testing. In-process the ini's `pythonpath` handles this; a
+# subprocess inherits nothing of it.
+_SRC = str(Path(skodun.__file__).resolve().parents[1])
+
+
+def _subprocess_env(db: Path) -> dict:
+    env = dict(os.environ)          # carries the autouse SKODUN_CONFIG pin
+    env["SKODUN_DB"] = str(db)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [_SRC] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    return env
 
 
 def _write_index(d, *rows):
@@ -660,3 +679,80 @@ def test_cli_triage_dismissal_flips_the_gate_from_1_to_0(tmp_path, monkeypatch,
 
     result = run_gate(st, repo, load_config(repo))
     assert result.code == 0, result.message
+
+
+# --------------------------------------------------------------------------
+# The process boundary — a closed stdout must never change these exit codes
+# --------------------------------------------------------------------------
+#
+# `shadow-compare`, `log`, and `triage --list` are all observational, and all
+# three are ordinary things to pipe into `head` or `grep -q`. Piping closes
+# stdout's read end before the child has written everything it means to, so
+# the write raises `BrokenPipeError` deterministically. Only a real subprocess
+# exercises that: in-process, `capsys` never lets a print actually fail.
+# Escaping, that exception would leave the interpreter's own exit code of 1 —
+# turning "nothing to report" or "here is your listing" into "findings remain
+# open" about a review that was never even consulted.
+
+
+def test_cli_shadow_compare_exit_code_survives_a_closed_stdout(tmp_path):
+    db = tmp_path / "sub" / "s.db"
+    Store.open(db).save_review(REC)   # at least one row, so the table has to print
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run(
+            [sys.executable, "-m", "skodun", "shadow-compare"],
+            stdout=w_fd, stderr=subprocess.PIPE, text=True, env=_subprocess_env(db))
+    finally:
+        os.close(w_fd)
+    assert p.returncode == 0, f"stderr={p.stderr!r}"
+
+
+def test_cli_log_exit_code_survives_a_closed_stdout(tmp_path):
+    db = tmp_path / "sub" / "s.db"
+    st = Store.open(db)
+    for i in range(5):
+        st.save_review({**REC, "id": f"r{i}", "reviewed_at": f"2026-07-27T1{i}:00:00Z"})
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run(
+            [sys.executable, "-m", "skodun", "log"],
+            stdout=w_fd, stderr=subprocess.PIPE, text=True, env=_subprocess_env(db))
+    finally:
+        os.close(w_fd)
+    assert p.returncode == 0, f"stderr={p.stderr!r}"
+
+
+def test_cli_triage_list_exit_code_survives_a_closed_stdout(tmp_path):
+    db = tmp_path / "sub" / "s.db"
+    st = Store.open(db)
+    st.save_review(_artifact_with_one_finding("rev1", "feat", "s"*40, "d"*40))
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run(
+            [sys.executable, "-m", "skodun", "triage", "--list", "rev1"],
+            stdout=w_fd, stderr=subprocess.PIPE, text=True, env=_subprocess_env(db))
+    finally:
+        os.close(w_fd)
+    assert p.returncode == 0, f"stderr={p.stderr!r}"
+
+
+def test_cli_triage_dismissal_exit_code_survives_a_closed_stdout(tmp_path):
+    """The dismissal's own success line -- printed last, after the write already
+    landed -- must not turn a real `0` into a pipe error either."""
+    db = tmp_path / "sub" / "s.db"
+    st = Store.open(db)
+    st.save_review(_artifact_with_one_finding("rev1", "feat", "s"*40, "d"*40))
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run(
+            [sys.executable, "-m", "skodun", "triage", "rev1", "0",
+             "verified: handler already checks None on entry, see PR #1"],
+            stdout=w_fd, stderr=subprocess.PIPE, text=True, env=_subprocess_env(db))
+    finally:
+        os.close(w_fd)
+    assert p.returncode == 0, f"stderr={p.stderr!r}"
