@@ -146,7 +146,7 @@ def entry() -> None:
 
 **Interfaces:**
 - Produces: `load_config(repo_root: Path | None, global_path: Path | None = None) -> Config`;
-  `Config(defaults: Defaults, reviewers: list[Reviewer])`;
+  `Config(defaults: Defaults, reviewers: tuple[Reviewer, ...])`;
   `Reviewer(name, provider, model, effort, role, dimensions, persona, max_cost_usd, enabled)`;
   `Defaults(severity_gate="high", confidence_threshold=7, max_diff_bytes=400_000, timeout_sec=420, timeout_retries=1, degraded_retries=1, max_turns=40, deny_tools="bash,read,write,edit,web_search,web_fetch", context_pack=True, checklist_dir="docs/review/checklists", rules_json="docs/review/code-rules.json")`.
 - Effort is a canonical enum: `none|low|medium|high|max` or `None` (unset).
@@ -706,23 +706,27 @@ def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
     i = 0
     while i < len(toks) and toks[i]:
         code = toks[i][:1]
-        path = toks[i + 2] if code == "R" else toks[i + 1]   # rename: new name wins
+        two_path = code in ("R", "C")            # rename AND copy carry old\0new
+        path = toks[i + 2] if two_path else toks[i + 1]      # new name wins
         statuses[path] = code
-        i += 3 if code == "R" else 2
+        i += 3 if two_path else 2
     files = list(statuses)
     untracked = [f for f in _run(repo, "ls-files", "--others", "--exclude-standard",
                                  "-z").stdout.decode("utf-8", "replace").split("\0") if f]
     truncated = len(untracked) > untracked_max
-    chunks = [tracked]
+    # ORACLE PARITY: every capture round-trips a shell $(...) in the oracle, so
+    # each SECTION loses its trailing newlines, and sections are joined with
+    # exactly one "\n" (DIFF="$DIFF"$'\n'"$UDIFF"). Untracked-only therefore
+    # starts "\n" + udiff (empty first section). Joining unstripped sections
+    # would insert a doubled blank line and break the --diff-hash parity tests,
+    # which are the authority here.
+    sections = [tracked.rstrip(b"\n")]
     for f in sorted(untracked)[:untracked_max]:
         cp = _run(repo, "--no-pager", "diff", "--no-ext-diff", "--no-textconv",
                   "--no-index", "--", "/dev/null", f, ok_codes=(0, 1))
-        # ORACLE PARITY: sections are joined with "\n" (shell: DIFF="$DIFF"$'\n'"$UDIFF"),
-        # so an untracked-only change starts with a bare newline. The --diff-hash
-        # parity tests (incl. the untracked-only case) are the authority here.
-        chunks.append(b"\n"); chunks.append(cp.stdout.rstrip(b"\n"))
+        sections.append(cp.stdout.rstrip(b"\n"))
         files.append(f); statuses[f] = "A"
-    return Diff(data=b"".join(chunks), files=files, statuses=statuses,
+    return Diff(data=b"\n".join(sections), files=files, statuses=statuses,
                 truncated_untracked=truncated)
 
 def git_common_dir(repo: Path) -> Path:
@@ -797,11 +801,11 @@ Note: the legacy module's public function names may differ (`finding_key` vs `_f
 ```python
 # src/skodun/textnorm.py
 from __future__ import annotations
-import hashlib
+import hashlib, re
 
-def norm(s: str) -> str:
-    # PARITY-CRITICAL: must match grok_review_triage.py's normalization exactly.
-    return " ".join((s or "").strip().lower().split())
+def norm(s) -> str:
+    # PARITY-CRITICAL: byte-for-byte the oracle's _norm (grok_review_triage.py:70-72).
+    return re.sub(r"\s+", " ", str(s or "")).strip().lower()
 
 def finding_key(file: str, title: str) -> str:
     h = hashlib.sha256()
@@ -884,12 +888,13 @@ from .textnorm import finding_key, ledger_key, norm
 class TriageError(ValueError): ...
 class ArtifactError(ValueError): ...
 
-# PARITY: copy the full 28-item set verbatim from
-# tubescribes/scripts/grok_review_triage.py (PLACEHOLDER_REASONS).
+# PARITY: verbatim from tubescribes/scripts/grok_review_triage.py:58-63 —
+# the parity test below asserts exact set equality against the oracle module.
 PLACEHOLDER_REASONS = {
-    "false positive", "fp", "not a bug", "wontfix", "won't fix", "n/a", "na",
-    "by design", "intentional", "already fixed", "known", "irrelevant",
-    # ... (complete from source during port; the parity test in Step 4 enforces it)
+    "false positive", "fp", "not a bug", "wontfix", "won't fix", "no", "nope",
+    "n/a", "na", "none", "ignore", "ignored", "skip", "skipped", "ok", "fine",
+    "invalid", "wrong", "incorrect", "disagree", "not an issue", "no issue",
+    "already fixed", "by design", "intentional", "known", "irrelevant",
 }
 MIN_REASON_CHARS = 20
 
@@ -937,7 +942,7 @@ def open_findings(review: dict, triaged: dict[str, dict]) -> list[dict]:
     return out
 ```
 
-- [ ] **Step 4: Run to verify PASS.** Additionally add a parity check while porting: open the oracle and copy `PLACEHOLDER_REASONS` completely; add `test_placeholder_set_matches_legacy` mirroring the Task 5 legacy-module technique.
+- [ ] **Step 4: Run to verify PASS.** Add `test_placeholder_set_matches_legacy` (Task 5's legacy-module-loading technique): `assert PLACEHOLDER_REASONS == legacy.PLACEHOLDER_REASONS and MIN_REASON_CHARS == legacy.MIN_REASON_CHARS` — skipped when tubescribes is absent.
 - [ ] **Step 5: Commit** — `git commit -am "feat: triage ledger with audited dismissal reasons and fail-closed artifact validation"`
 
 ---
@@ -951,7 +956,7 @@ def open_findings(review: dict, triaged: dict[str, dict]) -> list[dict]:
 - Consumes: `Store`, `triage.open_findings`, `gitio` (diff identity of the *current* tree), `config`.
 - Produces: `run_gate(store, repo: Path, cfg: Config, env=os.environ) -> GateResult(code: int, message: str)`; CLI `skodun gate` prints `SKODUN GATE: ...` lines and exits with the code.
 - **Oracle:** `grok_review_triage.py` `gate` + `grok-review-now.sh --gate` (lines 53–136). Contract: recompute the current diff identity; **empty outgoing diff ⇒ PASS(0) "no outgoing change"** (oracle behavior — nothing to review); otherwise find a trustworthy review with that exact `diff_hash`; **re-assert the loaded artifact against the index** — the artifact's own `parse_ok/degraded/diff_truncated` must recompute to trustworthy via `trust.is_trustworthy` and the artifact's `diff_hash` must equal the current hash (index and artifact can diverge via crashed writer or hand edit; a derived summary is never trusted alone); verify `base_sha` matches (rebase detection); then 0 if no open findings, 1 if open findings remain, 2 otherwise. **Every unexpected exception → 2.** Identity-helper stderr (base warnings, untracked cap) is echoed as `SKODUN GATE: identity note: ...`.
-- **Recorded bypass:** `SKODUN_GATE_SKIP=1` ⇒ exit 0 with `SKODUN GATE: SKIPPED — recorded as a decision`, and a `gate_events` row `outcome="skipped"`. Every gate decision (pass/fail/skipped) writes a `gate_events` row — a bypass is a decision on the record, never a rule that quietly stopped applying. The durability is itself fail-closed: `GateResult` carries the computed `diff_hash` so the event identifies the gated content, and **a failure to persist the event converts the result to exit 2** (a gate that cannot write its own record is running on a broken store and must not certify anything).
+- **Recorded bypass:** `SKODUN_GATE_SKIP=1` ⇒ exit 0 with `SKODUN GATE: SKIPPED — recorded as a decision`, and a `gate_events` row `outcome="skipped"`. Every gate decision (pass/fail/skipped) writes a `gate_events` row — a bypass is a decision on the record, never a rule that quietly stopped applying. The durability is itself fail-closed: `GateResult` carries the computed `diff_hash` so the event identifies the gated content, and **a failure to persist the event converts the result to exit 2** (a gate that cannot write its own record is running on a broken store and must not certify anything). Identity conventions for the two hash-less decisions, by design and tested: a **skipped** event records `diff_hash=None` — the bypass must work even when identity computation itself is broken (that is what a bypass is for), so it never depends on it; an **empty-diff pass** records `diff_hash=""` (the defined empty-change identity).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1065,7 +1070,7 @@ def _gate(store: Store, repo: Path, cfg: Config) -> GateResult:
         notes.append(f"identity note: untracked scan capped at {cfg.defaults.untracked_max}")
     prefix = "".join(f"SKODUN GATE: {n}\n" for n in notes)
     if diff.data.rstrip(b"\n") == b"":
-        return GateResult(0, prefix + "SKODUN GATE: PASS no outgoing change", None)
+        return GateResult(0, prefix + "SKODUN GATE: PASS no outgoing change", "")
     dh = gitio.diff_identity(diff.data)
     review = store.latest_trustworthy_for(dh)
     if review is None:
@@ -1270,9 +1275,18 @@ def _safe_open(repo: Path, rel: str):
     if not str(resolved).startswith(str(Path(repo).resolve()) + os.sep):
         return None
     try:
-        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        if not stat.S_ISREG(os.lstat(resolved).st_mode):   # preflight: FIFO/device
+            return None                                    # would block on open
+        # O_NONBLOCK makes a racily-swapped-in FIFO open fail/return instead of
+        # hanging; harmless for regular files. fstat re-checks post-open (TOCTOU).
+        fd = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK
+                     | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
         return None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    os.set_blocking(fd, True)
     return os.fdopen(fd, "rb")
 ```
 
@@ -1291,23 +1305,9 @@ Body assembly mirrors the oracle **byte-for-byte**: header line listing omission
 **Interfaces:**
 - Consumes: `checklist.Selection`, `contextpack.Pack`, `Diff` bytes.
 - Produces: `build(branch, base_ref, base_sha, head, diff: bytes, max_diff_bytes: int, selection, pack_body: bytes | None) -> Prompt(text: bytes, diff_truncated: bool, prompt_bytes: int)` — the exact legacy prompt layout (oracle: `write_prompt`, `grok-prepush-review.sh` lines 1821–2066):
-  1. reviewer instructions (verbatim below), 2. JSON response contract, 3. branch/base/head block, 4. `----- BEGIN REPO RULES (path-scoped) -----` section, 5. `----- BEGIN DIFF -----` + diff (truncated at `max_diff_bytes` with `----- DIFF TRUNCATED at N bytes -----` marker), 6. FILE CONTEXT sections.
-- Instruction text (port verbatim):
-
-```
-You are a senior code reviewer reviewing a pull request BEFORE it is pushed.
-Review ONLY the unified diff below. Report real, concrete problems:
-bugs, security issues, broken error handling, concurrency hazards, data
-loss, and clear regressions. Be precise and conservative -- do not invent
-issues or flag pure style. Do NOT modify files or run commands.
-Additionally check the diff against the repo rules below; cite the rule id
-in the finding title when one is violated (e.g. "[no-blocking-handler] ...").
-
-Respond with ONLY a single JSON object (no prose, no markdown fences):
-{"summary":"...","findings":[{"file","line","severity":"high|medium|low",
- "category":"bug|security|perf|correctness|other","title","detail"}]}
-If there are no real issues, return an empty findings array.
-```
+  1. reviewer instructions, 2. JSON response contract, 3. branch/base/head block, 4. `----- BEGIN REPO RULES (path-scoped) -----` section, 5. `----- BEGIN DIFF -----` + diff (truncated at `max_diff_bytes` with `----- DIFF TRUNCATED at N bytes -----` marker), 6. FILE CONTEXT sections.
+- **Instruction text is ported BYTE-EXACTLY from the oracle's `write_prompt` (lines 2004–2064)** — including (a) the conditional 4-line FILE CONTEXT instruction block that appears **only when context packing is on** (`pack_body is not None`), and (b) the oracle's actual JSON response example, copied character-for-character (it is valid JSON; do NOT retype it from memory or from any summary — an invalid example in a schema-constrained prompt degrades output). The excerpt in the research report is orientation only, not the source.
+- **Parity oracle:** the `--write-prompt` seam (`sh scripts/grok-prepush-review.sh --write-prompt ...`) generates the legacy prompt for a fixture diff. Add `test_prompt_parity_with_oracle` (skipped when tubescribes is absent): generate both prompts for the same fixture inputs and assert byte equality of the instruction header (everything above the branch/base/head block), for both the packing-on and packing-off variants.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1783,19 +1783,23 @@ def test_skeptic_only_on_clean_trustworthy_now():
     assert not should_run_skeptic("now", False, 0)
     assert not should_run_skeptic("prepush", True, 0)
 
-PRIMARY = dict(id="r", parse_ok=True, degraded=False, diff_truncated=False,
-               trustworthy=True, findings_total=0, findings=[], summary="ok",
-               severity={"high": 0, "medium": 0, "low": 0}, extra_passes={})
+def _primary() -> dict:
+    # fresh nested structures per test — merge_extra_pass is ported from an
+    # in-place-mutating oracle, and dict() is only a shallow copy: a shared
+    # findings list or severity dict would contaminate the next test.
+    return dict(id="r", parse_ok=True, degraded=False, diff_truncated=False,
+                trustworthy=True, findings_total=0, findings=[], summary="ok",
+                severity={"high": 0, "medium": 0, "low": 0}, extra_passes={})
 
 def test_failed_extra_pass_clears_parse_ok():
-    out = merge_extra_pass(dict(PRIMARY), None, "security")
+    out = merge_extra_pass(_primary(), None, "security")
     assert out["parse_ok"] is False
     assert "security" in out["failure_reason"]
 
 def test_degraded_extra_pass_sets_degraded_not_parse_ok():
     extra = dict(parse_ok=True, degraded=True, degraded_reason="stopReason=Cancelled",
                  summary="s", findings=[])
-    out = merge_extra_pass(dict(PRIMARY), extra, "security")
+    out = merge_extra_pass(_primary(), extra, "security")
     assert out["parse_ok"] is True          # axes stay independent (oracle semantics)
     assert out["degraded"] is True and "security" in out["degraded_reason"]
 
@@ -1803,7 +1807,7 @@ def test_merge_prefixes_titles_and_recounts():
     extra = dict(parse_ok=True, degraded=False, summary="found",
                  findings=[dict(file="a", line=1, severity="high",
                                 category="", title="SQLi", detail="d")])
-    out = merge_extra_pass(dict(PRIMARY), extra, "security")
+    out = merge_extra_pass(_primary(), extra, "security")
     f = out["findings"][0]
     assert f["title"] == "(security) SQLi" and f["category"] == "security"
     assert out["findings_total"] == 1 and out["severity"]["high"] == 1
@@ -1814,7 +1818,7 @@ def test_rule_id_title_not_polluted():
                  findings=[dict(file="a", line=1, severity="low",
                                 category="bug", title="[no-blocking-handler] x",
                                 detail="d")])
-    out = merge_extra_pass(dict(PRIMARY), extra, "security")
+    out = merge_extra_pass(_primary(), extra, "security")
     f = out["findings"][0]
     assert f["title"].startswith("[no-blocking-handler]")
     assert f["detail"].startswith("(extra-pass: security) ")
@@ -1842,7 +1846,7 @@ def test_rule_id_title_not_polluted():
   4. Resolve base + capture diff; compute `diff_hash = gitio.diff_identity(diff.data)`. **No dedup: `--now` never dedups in the oracle** — every foreground invocation runs a fresh review (the dedup probe is dispatcher machinery, Phase 3).
   5. Decide `hold_for_security = should_run_security(...)` **before** any record is persisted.
   6. Checklist selection → context pack (headroom = `max_diff_bytes - len(diff)` minus 1, only when positive; statuses from `Diff.statuses`) → prompt build.
-  7. Persist a `running` record (id `sk_<utcstamp>_<pid>`), then run the finder via adapter + watchdog. Retries, always fresh runs: timeout ⇒ up to `timeout_retries`; degraded ⇒ up to `degraded_retries`. Each attempt appends `{n, rc, timed_out, duration_sec, first_output_sec}` to `attempts[]`. A timed-out attempt has empty stdout (the runner truncated it) and is **never parsed**; retries exhausted on timeout ⇒ `parse_ok=False`, `failure_reason="timed out after N attempts"`, status `failed`.
+  7. Persist a `running` record (id `sk_<utcstamp>_<pid>_<uuid4-hex8>` — the uuid component is mandatory, see the lock section), then run the finder via adapter + watchdog. Retries, always fresh runs: timeout ⇒ up to `timeout_retries`; degraded ⇒ up to `degraded_retries`. Each attempt appends `{n, rc, timed_out, duration_sec, first_output_sec}` to `attempts[]`. A timed-out attempt has empty stdout (the runner truncated it) and is **never parsed**; retries exhausted on timeout ⇒ `parse_ok=False`, `failure_reason="timed out after N attempts"`, status `failed`.
   8. Parse; run security pass if held (merge per Task 14 semantics); run skeptic pass if eligible (merge).
   9. Persist the final record — **the full artifact schema**: identity (`branch, head, base_ref, base_sha, diff_hash, context_hash`), config echo (`model, adapter, mode, timeout_seconds, max_turns`), trust axes (`parse_ok, degraded, degraded_reason, stop_reason, diff_truncated`), telemetry (`files_changed[], diff_bytes, prompt_bytes, checklist_sections[], checklist_bytes, context_bytes, context_files[], context_omitted_files[], attempts[]`), results (`summary, findings[], findings_total, severity{}, rule_ids[], extra_passes{}`, `failure_reason`). `rule_ids` extracted from finding titles with `\[([a-z0-9]+(?:-[a-z0-9]+)*)\]` (closes the rules-telemetry loop; Task 17's log viewer reads `files_changed`). Status `clean` if trustworthy, else `degraded`/`failed`. **Then** emit the banner from the persisted record. If persistence itself fails: print `banner_failure("no review was recorded")` and exit 4.
   10. On any crash, the `finally` block releases the lock (only if still owner) and downgrades a still-`running` record to `failed`.
@@ -2188,4 +2192,4 @@ def test_union_surfaces_one_sided_hashes_and_newest_row_wins(tmp_path):
 - Spec coverage: diff identity (T4, legacy-compatible trailing-newline semantics + oracle parity test), checklists (T8), context packing (T9, status-aware), prompt (T10), watchdog/retries/timeout-output-discard (T11, T15), grok envelope + degraded detection (T12, case-insensitive), trust computed-on-write (T3) + banner (T13), security/skeptic with independent demotion axes (T14), gate 0/1/2 with empty-diff PASS, artifact↔index re-assertion, and recorded `SKODUN_GATE_SKIP` bypass (T7), triage ledger + parity keys + negative-index guard (T5, T6), SQLite + gate_events (T3), stale-record recovery (T15), legacy import with artifact-backed trust (T16), union shadow compare (T17), ≥5-change-set acceptance (T18), fg-lock byte-format interop (T15).
 - Explicitly out of scope (Global Constraints): batching (fail-closed truncation tested in T15), pre-push dispatcher + dedup probe (`--now` never dedups — tested in T15), same-branch supersede, rules-registry generation/sync (stays in tubescribes), the legacy `-p` re-shell fallback, MCP/scheduling/other adapters/retention.
 - Known intentional deviations from legacy: SQLite instead of JSONL sprawl; explicit `-m` model flag; `SKODUN`-prefixed banner/gate lines (cutover-compat shims are a later phase); phase-1 extra passes reuse the finder model (cross-provider refuter is Phase 2); no `-p` ARG_MAX fallback.
-- This plan was adversarially reviewed by codex (gpt-5.6-sol, high reasoning effort); all 26 round-1 findings and all 12 round-2 findings (incl. `bool("false")` coercion, NUL-delimited path parsing, untracked-only diff separator parity, oracle context markers, ID uniqueness) are incorporated above.
+- This plan was adversarially reviewed by codex (gpt-5.6-sol, high reasoning effort) over multiple rounds; all 26 round-1, 12 round-2, and 9 round-3 findings (incl. `bool("false")` coercion, NUL-delimited path parsing with `R`/`C` two-path records, section-stripped `\n` join for diff parity, byte-exact prompt port via the `--write-prompt` seam, FIFO-safe `_safe_open`, the complete inline `PLACEHOLDER_REASONS` set, and uuid-suffixed record IDs) are incorporated above.
