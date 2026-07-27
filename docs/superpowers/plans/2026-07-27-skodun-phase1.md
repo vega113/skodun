@@ -104,7 +104,7 @@ skodun = "skodun.cli:entry"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 ```
 
 ```python

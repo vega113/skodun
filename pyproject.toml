@@ -1,0 +1,11 @@
+[project]
+name = "skodun"
+version = "0.1.0"
+requires-python = ">=3.12"
+[project.scripts]
+skodun = "skodun.cli:entry"
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
