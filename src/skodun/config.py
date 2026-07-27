@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, tomllib
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 EFFORTS = {"none", "low", "medium", "high", "max"}
@@ -72,6 +72,8 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     for layer in layers:
         dvals.update(layer.get("defaults", {}))
         for entry in layer.get("reviewers", []):
+            if "name" not in entry:
+                raise ValueError("reviewer entry is missing its required 'name' key")
             name = entry["name"]
             if name not in rmap:
                 rmap[name] = {}; order.append(name)
