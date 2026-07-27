@@ -14,10 +14,29 @@ shape every decision below:
     whole. Half a file is worse than no file: the model cannot tell a truncated
     tail from a real one and will report findings about code that does not
     exist.
-  * **Never blocks, never escapes.** Path lists reach this module from
-    `git diff --name-only` on a tree an attacker may control. A hostile or
-    merely unlucky entry must degrade to an omission reason, never to a read
-    outside the worktree and never to a hang. See `_safe_open`.
+  * **Never blocks, never raises, never follows a link out.** Path lists reach
+    this module from `git diff --name-only` on a tree an attacker may control.
+    A hostile or merely unlucky entry must degrade to an omission reason, never
+    to a symlinked read outside the worktree, never to a hang, and never to an
+    exception. See `_safe_open` and `_encode_prompt_text`.
+
+THREE RESIDUAL WEAKNESSES, all inherited from the oracle and all unfixable
+while the packed bytes must match it. They are documented here rather than
+fixed, so that the guarantee above is not read as more than it is:
+
+  * A **hard link** inside the worktree whose inode also lives outside it is
+    packed in full. No `lstat` or `realpath` check can tell it from an ordinary
+    file — indistinguishability is what a hard link *is* — so the symlink
+    layers below do not help. Exposure is small: git cannot check a hard link
+    out, so this needs a local actor who already has worktree write access.
+  * **File content can forge the markers.** A file whose text contains a
+    literal `----- BEGIN FILE CONTEXT: x -----` line lands in the prompt
+    verbatim, so content can impersonate a section boundary. The markers are a
+    prompt convention the model reads, not framing a parser enforces.
+  * **A path containing `,` or a newline corrupts the omission header**, whose
+    entries are joined with `", "` and terminated by `"\n"`. Only the prose
+    header is affected; `Pack.omitted` is a list of pairs and stays exact, and
+    it is what callers should read.
 
 ORACLE PARITY. The body format is a prompt format: the markers below are read
 by the model and are part of the input that stored reviews were produced from.
@@ -39,10 +58,12 @@ equivalent input):
      a path that is both binary-in-the-diff and unreadable now, which the
      oracle calls `binary` and skodun calls `missing`.
   2. The oracle packs a large added file only under an opt-in env flag
-     (`GR_CONTEXT_PACK_LARGE_ADDED`); skodun always does. A single-shot diff
-     carries a small added file's full content already (hence
-     `already-in-diff`), but at >= 16 KiB the diff may be batched or split, so
-     the file is packed. Parity runs set the oracle's flag.
+     (`GR_CONTEXT_PACK_LARGE_ADDED`); skodun's `pack_large_added` parameter
+     defaults to on. A single-shot diff carries a small added file's full
+     content already (hence `already-in-diff`), but at >= 16 KiB the diff may
+     be batched or split, so by default the file is packed. Parity runs set
+     the oracle's flag to match the default. See `pack()` for when a caller
+     should turn it off.
 """
 
 from __future__ import annotations
@@ -123,11 +144,25 @@ def _safe_open(repo: Path, rel: str) -> BinaryIO | None:
         with a symlinked `link_dir` reaches outside just as effectively. A
         symlink is never followed for working-tree packing, so a hostile tree
         cannot inject a secret from elsewhere on the machine into the prompt.
-      * **Resolved path still under the worktree.** Belt and suspenders against
-        anything the component walk missed (mount tricks, `..` smuggled in by a
+      * **Resolved path still under the worktree.** Guards against anything the
+        component walk missed (mount tricks, `..` smuggled in by a
         normalisation bug).
+      * **`ValueError` alongside `OSError`, everywhere.** Not a stylistic
+        widening: a path with an embedded NUL makes `resolve()`, `os.lstat`
+        and `os.open` raise `ValueError`, which is *not* a subclass of
+        `OSError`, so catching only `OSError` lets it escape `pack()` and kill
+        the review over one bad filename. Two layers now catch it — the
+        `resolve` block above and the `os.*` block below — so removing either
+        alone still degrades to `missing`. That redundancy is deliberate, and
+        `test_embedded_nul_in_a_path_degrades_to_missing` pins the contract
+        rather than either layer.
       * **`O_NOFOLLOW`.** The component walk is a check-then-use; a symlink
         swapped in between the two would win without this.
+      * **Preflight `S_ISREG(lstat)`.** A FIFO, device or directory is rejected
+        *before* any `open` touches it. The post-open `fstat` would catch it
+        too, but only after the open had already happened — and opening a FIFO
+        is itself observable: it releases a writer blocked in `open(2)`. The
+        packer must not perturb the tree it is reading.
       * **`O_NONBLOCK` + post-open `S_ISREG(fstat)`.** The preflight `lstat`
         rejects a FIFO or device, but an attacker who swaps one in after it can
         make `open()` block forever on a pipe with no writer — a hung review,
@@ -136,14 +171,17 @@ def _safe_open(repo: Path, rel: str) -> BinaryIO | None:
         the *fd* (not the path) then rejects what was actually opened, and
         blocking mode is restored for the regular files that survive.
     """
-    root = repo.resolve()
+    try:
+        root = repo.resolve()
+    except (OSError, ValueError):
+        return None
     cur = root
     for part in rel.split("/"):
         cur = cur / part
         try:
             if cur.is_symlink():
                 return None
-        except OSError:
+        except (OSError, ValueError):
             return None
     try:
         cur.resolve().relative_to(root)
@@ -153,7 +191,7 @@ def _safe_open(repo: Path, rel: str) -> BinaryIO | None:
         if not stat.S_ISREG(os.lstat(cur).st_mode):
             return None
         fd = os.open(cur, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
-    except OSError:
+    except (OSError, ValueError):
         return None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -208,14 +246,46 @@ def _is_binary(data: bytes) -> bool:
     return (nontext / len(sample)) > BINARY_NONTEXT_RATIO
 
 
+def _encode_prompt_text(text: str) -> bytes:
+    """Encode prompt text that embeds a caller-supplied path. Cannot raise.
+
+    Paths arrive from `gitio`, which decodes git's NUL-delimited path stream
+    with `errors="surrogateescape"` — deliberately, because `replace` would
+    mangle a non-UTF-8 filename into U+FFFD and then open the wrong file. So
+    `Diff.files` and `Diff.statuses` legitimately carry lone surrogates, and a
+    strict `.encode("utf-8")` here would raise `UnicodeEncodeError` on one and
+    take the whole review down with it — for a path this module was only ever
+    going to report as an omission.
+
+    `surrogateescape` on the way out is the exact mirror of that decode: the
+    bytes emitted into the prompt are byte-for-byte the bytes git handed us,
+    which is the only rendering that names the real file. A surrogate outside
+    U+DC80..U+DCFF cannot have come from such a decode and does not round-trip,
+    so it is escaped visibly instead — ugly, but bounded, deterministic, and
+    still not an exception.
+
+    Every byte-length accounting of a marker goes through here too, so the
+    headroom budget and the emitted bytes can never disagree about a path's
+    cost.
+    """
+    try:
+        return text.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "backslashreplace")
+
+
+def _begin_marker(path: str) -> bytes:
+    return _encode_prompt_text(BEGIN_MARKER.format(path=path))
+
+
 def _section_overhead(path: str) -> int:
     """Byte cost of a section's markers, as they will actually be encoded."""
-    return len(BEGIN_MARKER.format(path=path).encode("utf-8")) + len(END_MARKER)
+    return len(_begin_marker(path)) + len(END_MARKER)
 
 
 def _omission_header(omitted: list[tuple[str, str]]) -> bytes:
     parts = ", ".join(f"{p} ({r})" for p, r in omitted)
-    return (OMITTED_PREFIX + parts + "\n").encode("utf-8")
+    return _encode_prompt_text(OMITTED_PREFIX + parts + "\n")
 
 
 def pack(
@@ -225,6 +295,7 @@ def pack(
     headroom: int,
     source: str = "wt",
     per_file_cap: int | None = None,
+    pack_large_added: bool = True,
 ) -> Pack:
     """Pack full file contents for `files` into at most `headroom` bytes.
 
@@ -234,9 +305,23 @@ def pack(
     remainder, so `headroom <= 0` is a normal outcome and yields an empty body
     with every candidate reported as `over-headroom`.
 
-    Never raises for bad input: an unreadable, escaping or non-regular path
-    becomes an omission with a reason. The only exception is an unimplemented
-    `source`, which is a programming error, not input.
+    `pack_large_added` decides what happens to an added (`A`) file of at least
+    `ALREADY_IN_DIFF_MAX` bytes. Smaller adds are always `already-in-diff`: the
+    diff carries their full content, so packing them spends headroom to say the
+    same thing twice. For larger ones the right answer depends on the caller:
+
+      * **On (the default, and what the oracle's `GR_CONTEXT_PACK_LARGE_ADDED`
+        opts into).** Correct when the diff may be batched or split, so the
+        model may never see the whole new file.
+      * **Off.** Correct for a *single-shot* review, where the diff already
+        carries every added file whole. Selection is size-descending, so a big
+        added file is packed first and can crowd out the modified files whose
+        surrounding context the reviewer actually needs — the diff shows what
+        changed in them, and only this packer can show what they now look like.
+
+    Never raises for bad input: an unreadable, escaping, non-regular or
+    non-UTF-8 path becomes an omission with a reason. The only exception is an
+    unimplemented `source`, which is a programming error, not input.
     """
     if source != "wt":
         raise NotImplementedError(
@@ -272,7 +357,7 @@ def pack(
             early_omit.append((path, "missing"))
             continue
         size, peek = probed
-        if st == "A" and size < ALREADY_IN_DIFF_MAX:
+        if st == "A" and (not pack_large_added or size < ALREADY_IN_DIFF_MAX):
             # The whole new file is in the diff already; packing it again would
             # spend headroom to say the same thing twice.
             early_omit.append((path, "already-in-diff"))
@@ -314,11 +399,9 @@ def pack(
             text = data.decode("utf-8", errors="replace")
             if not text.endswith("\n"):
                 text = text + "\n"
-            section = (
-                BEGIN_MARKER.format(path=path).encode("utf-8")
-                + text.encode("utf-8")
-                + END_MARKER
-            )
+            # `text` came from a `replace` decode, so it holds no surrogates and
+            # encodes strictly; only the path needs the tolerant encoder.
+            section = _begin_marker(path) + text.encode("utf-8") + END_MARKER
             # Re-check against the bytes actually produced: the file may have
             # grown since the size probe, and `replace` can widen a decode.
             if used + len(section) > headroom:

@@ -10,7 +10,16 @@ Two kinds of assertion live here and they carry different weight:
     a symlink anywhere in the path, and a FIFO must all degrade to an omission
     reason. A FIFO in particular must never block — a hung packer hangs the
     whole review, so that test is guarded by a real timeout rather than by
-    trusting the implementation not to block.
+    trusting the implementation not to block. Nor may any input *raise*: a
+    non-UTF-8 path and a path with an embedded NUL both reach `os.*` calls
+    that fail with `ValueError` rather than `OSError`, and both must come back
+    as an omission reason.
+
+Several tests here exist to pin a constant or a layer that outcome-only
+assertions cannot distinguish — an exact threshold, a check that must run
+before a syscall rather than after it. Each says in its docstring what would
+otherwise go unnoticed, because a fixture whose numbers look arbitrary is the
+first thing a later edit will "simplify".
 
 Oracle parity tests drive `scripts/grok-context-pack.py` through its env
 interface and compare body bytes, hash, inclusions and omissions.
@@ -99,6 +108,52 @@ def test_large_added_file_is_packed(tmp_path):
     p = pack(tmp_path, ["new.py"], {"new.py": "A"}, headroom=100_000)
     assert p.included == ["new.py"]
     assert b"z" * 20_000 in p.body
+
+
+def test_already_in_diff_threshold_is_exactly_16384(tmp_path):
+    """Pins `ALREADY_IN_DIFF_MAX` to the value, not to a band around it.
+
+    One byte either side of 16 KiB, so 16383, 16385 and a `<`-to-`<=` slip all
+    change an outcome asserted here.
+    """
+    (tmp_path / "under.py").write_text("u" * 16_383, encoding="utf-8")
+    (tmp_path / "at.py").write_text("a" * 16_384, encoding="utf-8")
+    st = {"under.py": "A", "at.py": "A"}
+    p = pack(tmp_path, ["under.py", "at.py"], st, headroom=100_000)
+    assert ("under.py", "already-in-diff") in p.omitted
+    assert p.included == ["at.py"]
+
+
+def test_pack_large_added_off_leaves_headroom_for_the_modified_files(tmp_path):
+    """The opt-out exists because size-descending selection has a bad case.
+
+    A big added file sorts first and can consume the whole envelope, evicting
+    the modified files the review is actually about. On a single-shot review
+    the diff already carries that added file whole, so packing it buys nothing;
+    the default stays on because a batched diff may not carry it.
+    """
+    (tmp_path / "new.py").write_text("z" * 30_000, encoding="utf-8")
+    (tmp_path / "mod.py").write_text("m" * 2_000, encoding="utf-8")
+    files = ["new.py", "mod.py"]
+    statuses = {"new.py": "A", "mod.py": "M"}
+
+    on = pack(tmp_path, files, statuses, headroom=31_000)
+    assert on.included == ["new.py"]
+    assert ("mod.py", "over-headroom") in on.omitted
+
+    off = pack(tmp_path, files, statuses, headroom=31_000, pack_large_added=False)
+    assert off.included == ["mod.py"]
+    assert ("new.py", "already-in-diff") in off.omitted
+    assert b"m" * 2_000 in off.body
+    assert b"z" * 30_000 not in off.body
+
+
+def test_pack_large_added_off_still_packs_a_large_modified_file(tmp_path):
+    # The flag is about `A` only: it must not touch anything else.
+    (tmp_path / "mod.py").write_text("m" * 30_000, encoding="utf-8")
+    p = pack(tmp_path, ["mod.py"], {"mod.py": "M"}, headroom=100_000,
+             pack_large_added=False)
+    assert p.included == ["mod.py"]
 
 
 def test_missing_added_file_is_missing_not_already_in_diff(tmp_path):
@@ -226,6 +281,75 @@ def test_traversal_rejected_brief_case(tmp_path):
     assert _reasons(p) == {"../etc/passwd": "missing", "/etc/passwd": "missing"}
 
 
+def test_windows_drive_prefix_rejected_when_the_path_really_exists(tmp_path):
+    """The drive-prefix rejection, pinned non-vacuously.
+
+    `C:/Windows/win.ini` in the parametrised case above proves nothing on
+    POSIX — the path simply does not exist, so every rejection layer is
+    unreachable and deleting the `path[1] == ':'` check keeps the suite green.
+    Here `C:` is a real directory (a legal POSIX name) holding a real file, so
+    only that check stands between the packer and its contents.
+    """
+    win = tmp_path / "C:" / "Windows"
+    win.mkdir(parents=True)
+    (win / "win.ini").write_text("drive-secret", encoding="utf-8")
+    # Sanity: without the prefix check this path resolves to a readable file.
+    assert (tmp_path / "C:" / "Windows" / "win.ini").is_file()
+
+    p = pack(tmp_path, ["C:/Windows/win.ini"], {}, headroom=10_000)
+    assert p.included == []
+    assert _reasons(p) == {"C:/Windows/win.ini": "missing"}
+    assert b"drive-secret" not in p.body
+    # The backslash spelling of the same path is rejected too.
+    assert pack(tmp_path, ["C:\\Windows\\win.ini"], {}, headroom=10_000).included == []
+
+
+def test_embedded_nul_in_a_path_degrades_to_missing(tmp_path):
+    """A NUL in a path raises `ValueError` from `os.*`, not `OSError`.
+
+    That is the blind spot the resolve-under-root block and the `ValueError`
+    arms on the `lstat`/`open` calls both cover; catching only `OSError` lets
+    the exception escape `pack()` and kill the review. This pins the contract
+    (degrade to a reason) rather than which layer catches it.
+    """
+    p = pack(tmp_path, ["a\x00b.txt"], {}, headroom=10_000)
+    assert p.included == []
+    assert _reasons(p) == {"a\x00b.txt": "missing"}
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
+def test_non_regular_paths_are_rejected_before_any_open(tmp_path, monkeypatch):
+    """The preflight `S_ISREG(lstat)` must reject *before* `os.open` runs.
+
+    The post-open `fstat` also rejects a FIFO, so outcome-only assertions
+    cannot tell the two layers apart and deleting the preflight looks free.
+    It is not: opening a FIFO is observable from outside — it releases a writer
+    blocked in `open(2)` — and the packer must not perturb the tree it reads.
+    So this asserts on the syscall, which is the thing the layer exists to
+    avoid.
+    """
+    os.mkfifo(tmp_path / "pipe.fifo")
+    (tmp_path / "adir").mkdir()
+    (tmp_path / "ok.txt").write_text("ok\n", encoding="utf-8")
+
+    opened: list[str] = []
+    real_open = os.open
+
+    def spy_open(path, *a, **kw):
+        opened.append(str(path))
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    p = pack(tmp_path, ["pipe.fifo", "adir", "ok.txt"], {}, headroom=10_000)
+
+    assert not any(o.endswith("pipe.fifo") for o in opened), opened
+    assert not any(o.endswith("adir") for o in opened), opened
+    # Not vacuous: the regular file *was* opened, so the spy really was live.
+    assert any(o.endswith("ok.txt") for o in opened), opened
+    assert p.included == ["ok.txt"]
+    assert _reasons(p) == {"pipe.fifo": "missing", "adir": "missing"}
+
+
 def test_binary_omitted(tmp_path):
     (tmp_path / "b.bin").write_bytes(b"\x00\x01\x02" * 100)
     p = pack(tmp_path, ["b.bin"], M, headroom=10_000)
@@ -238,6 +362,48 @@ def test_binary_by_nontext_ratio_without_nul(tmp_path):
     (tmp_path / "b.bin").write_bytes(b"\x01\x02\x03\x04" * 200 + b"abcdef" * 50)
     p = pack(tmp_path, ["b.bin"], M, headroom=10_000)
     assert ("b.bin", "binary") in p.omitted
+
+
+def test_nontext_ratio_threshold_is_exactly_thirty_percent(tmp_path):
+    """Pins `BINARY_NONTEXT_RATIO` to 0.30 and to `>` rather than `>=`.
+
+    Two 1000-byte NUL-free files straddling the ratio by a single byte, so the
+    verdict flips for any other cut point and for an inclusive comparison.
+    """
+    (tmp_path / "at.txt").write_bytes(b"\x01" * 300 + b"a" * 700)     # == 0.30
+    (tmp_path / "over.bin").write_bytes(b"\x01" * 301 + b"a" * 699)   # > 0.30
+    p = pack(tmp_path, ["at.txt", "over.bin"], {}, headroom=100_000)
+    assert p.included == ["at.txt"]
+    assert ("over.bin", "binary") in p.omitted
+
+
+def test_del_byte_counts_as_non_text(tmp_path):
+    # 0x7F only: no NUL and no C0 control byte, so the file reads as text
+    # unless `b == 127` is in the non-text class. 400/1000 = 0.40 > 0.30.
+    (tmp_path / "del.bin").write_bytes(b"\x7f" * 400 + b"a" * 600)
+    p = pack(tmp_path, ["del.bin"], {}, headroom=100_000)
+    assert ("del.bin", "binary") in p.omitted
+    assert p.included == []
+
+
+def test_binary_peek_window_is_exactly_8192_bytes(tmp_path):
+    """Pins `BINARY_PEEK_BYTES`: non-text bytes are front-loaded, so the
+    verdict depends on how much of the file the sample covers.
+
+      * `wide_win.bin` is 8500 bytes with 2500 non-text at the front:
+        2500/8192 = 0.305 -> binary, but a *larger* window sees the whole file
+        (2500/8500 = 0.294) and calls it text.
+      * `narrow_win.txt` is 9000 bytes with 2000 non-text at the front:
+        2000/8192 = 0.244 -> text, but a *smaller* window (2000/4096 = 0.49,
+        1024/1024 = 1.0) calls it binary.
+
+    Together they bracket 8192 from both sides.
+    """
+    (tmp_path / "wide_win.bin").write_bytes(b"\x01" * 2500 + b"a" * 6000)
+    (tmp_path / "narrow_win.txt").write_bytes(b"\x01" * 2000 + b"a" * 7000)
+    p = pack(tmp_path, ["wide_win.bin", "narrow_win.txt"], {}, headroom=100_000)
+    assert ("wide_win.bin", "binary") in p.omitted
+    assert p.included == ["narrow_win.txt"]
 
 
 def test_nul_after_the_peek_window_still_omitted(tmp_path):
@@ -328,6 +494,50 @@ def test_per_file_cap(tmp_path):
     p = pack(tmp_path, ["a.txt", "b.txt"], {}, headroom=10_000, per_file_cap=50)
     assert ("a.txt", "over-file-cap") in p.omitted
     assert p.included == ["b.txt"]
+
+
+def test_per_file_cap_is_a_maximum_not_an_exclusive_bound(tmp_path):
+    # A file of exactly the cap fits; one byte more does not. Pins `>` against
+    # a slip to `>=`, which would silently cost every caller one byte of cap.
+    (tmp_path / "at.txt").write_text("a" * 50, encoding="utf-8")
+    (tmp_path / "over.txt").write_text("b" * 51, encoding="utf-8")
+    p = pack(tmp_path, ["at.txt", "over.txt"], {}, headroom=10_000, per_file_cap=50)
+    assert p.included == ["at.txt"]
+    assert ("over.txt", "over-file-cap") in p.omitted
+
+
+def test_second_fit_check_catches_a_decode_that_widens(tmp_path):
+    """The post-encode re-check is load-bearing, not a paranoid duplicate.
+
+    `errors="replace"` widens invalid UTF-8, so bytes budgeted at `size + 1`
+    can render far larger. 1000 bytes of `0xE9` carry no NUL and no control
+    byte, so they classify as text and are budgeted at 1001 — but each byte is
+    an invalid sequence and decodes to U+FFFD, three bytes each, so the section
+    body is ~3000. The pre-check passes on the stale estimate and only the
+    re-check against the bytes actually produced keeps the body inside
+    headroom. Truncating here instead of omitting would overrun it ~3x.
+
+    No race and no filesystem timing is involved: the file never changes.
+    """
+    (tmp_path / "wide.txt").write_bytes(b"\xe9" * 1000)
+    overhead = len(b"----- BEGIN FILE CONTEXT: wide.txt -----\n"
+                   b"----- END FILE CONTEXT -----\n")
+    # Exactly what the pre-check budgets: `overhead + size + 1`. So the
+    # pre-check passes by a hair and the re-check is the only gate left.
+    headroom = overhead + 1000 + 1
+    p = pack(tmp_path, ["wide.txt"], {}, headroom=headroom)
+
+    assert p.included == []
+    assert _reasons(p) == {"wide.txt": "over-headroom"}
+    assert len(p.body) <= headroom
+    assert p.body == b"Context omitted for: wide.txt (over-headroom)\n"
+    # Nothing of the widened section leaked in, whole or truncated.
+    assert b"BEGIN FILE CONTEXT" not in p.body
+    assert "�".encode("utf-8") not in p.body
+    # Not vacuous: enough headroom for the *rendered* size and it is included.
+    roomy = pack(tmp_path, ["wide.txt"], {}, headroom=100_000)
+    assert roomy.included == ["wide.txt"]
+    assert len(roomy.body) > headroom
 
 
 def test_per_file_cap_below_one_is_ignored(tmp_path):
@@ -462,6 +672,110 @@ def test_omission_order_follows_input_order(tmp_path):
         b"Context omitted for: gone.py (deleted), b.bin (binary), "
         b"nope.py (missing)\n"
     )
+
+
+# --------------------------------------------------------------------------
+# Non-UTF-8 (surrogate-escaped) paths
+#
+# `gitio._paths` decodes git's path stream with `errors="surrogateescape"` on
+# purpose — `replace` would mangle a non-UTF-8 filename and open the wrong
+# file — so `Diff.files` and `Diff.statuses` legitimately carry lone
+# surrogates. Every one of these paths must degrade like any other candidate.
+# The bytes emitted for such a path are the bytes git gave us, which is the
+# only rendering that names the real file.
+# --------------------------------------------------------------------------
+
+# What `b"caf\xe9.txt"` becomes after gitio's decode: latin-1 'é', not UTF-8.
+SURROGATE_NAME = b"caf\xe9.txt".decode("utf-8", "surrogateescape")
+
+
+def _redirect(monkeypatch, name: str, target: Path) -> None:
+    """Make `os.lstat`/`os.open` treat a path ending in `name` as `target`.
+
+    Several filesystems (APFS among them) refuse to create a file whose name
+    is not valid UTF-8, so a surrogate name cannot simply be written to
+    `tmp_path` and still run everywhere. Redirecting the two syscalls that
+    reach the filesystem exercises the whole packer against such a path
+    without needing the filesystem to store one.
+    """
+    real_lstat, real_open = os.lstat, os.open
+
+    def lstat(path, *a, **kw):
+        return real_lstat(target if str(path).endswith(name) else path, *a, **kw)
+
+    def opn(path, *a, **kw):
+        return real_open(target if str(path).endswith(name) else path, *a, **kw)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "open", opn)
+
+
+def test_surrogate_path_in_the_omitted_position(tmp_path):
+    # Nothing on disk: the path is reported, and reporting it is what used to
+    # raise `UnicodeEncodeError` out of `pack()` and take the review with it.
+    p = pack(tmp_path, [SURROGATE_NAME], {}, headroom=10_000)
+    assert p.included == []
+    assert _reasons(p) == {SURROGATE_NAME: "missing"}
+    assert p.body == b"Context omitted for: caf\xe9.txt (missing)\n"
+
+
+def test_surrogate_path_in_the_included_position(tmp_path, monkeypatch):
+    (tmp_path / "real.txt").write_text("body-bytes\n", encoding="utf-8")
+    _redirect(monkeypatch, SURROGATE_NAME, tmp_path / "real.txt")
+
+    expected = (b"----- BEGIN FILE CONTEXT: caf\xe9.txt -----\n"
+                b"body-bytes\n"
+                b"----- END FILE CONTEXT -----\n")
+    p = pack(tmp_path, [SURROGATE_NAME], {}, headroom=10_000)
+    assert p.included == [SURROGATE_NAME]
+    assert p.body == expected
+    assert p.sha256 == hashlib.sha256(expected).hexdigest()
+
+    # The headroom budget must cost the path the same one byte the marker
+    # actually spends on it. If `_section_overhead` encoded the path any other
+    # way, the budget and the emitted bytes would disagree and this boundary
+    # (omit at exactly the section length, include one byte past it — see
+    # `test_budget_reserves_a_newline_even_when_the_file_has_one`) would move.
+    assert pack(tmp_path, [SURROGATE_NAME], {}, headroom=len(expected)).included == []
+    tight = pack(tmp_path, [SURROGATE_NAME], {}, headroom=len(expected) + 1)
+    assert tight.included == [SURROGATE_NAME]
+
+
+def test_surrogate_path_from_a_gitio_style_status_stream(tmp_path):
+    """End to end from the bytes git actually emits, not a hand-built string.
+
+    This is the shape `gitio._tracked_statuses` produces: a NUL-delimited
+    `--name-status -z` stream decoded with `surrogateescape`. It is the real
+    route by which a surrogate reaches `pack()`.
+    """
+    raw = b"M\x00caf\xe9.txt\x00D\x00d\xffel.py\x00A\x00ok.txt\x00"
+    toks = raw.decode("utf-8", "surrogateescape").split("\0")
+    statuses: dict[str, str] = {}
+    i = 0
+    while i < len(toks) and toks[i]:
+        statuses[toks[i + 1]] = toks[i][:1]
+        i += 2
+    files = list(statuses)
+    assert files[0] == SURROGATE_NAME  # the decode really did produce one
+    (tmp_path / "ok.txt").write_text("hello\n", encoding="utf-8")
+
+    p = pack(tmp_path, files, statuses, headroom=10_000)
+    assert p.included == []  # ok.txt is a small add -> already-in-diff
+    assert p.omitted == [(SURROGATE_NAME, "missing"),
+                         ("d\udcffel.py", "deleted"),
+                         ("ok.txt", "already-in-diff")]
+    assert p.body == (b"Context omitted for: caf\xe9.txt (missing), "
+                      b"d\xffel.py (deleted), ok.txt (already-in-diff)\n")
+
+
+def test_non_roundtrippable_surrogate_is_escaped_not_raised(tmp_path):
+    # U+D800 cannot come from a `surrogateescape` decode (that only produces
+    # U+DC80..U+DCFF), so it has no byte form to restore. It must still not
+    # raise: the fallback renders it visibly instead.
+    name = "bad\ud800.txt"
+    p = pack(tmp_path, [name], {}, headroom=10_000)
+    assert _reasons(p) == {name: "missing"}
+    assert p.body == b"Context omitted for: bad\\ud800.txt (missing)\n"
 
 
 # --------------------------------------------------------------------------
