@@ -27,6 +27,29 @@ def _lower_bool(value: object) -> str:
     return "true" if value else "false"
 
 
+def _coerce_int(value: object) -> int:
+    """Coerce a persisted count to `int`, returning `0` when it cannot be.
+
+    `findings_total` and the `severity` sub-counts come off an
+    already-persisted record this module does not control -- a corrupted or
+    hand-edited entry can carry a non-numeric string (or some other
+    unrelated type) where a count belongs. Plain `int(...)` raises on those,
+    which would make the count the thing that crashes the banner. We choose
+    to render `0` silently rather than a visible sentinel (e.g. `findings=?`):
+    the banner's format is a fixed contract downstream tooling parses as
+    `field=<int>`, the same convention already used for a missing/`None`
+    field (see `banner`'s docstring), so an unparseable count is folded into
+    that same "absent means zero" convention instead of inventing a second,
+    non-numeric shape for consumers to special-case.
+    """
+    if isinstance(value, (bool, int, float)):
+        return int(value)
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _clean(value: object) -> str:
     """Stringify a field for interpolation into the single-line banner.
 
@@ -53,18 +76,24 @@ def banner(review: dict) -> str:
     its zero value instead of raising: the banner must never be the thing
     that crashes a run.
     """
-    sev = review.get("severity") or {}
+    sev = review.get("severity")
+    if not isinstance(sev, dict):
+        # `severity` guards only falsy values with `or {}`; a truthy
+        # non-dict (a list, str, or int) would survive that and then
+        # `.get()` would raise `AttributeError`. Fall back to `{}` for any
+        # shape that isn't a dict, not just falsy ones.
+        sev = {}
     head = _clean(review.get("head"))[:9]
     line = (
         "SKODUN VERDICT: "
         f"trustworthy={_lower_bool(review.get('trustworthy'))} "
-        f"findings={int(review.get('findings_total') or 0)} "
+        f"findings={_coerce_int(review.get('findings_total'))} "
         f"degraded={_lower_bool(review.get('degraded'))} "
         f"stop_reason={_clean(review.get('stop_reason'))} "
         f"head={head} "
         f"id={_clean(review.get('id'))} "
-        f"severity={int(sev.get('high') or 0)}/{int(sev.get('medium') or 0)}"
-        f"/{int(sev.get('low') or 0)}"
+        f"severity={_coerce_int(sev.get('high'))}/{_coerce_int(sev.get('medium'))}"
+        f"/{_coerce_int(sev.get('low'))}"
     )
     return line
 

@@ -126,6 +126,72 @@ def test_banner_embedded_carriage_return_in_id_cannot_forge_a_second_line():
     assert b.startswith("SKODUN VERDICT: trustworthy=true")
 
 
+def test_banner_full_line_field_order_is_pinned():
+    """Locks the exact format string -- field names, order, and separators --
+    for a fully-populated record. Every other banner test uses substring
+    `in` checks, so a regression that swaps two adjacent fields (e.g. `head`
+    and `id`) would otherwise pass the whole suite silently."""
+    rec = dict(id="loop_9", head="g" * 40, trustworthy=True, findings_total=3,
+               degraded=False, stop_reason="EndTurn",
+               severity={"high": 2, "medium": 1, "low": 0})
+    b = banner(rec)
+    assert b == (
+        "SKODUN VERDICT: trustworthy=true findings=3 degraded=false "
+        "stop_reason=EndTurn head=ggggggggg id=loop_9 severity=2/1/0"
+    )
+
+
+def test_banner_findings_total_non_numeric_string_renders_zero():
+    rec = dict(id="loop_10", head="h" * 40, trustworthy=True,
+               findings_total="not-a-number", degraded=False,
+               stop_reason="EndTurn", severity={"high": 0, "medium": 0, "low": 0})
+    b = banner(rec)
+    assert len(b.splitlines()) == 1
+    assert "findings=0" in b
+
+
+def test_banner_findings_total_float_renders_without_raising():
+    rec = dict(id="loop_11", head="i" * 40, trustworthy=True,
+               findings_total=2.9, degraded=False,
+               stop_reason="EndTurn", severity={"high": 0, "medium": 0, "low": 0})
+    b = banner(rec)
+    assert len(b.splitlines()) == 1
+    assert "findings=2" in b
+
+
+def test_banner_findings_total_bool_renders_without_raising():
+    rec = dict(id="loop_12", head="j" * 40, trustworthy=True,
+               findings_total=True, degraded=False,
+               stop_reason="EndTurn", severity={"high": 0, "medium": 0, "low": 0})
+    b = banner(rec)
+    assert len(b.splitlines()) == 1
+    assert "findings=1" in b
+
+
+def test_banner_severity_as_list_renders_without_raising():
+    rec = dict(id="loop_13", head="k" * 40, trustworthy=True, findings_total=0,
+               degraded=False, stop_reason="EndTurn", severity=["high", "low"])
+    b = banner(rec)
+    assert len(b.splitlines()) == 1
+    assert "severity=0/0/0" in b
+
+
+def test_banner_severity_as_string_renders_without_raising():
+    rec = dict(id="loop_14", head="l" * 40, trustworthy=True, findings_total=0,
+               degraded=False, stop_reason="EndTurn", severity="corrupted")
+    b = banner(rec)
+    assert len(b.splitlines()) == 1
+    assert "severity=0/0/0" in b
+
+
+def test_banner_severity_as_int_renders_without_raising():
+    rec = dict(id="loop_15", head="m" * 40, trustworthy=True, findings_total=0,
+               degraded=False, stop_reason="EndTurn", severity=7)
+    b = banner(rec)
+    assert len(b.splitlines()) == 1
+    assert "severity=0/0/0" in b
+
+
 def test_banner_failure_is_single_line():
     b = banner_failure("no trustworthy review covers this exact content")
     assert b == ("SKODUN VERDICT: trustworthy=false reason="
