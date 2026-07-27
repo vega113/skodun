@@ -314,7 +314,7 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
 **Interfaces:**
 - Produces: `trust.is_trustworthy(parse_ok: bool, degraded: bool, diff_truncated: bool) -> bool` — the single definition of the invariant, imported everywhere, never re-derived;
   `Store.open(path: Path) -> Store` (WAL, foreign keys on, schema migrated);
-  `save_review(record: dict) -> None` — full artifact under `artifact_json`, indexed columns extracted. **`trustworthy` is COMPUTED by the store** via `trust.is_trustworthy(...)` from the record's `parse_ok`/`degraded`/`diff_truncated`; a caller-supplied `trustworthy` value is overwritten in both the column and the stored artifact JSON (an inconsistent index row must be impossible by construction);
+  `save_review(record: dict) -> None` — full artifact under `artifact_json`, indexed columns extracted. **`trustworthy` is COMPUTED by the store** via `trust.is_trustworthy(...)` from the record's `parse_ok`/`degraded`/`diff_truncated`; a caller-supplied `trustworthy` value is overwritten in both the column and the stored artifact JSON (an inconsistent index row must be impossible by construction). **The three trust axes must be actual `bool` instances** — `save_review` raises `ValueError` on any other type (`bool("false")` is `True`; a string-typed axis from a hand-edited or mis-mapped record must never coerce its way to trustworthy). The upsert's `ON CONFLICT` clause updates **every** indexed column, identity included (`diff_hash, branch, head, base_ref, base_sha, context_hash, reviewed_at, mode, model, adapter`) — index and artifact move in lockstep or not at all;
   `get_review(review_id) -> dict | None`; `latest_trustworthy_for(diff_hash: str) -> dict | None`;
   `add_triage(rec: dict) -> None`; `triage_for(branch, base_sha) -> dict[str, dict]` (keyed by `finding_key`);
   `list_reviews(branch: str | None, limit: int) -> list[dict]`;
@@ -358,6 +358,12 @@ def test_trust_is_computed_never_caller_supplied(tmp_path):
     st.save_review({**REC, "degraded": True, "trustworthy": True})  # liar caller
     assert st.latest_trustworthy_for("d" * 40) is None
     assert st.get_review("r1")["trustworthy"] is False   # artifact rewritten too
+
+def test_non_bool_trust_axis_rejected(tmp_path):
+    import pytest
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(ValueError):                       # bool("false") is True
+        st.save_review({**REC, "parse_ok": "false"})
 
 def test_set_status_updates_artifact_json_too(tmp_path):
     st = Store.open(tmp_path / "s.db")
@@ -415,9 +421,13 @@ class Store:
     def save_review(self, rec: dict) -> None:
         from .trust import is_trustworthy
         rec = dict(rec)   # never mutate the caller's dict
-        rec["trustworthy"] = is_trustworthy(
-            bool(rec.get("parse_ok")), bool(rec.get("degraded")),
-            bool(rec.get("diff_truncated")))
+        axes = {k: rec.get(k, False)
+                for k in ("parse_ok", "degraded", "diff_truncated")}
+        for k, v in axes.items():
+            if not isinstance(v, bool):   # bool("false") is True — refuse coercion
+                raise ValueError(f"save_review: {k} must be bool, got {type(v).__name__}")
+        rec.update(axes)
+        rec["trustworthy"] = is_trustworthy(**axes)
         sev = rec.get("severity") or {}
         self._c.execute(
             """INSERT INTO reviews (id, reviewed_at, branch, head, base_ref, base_sha,
@@ -426,12 +436,18 @@ class Store:
                  sev_high, sev_medium, sev_low, summary, source, artifact_json)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET
+                 reviewed_at=excluded.reviewed_at, branch=excluded.branch,
+                 head=excluded.head, base_ref=excluded.base_ref,
+                 base_sha=excluded.base_sha, diff_hash=excluded.diff_hash,
+                 context_hash=excluded.context_hash, mode=excluded.mode,
+                 model=excluded.model, adapter=excluded.adapter,
                  status=excluded.status, parse_ok=excluded.parse_ok,
                  degraded=excluded.degraded, diff_truncated=excluded.diff_truncated,
                  trustworthy=excluded.trustworthy, stop_reason=excluded.stop_reason,
                  findings_total=excluded.findings_total, sev_high=excluded.sev_high,
                  sev_medium=excluded.sev_medium, sev_low=excluded.sev_low,
-                 summary=excluded.summary, artifact_json=excluded.artifact_json""",
+                 summary=excluded.summary, source=excluded.source,
+                 artifact_json=excluded.artifact_json""",
             (rec["id"], rec.get("reviewed_at"), rec.get("branch"), rec.get("head"),
              rec.get("base_ref"), rec.get("base_sha"), rec.get("diff_hash"),
              rec.get("context_hash", ""), rec.get("mode"), rec.get("model"),
@@ -512,7 +528,7 @@ def is_trustworthy(parse_ok: bool, degraded: bool, diff_truncated: bool) -> bool
 
 **Interfaces:**
 - Produces: `resolve_base(repo: Path) -> Base(ref: str, sha: str, warning: str | None)` — candidate order `github/main` → `origin/main` → `main`; a candidate whose `merge-base <ref> HEAD` fails (unrelated histories) is skipped with the next tried; if none resolves, fall back to `HEAD^`, and if `HEAD^` doesn't exist (single-commit repo) to `HEAD` — both fallbacks carry `warning`.
-  `capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff(data: bytes, files: list[str], statuses: dict[str, str], truncated_untracked: bool)` — working tree vs base incl. untracked via `git diff --no-index -- /dev/null <f>`, capped; `statuses` maps path → one-letter status from `git diff --name-status <base_sha>` (`A`/`M`/`D`/`R`…), with untracked files entered as `A` — Task 9's context packer consumes it to classify `added`/`deleted`/`already-in-diff`.
+  `capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff(data: bytes, files: list[str], statuses: dict[str, str], truncated_untracked: bool)` — working tree vs base incl. untracked via `git diff --no-index -- /dev/null <f>`, capped; `statuses` maps path → one-letter status (`A`/`M`/`D`/`R`…), with untracked files entered as `A` — Task 9's context packer consumes it to classify `added`/`deleted`/`already-in-diff`. **Path parsing is NUL-delimited**: file lists come from `git diff --name-status -z <base_sha>` and `git ls-files --others --exclude-standard -z`, split on `\0` with no whitespace stripping — text-mode parsing plus `.strip()` corrupts filenames with non-ASCII characters (git quotes them as `"\303\244.txt"` under default `core.quotepath`) or meaningful leading/trailing spaces, and the context packer would then open the wrong path. **Concatenation parity:** the oracle joins the tracked diff and untracked `--no-index` sections with a `\n` separator (an untracked-only change yields `"\n" + udiff` after the empty tracked capture) — reproduce its exact concatenation; the `--diff-hash` parity tests below must include an untracked-only case.
   `blob_sha1(data: bytes) -> str` (git hash-object equivalent over raw bytes);
   `diff_identity(data: bytes) -> str` = `blob_sha1(data.rstrip(b"\n"))` — **the** diff-hash function. The oracle round-trips the diff through `$(...)` command substitution, which strips all trailing newlines before hashing; hashing raw captured bytes yields a hash the legacy archive has never seen, breaking legacy import joins and shadow-compare. All skodun code hashes via `diff_identity`, never `blob_sha1` directly.
   `git_common_dir(repo: Path) -> Path`; `current_branch(repo) -> str`; `head_sha(repo) -> str`;
@@ -580,19 +596,34 @@ def test_diff_identity_strips_trailing_newlines_like_shell():
 
 ORACLE = Path("/Users/vega/devroot/tubescribes/scripts/grok-prepush-review.sh")
 
+def _oracle_hash(repo: Path) -> str:
+    import subprocess as sp
+    return sp.run(["sh", str(ORACLE), "--diff-hash"], cwd=repo,
+                  capture_output=True, text=True).stdout.strip().splitlines()[-1]
+
 def test_diff_identity_parity_with_oracle(tmp_path):
-    import pytest, subprocess as sp
+    import pytest
     if not ORACLE.exists():
         pytest.skip("tubescribes checkout not present")
+    from skodun.gitio import resolve_base, capture_diff, diff_identity
     repo = _mkrepo(tmp_path)
     _git(repo, "checkout", "-b", "feat")
-    (repo / "a.txt").write_text("two\n", encoding="utf-8")
-    from skodun.gitio import resolve_base, capture_diff, diff_identity
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")           # tracked edit
     base = resolve_base(repo)
-    ours = diff_identity(capture_diff(repo, base.sha, 100).data)
-    theirs = sp.run(["sh", str(ORACLE), "--diff-hash"], cwd=repo,
-                    capture_output=True, text=True).stdout.strip().splitlines()[-1]
-    assert ours == theirs
+    assert diff_identity(capture_diff(repo, base.sha, 100).data) == _oracle_hash(repo)
+    (repo / "brand-new.txt").write_text("nu\n", encoding="utf-8")    # + untracked
+    assert diff_identity(capture_diff(repo, base.sha, 100).data) == _oracle_hash(repo)
+
+def test_diff_identity_parity_untracked_only(tmp_path):
+    import pytest
+    if not ORACLE.exists():
+        pytest.skip("tubescribes checkout not present")
+    from skodun.gitio import resolve_base, capture_diff, diff_identity
+    repo = _mkrepo(tmp_path)
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "only-new.txt").write_text("nu\n", encoding="utf-8")     # untracked ONLY —
+    base = resolve_base(repo)                    # oracle output starts "\n" + udiff
+    assert diff_identity(capture_diff(repo, base.sha, 100).data) == _oracle_hash(repo)
 
 def test_primary_checkout_detection(tmp_path):
     repo = _mkrepo(tmp_path)
@@ -668,21 +699,28 @@ def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
     tracked = _run(repo, "--no-pager", "diff", "--no-ext-diff", "--no-textconv",
                    base_sha).stdout
     statuses: dict[str, str] = {}
-    for line in _out(repo, "diff", "--name-status", base_sha).splitlines():
-        if not line.strip():
-            continue
-        code, _, rest = line.partition("\t")
-        path = rest.split("\t")[-1]          # rename lines are "R<n>\told\tnew"
-        statuses[path] = code[:1]
+    # -z: NUL-delimited records — "M\0path\0" / "R100\0old\0new\0". Never
+    # text-parse + strip(): quotepath mangles non-ASCII, strip() eats real spaces.
+    toks = _run(repo, "diff", "--name-status", "-z",
+                base_sha).stdout.decode("utf-8", "replace").split("\0")
+    i = 0
+    while i < len(toks) and toks[i]:
+        code = toks[i][:1]
+        path = toks[i + 2] if code == "R" else toks[i + 1]   # rename: new name wins
+        statuses[path] = code
+        i += 3 if code == "R" else 2
     files = list(statuses)
-    untracked = [f for f in _out(repo, "ls-files", "--others",
-                                 "--exclude-standard").splitlines() if f]
+    untracked = [f for f in _run(repo, "ls-files", "--others", "--exclude-standard",
+                                 "-z").stdout.decode("utf-8", "replace").split("\0") if f]
     truncated = len(untracked) > untracked_max
     chunks = [tracked]
     for f in sorted(untracked)[:untracked_max]:
         cp = _run(repo, "--no-pager", "diff", "--no-ext-diff", "--no-textconv",
                   "--no-index", "--", "/dev/null", f, ok_codes=(0, 1))
-        chunks.append(cp.stdout)
+        # ORACLE PARITY: sections are joined with "\n" (shell: DIFF="$DIFF"$'\n'"$UDIFF"),
+        # so an untracked-only change starts with a bare newline. The --diff-hash
+        # parity tests (incl. the untracked-only case) are the authority here.
+        chunks.append(b"\n"); chunks.append(cp.stdout.rstrip(b"\n"))
         files.append(f); statuses[f] = "A"
     return Diff(data=b"".join(chunks), files=files, statuses=statuses,
                 truncated_untracked=truncated)
@@ -913,7 +951,7 @@ def open_findings(review: dict, triaged: dict[str, dict]) -> list[dict]:
 - Consumes: `Store`, `triage.open_findings`, `gitio` (diff identity of the *current* tree), `config`.
 - Produces: `run_gate(store, repo: Path, cfg: Config, env=os.environ) -> GateResult(code: int, message: str)`; CLI `skodun gate` prints `SKODUN GATE: ...` lines and exits with the code.
 - **Oracle:** `grok_review_triage.py` `gate` + `grok-review-now.sh --gate` (lines 53–136). Contract: recompute the current diff identity; **empty outgoing diff ⇒ PASS(0) "no outgoing change"** (oracle behavior — nothing to review); otherwise find a trustworthy review with that exact `diff_hash`; **re-assert the loaded artifact against the index** — the artifact's own `parse_ok/degraded/diff_truncated` must recompute to trustworthy via `trust.is_trustworthy` and the artifact's `diff_hash` must equal the current hash (index and artifact can diverge via crashed writer or hand edit; a derived summary is never trusted alone); verify `base_sha` matches (rebase detection); then 0 if no open findings, 1 if open findings remain, 2 otherwise. **Every unexpected exception → 2.** Identity-helper stderr (base warnings, untracked cap) is echoed as `SKODUN GATE: identity note: ...`.
-- **Recorded bypass:** `SKODUN_GATE_SKIP=1` ⇒ exit 0 with `SKODUN GATE: SKIPPED — recorded as a decision`, and a `gate_events` row `outcome="skipped"`. Every gate decision (pass/fail/skipped) writes a `gate_events` row — a bypass is a decision on the record, never a rule that quietly stopped applying.
+- **Recorded bypass:** `SKODUN_GATE_SKIP=1` ⇒ exit 0 with `SKODUN GATE: SKIPPED — recorded as a decision`, and a `gate_events` row `outcome="skipped"`. Every gate decision (pass/fail/skipped) writes a `gate_events` row — a bypass is a decision on the record, never a rule that quietly stopped applying. The durability is itself fail-closed: `GateResult` carries the computed `diff_hash` so the event identifies the gated content, and **a failure to persist the event converts the result to exit 2** (a gate that cannot write its own record is running on a broken store and must not certify anything).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -989,7 +1027,9 @@ def test_gate_open_finding_is_1_until_triaged(tmp_path):
 
 def test_gate_store_corruption_is_2_not_1(tmp_path, monkeypatch):
     repo = _mkrepo(tmp_path); st = Store.open(tmp_path / "s.db")
-    monkeypatch.setattr(st, "latest_trustworthy_for",
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")   # a real outgoing change —
+    monkeypatch.setattr(st, "latest_trustworthy_for",        # else empty-diff PASS(0)
                         lambda *a: (_ for _ in ()).throw(RuntimeError("corrupt")))
     assert run_gate(st, repo, load_config(repo)).code == 2
 ```
@@ -1013,6 +1053,7 @@ from .trust import is_trustworthy
 class GateResult:
     code: int
     message: str
+    diff_hash: str | None = None
 
 def _gate(store: Store, repo: Path, cfg: Config) -> GateResult:
     notes: list[str] = []
@@ -1024,32 +1065,37 @@ def _gate(store: Store, repo: Path, cfg: Config) -> GateResult:
         notes.append(f"identity note: untracked scan capped at {cfg.defaults.untracked_max}")
     prefix = "".join(f"SKODUN GATE: {n}\n" for n in notes)
     if diff.data.rstrip(b"\n") == b"":
-        return GateResult(0, prefix + "SKODUN GATE: PASS no outgoing change")
+        return GateResult(0, prefix + "SKODUN GATE: PASS no outgoing change", None)
     dh = gitio.diff_identity(diff.data)
     review = store.latest_trustworthy_for(dh)
     if review is None:
         return GateResult(2, prefix + f"SKODUN GATE: FAIL(2) no trustworthy review for "
-                                      f"diff_hash={dh[:12]}")
+                                      f"diff_hash={dh[:12]}", dh)
     review = load_valid_artifact(review)
     # Re-assert artifact↔index agreement: the index is a derived summary and
     # the two can diverge (crashed writer, hand edit). Never trust it alone.
-    if not is_trustworthy(bool(review.get("parse_ok")), bool(review.get("degraded")),
-                          bool(review.get("diff_truncated"))):
+    axes = [review.get("parse_ok"), review.get("degraded"),
+            review.get("diff_truncated"), review.get("trustworthy")]
+    if any(not isinstance(v, bool) for v in axes):
+        return GateResult(2, prefix + "SKODUN GATE: FAIL(2) artifact trust fields "
+                                      "are not booleans", dh)
+    recomputed = is_trustworthy(axes[0], axes[1], axes[2])
+    if not recomputed or review["trustworthy"] is not recomputed:
         return GateResult(2, prefix + "SKODUN GATE: FAIL(2) index/artifact disagree "
-                                      f"on trust for review {review.get('id')}")
+                                      f"on trust for review {review.get('id')}", dh)
     if review.get("diff_hash") != dh:
         return GateResult(2, prefix + "SKODUN GATE: FAIL(2) index/artifact disagree "
-                                      "on diff_hash")
+                                      "on diff_hash", dh)
     if review.get("base_sha") != base.sha:
         return GateResult(2, prefix + "SKODUN GATE: FAIL(2) base_sha mismatch "
-                                      "(rebase detected) — re-review required")
+                                      "(rebase detected) — re-review required", dh)
     remaining = open_findings(review,
                               store.triage_for(review["branch"], review["base_sha"]))
     if remaining:
         return GateResult(1, prefix + f"SKODUN GATE: FAIL(1) {len(remaining)} finding(s) "
-                                      f"open on review {review['id']}")
+                                      f"open on review {review['id']}", dh)
     return GateResult(0, prefix + f"SKODUN GATE: PASS review {review['id']} "
-                                  f"covers diff_hash={dh[:12]}")
+                                  f"covers diff_hash={dh[:12]}", dh)
 
 def run_gate(store: Store, repo: Path, cfg: Config, env=os.environ) -> GateResult:
     def _record(result: GateResult, outcome: str) -> GateResult:
@@ -1057,10 +1103,12 @@ def run_gate(store: Store, repo: Path, cfg: Config, env=os.environ) -> GateResul
             store.log_gate_event(dict(
                 at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 repo=str(repo), branch=gitio.current_branch(repo),
-                diff_hash=None, outcome=outcome, code=result.code,
+                diff_hash=result.diff_hash, outcome=outcome, code=result.code,
                 note=result.message.splitlines()[-1]))
-        except Exception:
-            pass   # the event log must never change the gate verdict
+        except Exception as e:
+            # A gate that cannot write its own record must not certify anything.
+            return GateResult(2, result.message + f"\nSKODUN GATE: FAIL(2) "
+                              f"could not record gate event: {e!r}", result.diff_hash)
         return result
 
     if env.get("SKODUN_GATE_SKIP") == "1":
@@ -1091,7 +1139,7 @@ Wire into `cli.py`: subcommand `gate` with `--repo` (default cwd) loads config+s
 
 **Interfaces:**
 - Consumes: repo-relative `docs/review/checklists/*.md` and `docs/review/code-rules.json` (paths from `Defaults`).
-- Produces: `select(files: list[str], mode: str, checklist_dir: Path, rules_json: Path) -> Selection(sections: list[str], bytes_total: int, over_budget: bool, dropped: list[str], body: str)`.
+- Produces: `select(files: list[str], mode: str, checklist_dir: Path, rules_json: Path) -> Selection(sections: list[str], bytes_total: int, over_budget: bool, dropped: list[str], body: str, note: str = "")` — `note` carries fail-soft diagnostics (e.g. `"checklist selection failed: <err>; continuing without path-scoped rules"`); the pipeline surfaces it on stderr and in the artifact.
 - **Oracle:** `grok-checklist-select.py` (136 lines). Semantics to port exactly:
   - Longest-exclusive-prefix mapping: `src/main/resources/db/changelog/`→`migrations`, `src/main/`→`backend`, `ui/`→`frontend`, `scripts/`|`.github/`→`tooling`; test-path detection (`*.spec.ts`, `*.test.sh`, `*.test.mjs`, `test-utils`+`.ts`, `src/test/`, `integration-tests/src/test/`, `ui/src/app/testing/`) → `tests`.
   - `core` always included. `cross-file` only when a changed path matches a `crossFile` rule's globs read live from `code-rules.json`.
@@ -1139,11 +1187,11 @@ def test_budget_drop_order_never_drops_core(tmp_path):
 
 def test_fail_soft_on_missing_dir(tmp_path):
     sel = select(["a"], "full", tmp_path / "nope", tmp_path / "nope.json")
-    assert sel.sections == [] and sel.body == ""
+    assert sel.sections == [] and sel.body == "" and "failed" in sel.note
 ```
 
 - [ ] **Step 2: Run to verify FAIL**
-- [ ] **Step 3: Implementation** — port `grok-checklist-select.py` into `select()`; keep constants `BUDGET = 18 * 1024`, `DROP_ORDER = ["tooling", "frontend", "tests", "backend", "migrations", "cross-file"]`; use `fnmatch`-on-`/`-segments for `crossFile` globs matching the oracle's glob semantics (check whether the oracle uses `fnmatch` or `pathlib.match` — mirror it). The whole body is wrapped in `try/except Exception: return Selection([], 0, False, [], "")`.
+- [ ] **Step 3: Implementation** — port `grok-checklist-select.py` into `select()`; keep constants `BUDGET = 18 * 1024`, `DROP_ORDER = ["tooling", "frontend", "tests", "backend", "migrations", "cross-file"]`; use `fnmatch`-on-`/`-segments for `crossFile` globs matching the oracle's glob semantics (check whether the oracle uses `fnmatch` or `pathlib.match` — mirror it). The whole body is wrapped in `try/except Exception as e: return Selection([], 0, False, [], "", note=f"checklist selection failed: {e}; continuing without path-scoped rules")`.
 - [ ] **Step 4: Run to verify PASS**
 - [ ] **Step 5: Commit** — `git commit -am "feat: path-scoped checklist selection with budget and fail-soft (port)"`
 
@@ -1228,7 +1276,7 @@ def _safe_open(repo: Path, rel: str):
     return os.fdopen(fd, "rb")
 ```
 
-Body assembly mirrors the oracle: header line listing omissions, then per-file sections `----- FILE: <path> -----\n<bytes>\n`; recompute and drop trailing sections until the omission header fits inside `headroom`; `sha256` over the final body bytes.
+Body assembly mirrors the oracle **byte-for-byte**: header line listing omissions, then per-file sections framed with the oracle's exact markers — `----- BEGIN FILE CONTEXT: <path> -----\n<bytes>\n----- END FILE CONTEXT -----\n` (not any invented `FILE:` marker — prompt parity is the point); recompute and drop trailing sections until the omission header fits inside `headroom`; `sha256` over the final body bytes. Add a byte-level fixture test asserting the exact marker lines. `_safe_open` additionally verifies the opened fd is a **regular file** via `stat.S_ISREG(os.fstat(fd).st_mode)` (checked post-open, so a FIFO or device swapped in cannot block the review process; close and return `None` otherwise).
 
 - [ ] **Step 4: Run to verify PASS**
 - [ ] **Step 5: Commit** — `git commit -am "feat: hardened working-tree context packing (port)"`
@@ -1497,6 +1545,11 @@ def test_malformed_finding_items_fail_parse():
                                            "title": "t", "detail": "d"}]}
     env2 = json.dumps({"structuredOutput": bad2, "stopReason": "EndTurn"}).encode()
     assert not GrokAdapter().parse(env2, b"").parse_ok
+    bad3 = {"summary": "ok", "findings": [{"file": "a", "severity": "low",
+                                           "title": "t", "detail": "d",
+                                           "line": True}]}   # bool is an int subclass
+    env3 = json.dumps({"structuredOutput": bad3, "stopReason": "EndTurn"}).encode()
+    assert not GrokAdapter().parse(env3, b"").parse_ok
 
 def test_max_turns_in_stdout_is_not_degraded_but_stderr_is():
     env = json.dumps({"structuredOutput":
@@ -1571,8 +1624,8 @@ def _valid_payload(obj) -> bool:
             return False
         if f.get("severity") not in _SEVERITIES:
             return False
-        if "line" in f and not isinstance(f["line"], int):
-            return False
+        if "line" in f and type(f["line"]) is not int:   # bool is an int subclass;
+            return False                                 # {"line": true} must fail
     return True
 
 @dataclass(frozen=True)
@@ -1957,7 +2010,7 @@ def _lock_is_stale(lock: Path, stale: int) -> bool:
 
 Release (in `finally`): re-read `_owner_pid(lock)`; remove the lock dir **only if it equals our pid** (ABA guard — a reclaim by a peer must not be deleted by us).
 
-Release in `finally` only when `(lock/"owner")` still holds our pid (ABA guard, oracle: grok-review-now.sh lock release). Extra passes run while the lock is held. The record id: `f"sk_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{os.getpid()}"`.
+Release in `finally` only when `(lock/"owner")` still holds our pid (ABA guard, oracle: grok-review-now.sh lock release). Extra passes run while the lock is held. The record id: `f"sk_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{os.getpid()}_{uuid.uuid4().hex[:8]}"` — the uuid component is mandatory: second-resolution time + pid collides for two runs in the same process-second, and the store's upsert would silently overwrite the first review.
 
 - [ ] **Step 4: Run to verify PASS** (tests use short `wait` via monkeypatched constants where needed)
 - [ ] **Step 5: Commit** — `git commit -am "feat: foreground review pipeline with legacy-compatible lock, dedup, extra passes"`
@@ -2032,11 +2085,11 @@ def test_index_row_without_artifact_is_imported_demoted(tmp_path):
 
 **Interfaces:**
 - Produces:
-  `compare(store: Store, grok_reviews_dir: Path, diff_hash: str | None) -> list[Comparison]` — iterate the **union** of diff_hashes from both sides (skodun store ∪ legacy `index.jsonl`), or the one given hash; where a hash has multiple rows on a side, take the **newest by `reviewed_at`** per side; diff the tuple `(trustworthy, findings_total, sev_high, sev_medium, sev_low)`; `Comparison(diff_hash, skodun: dict | None, legacy: dict | None, match: bool, deltas: dict)` — one-sided hashes get `match=False` with the missing side `None` (iterating only skodun rows could never surface `legacy-only`, making the summary a lie);
+  `compare(store: Store, grok_reviews_dir: Path, diff_hash: str | None) -> list[Comparison]` — iterate the **union** of diff_hashes from both sides (skodun store ∪ legacy `index.jsonl`), or the one given hash; where a hash has multiple rows on a side, take the **newest by `reviewed_at`** per side; `Comparison(diff_hash, skodun: dict | None, legacy: dict | None, match: bool, deltas: dict)` — one-sided hashes get `match=False` with the missing side `None` (iterating only skodun rows could never surface `legacy-only`, making the summary a lie). **`match` has exactly one definition:** both sides present, both agree on `trustworthy`, and both agree on cleanliness (`findings_total == 0` vs `> 0`). Exact finding counts and severity tallies across two independent LLM runs are *not* expected to be equal — they go into `deltas` (`findings_total`, `sev_high/medium/low` as `(skodun, legacy)` pairs) for human eyes only and never affect `match`;
   CLI `skodun shadow-compare [--dir PATH]` prints a table (`diff_hash[:12] | skodun t/f/H-M-L | legacy t/f/H-M-L | MATCH/MISMATCH/SKODUN-ONLY/LEGACY-ONLY`) and a summary line `shadow: N compared, M matched, K skodun-only, L legacy-only`; exit 0 always (shadow is observational);
   CLI `skodun log [--branch B] [-n N]` prints `reviewed_at | branch | files | H/M/L | status | summary` newest-first with `!` on non-trustworthy rows;
   CLI `skodun triage <review-id> <finding-index> "<reason>"` and `skodun triage --list <review-id>`.
-- Semantics note: findings-count equality across two independent LLM runs is **not expected**; `match` means both sides agree on `trustworthy` and both are clean or both non-clean. Per-finding diffs are printed for human eyes, not asserted.
+- Per-finding text diffs are printed for human eyes, never asserted.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2135,4 +2188,4 @@ def test_union_surfaces_one_sided_hashes_and_newest_row_wins(tmp_path):
 - Spec coverage: diff identity (T4, legacy-compatible trailing-newline semantics + oracle parity test), checklists (T8), context packing (T9, status-aware), prompt (T10), watchdog/retries/timeout-output-discard (T11, T15), grok envelope + degraded detection (T12, case-insensitive), trust computed-on-write (T3) + banner (T13), security/skeptic with independent demotion axes (T14), gate 0/1/2 with empty-diff PASS, artifact↔index re-assertion, and recorded `SKODUN_GATE_SKIP` bypass (T7), triage ledger + parity keys + negative-index guard (T5, T6), SQLite + gate_events (T3), stale-record recovery (T15), legacy import with artifact-backed trust (T16), union shadow compare (T17), ≥5-change-set acceptance (T18), fg-lock byte-format interop (T15).
 - Explicitly out of scope (Global Constraints): batching (fail-closed truncation tested in T15), pre-push dispatcher + dedup probe (`--now` never dedups — tested in T15), same-branch supersede, rules-registry generation/sync (stays in tubescribes), the legacy `-p` re-shell fallback, MCP/scheduling/other adapters/retention.
 - Known intentional deviations from legacy: SQLite instead of JSONL sprawl; explicit `-m` model flag; `SKODUN`-prefixed banner/gate lines (cutover-compat shims are a later phase); phase-1 extra passes reuse the finder model (cross-provider refuter is Phase 2); no `-p` ARG_MAX fallback.
-- This plan was adversarially reviewed by codex (gpt-5.6-sol, high reasoning effort); all 26 findings of round 1 are incorporated above.
+- This plan was adversarially reviewed by codex (gpt-5.6-sol, high reasoning effort); all 26 round-1 findings and all 12 round-2 findings (incl. `bool("false")` coercion, NUL-delimited path parsing, untracked-only diff separator parity, oracle context markers, ID uniqueness) are incorporated above.
