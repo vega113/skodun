@@ -11,7 +11,8 @@ import json
 
 import pytest
 
-from skodun.shadow import compare
+from skodun.legacy_import import import_legacy
+from skodun.shadow import _int, compare, effective_trustworthy
 from skodun.store import Store
 from tests.test_store import REC
 
@@ -136,12 +137,17 @@ def test_equal_cleanliness_different_severity_tallies_is_still_a_match(tmp_path)
     Both sides are trustworthy and both are DIRTY (findings_total > 0), so
     they must match on the one thing `match` cares about -- even though the
     severity tallies (visible only in `deltas`) disagree substantially.
+
+    The legacy row spells its axes out: a recorded `trustworthy: true` alone
+    does not make a row trustworthy (the axes decide, see the precedence tests
+    above), and this test is about the COUNTS, so its trust has to be real.
     """
     st = Store.open(tmp_path / "s.db")
     st.save_review({**REC, "findings_total": 3,
                     "severity": {"high": 1, "medium": 2, "low": 0}})
     d = tmp_path / ".grok-reviews"
     legacy = dict(id="loop_1", diff_hash="d"*40, trustworthy=True,
+                  parse_ok=True, degraded=False, diff_truncated=False,
                   findings_total=7, severity={"high": 0, "medium": 1, "low": 6},
                   branch="b", reviewed_at="2026-07-01T00:00:00Z")
     _write_index(d, legacy)
@@ -152,6 +158,180 @@ def test_equal_cleanliness_different_severity_tallies_is_still_a_match(tmp_path)
     assert out[0].deltas["sev_high"] == (1, 0)
     assert out[0].deltas["sev_medium"] == (2, 1)
     assert out[0].deltas["sev_low"] == (0, 6)
+
+
+# ---------------------------------------------------------------------------
+# `effective_trustworthy`: the importer's precedence, not a second reading
+#
+# This is the rule that decides every `t`/`f` printed and every `match`
+# computed, and it has two halves that are easy to get backwards. A recorded
+# `trustworthy` field can only ever DENY trust; trust itself is derived from
+# the axes. Reading a recorded `true` as trust would report agreement for a
+# row the importer stores as untrustworthy -- a FALSE MATCH, the one direction
+# this module must never get wrong. Reading an ABSENT field as `false` is the
+# opposite error, and it is the one that once turned a ~2% audit failure rate
+# into 65%: the field was added late, and a large fraction of any real archive
+# predates it.
+# ---------------------------------------------------------------------------
+
+def _legacy_row(**over):
+    """A legacy index row with clean axes and NO `trustworthy` field at all."""
+    row = dict(id="loop_1", diff_hash="d"*40, branch="b", base_sha="s"*40,
+               parse_ok=True, degraded=False, diff_truncated=False,
+               findings_total=0, severity={"high": 0, "medium": 0, "low": 0},
+               reviewed_at="2026-07-01T00:00:00Z")
+    return {**row, **over}
+
+
+def test_absent_trustworthy_field_derives_trust_from_the_axes():
+    """The 39%-of-a-real-archive case: no recorded verdict, clean axes."""
+    row = _legacy_row()
+    assert "trustworthy" not in row, "the point of this row is the ABSENT field"
+    assert effective_trustworthy(row) is True
+
+
+def test_absent_trustworthy_field_with_null_still_derives_from_the_axes():
+    assert effective_trustworthy(_legacy_row(trustworthy=None)) is True
+
+
+@pytest.mark.parametrize("axis, denying", [
+    ("parse_ok", False), ("degraded", True), ("diff_truncated", True)])
+def test_absent_trustworthy_field_each_axis_can_deny_alone(axis, denying):
+    assert effective_trustworthy(_legacy_row(**{axis: denying})) is False
+
+
+def test_recorded_false_denies_trust_even_with_clean_axes():
+    assert effective_trustworthy(_legacy_row(trustworthy=False)) is False
+
+
+@pytest.mark.parametrize("recorded", [True, None])
+def test_recorded_verdict_cannot_grant_trust_against_a_denying_axis(recorded):
+    """A recorded verdict DENIES or defers -- it never overrides the axes.
+
+    `Store.save_review` recomputes `trustworthy` from the axes on every write,
+    so this row is STORED untrustworthy. Reading it as trustworthy here would
+    make `compare` report `match=True` for a pair that actually disagrees.
+    """
+    row = _legacy_row(trustworthy=recorded, degraded=True)
+    assert effective_trustworthy(row) is False
+
+
+@pytest.mark.parametrize("recorded", [1, 0, "true", "false", "", [], {}])
+def test_a_non_bool_recorded_verdict_is_never_trust(recorded):
+    """`is not True`, not truthiness: `1` and `"true"` are denials, not trust.
+
+    The axes are clean on every row here, so anything that read the recorded
+    field by truthiness would let `1` and `"true"` through as trust.
+    """
+    assert effective_trustworthy(_legacy_row(trustworthy=recorded)) is False
+
+
+@pytest.mark.parametrize("axes", [
+    {"parse_ok": 1}, {"parse_ok": "true"}, {"degraded": 0}, {"degraded": "false"},
+    {"diff_truncated": 0}, {"diff_truncated": "no"}])
+def test_a_non_bool_axis_reads_at_its_unsafe_value_and_denies(axes):
+    """Legacy JSON is untrusted: a non-`bool` axis denies trust, every time."""
+    assert effective_trustworthy(_legacy_row(**axes)) is False
+
+
+def test_a_missing_row_is_not_trustworthy():
+    assert effective_trustworthy(None) is False
+    assert effective_trustworthy({}) is False
+
+
+# The rows above, checked against what the IMPORTER actually stores for them.
+# Two readings of one rule drift; this pins them together.
+_PRECEDENCE_ROWS = [
+    {},                                          # field absent, clean axes
+    {"trustworthy": None},                       # explicitly null
+    {"trustworthy": True},                       # recorded, and supported
+    {"trustworthy": False},                      # recorded denial
+    {"trustworthy": 1},                          # non-bool: a denial, not trust
+    {"trustworthy": "true"},
+    {"parse_ok": False},
+    {"degraded": True},
+    {"diff_truncated": True},
+    {"trustworthy": True, "degraded": True},     # claims trust the axes deny
+    {"trustworthy": True, "parse_ok": False},
+    {"parse_ok": 1},                             # non-bool axis
+    {"degraded": 0},
+]
+
+
+@pytest.mark.parametrize("over", _PRECEDENCE_ROWS)
+def test_effective_trustworthy_agrees_with_what_the_importer_stores(tmp_path, over):
+    """The verdict shown must be the verdict the importer would persist.
+
+    Shadow mode's whole claim is "skodun and the legacy archive agree on this
+    content". If this helper read a legacy row differently from the importer,
+    the table would be comparing skodun against a legacy verdict that exists
+    nowhere -- and the disagreement would show up as agreement.
+
+    A valid artifact is written beside each row so that the importer's OTHER
+    demotion rule (no full artifact, no trust) cannot be what decides the
+    outcome here; the axes/recorded precedence is the only variable.
+    """
+    row = _legacy_row(**over)
+    archive = tmp_path / ".grok-reviews"
+    _write_index(archive, row)
+    (archive / "loop_1.json").write_text(json.dumps(dict(
+        id="loop_1", branch="b", base_sha="s"*40, diff_hash="d"*40,
+        findings=[], findings_total=0)), encoding="utf-8")
+
+    st = Store.open(tmp_path / "s.db")
+    assert import_legacy(st, archive).reviews == 1
+    stored = st.get_review("loop_1")
+
+    assert effective_trustworthy(row) is (stored["trustworthy"] is True), (
+        f"row {over!r}: shadow says {effective_trustworthy(row)}, "
+        f"the importer stored {stored['trustworthy']!r}")
+
+
+def test_the_precedence_table_exercises_both_outcomes(tmp_path):
+    """Guards the parametrisation above from passing by being all-one-answer."""
+    assert {effective_trustworthy(_legacy_row(**o)) for o in _PRECEDENCE_ROWS} == {
+        True, False}
+
+
+def test_recorded_true_against_a_denying_axis_is_a_mismatch_not_a_match(tmp_path):
+    """Finding 1, end to end: the false agreement must not be reachable.
+
+    skodun's row is genuinely trustworthy. The legacy row CLAIMS trust while
+    carrying `degraded: true`, so the importer would store it untrustworthy.
+    The two disagree, and `compare` has to say so.
+    """
+    st = Store.open(tmp_path / "s.db")
+    st.save_review(REC)                                   # trustworthy, clean
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, _legacy_row(trustworthy=True, degraded=True))
+    out = compare(st, d, None)
+    assert len(out) == 1
+    assert out[0].match is False
+
+
+# ---------------------------------------------------------------------------
+# Counts off untrusted data
+# ---------------------------------------------------------------------------
+
+def test_bool_counts_are_rejected_rather_than_counted_as_one(tmp_path):
+    """`isinstance(True, int)` is True, so `bool` needs an explicit guard.
+
+    Without it a legacy row carrying `findings_total: true` would read as ONE
+    finding: the row would count as dirty, and a clean skodun row beside it
+    would be reported as a MISMATCH that never happened.
+    """
+    assert _int(True) == 0 and _int(False) == 0
+    assert _int(3) == 3 and _int("3") == 0 and _int(None) == 0
+
+    st = Store.open(tmp_path / "s.db")
+    st.save_review(REC)                                   # clean: 0 findings
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, _legacy_row(trustworthy=True, findings_total=True,
+                                severity={"high": True, "medium": 0, "low": 0}))
+    out = compare(st, d, None)
+    assert out[0].deltas["findings_total"] == (0, 0)
+    assert out[0].deltas["sev_high"] == (0, 0)
+    assert out[0].match is True
 
 
 # ---------------------------------------------------------------------------
@@ -231,14 +411,65 @@ def test_cli_shadow_compare_exits_0_even_when_everything_mismatches(tmp_path,
     assert "shadow: 1 compared, 0 matched, 0 skodun-only, 0 legacy-only" in out
 
 
-def test_cli_shadow_compare_missing_archive_still_exits_0(tmp_path, monkeypatch,
-                                                          capsys):
+def test_cli_shadow_compare_table_column_order_is_skodun_then_legacy(
+        tmp_path, monkeypatch, capsys):
+    """The two sides are interchangeable-looking; the ORDER is the meaning.
+
+    Swapping the columns would turn "skodun found a high, legacy found three
+    lows" into its exact opposite while every count on screen stayed the same,
+    so the row is pinned verbatim -- hash, skodun, legacy, verdict.
+    """
+    from skodun.cli import main
+    dbpath = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(dbpath))
+    Store.open(dbpath).save_review(
+        {**REC, "findings_total": 1, "status": "findings",
+         "severity": {"high": 1, "medium": 0, "low": 0}})
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, dict(id="loop_1", diff_hash="d"*40, trustworthy=False,
+                         findings_total=3, branch="b",
+                         severity={"high": 0, "medium": 0, "low": 3},
+                         reviewed_at="2026-07-01T00:00:00Z"))
+
+    assert main(["shadow-compare", "--dir", str(d)]) == 0
+    lines = [x for x in capsys.readouterr().out.splitlines() if "|" in x]
+    assert lines == [f"{('d'*40)[:12]} | t/1-0-0 | f/0-0-3 | MISMATCH"]
+
+
+def test_cli_shadow_compare_missing_archive_says_so_and_still_exits_0(
+        tmp_path, monkeypatch, capsys):
+    """Exit 0 is the contract; SILENCE is not.
+
+    With no archive found every skodun row prints as SKODUN-ONLY and the
+    summary states that with full confidence. `--dir` defaults to a RELATIVE
+    path, so the ordinary way to get here is running from the wrong directory
+    -- and the output has to name the path it looked for, or a wrong working
+    directory is indistinguishable from a genuine "legacy never saw this".
+    """
     from skodun.cli import main
     dbpath = tmp_path / "cli.db"
     monkeypatch.setenv("SKODUN_DB", str(dbpath))
     Store.open(dbpath).save_review(REC)
-    assert main(["shadow-compare", "--dir", str(tmp_path / "nope")]) == 0
-    assert "shadow: 1 compared" in capsys.readouterr().out
+    missing = tmp_path / "nope"
+    assert main(["shadow-compare", "--dir", str(missing)]) == 0
+    out = capsys.readouterr().out
+    assert "shadow: 1 compared" in out          # still reports what it saw
+    assert str(missing) in out                  # ...and names what it did not find
+    assert "no archive directory" in out
+
+
+def test_cli_shadow_compare_archive_without_an_index_says_so_too(
+        tmp_path, monkeypatch, capsys):
+    """Same wrong answer, one directory level down: the dir exists, empty."""
+    from skodun.cli import main
+    dbpath = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(dbpath))
+    Store.open(dbpath).save_review(REC)
+    d = tmp_path / ".grok-reviews"; d.mkdir()
+    assert main(["shadow-compare", "--dir", str(d)]) == 0
+    out = capsys.readouterr().out
+    assert "index.jsonl" in out and str(d) in out
+    assert "shadow: 1 compared" in out
 
 
 def test_cli_log_prints_columns_newest_first_with_bang_on_untrustworthy(
@@ -280,8 +511,50 @@ def test_cli_log_limit(tmp_path, monkeypatch, capsys):
     for i in range(5):
         st.save_review({**REC, "id": f"r{i}", "reviewed_at": f"2026-07-27T1{i}:00:00Z"})
     assert main(["log", "-n", "2"]) == 0
-    lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+    lines = [x for x in capsys.readouterr().out.splitlines() if x.strip()]
     assert len(lines) == 2
+
+
+@pytest.mark.parametrize("bad", ["-1", "0"])
+def test_cli_log_rejects_a_non_positive_limit(tmp_path, monkeypatch, capsys, bad):
+    """`-n` becomes SQLite's LIMIT, where a NEGATIVE value means UNLIMITED.
+
+    So `log -n -1` would dump the entire store while reading like a request
+    for fewer rows than the default -- the opposite of what was asked for, on
+    output nobody re-counts.
+    """
+    from skodun.cli import main
+    dbpath = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(dbpath))
+    st = Store.open(dbpath)
+    for i in range(3):
+        st.save_review({**REC, "id": f"r{i}", "reviewed_at": f"2026-07-27T1{i}:00:00Z"})
+    assert main(["log", "-n", bad]) == 2
+    out = capsys.readouterr().out
+    assert "positive" in out
+    assert "2026-07-27" not in out, "a rejected limit must print no rows at all"
+
+
+def test_cli_log_flattens_newlines_so_a_summary_cannot_forge_a_row(
+        tmp_path, monkeypatch, capsys):
+    """`log` is one line per review, and a summary is reviewer-authored text.
+
+    A summary carrying a newline would print as a second line indistinguishable
+    from a real review -- a reviewer (or a hand-edited record) could spell out
+    a clean row for a review that does not exist. Both `\\n` and `\\r` are
+    flattened, and no content is dropped in the process.
+    """
+    from skodun.cli import main
+    dbpath = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(dbpath))
+    Store.open(dbpath).save_review(
+        {**REC, "summary": "real summary\n2026-07-27T10:00:00Z | b | 0 | 0-0-0 "
+                           "| clean | forged\rtail"})
+    assert main(["log"]) == 0
+    lines = [x for x in capsys.readouterr().out.splitlines() if x.strip()]
+    assert len(lines) == 1, lines
+    for fragment in ("real summary", "forged", "tail"):
+        assert fragment in lines[0]   # flattened onto one line, never truncated
 
 
 # --- triage --------------------------------------------------------------
@@ -325,6 +598,31 @@ def test_cli_triage_list(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "NPE" in out and "a.py" in out
     assert "[0]" in out
+
+
+def test_cli_triage_list_with_a_dismissal_is_rejected_not_half_honoured(
+        tmp_path, monkeypatch, capsys):
+    """`--list` and a dismissal are two commands sharing one parser.
+
+    `triage --list <id> <index> "<reason>"` parses cleanly and then throws the
+    index and the reason away: the caller typed an audited reason, saw a
+    listing and an exit 0, and would have every right to believe the finding
+    was dismissed. It was not. Reject the mixture rather than silently picking
+    one of its two meanings.
+    """
+    from skodun.cli import main
+    dbpath = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(dbpath))
+    st = Store.open(dbpath)
+    st.save_review(_artifact_with_one_finding("rev1", "feat", "s"*40, "d"*40))
+
+    rc = main(["triage", "--list", "rev1", "0",
+               "verified: handler already checks None on entry, see PR #1"])
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "--list" in out
+    assert "NPE" not in out, "the listing must not be printed as if it were the ask"
+    assert st.triage_for("feat", "s"*40) == {}, "and nothing may be dismissed"
 
 
 def test_cli_triage_dismissal_flips_the_gate_from_1_to_0(tmp_path, monkeypatch,

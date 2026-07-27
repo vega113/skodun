@@ -346,6 +346,7 @@ def _cmd_shadow_compare(args) -> int:
     Every failure path below is reported on stdout and still returns 0.
     """
     try:
+        from .legacy_import import INDEX_NAME
         from .shadow import compare
         from .store import Store
     except BaseException as e:
@@ -353,6 +354,26 @@ def _cmd_shadow_compare(args) -> int:
         return 0
 
     archive = Path(args.dir) if args.dir else Path(_LEGACY_DIR)
+
+    # A missing archive is not an error -- a machine that never ran the legacy
+    # tool has nothing to compare against -- but it must not be SILENT. With no
+    # archive found, every legacy row is absent, so the table renders every
+    # skodun row as SKODUN-ONLY and the summary line below states that with
+    # full confidence. `--dir` defaults to a RELATIVE path, so the commonest
+    # way to get here is running from the wrong directory, and naming the path
+    # that was not found is what makes that diagnosable at a glance. The exit
+    # code stays 0: shadow mode is observational and must never fail a
+    # workflow, not even on its own misconfiguration.
+    try:
+        if not archive.is_dir():
+            print(f"skodun shadow-compare: no archive directory at {archive} "
+                  f"-- nothing on the legacy side to compare against")
+        elif not (archive / INDEX_NAME).is_file():
+            print(f"skodun shadow-compare: no {INDEX_NAME} in {archive} "
+                  f"-- nothing on the legacy side to compare against")
+    except BaseException:
+        pass   # a notice is a courtesy; it may never become the failure itself
+
     try:
         store = Store.open(_store_path())
         comparisons = compare(store, archive, None)
@@ -383,6 +404,13 @@ def _cmd_shadow_compare(args) -> int:
 
 def _cmd_log(args) -> int:
     """Print recent reviews, newest first. `2` if the store cannot be read."""
+    # `-n` becomes SQLite's LIMIT, where a NEGATIVE value means "no limit" --
+    # so `log -n -1` would dump the whole store while reading like a request
+    # for fewer rows than the default. Below 1 there is no row count to ask
+    # for, so this is a usage error rather than something to clamp silently.
+    if args.limit < 1:
+        print(f"skodun log: -n must be a positive row count, got {args.limit}")
+        return 2
     try:
         from .store import Store
         store = Store.open(_store_path())
@@ -417,6 +445,16 @@ def _cmd_triage(args) -> int:
     ordinary shape of "a human needs to try again", not an internal failure.
     """
     from .store import Store
+
+    # `--list` and a dismissal are two different commands sharing one parser,
+    # so `triage --list <id> <index> "<reason>"` parses cleanly and then throws
+    # the index and the reason away. Someone who typed a reason believes a
+    # finding was dismissed; they get a listing and a 0. Reject the mixture
+    # instead of picking one of the two meanings.
+    if args.list_only and not (args.finding_index is None and args.reason is None):
+        print("skodun triage: --list takes only a review id; drop the finding "
+              "index and the reason to list, or drop --list to dismiss")
+        return 2
 
     try:
         store = Store.open(_store_path())

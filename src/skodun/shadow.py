@@ -23,11 +23,17 @@ reviewer is *worse*, so they are carried in `deltas` for eyes only.
 writer can leave a half-written final line, so parsing reuses
 `legacy_import._iter_records`, the same corrupt/truncated-line-tolerant reader
 the importer uses -- matching its posture is the point, not an accident.
-`effective_trustworthy` reuses the same recorded-field-wins-over-derived-axes
-precedence rule as `legacy_import._recorded_denies_trust` / oracle
-`is_trustworthy`, for the same reason: a legacy row predating the
+`effective_trustworthy` calls `legacy_import._recorded_denies_trust` and then
+`trust.is_trustworthy` -- the importer's own two-step precedence, in the
+importer's own order -- so a legacy row reads here exactly as the importer
+reads it. Two reasons, one per half of the rule: a row predating the
 `trustworthy` field must not read as untrustworthy just because the field is
-absent.
+absent, and a row that *records* trust its axes deny must not read as
+trustworthy just because it said so. (What the importer would ultimately
+STORE can still be stricter than this: it also demotes a row whose full
+artifact is missing or invalid. That is a statement about what may pass a
+GATE, not about what the legacy tool concluded, and this module is comparing
+conclusions.)
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .legacy_import import INDEX_NAME, _axis, _iter_records
+from .legacy_import import INDEX_NAME, _axis, _iter_records, _recorded_denies_trust
 from .store import Store
 from .trust import is_trustworthy
 
@@ -63,21 +69,32 @@ class Comparison:
 
 
 def effective_trustworthy(row: dict | None) -> bool:
-    """Whether `row` counts as trustworthy, legacy back-compat rule included.
+    """Whether `row` counts as trustworthy, by the importer's exact precedence.
 
-    A skodun-stored row always carries a real, recomputed `trustworthy` bool
-    (`Store.save_review`'s invariant), so for those rows this is just
-    `row["trustworthy"] is True`. A raw legacy index row may predate the field
-    entirely, so the same precedence already used on import applies here: a
-    row that *records* `trustworthy` is taken at its word (`is True`, so `1`
-    or `"true"` is not trust); only a row where the field is absent or
-    explicitly `null` falls back to deriving trust from the three axes.
+    This CALLS `legacy_import`'s rule rather than restating it, because the
+    verdict this module reports has to be the verdict the same row gets on
+    import -- otherwise `compare` can report agreement between a skodun row
+    and a legacy row that the importer read the other way, which is the one
+    direction the module docstring says it must never get wrong.
+
+    The rule has two halves and both are load-bearing:
+
+      * A row that RECORDS `trustworthy` is taken at its word, but only in the
+        denying direction (`_recorded_denies_trust`: not `None` and not
+        `True`, so `1` or `"true"` is a denial, not trust). A recorded verdict
+        can never GRANT trust against the axes -- `Store.save_review`
+        recomputes trust from the axes on every write, so a row spelling
+        `trustworthy: true` beside `degraded: true` is stored untrustworthy
+        and must read untrustworthy here too.
+      * A row where the field is absent or `null` -- it was added late, and it
+        is absent on a large fraction of any real archive -- derives trust
+        from the three axes. Reading its absence as `false` is the error that
+        once inflated an audit's failure rate from ~2% to 65%.
     """
     if not row:
         return False
-    recorded = row.get("trustworthy")
-    if recorded is not None:
-        return recorded is True
+    if _recorded_denies_trust(row):
+        return False
     axes = {k: _axis(row, k) for k in _AXES}
     return is_trustworthy(**axes)
 
@@ -176,17 +193,17 @@ def compare(store: Store, grok_reviews_dir: Path,
     out: list[Comparison] = []
     for dh in hashes:
         s = skodun.get(dh)
-        l = legacy.get(dh)
+        g = legacy.get(dh)
         deltas = dict(
-            findings_total=(_findings_total(s), _findings_total(l)),
-            sev_high=(_sev(s, "high"), _sev(l, "high")),
-            sev_medium=(_sev(s, "medium"), _sev(l, "medium")),
-            sev_low=(_sev(s, "low"), _sev(l, "low")),
+            findings_total=(_findings_total(s), _findings_total(g)),
+            sev_high=(_sev(s, "high"), _sev(g, "high")),
+            sev_medium=(_sev(s, "medium"), _sev(g, "medium")),
+            sev_low=(_sev(s, "low"), _sev(g, "low")),
         )
-        if s is not None and l is not None:
-            match = (effective_trustworthy(s) == effective_trustworthy(l)
-                      and (_findings_total(s) > 0) == (_findings_total(l) > 0))
+        if s is not None and g is not None:
+            match = (effective_trustworthy(s) == effective_trustworthy(g)
+                      and (_findings_total(s) > 0) == (_findings_total(g) > 0))
         else:
             match = False
-        out.append(Comparison(dh, s, l, match, deltas))
+        out.append(Comparison(dh, s, g, match, deltas))
     return out
