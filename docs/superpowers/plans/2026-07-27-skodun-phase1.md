@@ -830,7 +830,7 @@ def ledger_key(branch: str, base_sha: str, fkey: str) -> str:
 **Interfaces:**
 - Consumes: `Store` (Task 3), `textnorm` (Task 5).
 - Produces: `validate_reason(reason: str) -> None` (raises `TriageError`); `dismiss(store, review: dict, index: int, reason: str, now: str) -> dict`; `load_valid_artifact(rec: dict) -> dict` (raises `ArtifactError` on every self-inconsistent shape); `open_findings(review: dict, triaged: dict[str, dict]) -> list[dict]`.
-- **Oracle:** `grok_review_triage.py` lines 93–107 (reason rules: min 20 chars post-normalization; reject the 28-item `PLACEHOLDER_REASONS` set — **copy that set verbatim from the source**), 176–230 (artifact validation: reject non-object artifact, non-list findings, non-dict list members, boolean/float/string `findings_total`, and `findings_total != len(findings)`).
+- **Oracle:** `grok_review_triage.py` lines 58–63 and 93–107 (reason rules: min 20 chars post-normalization; reject the 27-item `PLACEHOLDER_REASONS` set, inlined verbatim below), 176–230 (artifact validation: reject non-object artifact, non-list findings, non-dict list members, boolean/float/string `findings_total`, and `findings_total != len(findings)`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -987,6 +987,8 @@ def test_gate_empty_diff_is_0_no_outgoing_change(tmp_path):
     repo = _mkrepo(tmp_path); st = Store.open(tmp_path / "s.db")
     r = run_gate(st, repo, load_config(repo))          # clean tree on main
     assert r.code == 0 and "no outgoing change" in r.message
+    row = st._c.execute("SELECT diff_hash FROM gate_events").fetchone()
+    assert row["diff_hash"] == ""                      # empty-change identity
 
 def test_gate_no_review_is_2(tmp_path):
     repo = _mkrepo(tmp_path); st = Store.open(tmp_path / "s.db")
@@ -1000,8 +1002,9 @@ def test_gate_skip_is_recorded(tmp_path):
     (repo / "a.txt").write_text("two\n", encoding="utf-8")
     r = run_gate(st, repo, load_config(repo), env={"SKODUN_GATE_SKIP": "1"})
     assert r.code == 0 and "SKIPPED" in r.message
-    row = st._c.execute("SELECT outcome FROM gate_events").fetchone()
+    row = st._c.execute("SELECT outcome, diff_hash FROM gate_events").fetchone()
     assert row["outcome"] == "skipped"
+    assert row["diff_hash"] is None    # skip never depends on identity computation
 
 def test_gate_rejects_artifact_index_disagreement(tmp_path):
     repo = _mkrepo(tmp_path); st = Store.open(tmp_path / "s.db")
@@ -1105,9 +1108,14 @@ def _gate(store: Store, repo: Path, cfg: Config) -> GateResult:
 def run_gate(store: Store, repo: Path, cfg: Config, env=os.environ) -> GateResult:
     def _record(result: GateResult, outcome: str) -> GateResult:
         try:
+            branch = None
+            try:
+                branch = gitio.current_branch(repo)
+            except Exception:
+                pass   # best-effort: a skip must survive a broken repo identity
             store.log_gate_event(dict(
                 at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                repo=str(repo), branch=gitio.current_branch(repo),
+                repo=str(repo), branch=branch,
                 diff_hash=result.diff_hash, outcome=outcome, code=result.code,
                 note=result.message.splitlines()[-1]))
         except Exception as e:
@@ -1848,7 +1856,7 @@ def test_rule_id_title_not_polluted():
   6. Checklist selection → context pack (headroom = `max_diff_bytes - len(diff)` minus 1, only when positive; statuses from `Diff.statuses`) → prompt build.
   7. Persist a `running` record (id `sk_<utcstamp>_<pid>_<uuid4-hex8>` — the uuid component is mandatory, see the lock section), then run the finder via adapter + watchdog. Retries, always fresh runs: timeout ⇒ up to `timeout_retries`; degraded ⇒ up to `degraded_retries`. Each attempt appends `{n, rc, timed_out, duration_sec, first_output_sec}` to `attempts[]`. A timed-out attempt has empty stdout (the runner truncated it) and is **never parsed**; retries exhausted on timeout ⇒ `parse_ok=False`, `failure_reason="timed out after N attempts"`, status `failed`.
   8. Parse; run security pass if held (merge per Task 14 semantics); run skeptic pass if eligible (merge).
-  9. Persist the final record — **the full artifact schema**: identity (`branch, head, base_ref, base_sha, diff_hash, context_hash`), config echo (`model, adapter, mode, timeout_seconds, max_turns`), trust axes (`parse_ok, degraded, degraded_reason, stop_reason, diff_truncated`), telemetry (`files_changed[], diff_bytes, prompt_bytes, checklist_sections[], checklist_bytes, context_bytes, context_files[], context_omitted_files[], attempts[]`), results (`summary, findings[], findings_total, severity{}, rule_ids[], extra_passes{}`, `failure_reason`). `rule_ids` extracted from finding titles with `\[([a-z0-9]+(?:-[a-z0-9]+)*)\]` (closes the rules-telemetry loop; Task 17's log viewer reads `files_changed`). Status `clean` if trustworthy, else `degraded`/`failed`. **Then** emit the banner from the persisted record. If persistence itself fails: print `banner_failure("no review was recorded")` and exit 4.
+  9. Persist the final record — **the full artifact schema**: identity (`branch, head, base_ref, base_sha, diff_hash, context_hash`), config echo (`model, adapter, mode, timeout_seconds, max_turns`), trust axes (`parse_ok, degraded, degraded_reason, stop_reason, diff_truncated`), telemetry (`files_changed[], diff_bytes, prompt_bytes, checklist_sections[], checklist_bytes, checklist_note, context_bytes, context_files[], context_omitted_files[], attempts[]` — `checklist_note` persists `Selection.note` so a fail-soft selection failure is visible in the artifact, not just on stderr), results (`summary, findings[], findings_total, severity{}, rule_ids[], extra_passes{}`, `failure_reason`). `rule_ids` extracted from finding titles with `\[([a-z0-9]+(?:-[a-z0-9]+)*)\]` (closes the rules-telemetry loop; Task 17's log viewer reads `files_changed`). Status `clean` if trustworthy, else `degraded`/`failed`. **Then** emit the banner from the persisted record. If persistence itself fails: print `banner_failure("no review was recorded")` and exit 4.
   10. On any crash, the `finally` block releases the lock (only if still owner) and downgrades a still-`running` record to `failed`.
 - **Lock owner-file format (interop-critical):** the legacy scripts write `owner` as three lines — `pid=<pid>`, `started=<unix-epoch>`, `worktree=<abs-path>` — and parse peers the same way. skodun writes and parses **exactly this format**. A plain-integer owner file (or any unparsable owner) is treated as owner-unknown: reclaim only past the 30s write-grace + stale ceiling, mirroring the oracle (`grok-review-now.sh` lines 138–325). Interop is tested in both directions (skodun respects a legacy-format live lock; a legacy-side parse of skodun's owner file yields the right pid — asserted by writing/parsing the exact byte format).
 - Reviewer selection: role `finder` from config (first enabled), roles `security` / `refuter` reuse the finder's adapter in Phase 1 (same model — parity with legacy same-model passes; cross-provider comes in Phase 2).
