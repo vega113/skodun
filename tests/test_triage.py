@@ -8,6 +8,11 @@ already-litigated finding or let a corrupt artifact satisfy the gate.
 load the *actual* oracle module from `$SKODUN_ORACLE_DIR` and assert
 agreement directly; they skip (not xfail, not silently pass) when the oracle
 checkout is absent.
+
+Artifact validation is the one place skodun is deliberately STRICTER than the
+oracle, because it guards the gate's fail-closed contract rather than a
+display path. That divergence is documented in `triage.py` and pinned from
+both sides by `test_load_valid_artifact_divergence_from_legacy_is_deliberate`.
 """
 
 import importlib.util
@@ -126,31 +131,59 @@ def test_artifact_findings_non_dict_members_rejected():
         load_valid_artifact(dict(GOOD, findings=["x", "y"], findings_total=2))
 
 
-def test_artifact_missing_findings_defaults_to_empty_list():
-    # PARITY: the oracle treats a missing/None `findings` as an empty list,
-    # not corruption (grok_review_triage.py:196-202) -- an artifact that
-    # simply has nothing to report must not be indistinguishable from a
-    # truncated one.
-    rec = dict(id="r1", branch="feat", base_sha="s" * 40)
-    out = load_valid_artifact(rec)
-    assert out is rec
+def test_artifact_empty_but_complete_is_accepted():
+    # The fail-closed rule is about *asserted* shape, not about forbidding a
+    # clean review: an artifact that explicitly records zero findings and a
+    # matching zero total is well-formed and must pass.
+    rec = dict(id="r1", branch="feat", base_sha="s" * 40,
+               findings=[], findings_total=0)
+    assert load_valid_artifact(rec) is rec
     assert open_findings(rec, {}) == []
 
 
-def test_artifact_missing_findings_total_skips_total_check():
-    # PARITY: the oracle only validates findings_total when the artifact
-    # actually asserts one (grok_review_triage.py:216-229); a well-formed
-    # artifact that omits the count entirely must not be rejected just
-    # because there is nothing to compare against len(findings).
-    rec = dict(GOOD)
-    del rec["findings_total"]
-    out = load_valid_artifact(rec)
-    assert out["findings"] == GOOD["findings"]
+# --- Deliberate divergence from the oracle -------------------------------
+#
+# The oracle's `load_review` ACCEPTS every artifact below: it coerces a
+# missing/None `findings` to `[]` and skips the `findings_total` check
+# entirely when that key is missing/None. skodun rejects all of them, on
+# purpose. `load_valid_artifact` guards the gate's fail-closed contract --
+# under the lenient rule an artifact with no recorded `findings` reads as
+# "zero findings", i.e. clean, and the gate could PASS a review whose
+# findings were never stored. It is also the check the legacy importer
+# relies on to stop a findings-less index row from certifying a push.
+# Being stricter than the oracle is fail-safe in this direction: the worst
+# case is that a malformed artifact forces one fresh review.
+# `test_load_valid_artifact_divergence_from_legacy_is_deliberate` pins the
+# other half of this claim -- that the oracle really does accept them.
+
+DIVERGENT = {
+    "missing findings": dict(id="r2", branch="feat", base_sha="s" * 40,
+                             findings_total=0),
+    "null findings": dict(id="r2", branch="feat", base_sha="s" * 40,
+                          findings=None, findings_total=0),
+    "missing findings_total": {k: v for k, v in GOOD.items()
+                               if k != "findings_total"},
+    "null findings_total": dict(GOOD, findings_total=None),
+}
 
 
-def test_artifact_null_findings_total_also_skips_check():
-    rec = dict(GOOD, findings_total=None)
-    load_valid_artifact(rec)  # must not raise
+@pytest.mark.parametrize("label", sorted(DIVERGENT))
+def test_artifact_missing_or_null_keys_rejected_stricter_than_oracle(label):
+    with pytest.raises(ArtifactError):
+        load_valid_artifact(DIVERGENT[label])
+
+
+def test_dismiss_and_open_findings_reject_the_divergent_shapes_too(tmp_path):
+    # The strictness has to hold on the paths that actually reach the gate,
+    # not just on the validator in isolation -- neither entry point may fall
+    # back to "no findings key means nothing to report".
+    st = Store.open(tmp_path / "s.db")
+    for rec in DIVERGENT.values():
+        with pytest.raises(ArtifactError):
+            dismiss(st, rec, 0, "a perfectly valid twenty-plus character reason here",
+                    now="2026-07-27T10:00:00Z")
+        with pytest.raises(ArtifactError):
+            open_findings(rec, {})
 
 
 # ---------------------------------------------------------------------------
@@ -265,21 +298,38 @@ def test_validate_reason_parity_with_legacy_module():
         assert skodun_ok == legacy_ok, f"disagreement on {reason!r}"
 
 
-def test_load_valid_artifact_parity_with_legacy_load_review(tmp_path):
+def _legacy_accepts(legacy, tmp_path, review_id: str, rec) -> bool:
+    """True if the oracle's `load_review` accepts `rec`.
+
+    It reads from a file on disk keyed by review id, so each case has to be
+    materialized as a temp artifact file first.
+    """
+    import json
+    (tmp_path / f"{review_id}.json").write_text(json.dumps(rec), encoding="utf-8")
+    try:
+        legacy.load_review(str(tmp_path), review_id)
+        return True
+    except ValueError:
+        return False
+
+
+def test_load_valid_artifact_parity_with_legacy_on_fully_specified_artifacts(tmp_path):
+    # Where the artifact actually asserts both keys, skodun and the oracle
+    # must agree exactly -- the divergence below is confined to the
+    # missing/None cases and must not have leaked anywhere else.
     if LEGACY is None or not LEGACY.exists():
         pytest.skip("oracle checkout not present (set SKODUN_ORACLE_DIR)")
-    import json
     legacy = _load_legacy()
 
     cases = [
         GOOD,
+        dict(id="r3", branch="feat", base_sha="s" * 40, findings=[], findings_total=0),
         dict(GOOD, findings_total=2),
         dict(GOOD, findings="oops"),
         dict(GOOD, findings=[1]),
         dict(GOOD, findings_total=True),
         dict(GOOD, findings_total=1.0),
-        dict(id="r2", branch="feat", base_sha="s" * 40),  # missing findings entirely
-        dict(GOOD, findings_total=None),
+        dict(GOOD, findings_total="1"),
     ]
     for i, rec in enumerate(cases):
         skodun_ok = True
@@ -287,15 +337,25 @@ def test_load_valid_artifact_parity_with_legacy_load_review(tmp_path):
             load_valid_artifact(rec)
         except ArtifactError:
             skodun_ok = False
-
-        # Legacy's load_review reads from a file on disk keyed by review id;
-        # give it the same shape via a temp artifact file.
-        review_id = f"case{i}"
-        (tmp_path / f"{review_id}.json").write_text(json.dumps(rec), encoding="utf-8")
-        legacy_ok = True
-        try:
-            legacy.load_review(str(tmp_path), review_id)
-        except ValueError:
-            legacy_ok = False
-
+        legacy_ok = _legacy_accepts(legacy, tmp_path, f"case{i}", rec)
         assert skodun_ok == legacy_ok, f"disagreement on case {i}: {rec!r}"
+
+
+def test_load_valid_artifact_divergence_from_legacy_is_deliberate(tmp_path):
+    # Pins BOTH halves of the documented divergence against the real oracle:
+    # the oracle accepts each of these findings-less / total-less artifacts,
+    # and skodun rejects each. The direction is intentional and fail-safe --
+    # `load_valid_artifact` guards the gate's fail-closed contract, and the
+    # oracle's leniency would let an artifact with no recorded findings read
+    # as clean and certify a push. If this test starts failing because the
+    # oracle grew stricter, the fix is to delete the divergence note, never
+    # to loosen skodun.
+    if LEGACY is None or not LEGACY.exists():
+        pytest.skip("oracle checkout not present (set SKODUN_ORACLE_DIR)")
+    legacy = _load_legacy()
+
+    for i, (label, rec) in enumerate(sorted(DIVERGENT.items())):
+        assert _legacy_accepts(legacy, tmp_path, f"div{i}", rec), \
+            f"oracle unexpectedly rejects {label}: {rec!r}"
+        with pytest.raises(ArtifactError):
+            load_valid_artifact(rec)
