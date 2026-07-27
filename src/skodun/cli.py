@@ -69,6 +69,27 @@ def build_parser() -> argparse.ArgumentParser:
                           "current directory)")
     imp.add_argument("--dir", type=Path, default=None, dest="dir",
                      help=f"archive directory (default: <repo>/{_LEGACY_DIR})")
+
+    shadow = sub.add_parser(
+        "shadow-compare",
+        help="compare skodun's verdicts against the legacy .grok-reviews archive")
+    shadow.add_argument("--dir", type=Path, default=None, dest="dir",
+                        help=f"archive directory (default: ./{_LEGACY_DIR})")
+
+    log = sub.add_parser("log", help="show recent reviews, newest first")
+    log.add_argument("--branch", default=None,
+                     help="restrict to one branch (default: every branch)")
+    log.add_argument("-n", type=int, default=20, dest="limit",
+                     help="maximum rows to show (default: 20)")
+
+    tri = sub.add_parser(
+        "triage",
+        help="dismiss a finding with an audited reason, or list a review's findings")
+    tri.add_argument("review_id")
+    tri.add_argument("finding_index", nargs="?", type=int, default=None)
+    tri.add_argument("reason", nargs="?", default=None)
+    tri.add_argument("--list", action="store_true", dest="list_only",
+                     help="list a review's findings instead of dismissing one")
     return p
 
 
@@ -296,6 +317,153 @@ def _cmd_import_legacy(args) -> int:
         f"store_failures={stats.store_failures}", 2 if failed else 0)
 
 
+def _fmt_side(row: dict | None) -> str:
+    """Render one side of a shadow comparison as `t/H-M-L`, or `-` if absent.
+
+    `effective_trustworthy` -- not the raw `trustworthy` field -- decides the
+    `t`/`f`, so a legacy row that predates the field (absent, not `false`)
+    displays the same verdict that `shadow.compare` used to decide `match`.
+    """
+    from .shadow import effective_trustworthy
+
+    if row is None:
+        return "-"
+    sev = row.get("severity") if isinstance(row.get("severity"), dict) else {}
+
+    def _n(v: object) -> int:
+        return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+    mark = "t" if effective_trustworthy(row) else "f"
+    return f"{mark}/{_n(sev.get('high'))}-{_n(sev.get('medium'))}-{_n(sev.get('low'))}"
+
+
+def _cmd_shadow_compare(args) -> int:
+    """Print the shadow-mode comparison table and summary. Always exits 0.
+
+    Shadow mode is purely observational: it exists to show a human whether
+    skodun agrees with the legacy tool, and a workflow that happens to run it
+    must never be failed by what it finds -- or by it failing to run at all.
+    Every failure path below is reported on stdout and still returns 0.
+    """
+    try:
+        from .shadow import compare
+        from .store import Store
+    except BaseException as e:
+        print(f"skodun shadow-compare: could not load the shadow module: {e!r}")
+        return 0
+
+    archive = Path(args.dir) if args.dir else Path(_LEGACY_DIR)
+    try:
+        store = Store.open(_store_path())
+        comparisons = compare(store, archive, None)
+    except BaseException as e:
+        print(f"skodun shadow-compare: FAILED on {archive}: {e!r}")
+        return 0
+
+    matched = skodun_only = legacy_only = 0
+    for c in sorted(comparisons, key=lambda c: c.diff_hash):
+        if c.legacy is None:
+            skodun_only += 1
+            label = "SKODUN-ONLY"
+        elif c.skodun is None:
+            legacy_only += 1
+            label = "LEGACY-ONLY"
+        elif c.match:
+            matched += 1
+            label = "MATCH"
+        else:
+            label = "MISMATCH"
+        print(f"{c.diff_hash[:12]} | {_fmt_side(c.skodun)} | {_fmt_side(c.legacy)} "
+              f"| {label}")
+
+    print(f"shadow: {len(comparisons)} compared, {matched} matched, "
+          f"{skodun_only} skodun-only, {legacy_only} legacy-only")
+    return 0
+
+
+def _cmd_log(args) -> int:
+    """Print recent reviews, newest first. `2` if the store cannot be read."""
+    try:
+        from .store import Store
+        store = Store.open(_store_path())
+        rows = store.list_reviews(args.branch, args.limit)
+    except BaseException as e:
+        print(f"skodun log: could not read the store: {e!r}")
+        return 2
+
+    def _n(v: object) -> int:
+        return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+    for rec in rows:
+        trustworthy = rec.get("trustworthy") is True
+        sev = rec.get("severity") if isinstance(rec.get("severity"), dict) else {}
+        files = rec.get("files_changed")
+        nfiles = len(files) if isinstance(files, list) else 0
+        # A summary carrying a stray newline must not be able to fake a second
+        # row in what is meant to be a one-line-per-review listing.
+        summary = str(rec.get("summary") or "").replace("\r", " ").replace("\n", " ")
+        mark = "!" if not trustworthy else " "
+        print(f"{mark}{rec.get('reviewed_at')} | {rec.get('branch')} | {nfiles} | "
+              f"{_n(sev.get('high'))}-{_n(sev.get('medium'))}-{_n(sev.get('low'))} | "
+              f"{rec.get('status')} | {summary}")
+    return 0
+
+
+def _cmd_triage(args) -> int:
+    """Dismiss one finding with an audited reason, or list a review's findings.
+
+    A rejected reason or a missing/invalid review is reported as a clear
+    message and a nonzero exit -- never a traceback -- because both are the
+    ordinary shape of "a human needs to try again", not an internal failure.
+    """
+    from .store import Store
+
+    try:
+        store = Store.open(_store_path())
+    except BaseException as e:
+        print(f"skodun triage: could not open the store: {e!r}")
+        return 2
+
+    review = store.get_review(args.review_id)
+    if review is None:
+        print(f"skodun triage: no such review: {args.review_id!r}")
+        return 2
+
+    from .textnorm import finding_key
+    from .triage import ArtifactError, TriageError, dismiss, load_valid_artifact
+
+    try:
+        review = load_valid_artifact(review)
+    except ArtifactError as e:
+        print(f"skodun triage: invalid review artifact: {e}")
+        return 2
+
+    if args.list_only:
+        triaged = store.triage_for(review["branch"], review["base_sha"])
+        for i, f in enumerate(review["findings"]):
+            fkey = finding_key(f.get("file", ""), f.get("title", ""))
+            status = "DISMISSED" if fkey in triaged else "OPEN"
+            print(f"[{i}] {f.get('severity')} {f.get('file')}:{f.get('line')} "
+                  f"{f.get('title')} ({status})")
+        return 0
+
+    if args.finding_index is None or args.reason is None:
+        print("skodun triage: usage: skodun triage <review-id> <finding-index> "
+              "\"<reason>\"  |  skodun triage --list <review-id>")
+        return 2
+
+    try:
+        dismiss(store, review, args.finding_index, args.reason,
+                now=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    except (TriageError, ArtifactError) as e:
+        print(f"skodun triage: rejected: {e}")
+        return 2
+
+    print(f"skodun triage: dismissed finding {args.finding_index} on review "
+          f"{args.review_id}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         # Inside the guard: building the parser is not inert. argparse probes
@@ -335,6 +503,12 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_review(args)
         if args.command == "import-legacy":
             return _cmd_import_legacy(args)
+        if args.command == "shadow-compare":
+            return _cmd_shadow_compare(args)
+        if args.command == "log":
+            return _cmd_log(args)
+        if args.command == "triage":
+            return _cmd_triage(args)
         # Unreachable while the subparsers are `required=True`, and kept as
         # defence in depth: if that ever comes off, an unrecognised command
         # must still not certify a push by exiting 0.
