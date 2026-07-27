@@ -53,6 +53,16 @@ def _paths(raw: bytes) -> list[str]:
     return raw.decode("utf-8", "surrogateescape").split("\0")
 
 
+def _worktree_root(repo: Path) -> Path:
+    """The worktree root containing `repo`.
+
+    ORACLE PARITY: the oracle opens both its `--diff-hash` and `--base-sha`
+    seams with `WORKTREE="$(git rev-parse --show-toplevel)"; cd "$WORKTREE"`.
+    That is load-bearing, not tidiness — see `capture_diff`.
+    """
+    return Path(_out(repo, "rev-parse", "--show-toplevel"))
+
+
 def blob_sha1(data: bytes) -> str:
     """git's blob object id for `data` (== `git hash-object --stdin`)."""
     h = hashlib.sha1()
@@ -157,6 +167,15 @@ def _tracked_statuses(repo: Path, base_sha: str) -> dict[str, str]:
 def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
     """Working tree vs `base_sha`, including untracked files, capped.
 
+    `repo` may be any path inside the worktree; it is normalised to the
+    worktree root before any git call. That is required, not a courtesy:
+    `git diff` emits worktree-root-relative paths while
+    `git ls-files --others` emits paths relative to the cwd, so running the
+    two from a subdirectory would mix two path bases into one `files` list
+    (untracked entries unopenable from the root) and into one hash. The
+    oracle avoids this the same way — `cd "$(git rev-parse --show-toplevel)"`
+    before `resolve_outgoing_change`.
+
     ORACLE PARITY, three separate points:
       1. Each `$(...)` capture strips trailing newlines, so the tracked section
          and the *whole* untracked section are each right-stripped.
@@ -186,6 +205,7 @@ def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
     not re-sorted in Python, so the capped subset can never diverge from the
     oracle's on a locale or code-point-vs-byte ordering difference.
     """
+    repo = _worktree_root(repo)
     tracked = _run(repo, "--no-pager", "diff", *_DIFF_FLAGS, base_sha).stdout
     statuses = _tracked_statuses(repo, base_sha)
     files = list(statuses)

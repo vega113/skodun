@@ -10,6 +10,7 @@ hygiene: no local path may be hardcoded here).
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -17,6 +18,7 @@ import pytest
 
 from skodun.gitio import (
     Base,
+    GitError,
     blob_sha1,
     capture_diff,
     current_branch,
@@ -35,6 +37,22 @@ requires_oracle = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _neutralise_ambient_git_config(monkeypatch):
+    """Drop `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` from the env.
+
+    Those entries rank with `git -c`, i.e. ABOVE repo-local config, so a runner
+    that exports them would override the settings `_mkrepo` pins (notably
+    `core.quotepath`) for skodun's git calls and the oracle's alike, and the
+    documented divergence below would silently stop being the thing it claims to
+    document. Everything else (`~/.gitconfig`, system config) ranks below
+    repo-local and is already neutralised by the pin itself.
+    """
+    for key in [k for k in os.environ if k.startswith("GIT_CONFIG_")]:
+        if key == "GIT_CONFIG_COUNT" or key.split("_")[-1].isdigit():
+            monkeypatch.delenv(key, raising=False)
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
@@ -47,6 +65,12 @@ def _mkrepo(tmp_path: Path) -> Path:
     _git(repo, "init", "-b", "main")
     _git(repo, "config", "user.email", "t@t")
     _git(repo, "config", "user.name", "t")
+    # Pinned, not inherited: `core.quotepath` decides whether the oracle's
+    # text-mode untracked listing hands its `[ -f ]` guard a quoted name, which
+    # is exactly what test_known_divergence_untracked_nonascii_name documents.
+    # Leaving it to ambient config would make that test's result a property of
+    # the developer's machine.
+    _git(repo, "config", "core.quotepath", "true")
     (repo / "a.txt").write_text("one\n", encoding="utf-8")
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "c0")
@@ -213,7 +237,10 @@ def test_no_separator_appended_when_untracked_yields_no_diff(tmp_path):
     (repo / "a.txt").write_text("two\n", encoding="utf-8")
     base = resolve_base(repo)
     before = capture_diff(repo, base.sha, untracked_max=100).data
+    assert before.startswith(b"diff --git ")  # not vacuous: `before` is a real diff
     (repo / "dangling.lnk").symlink_to("/definitely/missing/target")
+    # the untracked LIST is non-empty; only the untracked DIFF section is
+    assert "dangling.lnk" in _git(repo, "ls-files", "--others", "--exclude-standard")
     after = capture_diff(repo, base.sha, untracked_max=100)
     assert after.data == before
     assert "dangling.lnk" not in after.files
@@ -278,6 +305,118 @@ def test_untracked_cap_truncates_and_flags(tmp_path):
     d_all = capture_diff(repo, resolve_base(repo).sha, untracked_max=100)
     assert d_all.truncated_untracked is False
     assert b"u4.txt" in d_all.data
+
+
+def _exec_script(path: Path, body: str) -> Path:
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_diff_flags_suppress_textconv_and_external_drivers(tmp_path):
+    """`--no-ext-diff --no-textconv` are load-bearing, so pin them with a test.
+
+    Without them the hashed bytes are a function of the developer's
+    `.gitattributes` + `diff.<driver>.*` config: the gate would enforce an
+    identity nobody else can reproduce, and the reviewer would be shown a
+    transformed view of the change rather than the change. Both drivers are
+    asserted LIVE first (raw `git diff` output shows them), so this test cannot
+    pass by the drivers simply never firing.
+    """
+    repo = _mkrepo(tmp_path)
+    # .gitattributes lands in the BASE commit so it is not itself part of the diff
+    (repo / ".gitattributes").write_text(
+        "tc.txt diff=tcdrv\next.txt diff=extdrv\nu-new.txt diff=tcdrv\n", encoding="utf-8"
+    )
+    (repo / "tc.txt").write_text("textconv target\n", encoding="utf-8")
+    (repo / "ext.txt").write_text("external target\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "attrs")
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "tc.txt").write_text("textconv target EDITED\n", encoding="utf-8")
+    (repo / "ext.txt").write_text("external target EDITED\n", encoding="utf-8")
+    (repo / "u-new.txt").write_text("untracked\n", encoding="utf-8")  # --no-index path
+    base = resolve_base(repo)
+    before = capture_diff(repo, base.sha, untracked_max=100)
+    assert before.data.startswith(b"diff --git ")
+
+    # Scripts live outside the repo so they are not themselves untracked content.
+    tc = _exec_script(tmp_path / "textconv.sh", '#!/bin/sh\nsed "s/^/TEXTCONV-/" "$1"\n')
+    ext = _exec_script(tmp_path / "extdiff.sh", "#!/bin/sh\necho EXTERNAL-DIFF-RAN\n")
+    _git(repo, "config", "diff.tcdrv.textconv", str(tc))
+    _git(repo, "config", "diff.extdrv.command", str(ext))
+
+    # Both drivers are live: git's own output changes once they are configured.
+    raw = subprocess.run(
+        ["git", "-C", str(repo), "--no-pager", "diff", base.sha], capture_output=True
+    ).stdout
+    assert b"TEXTCONV-" in raw, "textconv driver did not fire; test would be vacuous"
+    assert b"EXTERNAL-DIFF-RAN" in raw, "external diff did not fire; test would be vacuous"
+    raw_untracked = subprocess.run(
+        ["git", "-C", str(repo), "--no-pager", "diff", "--no-index", "--", "/dev/null", "u-new.txt"],
+        capture_output=True,
+    ).stdout
+    assert b"TEXTCONV-" in raw_untracked, "textconv did not fire on --no-index"
+
+    after = capture_diff(repo, base.sha, untracked_max=100)
+    assert after.data == before.data
+    assert diff_identity(after.data) == diff_identity(before.data)
+    assert b"TEXTCONV-" not in after.data
+    assert b"EXTERNAL-DIFF-RAN" not in after.data
+    assert b"textconv target EDITED" in after.data  # the real content survived
+
+
+def _subdir_repo(tmp_path: Path) -> Path:
+    """A repo whose change spans the root and a subdirectory, incl. untracked."""
+    repo = _mkrepo(tmp_path)
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "sub").mkdir()
+    (repo / "sub" / "kept.txt").write_text("kept\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "c1")
+    _git(repo, "checkout", "-b", "feat2")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")  # tracked, at the root
+    (repo / "sub" / "kept.txt").write_text("kept edited\n", encoding="utf-8")  # tracked, in sub
+    (repo / "sub" / "new.txt").write_text("nu\n", encoding="utf-8")  # untracked, in sub
+    return repo
+
+
+def test_capture_diff_normalises_subdirectory_to_worktree_root(tmp_path):
+    """`git diff` paths are root-relative, `ls-files --others` paths are
+    cwd-relative — capturing from a subdirectory must not mix the two bases."""
+    repo = _subdir_repo(tmp_path)
+    base = resolve_base(repo)
+    from_root = capture_diff(repo, base.sha, untracked_max=100)
+    from_sub = capture_diff(repo / "sub", base.sha, untracked_max=100)
+    assert from_sub.data == from_root.data
+    assert from_sub.files == from_root.files
+    assert from_sub.statuses == from_root.statuses
+    assert diff_identity(from_sub.data) == diff_identity(from_root.data)
+    # not vacuous: the untracked entry is the one whose base would have differed
+    assert "sub/new.txt" in from_sub.files
+    # every listed path opens relative to the worktree root
+    for f in from_sub.files:
+        assert (repo / f).exists(), f"{f!r} is not openable from the worktree root"
+
+
+# --------------------------------------------------------------------------
+# error surface
+# --------------------------------------------------------------------------
+
+
+def test_git_failure_raises_giterror_carrying_the_command(tmp_path):
+    """A failing git invocation must surface as `GitError`, not a silent empty
+    result that a caller could mistake for "no change"."""
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    precheck = subprocess.run(
+        ["git", "-C", str(plain), "rev-parse", "--git-dir"], capture_output=True
+    )
+    assert precheck.returncode != 0, "precondition: the directory must not be a git repo"
+    with pytest.raises(GitError) as excinfo:
+        resolve_base(plain)
+    assert "rev-parse" in str(excinfo.value)  # the failing command is named
+    assert "rc=" in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------
@@ -347,11 +486,21 @@ def test_known_divergence_untracked_nonascii_name(tmp_path):
     simply fails to join and skodun asks for a fresh review — it never skips
     one. Reproducing the bug instead would require emulating git's
     `quote_c_style` in Python, a new and larger source of divergence.
+
+    The divergence exists under `core.quotepath=true` (git's default), which
+    `_mkrepo` pins repo-locally — so this test asserts a property of THAT
+    configuration rather than of whatever the runner's git happens to be set to.
+    Under `core.quotepath=false` the oracle would see the raw name, its `[ -f ]`
+    guard would pass, and the hashes would agree.
     """
     repo = _mkrepo(tmp_path)
     _git(repo, "checkout", "-b", "feat")
     (repo / "a.txt").write_text("two\n", encoding="utf-8")
     (repo / "ä-new.txt").write_text("umlaut\n", encoding="utf-8")  # untracked
+    # The precondition, asserted behaviourally rather than by reading config:
+    # the text-mode listing the oracle consumes really does quote the name.
+    assert _git(repo, "config", "--get", "core.quotepath") == "true"
+    assert '"\\303\\244-new.txt"' in _git(repo, "ls-files", "--others", "--exclude-standard")
     d = capture_diff(repo, resolve_base(repo).sha, 100)
     assert b"umlaut" in d.data  # skodun reviews it...
     assert "ä-new.txt" in d.files
@@ -359,6 +508,34 @@ def test_known_divergence_untracked_nonascii_name(tmp_path):
     # and the divergence is exactly the dropped section, nothing else
     without = capture_diff(repo, resolve_base(repo).sha, 0)
     assert diff_identity(without.data) == _oracle(repo, "--diff-hash")
+
+
+@requires_oracle
+def test_diff_identity_parity_untracked_all_skipped(tmp_path):
+    """The pure-separator branch: the untracked LIST is non-empty but every
+    entry fails `[ -f ]`, so no separator is appended. The oracle is the
+    authority that a bare `\\n` must not be joined on here."""
+    repo = _mkrepo(tmp_path)
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    (repo / "z-dangling.lnk").symlink_to("/definitely/missing/target")
+    listing = _git(repo, "ls-files", "--others", "--exclude-standard")
+    assert listing.splitlines() == ["z-dangling.lnk"]  # non-empty, and ONLY the symlink
+    d = capture_diff(repo, resolve_base(repo).sha, 100)
+    assert "z-dangling.lnk" not in d.files
+    assert not d.data.endswith(b"\n")
+    assert diff_identity(d.data) == _oracle(repo, "--diff-hash")
+
+
+@requires_oracle
+def test_diff_identity_parity_from_subdirectory(tmp_path):
+    """The oracle self-normalises with `cd "$(git rev-parse --show-toplevel)"`;
+    capturing from a subdirectory must land on the same hash it does."""
+    repo = _subdir_repo(tmp_path)
+    base = resolve_base(repo)
+    from_sub = capture_diff(repo / "sub", base.sha, 100)
+    assert diff_identity(from_sub.data) == _oracle(repo / "sub", "--diff-hash")
+    assert diff_identity(from_sub.data) == _oracle(repo, "--diff-hash")
 
 
 @requires_oracle

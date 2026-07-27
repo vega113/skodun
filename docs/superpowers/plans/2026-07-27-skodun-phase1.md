@@ -527,13 +527,17 @@ def is_trustworthy(parse_ok: bool, degraded: bool, diff_truncated: bool) -> bool
 - Create: `src/skodun/gitio.py`, `tests/test_gitio.py`
 
 **Interfaces:**
-- Produces: `resolve_base(repo: Path) -> Base(ref: str, sha: str, warning: str | None)` — candidate order `github/main` → `origin/main` → `main`; a candidate whose `merge-base <ref> HEAD` fails (unrelated histories) is skipped with the next tried; if none resolves, fall back to `HEAD^`, and if `HEAD^` doesn't exist (single-commit repo) to `HEAD` — both fallbacks carry `warning`.
-  `capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff(data: bytes, files: list[str], statuses: dict[str, str], truncated_untracked: bool)` — working tree vs base incl. untracked via `git diff --no-index -- /dev/null <f>`, capped; `statuses` maps path → one-letter status (`A`/`M`/`D`/`R`…), with untracked files entered as `A` — Task 9's context packer consumes it to classify `added`/`deleted`/`already-in-diff`. **Path parsing is NUL-delimited**: file lists come from `git diff --name-status -z <base_sha>` and `git ls-files --others --exclude-standard -z`, split on `\0` with no whitespace stripping — text-mode parsing plus `.strip()` corrupts filenames with non-ASCII characters (git quotes them as `"\303\244.txt"` under default `core.quotepath`) or meaningful leading/trailing spaces, and the context packer would then open the wrong path. **Concatenation parity:** the oracle joins the tracked diff and untracked `--no-index` sections with a `\n` separator (an untracked-only change yields `"\n" + udiff` after the empty tracked capture) — reproduce its exact concatenation; the `--diff-hash` parity tests below must include an untracked-only case.
+- Produces: `resolve_base(repo: Path) -> Base(ref: str, sha: str, warning: str | None)` — candidate order `github/main` → `origin/main` → `main`. **ORACLE-DRIVEN CORRECTION** (the live oracle contradicted this plan's original wording): candidate selection is **existence-only with `break`** — the oracle takes the *first* candidate that merely `rev-parse --verify`s and stops looking (`&& { BASE_REF="$cand"; break; }`). A candidate that exists but has **no** `merge-base` with HEAD does **not** fall through to the next candidate; it falls straight to `HEAD^`. Falling through would pick a different `base_sha` — and therefore a different diff and a different `diff_hash` — than the oracle in any repo with an unrelated `github/main`. If `HEAD^` doesn't exist (single-commit repo) fall back to `HEAD` — both fallbacks carry `warning`.
+  `capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff(data: bytes, files: list[str], statuses: dict[str, str], truncated_untracked: bool)` — working tree vs base incl. untracked via `git diff --no-index -- /dev/null <f>`, capped; `statuses` maps path → one-letter status (`A`/`M`/`D`/`R`…), with untracked files entered as `A` — Task 9's context packer consumes it to classify `added`/`deleted`/`already-in-diff`. **Path parsing is NUL-delimited**: file lists come from `git diff --name-status -z <base_sha>` and `git ls-files --others --exclude-standard -z`, split on `\0` with no whitespace stripping — text-mode parsing plus `.strip()` corrupts filenames with non-ASCII characters (git quotes them as `"\303\244.txt"` under default `core.quotepath`) or meaningful leading/trailing spaces, and the context packer would then open the wrong path.
+  **ORACLE-DRIVEN CORRECTIONS to `capture_diff`, all three found by running the oracle:**
+  - **Worktree-root normalisation.** `capture_diff` resolves `repo` to `git rev-parse --show-toplevel` *before any git call*, exactly as the oracle's `--diff-hash`/`--base-sha` seams do (`WORKTREE="$(git rev-parse --show-toplevel)"; cd "$WORKTREE"`). `git diff` emits worktree-root-relative paths while `git ls-files --others` emits cwd-relative ones, so a caller passing a subdirectory would otherwise silently mix two path bases into one `files` list (untracked entries unopenable from the root) and into one hash.
+  - **Non-regular untracked entries are skipped.** The oracle guards each untracked entry with `[ -f "$_uf" ]`, so a dangling symlink (or anything not a regular file) contributes no bytes — even though `git diff --no-index` would happily emit a section for it. Such entries stay out of `files`/`statuses` too: they carry no diff bytes and the context packer could not open them.
+  - **The `\n` separator is conditional.** The tracked and untracked sections are joined with exactly one `\n` **only when the untracked section is non-empty** (`[ -n "$UDIFF" ] && DIFF="$(printf '%s\n%s' "$DIFF" "$UDIFF")"`). An untracked-only change therefore yields `"\n" + udiff` (empty tracked capture), while a tracked-only change — or one whose untracked entries were all skipped by `[ -f ]` — gains no trailing separator at all. Each `$(...)` capture also strips ALL trailing newlines, so both sections are right-stripped before the join. The `--diff-hash` parity tests below must include an untracked-only case *and* a case where the untracked list is non-empty but the untracked section is not.
   `blob_sha1(data: bytes) -> str` (git hash-object equivalent over raw bytes);
   `diff_identity(data: bytes) -> str` = `blob_sha1(data.rstrip(b"\n"))` — **the** diff-hash function. The oracle round-trips the diff through `$(...)` command substitution, which strips all trailing newlines before hashing; hashing raw captured bytes yields a hash the legacy archive has never seen, breaking legacy import joins and shadow-compare. All skodun code hashes via `diff_identity`, never `blob_sha1` directly.
   `git_common_dir(repo: Path) -> Path`; `current_branch(repo) -> str`; `head_sha(repo) -> str`;
   `is_primary_checkout(repo: Path) -> bool` — true iff resolved `--git-dir` == resolved `--git-common-dir` (they differ exactly for linked worktrees; substring tests on the path misclassify repos that merely contain a `worktrees` directory in their path).
-- Oracle: `grok-prepush-review.sh` `resolve_outgoing_change` (lines 1694–1746) and the `--diff-hash` seam. `--no-ext-diff --no-textconv` mandatory.
+- Oracle: `grok-prepush-review.sh` `resolve_outgoing_change` (lines 1694–1746) and the `--diff-hash` seam. `--no-ext-diff --no-textconv` mandatory — and pinned by a test of their own (`.gitattributes` + a `diff.<drv>.textconv`/`diff.<drv>.command` driver configured in the test repo, asserting the captured bytes are unchanged), since oracle parity alone cannot catch their removal: both sides would be transformed equally.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -672,22 +676,33 @@ class Base:
     sha: str
     warning: str | None = None
 
+# Same text the oracle warns with, so shadow-compare diffs cleanly.
+_FALLBACK_WARNING = ("no main ref (github/main|origin/main|main) with a merge-base "
+                     "found; reviewing {ref}..HEAD + local edits only -- a "
+                     "multi-commit branch may be under-reviewed")
+
 def resolve_base(repo: Path) -> Base:
-    for ref in ("github/main", "origin/main", "main"):
-        cp = _run(repo, "rev-parse", "--verify", "--quiet", ref, ok_codes=(0, 1))
-        if cp.returncode != 0:
-            continue
-        mb = _run(repo, "merge-base", ref, "HEAD", ok_codes=(0, 1, 128))
-        if mb.returncode == 0:
-            return Base(ref=ref, sha=mb.stdout.decode("utf-8").strip())
-        # ref exists but shares no history — try the next candidate
-    cp = _run(repo, "rev-parse", "--verify", "--quiet", "HEAD^", ok_codes=(0, 1, 128))
+    # ORACLE PARITY: existence-only selection with `break`. The FIRST candidate
+    # that resolves wins outright; if it has no merge-base with HEAD we fall to
+    # HEAD^, we do NOT try the next candidate. (Falling through would pick a
+    # different base_sha — and diff, and diff_hash — than the oracle whenever an
+    # unrelated github/main exists.)
+    base_ref = ""
+    for cand in ("github/main", "origin/main", "main"):
+        if _run(repo, "rev-parse", "--verify", "-q", cand, ok_codes=(0, 1)).returncode == 0:
+            base_ref = cand
+            break
+    if base_ref:
+        mb = _run(repo, "merge-base", base_ref, "HEAD", ok_codes=(0, 1, 128))
+        sha = mb.stdout.decode("utf-8").strip() if mb.returncode == 0 else ""
+        if sha:
+            return Base(ref=base_ref, sha=sha)
+    cp = _run(repo, "rev-parse", "--verify", "-q", "HEAD^", ok_codes=(0, 1, 128))
     if cp.returncode == 0:
         return Base(ref="HEAD^", sha=cp.stdout.decode("utf-8").strip(),
-                    warning="no main ref found; falling back to HEAD^ — a "
-                            "multi-commit branch may be under-reviewed")
+                    warning=_FALLBACK_WARNING.format(ref="HEAD^"))
     return Base(ref="HEAD", sha=_out(repo, "rev-parse", "HEAD"),
-                warning="no main ref and no parent commit; falling back to HEAD")
+                warning=_FALLBACK_WARNING.format(ref="HEAD"))
 
 @dataclass(frozen=True)
 class Diff:
@@ -697,6 +712,12 @@ class Diff:
     truncated_untracked: bool = False
 
 def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
+    # ORACLE PARITY: the oracle's seams open with
+    #   WORKTREE="$(git rev-parse --show-toplevel)"; cd "$WORKTREE"
+    # `git diff` paths are worktree-root-relative, `ls-files --others` paths are
+    # cwd-relative — capturing from a subdirectory would mix two path bases into
+    # one file list and one hash. Normalise BEFORE any git call.
+    repo = Path(_out(repo, "rev-parse", "--show-toplevel"))
     tracked = _run(repo, "--no-pager", "diff", "--no-ext-diff", "--no-textconv",
                    base_sha).stdout
     statuses: dict[str, str] = {}
@@ -715,19 +736,35 @@ def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
     untracked = [f for f in _run(repo, "ls-files", "--others", "--exclude-standard",
                                  "-z").stdout.decode("utf-8", "replace").split("\0") if f]
     truncated = len(untracked) > untracked_max
-    # ORACLE PARITY: every capture round-trips a shell $(...) in the oracle, so
-    # each SECTION loses its trailing newlines, and sections are joined with
-    # exactly one "\n" (DIFF="$DIFF"$'\n'"$UDIFF"). Untracked-only therefore
-    # starts "\n" + udiff (empty first section). Joining unstripped sections
-    # would insert a doubled blank line and break the --diff-hash parity tests,
-    # which are the authority here.
-    sections = [tracked.rstrip(b"\n")]
-    for f in sorted(untracked)[:untracked_max]:
+    # ORACLE PARITY, three points the live oracle settled:
+    #  (1) every capture round-trips a shell $(...), so the tracked section and
+    #      the WHOLE untracked section are each trailing-newline-stripped;
+    #  (2) `[ -f "$_uf" ]` skips non-regular entries — a dangling symlink
+    #      contributes nothing, and must stay out of files/statuses too (no diff
+    #      bytes, and Task 9's packer could not open it);
+    #  (3) the "\n" separator is appended ONLY when the untracked section is
+    #      non-empty ([ -n "$UDIFF" ] && DIFF="$(printf '%s\n%s' ...)"). So an
+    #      untracked-only change starts "\n" + udiff, while a tracked-only change
+    #      — or one whose untracked entries were all skipped — gains no trailing
+    #      separator. Unconditional joining breaks the --diff-hash parity tests,
+    #      which are the authority here.
+    # Untracked order is git's own (ls-files order, then the cap) — never
+    # re-sorted in Python, which could diverge on locale/byte-order.
+    udiff = b""
+    for f in untracked[:untracked_max]:
+        if not (repo / f).is_file():   # `[ -f ]`: follows symlinks, rejects dangling
+            continue
         cp = _run(repo, "--no-pager", "diff", "--no-ext-diff", "--no-textconv",
                   "--no-index", "--", "/dev/null", f, ok_codes=(0, 1))
-        sections.append(cp.stdout.rstrip(b"\n"))
+        if not cp.stdout:
+            continue
+        udiff += cp.stdout
         files.append(f); statuses[f] = "A"
-    return Diff(data=b"\n".join(sections), files=files, statuses=statuses,
+    data = tracked.rstrip(b"\n")
+    udiff = udiff.rstrip(b"\n")
+    if udiff:
+        data = data + b"\n" + udiff
+    return Diff(data=data, files=files, statuses=statuses,
                 truncated_untracked=truncated)
 
 def git_common_dir(repo: Path) -> Path:
@@ -2202,4 +2239,5 @@ def test_union_surfaces_one_sided_hashes_and_newest_row_wins(tmp_path):
 - Spec coverage: diff identity (T4, legacy-compatible trailing-newline semantics + oracle parity test), checklists (T8), context packing (T9, status-aware), prompt (T10), watchdog/retries/timeout-output-discard (T11, T15), grok envelope + degraded detection (T12, case-insensitive), trust computed-on-write (T3) + banner (T13), security/skeptic with independent demotion axes (T14), gate 0/1/2 with empty-diff PASS, artifact↔index re-assertion, and recorded `SKODUN_GATE_SKIP` bypass (T7), triage ledger + parity keys + negative-index guard (T5, T6), SQLite + gate_events (T3), stale-record recovery (T15), legacy import with artifact-backed trust (T16), union shadow compare (T17), ≥5-change-set acceptance (T18), fg-lock byte-format interop (T15).
 - Explicitly out of scope (Global Constraints): batching (fail-closed truncation tested in T15), pre-push dispatcher + dedup probe (`--now` never dedups — tested in T15), same-branch supersede, rules-registry generation/sync (stays in tubescribes), the legacy `-p` re-shell fallback, MCP/scheduling/other adapters/retention.
 - Known intentional deviations from legacy: SQLite instead of JSONL sprawl; explicit `-m` model flag; `SKODUN`-prefixed banner/gate lines (cutover-compat shims are a later phase); phase-1 extra passes reuse the finder model (cross-provider refuter is Phase 2); no `-p` ARG_MAX fallback.
+- Known intentional deviation from legacy — **untracked files with non-ASCII names (Task 4)**: the oracle lists untracked files in *text* mode, so under git's default `core.quotepath=true` a brand-new file named e.g. `ä-new.txt` reaches its `[ -f "$_uf" ]` guard as the literal string `"\303\244-new.txt"`, the guard fails, and the file is dropped from the reviewed diff entirely — i.e. **it is silently never reviewed**. That is an oracle bug, and skodun does not reproduce it: it reads NUL-delimited names and includes the file, so for exactly this input class skodun's diff bytes are a *superset* of the oracle's and the two `diff_hash`es differ. The direction is fail-safe — a legacy record for such a change simply fails to join, so skodun asks for one extra review; it can never turn a missed join into a wrong gate PASS. Reproducing the bug instead would mean emulating git's `quote_c_style` in Python, a new and larger source of divergence. Pinned by `test_known_divergence_untracked_nonascii_name`, which pins `core.quotepath=true` repo-locally so it documents *which* configuration exhibits the bug rather than inheriting the runner's.
 - This plan was adversarially reviewed by codex (gpt-5.6-sol, high reasoning effort) over multiple rounds; all 26 round-1, 12 round-2, and 9 round-3 findings (incl. `bool("false")` coercion, NUL-delimited path parsing with `R`/`C` two-path records, section-stripped `\n` join for diff parity, byte-exact prompt port via the `--write-prompt` seam, FIFO-safe `_safe_open`, the complete inline `PLACEHOLDER_REASONS` set, and uuid-suffixed record IDs) are incorporated above.
