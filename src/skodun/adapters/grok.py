@@ -28,6 +28,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..config import Defaults, Reviewer
 
@@ -77,8 +78,11 @@ _SEVERITIES = frozenset({"high", "medium", "low"})
 _NO_EFFORT_PREFIXES = ("grok-build",)
 
 # `effort` values that mean "do not pass the flag at all". `None` is unset;
-# `"none"` is the user's explicit opt-out (see `config.EFFORTS`).
-_EFFORT_OFF = (None, "", "none")
+# `"none"` is the user's explicit opt-out. Those are the only two: `config`
+# rejects every other spelling (`""` included — it is not in `config.EFFORTS`)
+# before a `Reviewer` can reach this module, so an empty-string branch here
+# would be dead code that quietly implies a third, undocumented opt-out.
+_EFFORT_OFF = (None, "none")
 
 
 @dataclass(frozen=True)
@@ -205,6 +209,38 @@ def _first_review_object(text: str) -> dict | None:
     return None
 
 
+def _root_envelope(text: str) -> object | None:
+    """The envelope ROOT value, or None if `text` does not open with one.
+
+    `raw_decode` rather than `json.loads`, and this is a trust fix rather than
+    a tidy-up: `loads` raises "Extra data" on ANY trailing byte, while the
+    level-3 scan below is deliberately built to survive exactly that (grok
+    wraps its answer in prose and *sometimes emits the final object twice*).
+    With `loads` here the two disagreed, and the disagreement was silent and
+    one-directional: stdout of a good envelope carrying `"stopReason":
+    "Cancelled"` plus one trailing line parsed fine at level 3 but produced NO
+    root, so the stopReason check was skipped and the run recorded
+    `parse_ok=True, degraded=False` — the exact combination that certifies a
+    review, on a run the model cancelled.
+
+    Deliberate divergence from the oracle, in the FAIL-SAFE direction: the
+    oracle's `grok_stop_reason` uses `json.load` and goes silent on the same
+    input, so skodun now flags degraded where the oracle stayed quiet. A false
+    positive costs one re-review; a false negative is a silent false all-clear.
+    Pinned by `test_oracle_misses_stop_reason_after_trailing_data`.
+    """
+    # `raw_decode` does not skip leading whitespace (`loads` does); strip it so
+    # a pretty-printed envelope is still recognised as an envelope.
+    stripped = text.lstrip()
+    if not stripped:
+        return None
+    try:
+        root, _ = json.JSONDecoder().raw_decode(stripped, 0)
+    except ValueError:
+        return None
+    return root
+
+
 def _root_stop_reason(root: object) -> str | None:
     """Root `stopReason`, read as a STRING or not at all.
 
@@ -227,12 +263,16 @@ def _extract_review(stdout: bytes) -> tuple[dict | None, str | None]:
     carries non-ASCII, and in exactly the truncated runs that matter it carries
     invalid multibyte sequences. A `UnicodeDecodeError` here would skip the
     stopReason check on the very runs it exists to catch.
+
+    That is the second deliberate divergence from the oracle, again in the
+    FAIL-SAFE direction: the oracle's `grok_stop_reason` opens the file with a
+    strict `encoding="utf-8"` and lets `except Exception` swallow the
+    `UnicodeDecodeError`, so an envelope carrying one bad byte alongside
+    `"stopReason": "Cancelled"` yields no signal there and a `degraded` flag
+    here. Pinned by `test_oracle_misses_stop_reason_in_invalid_utf8_envelope`.
     """
     text = stdout.decode("utf-8", "replace")
-    try:
-        root = json.loads(text)
-    except ValueError:
-        root = None
+    root = _root_envelope(text)
 
     stop_reason = _root_stop_reason(root)
 
@@ -260,9 +300,13 @@ def _extract_review(stdout: bytes) -> tuple[dict | None, str | None]:
 
 def _valid_payload(obj: object) -> bool:
     """True iff `obj` is a review this program can act on without guessing."""
-    if not _eligible(obj):
+    # `_eligible` already implies `isinstance(obj, dict)`, but this is the
+    # trust-critical validator: the narrowing is spelled as a real check rather
+    # than an `assert`, which `python -O` strips. Under -O a bare assert would
+    # leave `obj.get` unguarded and turn a hostile payload into an
+    # AttributeError inside the gate path instead of a clean `parse_ok=False`.
+    if not isinstance(obj, dict) or not _eligible(obj):
         return False
-    assert isinstance(obj, dict)  # narrowed by _eligible
     if not isinstance(obj.get("summary"), str):
         return False
     findings = obj.get("findings")
@@ -286,6 +330,17 @@ def _valid_payload(obj: object) -> bool:
             if isinstance(line, bool) or not isinstance(line, int):
                 return False
     return True
+
+
+if TYPE_CHECKING:  # pragma: no cover - static conformance, no runtime cost
+    # `GrokAdapter` explicitly declares that it satisfies the package's
+    # `Adapter` protocol. Under TYPE_CHECKING only, because the protocol lives
+    # in the package `__init__` that imports this module — a runtime import
+    # would be a cycle. A type checker fails HERE, at the definition site, if
+    # `build_cmd`/`parse` ever drift from the protocol.
+    from . import Adapter
+
+    _CONFORMS: type[Adapter] = GrokAdapter
 
 
 # --------------------------------------------------------------------------

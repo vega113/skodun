@@ -53,6 +53,22 @@ TOKEN_ENVELOPE = json.dumps(
      "text": f"<{LEAKED}>search"}, ensure_ascii=False).encode("utf-8")
 
 
+@pytest.fixture(autouse=True)
+def pinned_grok_bin(monkeypatch, tmp_path):
+    """Never touch the developer's real `~/.grok`.
+
+    `resolve_grok_bin` falls back to `os.access(Path.home()/".grok"/...)`, so
+    every `build_cmd` test that left `SKODUN_GROK_BIN` unset was stat-ing the
+    real home directory and letting `argv[0]` vary by machine. Nothing is
+    created or modified there, but the constraint is absolute and a
+    machine-dependent argv is a latent flake. The five dedicated
+    binary-resolution tests below override this fixture explicitly (they set or
+    delete the variable themselves), which is the point: resolution order is
+    tested only where it is the subject.
+    """
+    monkeypatch.setenv("SKODUN_GROK_BIN", str(tmp_path / "pinned" / "grok"))
+
+
 def env(**kw) -> bytes:
     """A realistic grok envelope: the real key set observed on the wire."""
     e = {
@@ -484,6 +500,32 @@ def test_malformed_finding_items_fail_parse():
          "line": True}]})
 
 
+@pytest.mark.parametrize("payload", [
+    pytest.param({"summary": "ok", "findings": [1]}, id="non-dict-item"),
+    pytest.param({"summary": "ok", "findings": [
+        {"file": "a", "severity": "urgent", "title": "t", "detail": "d"}]},
+        id="bad-severity"),
+    pytest.param({"summary": "ok", "findings": [
+        VALID_FINDING, {"file": "a", "severity": "low", "title": "t"}]},
+        id="one-good-one-truncated"),
+    pytest.param({"summary": 1, "findings": [VALID_FINDING]},
+                 id="good-findings-bad-summary"),
+])
+def test_rejected_payload_leaks_no_findings(payload):
+    """The `ParseResult` invariant: `findings` is empty unless `parse_ok`.
+
+    Each payload HAS a `findings` list — some of it well-formed — and still
+    fails validation. A caller that checked `degraded` but forgot `parse_ok`
+    must see nothing, not a half-shaped list it will key by `file`/`severity`.
+    Guards the `if parse_ok` in `GrokAdapter.parse`: populating `findings`
+    whenever `payload["findings"]` is a list passes every other test here.
+    """
+    p = GrokAdapter().parse(env(structuredOutput=payload), b"")
+    assert not p.parse_ok
+    assert p.findings == []
+    assert p.summary == ""
+
+
 # --------------------------------------------------------------------------
 # degraded detection
 # --------------------------------------------------------------------------
@@ -620,6 +662,64 @@ def test_non_envelope_output_has_no_stop_reason_signal():
     assert p.parse_ok and not p.degraded and p.stop_reason is None
 
 
+# --- trailing bytes must not hide the stopReason --------------------------
+#
+# The envelope root is parsed with `raw_decode`, not `json.loads`. `loads`
+# raises "Extra data" on any trailing byte, while the payload extractor's
+# level-3 scan is built to survive exactly that — so with `loads` a good
+# envelope plus one trailing line yielded `parse_ok=True, degraded=False,
+# stop_reason=None` on a run the model CANCELLED. Each test below fails if the
+# root parse goes back to `json.loads`.
+
+
+def test_trailing_prose_does_not_hide_a_cancelled_stop_reason():
+    raw = (json.dumps({"structuredOutput": GOOD, "stopReason": "Cancelled"})
+           + "\nVERDICT: clean\n").encode()
+    p = GrokAdapter().parse(raw, b"")
+    assert p.stop_reason == "Cancelled"
+    assert p.degraded and "stopReason" in p.degraded_reason
+    # the payload is still recovered: this adds a signal, it removes nothing
+    assert p.parse_ok and p.summary == "ok"
+
+
+def test_trailing_prose_after_endturn_is_still_clean():
+    """The fix must not invent a signal: `EndTurn` + trailing bytes is fine."""
+    raw = (json.dumps({"structuredOutput": GOOD, "stopReason": "EndTurn"})
+           + "\nVERDICT: clean\n").encode()
+    p = GrokAdapter().parse(raw, b"")
+    assert p.stop_reason == "EndTurn"
+    assert not p.degraded and p.degraded_reason == ""
+    assert p.parse_ok and p.summary == "ok"
+
+
+def test_duplicated_final_object_does_not_hide_the_stop_reason():
+    """grok sometimes emits its final object twice (the shape the raw scan
+    exists for). The root read must survive it too."""
+    one = json.dumps({"structuredOutput": GOOD, "stopReason": "Cancelled"})
+    p = GrokAdapter().parse((one + "\n" + one).encode(), b"")
+    assert p.parse_ok and p.summary == "ok"
+    assert p.stop_reason == "Cancelled" and p.degraded
+
+
+def test_leading_whitespace_envelope_still_yields_a_stop_reason():
+    """`raw_decode` does not skip leading whitespace the way `loads` does; a
+    pretty-printed / newline-prefixed envelope must not lose its stopReason."""
+    raw = ("\n  " + json.dumps(
+        {"structuredOutput": GOOD, "stopReason": "Cancelled"}, indent=2)).encode()
+    p = GrokAdapter().parse(raw, b"")
+    assert p.stop_reason == "Cancelled" and p.degraded and p.parse_ok
+
+
+def test_trailing_bytes_before_a_root_object_are_still_no_signal():
+    """Only a root that OPENS the output counts. Prose first means the object
+    is not the envelope root, and a stopReason inside it is not a root field."""
+    raw = (b"here is my answer: "
+           + json.dumps({"structuredOutput": GOOD,
+                         "stopReason": "Cancelled"}).encode())
+    p = GrokAdapter().parse(raw, b"")
+    assert p.stop_reason is None and not p.degraded
+
+
 # --- the two explicit NON-signals -----------------------------------------
 
 
@@ -688,13 +788,35 @@ PARITY_CASES = [
     ("empty-both", b"", b"", False),
 ]
 
-# Known, deliberate divergence: the oracle's turn-limit grep is `grep -Fq`
-# (case-SENSITIVE, line 393), while skodun matches case-insensitively. That is
-# a strict superset in the fail-safe direction — skodun flags everything the
-# oracle flags, plus mixed-case spellings. Pinned by
-# `test_oracle_is_case_sensitive_for_max_turns_and_skodun_is_not` below and
-# excluded from the row-by-row parity sweep.
+# Three known, deliberate divergences. All are strict supersets in the
+# fail-safe direction — skodun flags everything the oracle flags, plus shapes
+# the oracle goes silent on — so each is pinned by its own test below and kept
+# OUT of the row-by-row sweep above rather than being dropped from it.
+
+# (1) The oracle's turn-limit grep is `grep -Fq` (case-SENSITIVE, line 393),
+# while skodun matches case-insensitively.
+# Pinned by `test_oracle_is_case_sensitive_for_max_turns_and_skodun_is_not`.
 MAX_TURNS_MIXED_CASE = b"Max Turns Reached"
+
+# (2) The oracle's `grok_stop_reason` reads the root with `json.load`, which
+# raises "Extra data" on ANY trailing byte, so a Cancelled envelope followed by
+# one more line yields NO signal there. skodun reads the root with `raw_decode`
+# and still sees the stopReason.
+# Pinned by `test_oracle_misses_stop_reason_after_trailing_data`.
+TRAILING_DATA_CANCELLED = (
+    json.dumps({"structuredOutput": GOOD, "stopReason": "Cancelled"})
+    + "\nVERDICT: clean\n").encode("utf-8")
+
+# (3) skodun decodes the envelope with `errors="replace"` while the oracle
+# opens it with a strict `encoding="utf-8"` `json.load` whose `except
+# Exception` swallows the resulting UnicodeDecodeError. One invalid byte
+# anywhere in the envelope therefore hides a Cancelled stopReason from the
+# oracle and not from skodun — and invalid multibyte sequences occur in exactly
+# the truncated runs this signal exists to catch.
+# Pinned by `test_oracle_misses_stop_reason_in_invalid_utf8_envelope`.
+INVALID_UTF8_CANCELLED = json.dumps(
+    {"structuredOutput": GOOD, "stopReason": "Cancelled", "text": "MARK"},
+).encode("utf-8").replace(b"MARK", b"\xff")
 
 
 def _oracle_driver(tmp_path: Path) -> Path:
@@ -759,6 +881,49 @@ def test_oracle_is_case_sensitive_for_max_turns_and_skodun_is_not(tmp_path):
     assert GrokAdapter().parse(CLEAN, b"max turns reached").degraded is True
     assert _run_oracle(tmp_path, CLEAN, MAX_TURNS_MIXED_CASE) is False
     assert GrokAdapter().parse(CLEAN, MAX_TURNS_MIXED_CASE).degraded is True
+
+
+@pytest.mark.skipif(oracle_dir() is None, reason="SKODUN_ORACLE_DIR not set")
+def test_oracle_misses_stop_reason_after_trailing_data(tmp_path):
+    """Pins divergence (2): trailing bytes hide the stopReason from the oracle.
+
+    `grok_stop_reason` uses `json.load`, so one extra line after the envelope
+    makes it raise "Extra data", get swallowed by `except Exception`, and print
+    "" — no signal, on a run the model CANCELLED, whose payload parses fine.
+    skodun's `raw_decode` root read still sees it. Fail-safe direction: a false
+    positive costs one re-review, a false negative is a silent false all-clear.
+
+    If this ever fails because the oracle learned to parse resiliently, the fix
+    is to delete the divergence note — never to loosen skodun.
+    """
+    assert _run_oracle(tmp_path, TRAILING_DATA_CANCELLED, b"") is False
+    ours = GrokAdapter().parse(TRAILING_DATA_CANCELLED, b"")
+    assert ours.degraded is True and ours.stop_reason == "Cancelled"
+    # ...and the payload the oracle would have believed is genuinely valid, so
+    # the divergence is an added signal rather than a parse difference.
+    assert ours.parse_ok is True
+    # The same envelope WITHOUT trailing bytes: both agree. The divergence is
+    # confined to the trailing-data shape.
+    plain = json.dumps({"structuredOutput": GOOD,
+                        "stopReason": "Cancelled"}).encode("utf-8")
+    assert _run_oracle(tmp_path, plain, b"") is True
+    assert GrokAdapter().parse(plain, b"").degraded is True
+
+
+@pytest.mark.skipif(oracle_dir() is None, reason="SKODUN_ORACLE_DIR not set")
+def test_oracle_misses_stop_reason_in_invalid_utf8_envelope(tmp_path):
+    """Pins divergence (3): a bad byte hides the stopReason from the oracle.
+
+    The oracle opens the file with a strict `encoding="utf-8"`, so one invalid
+    byte raises `UnicodeDecodeError`, `except Exception` swallows it, and the
+    Cancelled run reads clean. skodun decodes with `errors="replace"` and still
+    reads the root field.
+    """
+    assert b"\xff" in INVALID_UTF8_CANCELLED
+    assert _run_oracle(tmp_path, INVALID_UTF8_CANCELLED, b"") is False
+    ours = GrokAdapter().parse(INVALID_UTF8_CANCELLED, b"")
+    assert ours.degraded is True and ours.stop_reason == "Cancelled"
+    assert ours.parse_ok is True
 
 
 @pytest.mark.skipif(oracle_dir() is None, reason="SKODUN_ORACLE_DIR not set")

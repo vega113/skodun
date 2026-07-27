@@ -36,7 +36,10 @@ class Adapter(Protocol):
         ...
 
 
-_REGISTRY: dict[str, type] = {"xai": GrokAdapter}
+# Typed as `type[Adapter]`, not bare `type`: registering a class that does not
+# satisfy the protocol is then a type error at the table, not a surprise at the
+# first `parse()` of a real review.
+_REGISTRY: dict[str, type[Adapter]] = {"xai": GrokAdapter}
 
 
 def get_adapter(provider: str) -> Adapter:
