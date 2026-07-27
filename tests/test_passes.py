@@ -17,14 +17,18 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from skodun.config import SECURITY_PATH_SEGMENTS, load_config
-from skodun.passes import (merge_extra_pass, security_prompt, should_run_security,
+from skodun.config import (SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOT_NAMES,
+                           SECURITY_PROMPT_SLOTS, load_config)
+from skodun.passes import (_SECURITY_LEAD_TEMPLATE, failed_pass_reason,
+                           merge_extra_pass, merge_failed_extra_pass,
+                           security_lead, security_prompt, should_run_security,
                            should_run_skeptic, skeptic_prompt)
 from tests.conftest import oracle_dir
 
@@ -49,8 +53,9 @@ def test_default_segments_are_the_configs_generic_set():
     """The default really is `config.SECURITY_PATH_SEGMENTS`, not a copy."""
     assert "credential" in SECURITY_PATH_SEGMENTS
     assert should_run_security("now", ["svc/credential/Store.go"])
-    # ... and the oracle's own repo-specific segments are NOT in the default.
-    assert not should_run_security("now", ["src/main/scala/dao/UserDao.scala"])
+    # ... and a repo's own layout vocabulary is NOT in the default: `dao` is a
+    # perfectly good segment to configure, and skodun does not ship it.
+    assert not should_run_security("now", ["app/dao/UserStore.scala"])
 
 
 def test_security_trigger_tables_come_from_config():
@@ -133,9 +138,39 @@ def _primary() -> dict:
 
 
 def test_failed_extra_pass_clears_parse_ok():
-    out = merge_extra_pass(_primary(), None, "security")
+    out = merge_failed_extra_pass(_primary(), "security",
+                                  failed_pass_reason("security"))
     assert out["parse_ok"] is False
+    # The demoted record must not read as more trustworthy than it is: pinning
+    # `trustworthy` here as well as `parse_ok` is what stops a `trustworthy:
+    # True, parse_ok: False` record from ever being emitted.
+    assert out["trustworthy"] is False
     assert "security" in out["failure_reason"]
+
+
+def test_merge_extra_pass_refuses_to_demote_on_a_None_record():
+    """The failure path has to be asked for by name (DIVERGENCE 1).
+
+    A pass `should_run_*` declined is simply not merged; a pass that ran and
+    produced nothing goes through `merge_failed_extra_pass`. Neither can be
+    reached by handing `merge_extra_pass` a `None`, so no caller demotes a good
+    review by accident.
+    """
+    with pytest.raises(TypeError, match="merge_failed_extra_pass"):
+        merge_extra_pass(_primary(), None, "security")  # type: ignore[arg-type]
+
+
+def test_merge_failed_extra_pass_requires_a_reason():
+    with pytest.raises(ValueError, match="failure_reason"):
+        merge_failed_extra_pass(_primary(), "security", "")
+    with pytest.raises(ValueError, match="failure_reason"):
+        merge_failed_extra_pass(_primary(), "security", "   ")
+
+
+def test_merge_failed_extra_pass_records_the_callers_own_reason():
+    out = merge_failed_extra_pass(_primary(), "skeptic", "grok exited 137")
+    assert out["failure_reason"] == "grok exited 137"
+    assert out["parse_ok"] is False and out["trustworthy"] is False
 
 
 def test_unparseable_extra_pass_clears_parse_ok_and_keeps_its_reason():
@@ -143,8 +178,18 @@ def test_unparseable_extra_pass_clears_parse_ok_and_keeps_its_reason():
                  failure_reason="no JSON object in output")
     out = merge_extra_pass(_primary(), extra, "skeptic")
     assert out["parse_ok"] is False
+    assert out["trustworthy"] is False       # not just the axis — the verdict
     assert out["failure_reason"] == "no JSON object in output"
     assert out["degraded"] is False          # the other axis is untouched
+
+
+def test_extra_pass_that_omits_parse_ok_is_a_failure_not_a_clear():
+    """`parse_ok` must be exactly True. Silence is not success."""
+    out = merge_extra_pass(_primary(), dict(findings=[]), "security")
+    assert out["parse_ok"] is False
+    assert out["trustworthy"] is False
+    assert "security" in out["failure_reason"]
+    assert out["extra_passes"]["security"]["parse_ok"] is False
 
 
 def test_degraded_extra_pass_sets_degraded_not_parse_ok():
@@ -281,8 +326,13 @@ def test_merge_records_observability_meta():
     meta = merge_extra_pass(_primary(), extra, "security")["extra_passes"]["security"]
     assert meta["ran"] is True and meta["pass"] == "security"
     assert meta["findings_total"] == 1 and meta["id"] == "x1"
-    meta_none = merge_extra_pass(_primary(), None, "skeptic")["extra_passes"]["skeptic"]
-    assert meta_none["ran"] is False and meta_none["skipped"] is True
+    failed = merge_failed_extra_pass(_primary(), "skeptic",
+                                     failed_pass_reason("skeptic"))
+    meta_failed = failed["extra_passes"]["skeptic"]
+    # `failed`, never `skipped`: the observability record has to agree with the
+    # demotion it sits next to (`parse_ok: False` and a reason blaming the pass).
+    assert meta_failed["ran"] is False and meta_failed["failed"] is True
+    assert "skipped" not in meta_failed
 
 
 def test_merge_does_not_mutate_primary():
@@ -314,9 +364,48 @@ def test_two_merges_from_one_primary_do_not_contaminate_each_other():
     assert b["severity"] == {"high": 0, "medium": 0, "low": 1}
 
 
+def test_carried_over_finding_dicts_are_shared_but_never_written():
+    """DIVERGENCE 2, stated exactly: fresh containers, shared elements.
+
+    The result's `findings` list is new, but the primary's own finding dicts go
+    into it by reference — merging copies a finding only when it tags one. The
+    same goes for an earlier pass's meta dict across a chained merge. Nothing
+    here writes to either, and this pins that promise at its real width so the
+    docstring cannot quietly overstate it.
+    """
+    primary = _primary()
+    primary["findings"] = [dict(file="p", line=1, severity="high", title="A")]
+    extra = dict(parse_ok=True, degraded=False, summary="s",
+                 findings=[dict(file="a", line=2, severity="low", title="B")])
+    first = merge_extra_pass(primary, extra, "security")
+
+    assert first["findings"] is not primary["findings"]     # fresh container
+    assert first["findings"][0] is primary["findings"][0]   # shared element
+    assert primary["findings"][0] == dict(file="p", line=1, severity="high",
+                                          title="A")        # ... never written
+    # The extra pass's own findings are copied before tagging, so the caller's
+    # `extra` record is untouched too.
+    assert first["findings"][1] is not extra["findings"][0]
+    assert extra["findings"][0]["title"] == "B"
+
+    second = merge_extra_pass(first, dict(parse_ok=True, degraded=False,
+                                          summary="s", findings=[]), "skeptic")
+    assert second["extra_passes"] is not first["extra_passes"]
+    assert second["extra_passes"]["security"] is first["extra_passes"]["security"]
+    assert first["extra_passes"]["security"]["pass"] == "security"
+
+
 def test_merge_rejects_a_non_dict_primary():
-    with pytest.raises(TypeError):
-        merge_extra_pass(["not", "a", "dict"], None, "security")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="primary"):
+        merge_extra_pass(["not", "a", "dict"],  # type: ignore[arg-type]
+                         dict(parse_ok=True, findings=[]), "security")
+
+
+@pytest.mark.parametrize("bad", [["findings"], "parse_ok", 7, True])
+def test_merge_rejects_a_non_mapping_extra(bad):
+    """`extra` is the untrusted side — it must fail as clearly as `primary`."""
+    with pytest.raises(TypeError, match="extra must be a mapping"):
+        merge_extra_pass(_primary(), bad, "security")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +434,67 @@ def test_security_prompt_is_security_only():
     assert '"category":"security"' in text
     # a dedicated pass, not a checklist review
     assert "REPO RULES" not in text
+
+
+# --- the security prompt's variable spans ----------------------------------
+
+def test_prompt_template_slot_names_match_the_config_key():
+    """The template and `Defaults.security_prompt_slots` must agree.
+
+    `config.load_config` validates a user's slot names against
+    `SECURITY_PROMPT_SLOT_NAMES`, so a template slot missing from that set would
+    be unfillable and a config-only name would be silently dropped.
+    """
+    used = set(re.findall(r"%\((\w+)\)s", "\n".join(_SECURITY_LEAD_TEMPLATE)))
+    assert used == set(SECURITY_PROMPT_SLOT_NAMES)
+    assert used == {name for name, _ in SECURITY_PROMPT_SLOTS}
+    # No bare `%` anywhere else, or `%`-substitution would explode on a prompt.
+    assert security_lead()          # renders at all, with the defaults
+
+
+def test_default_security_prompt_names_no_particular_project():
+    """The shipped prompt is data sent to a model in every repo skodun runs in.
+
+    It must read naturally with no project in mind — the concrete vocabulary of
+    any one stack belongs in that repo's config (examples/ carries a worked one).
+    """
+    text = security_prompt(diff=b"", **_ARGS).text.decode("utf-8").lower()
+    lead = text.split("branch:")[0]
+    for noun in ("telegram", "credits", "dao", "routeservice", "route service"):
+        assert noun not in lead, noun
+    # ... and it still names the generic surfaces and checks.
+    for phrase in ("authentication, authorization", "public http endpoints",
+                   "webhook validation", "payment and quota integrity"):
+        assert phrase in lead, phrase
+
+
+def test_security_prompt_slots_come_from_config():
+    text = security_prompt(
+        diff=b"", prompt_slots=(("surfaces", "widgets and sprockets"),
+                                ("extra_checks", "- sprocket integrity")),
+        **_ARGS).text.decode("utf-8")
+    assert "risky surfaces (widgets and sprockets). This is a dedicated" in text
+    assert "\n- sprocket integrity\n" in text
+    assert "authentication, authorization" not in text
+
+
+def test_unfilled_and_unknown_prompt_slots_are_fail_soft():
+    """Consuming a table is fail-soft; a malformed one died at load time."""
+    only_one = security_lead((("surfaces", "widgets"),))
+    assert "risky surfaces (widgets)." in only_one[1]
+    # the slot that was not supplied keeps its generic default
+    assert any("payment and quota integrity" in line for line in only_one)
+    assert security_lead((("nonesuch", "ignored"),)) == security_lead(())
+    assert security_lead(()) == security_lead()
+
+
+def test_example_config_security_prompt_uses_its_own_vocabulary(tmp_path):
+    """Runs without the oracle; the byte-exact check is the parity test below."""
+    slots = _example_defaults(tmp_path).security_prompt_slots
+    text = security_prompt(diff=b"", prompt_slots=slots, **_ARGS).text.decode("utf-8")
+    assert ("risky surfaces (auth, public HTTP routes, db/dao, Telegram webhooks,\n"
+            "billing, or credits). This is a dedicated security pass") in text
+    assert "- billing/credits integrity (privilege escalation, free usage)\n" in text
 
 
 @pytest.mark.parametrize("fn", [security_prompt, skeptic_prompt])
@@ -387,6 +537,12 @@ def test_example_config_declares_both_security_tables(tmp_path):
     assert "dao" in d.security_path_segments      # repo-specific, not a default
     assert d.security_path_segments != SECURITY_PATH_SEGMENTS
     assert any("routeservice" in p for p in d.security_basename_patterns)
+
+
+def test_example_config_fills_every_security_prompt_slot(tmp_path):
+    slots = _example_defaults(tmp_path).security_prompt_slots
+    assert {name for name, _ in slots} == set(SECURITY_PROMPT_SLOT_NAMES)
+    assert slots != SECURITY_PROMPT_SLOTS         # repo-specific, not a default
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +596,41 @@ ORACLE_PATH_CORPUS: tuple[str, ...] = (
 )
 
 
+#: The ONLY paths on which skodun and the oracle disagree, as
+#: `(path, oracle_is_risky, skodun_is_risky)` — found by a 20k-path differential
+#: over generated path shapes, and recorded here so they can never resurface as
+#: a surprise. All four come from the one deliberate rule change: a
+#: `security_basename_patterns` entry containing "/" is matched against the
+#: SEGMENT-compacted path, so a directory boundary means what it says, where the
+#: oracle compacted the whole path flat and tested `"/api/services/" in path`.
+#:
+#:  * rows 1-2 are FAIL-OPEN (oracle runs a security pass, skodun does not): a
+#:    directory literally named like a route service sitting above the real
+#:    `api/services/`, which satisfies the oracle's two independent substring
+#:    tests by accident. Nothing under `api/services/` is named like a route
+#:    service, so there is no route-service surface in the change;
+#:  * rows 3-4 are FAIL-SAFE (skodun runs an extra pass the oracle skips):
+#:    punctuation inside a directory name that compaction removes, so skodun
+#:    sees the directory the oracle's literal substring test missed.
+#:
+#: This is a clearly-labeled parity corpus, so it carries the concrete literals.
+ORACLE_KNOWN_DIVERGENCES: tuple[tuple[str, bool, bool], ...] = (
+    ("RouteService/api/services/x.ts", True, False),
+    ("routeservice/api/services/x.ts", True, False),
+    ("a.p.i/services/FooRouteService.scala", False, True),
+    ("api/serv.ices/FooRouteService.scala", False, True),
+)
+
+
+@pytest.mark.parametrize("path,_oracle,skodun", ORACLE_KNOWN_DIVERGENCES)
+def test_known_divergences_skodun_side(tmp_path, path, _oracle, skodun):
+    """Pinned without the oracle, so CI holds skodun's half of each row."""
+    d = _example_defaults(tmp_path)
+    assert should_run_security(
+        "now", [path], path_segments=d.security_path_segments,
+        basename_patterns=d.security_basename_patterns) is skodun
+
+
 def _oracle_module(root: Path):
     path = root / ORACLE_SCRIPT
     assert path.is_file(), f"oracle script not found: {path}"
@@ -470,6 +661,24 @@ def test_example_config_reproduces_oracle_security_triggers(tmp_path):
     clean = [p for p, w in zip(ORACLE_PATH_CORPUS, expected) if not w]
     assert should_run_security("now", clean, **tables) is \
         oracle.any_path_risky(clean)
+
+
+@pytest.mark.skipif(oracle_dir() is None, reason="SKODUN_ORACLE_DIR unset")
+def test_known_divergences_are_still_exactly_these(tmp_path):
+    """Both halves of every recorded row, against the live oracle.
+
+    A fix that closes one of these must delete its row, not leave it lying;
+    a *new* divergence has to be found by re-running the differential, but the
+    recorded four staying true is the cheap continuous half of that.
+    """
+    oracle = _oracle_module(oracle_dir())
+    d = _example_defaults(tmp_path)
+    for path, want_oracle, want_skodun in ORACLE_KNOWN_DIVERGENCES:
+        assert oracle.path_is_risky(path) is want_oracle, path
+        assert should_run_security(
+            "now", [path], path_segments=d.security_path_segments,
+            basename_patterns=d.security_basename_patterns) is want_skodun, path
+        assert want_oracle is not want_skodun, path
 
 
 @pytest.mark.skipif(oracle_dir() is None, reason="SKODUN_ORACLE_DIR unset")
@@ -513,15 +722,22 @@ def _run_oracle_prompt(root: Path, tmp_path: Path, command: str, diff: bytes,
 ])
 def test_prompt_parity_with_oracle(tmp_path, command, fn, diff, max_bytes):
     want = _run_oracle_prompt(oracle_dir(), tmp_path, command, diff, max_bytes)
-    got = fn(diff=diff, max_diff_bytes=max_bytes or 400_000, **_ARGS)
+    # The security lead's two variable spans are config, and the example config
+    # carries the oracle's own fragments: byte-exact parity is reached THROUGH
+    # `load_config`, never from a committed default. (The skeptic prompt has no
+    # slots — it names nothing project-specific.)
+    slots = {} if fn is skeptic_prompt else {
+        "prompt_slots": _example_defaults(tmp_path).security_prompt_slots}
+    got = fn(diff=diff, max_diff_bytes=max_bytes or 400_000, **slots, **_ARGS)
     assert got.text == want
     assert got.prompt_bytes == len(want)
     assert got.diff_truncated is (len(diff) > (max_bytes or 400_000))
 
 
 #: (primary, extra, pass_name) triples driven through the oracle's `merge`
-#: command. `extra is None` is deliberately absent — see the DIVERGENCE note in
-#: `passes.merge_extra_pass` and `test_failed_extra_pass_clears_parse_ok`.
+#: command. The failed-pass path is deliberately absent — skodun demotes there
+#: and the oracle does not; see DIVERGENCE 1 in `passes` and
+#: `test_failed_extra_pass_clears_parse_ok`.
 ORACLE_MERGE_CASES: tuple[tuple[dict, dict, str], ...] = (
     (dict(parse_ok=True, degraded=False, trustworthy=True, findings=[],
           summary="ok", severity={"high": 0, "medium": 0, "low": 0}),

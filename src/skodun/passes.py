@@ -20,17 +20,26 @@ them byte-for-byte against the live oracle, along with the trigger decision and
 the merge result. Deliberate divergences are marked `DIVERGENCE` below and each
 one has its own test.
 
-Risky paths are CONFIGURATION, not code
----------------------------------------
-The oracle hardcoded one monorepo's risky surfaces (its `dao`/`db`/`credits`
-package names, its Telegram webhook services, its `api/services/*RouteService*`
-HTTP layer). Here both tables arrive as arguments
-(`Defaults.security_path_segments` / `Defaults.security_basename_patterns`).
-The committed default for the first is the generic, stack-agnostic set
-`config.SECURITY_PATH_SEGMENTS` — words that name a *concern*, not a directory
-convention — and the second defaults to empty. The oracle's own tables live in
-`examples/scala-angular-monorepo.toml`, which the parity test loads, so oracle
-behaviour stays asserted end-to-end while committed code stays generic.
+Risky surfaces are CONFIGURATION, not code
+------------------------------------------
+The oracle hardcoded one monorepo's risky surfaces twice over: once in the
+tables that decide *when* the pass runs (its own package names, its own webhook
+services, its own HTTP route layer), and once in the prompt text that tells the
+model *what* risky means in this repo. Neither belongs in code that ships to
+every repo, so both arrive from config:
+
+* **when** — `Defaults.security_path_segments` (default: the generic,
+  stack-agnostic `config.SECURITY_PATH_SEGMENTS`, words that name a *concern*
+  rather than a directory convention) and `Defaults.security_basename_patterns`
+  (default: empty);
+* **what** — `Defaults.security_prompt_slots`, `(slot-name, fragment)` pairs
+  filling the two variable spans of the security prompt (default: the generic
+  `config.SECURITY_PROMPT_SLOTS`; an unfilled slot keeps its generic text).
+
+A worked example carrying one concrete stack's tables *and* prompt fragments
+lives in `examples/scala-angular-monorepo.toml`. The parity tests load that
+file, so the oracle's trigger decisions and its exact prompt bytes stay
+asserted end-to-end while committed code and the shipped prompt stay generic.
 
 Matching semantics (this module owns them)
 ------------------------------------------
@@ -46,25 +55,28 @@ This is the oracle's `_RISKY_SEGMENTS` rule exactly.
 
 `security_basename_patterns` — each entry is an `fnmatch.fnmatchcase` glob,
 lowercased before use, matched against one of two *compacted* renderings of the
-path. Compaction (dropping every character outside `[a-z0-9]`) is what makes
-one pattern match `TelegramWebhookRouteService.scala`,
-`telegram-webhook.service.ts`, and `telegram_webhook.py` alike, which is the
-whole point of the oracle's `_RISKY_NAME_SUBSTR` table. Which rendering is used
-depends on whether the pattern mentions a directory:
+path. Compaction (dropping every character outside `[a-z0-9]`) is what lets one
+pattern match `PaymentWebhookHandler.scala`, `payment-webhook.handler.ts`, and
+`payment_webhook.py` alike, which is the whole point of the oracle's
+name-substring table. Which rendering is used depends on whether the pattern
+mentions a directory:
 
 * **no `/` in the pattern** → the *flat* compaction: the whole path with every
   non-alphanumeric character removed, separators included. A pure name-shape
   test, deliberately blind to path boundaries — exactly the oracle's
-  `re.sub(r"[^a-z0-9]", "", path)` substring check, so `*telegramwebhook*`
-  matches `telegram/Webhook.scala` here just as it does there.
+  `re.sub(r"[^a-z0-9]", "", path)` substring check, so `*paymentwebhook*`
+  matches `payment/Webhook.scala` here just as it does there.
 * **`/` in the pattern** → the *segment* compaction: each `/`-separated segment
   compacted on its own, rejoined with `/`, and prefixed with `/` so a leading
-  `/api/` can be anchored. `*` still crosses `/` (fnmatch semantics), so
-  `*/api/services/*routeservice*` reads as "somewhere under a real
-  `api/services/` directory, something whose name compacts to contain
-  `routeservice`" — the oracle's third rule, but with the directory boundary
-  respected, so `xapi/services/FooRouteService.scala` is correctly excluded
-  where the oracle's flat compaction would have let it through had it used one.
+  directory can be anchored. `*` still crosses `/` (fnmatch semantics), so
+  `*/svc/http/*gateway*` reads as "somewhere under a real `svc/http/`
+  directory, something whose name compacts to contain `gateway`" — the oracle's
+  directory-scoped rule, but with the directory boundary actually respected, so
+  `xsvc/http/FooGateway.scala` is correctly excluded where the oracle's flat
+  compaction would have let it through had it used one. A 20k-path differential
+  found exactly four paths where that stricter reading disagrees with the
+  oracle; all four are recorded and pinned by
+  `tests/test_passes.py::ORACLE_KNOWN_DIVERGENCES`.
 
 Both tables are consumed FAIL-SOFT: empty, or matching nothing, simply means
 "no security pass" and never an error. (A *malformed* table is rejected loudly
@@ -82,8 +94,9 @@ goes into `detail` instead, so `rule_ids` extraction stays clean.
 The demotion rules keep `parse_ok` and `degraded` **independent**, because they
 mean different things and the gate reads them separately:
 
-* a *failed* pass (no record at all, or `parse_ok` false) clears the primary's
-  `parse_ok` and appends to `failure_reason`;
+* a *failed* pass (`merge_failed_extra_pass`, or a record whose `parse_ok` is
+  not exactly `True`) clears the primary's `parse_ok` and appends to
+  `failure_reason`;
 * a *degraded* pass sets `degraded` and appends to `degraded_reason`, and does
   not touch `parse_ok`;
 * a *size-capped* pass (`diff_truncated`) records `partial_coverage` under
@@ -96,19 +109,26 @@ axes by `store.save_review` regardless.
 
 DIVERGENCES from the oracle
 ---------------------------
-1. **`extra is None` demotes.** The oracle records `ran: False, skipped: True`
-   and leaves the primary untouched, because in its orchestrator `None` means
-   "this pass was never scheduled". Here the caller only merges a pass it
-   decided to run, so `None` means "the pass produced nothing usable" — and a
-   security pass that failed must not leave a false clear behind (Global
-   Constraints: nothing may pass the gate unless `trustworthy` is true). Pinned
-   by `test_failed_extra_pass_clears_parse_ok`; deliberately excluded from the
+1. **A pass that produced nothing demotes, and says so by name.** The oracle
+   takes `extra=None` to mean "this pass was never scheduled" and records
+   `ran: False, skipped: True` without touching the primary. Here the caller
+   only merges a pass it decided to run, so "nothing came back" is a failure —
+   and a security pass that failed must not leave a false clear behind (Global
+   Constraints: nothing may pass the gate unless `trustworthy` is true). Rather
+   than hang that on an easily-mistyped `None` argument, the failure path is its
+   own function, `merge_failed_extra_pass`, which demands an explicit reason;
+   `merge_extra_pass(primary, None, ...)` raises. Pinned by
+   `test_failed_extra_pass_clears_parse_ok`; deliberately excluded from the
    merge parity corpus.
 2. **No mutation.** The oracle mutates `primary` in place and returns it. This
-   returns a new record and leaves the argument alone — including its `findings`
-   list, `severity` dict, and `extra_passes` dict, none of which are shared with
-   the result. Merging two passes off one primary is a normal thing to want, and
-   a shallow `dict()` copy would have silently cross-contaminated them.
+   returns a new record: the `findings` list, `severity` dict, `rule_ids` list
+   and `extra_passes` dict are all freshly built, so merging two passes off one
+   primary — a normal thing to want — cannot cross-contaminate them, as a
+   shallow `dict()` copy would have. Individual carried-over finding *dicts*,
+   and in a chained merge an earlier pass's `extra_passes[<name>]` meta dict,
+   are shared with the argument by reference; this module never writes into
+   either (it copies a finding before tagging it), and
+   `test_carried_over_finding_dicts_are_shared_but_never_written` pins that.
 3. **The prompt builders return `promptbuild.Prompt`, not raw bytes.** The
    oracle's CLI writes the truncation flag to a `<prompt>.flags` sidecar because
    its orchestrator needs it to set `partial_coverage`; in-process there is no
@@ -128,15 +148,16 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from .config import SECURITY_PATH_SEGMENTS
+from .config import SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOTS, Defaults
 from .promptbuild import Prompt
 
 #: Env kill switches. Set either to `0` to never schedule that pass.
 SECURITY_PASS_ENV = "SKODUN_SECURITY_PASS"
 SKEPTIC_PASS_ENV = "SKODUN_SKEPTIC_PASS"
 
-#: The oracle's own `GROK_MAX_DIFF_BYTES` default, and `Defaults.max_diff_bytes`.
-DEFAULT_MAX_DIFF_BYTES = 400_000
+#: The diff budget, sourced from config so there is exactly one of this number
+#: (it is also the oracle's own `GROK_MAX_DIFF_BYTES` default).
+DEFAULT_MAX_DIFF_BYTES: int = Defaults.max_diff_bytes
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]")
 #: `[kebab-rule-id]` citations, as `trust`/triage read them out of a title.
@@ -256,11 +277,18 @@ def should_run_skeptic(
 # `_cmd_write_skeptic_prompt` `lines = [...]` literals via its own AST. The
 # `Branch:` / `Base:` / `Head:` block and the diff fences are interpolated by
 # `_render` below in the oracle's order.
+#
+# The security lead keeps the oracle's wording EXCEPT at two `%(slot)s` spans,
+# where the oracle named its own project's surfaces. Those are filled from
+# `Defaults.security_prompt_slots` (generic by default; the oracle's exact
+# fragments live in examples/, and loading them reproduces the oracle's prompt
+# byte for byte). A slot value may contain newlines and expand to several lines,
+# which is how the wrapped surface list keeps the oracle's line breaks. Nothing
+# else in either template may contain a bare `%`.
 
-_SECURITY_LEAD: tuple[str, ...] = (
+_SECURITY_LEAD_TEMPLATE: tuple[str, ...] = (
     'You are a SECURITY-FOCUSED code reviewer on a pull request that touches',
-    'risky surfaces (auth, public HTTP routes, db/dao, Telegram webhooks,',
-    'billing, or credits). This is a dedicated security pass — not a general',
+    'risky surfaces (%(surfaces)s). This is a dedicated security pass — not a general',
     'style or house-rule checklist review.',
     '',
     'Look ONLY for concrete security problems in the unified diff:',
@@ -268,8 +296,7 @@ _SECURITY_LEAD: tuple[str, ...] = (
     '- data exposure (PII, secrets, cross-tenant leakage)',
     '- injection (SQL, command, template, path traversal)',
     '- secret handling (tokens, keys, signed URLs in logs)',
-    '- webhook validation (Telegram secret token, unsigned public ingress)',
-    '- billing/credits integrity (privilege escalation, free usage)',
+    '%(extra_checks)s',
     '',
     'Be precise and conservative. Do not invent issues or flag pure style.',
     'Do NOT modify files or run commands. Findings must anchor to the DIFF.',
@@ -302,6 +329,24 @@ _SKEPTIC_LEAD: tuple[str, ...] = (
 )
 _SKEPTIC_PASS_LINE = 'Pass:   skeptic / adversarial clean-check (#3284)'
 # --- ORACLE TEXT END ---
+
+
+def security_lead(
+    prompt_slots: Sequence[tuple[str, str]] = SECURITY_PROMPT_SLOTS,
+) -> tuple[str, ...]:
+    """Render the security prompt's lead lines with `prompt_slots` filled in.
+
+    FAIL-SOFT, like every other consumer of a config table in this module: a
+    partial table leaves the unfilled slots on their generic defaults, and a
+    slot name the template does not have is ignored (`config.load_config`
+    already rejected that loudly, by name, at load time). A slot value spanning
+    several lines expands to several prompt lines.
+    """
+    slots = dict(SECURITY_PROMPT_SLOTS)
+    for name, fragment in prompt_slots or ():
+        if name in slots:
+            slots[name] = fragment
+    return tuple(("\n".join(_SECURITY_LEAD_TEMPLATE) % slots).split("\n"))
 
 
 def _render(
@@ -353,10 +398,15 @@ def security_prompt(
     head: str,
     diff: bytes,
     max_diff_bytes: int = DEFAULT_MAX_DIFF_BYTES,
+    prompt_slots: Sequence[tuple[str, str]] = SECURITY_PROMPT_SLOTS,
 ) -> Prompt:
-    """The security-only role prompt: no checklist sections, security lens only."""
-    return _render(_SECURITY_LEAD, _SECURITY_PASS_LINE, branch, base_ref,
-                   base_sha, head, diff, max_diff_bytes)
+    """The security-only role prompt: no checklist sections, security lens only.
+
+    `prompt_slots` is `Defaults.security_prompt_slots` — what "risky surfaces"
+    means in the repo under review. Unset, the prompt names generic concerns.
+    """
+    return _render(security_lead(prompt_slots), _SECURITY_PASS_LINE, branch,
+                   base_ref, base_sha, head, diff, max_diff_bytes)
 
 
 def skeptic_prompt(
@@ -433,18 +483,79 @@ def _appended(previous: Any, addition: str) -> str:
     return (prev + "; " if prev else "") + addition
 
 
+def failed_pass_reason(pass_name: str) -> str:
+    """The standard `failure_reason` for a pass that returned nothing usable."""
+    return "extra pass %s failed to produce a usable review" % pass_name
+
+
 def merge_extra_pass(
     primary: Mapping[str, Any],
-    extra: Mapping[str, Any] | None,
+    extra: Mapping[str, Any],
     pass_name: str,
 ) -> dict:
     """Fold one extra-pass review into a copy of the primary review record.
 
-    Returns a NEW record; `primary` is not mutated and shares no mutable
-    container with the result (DIVERGENCE 2 in the module docstring). `extra`
-    is `None` when the pass produced no usable review at all, which demotes
-    `parse_ok` (DIVERGENCE 1).
+    CONTRACT
+    --------
+    `extra` is the record a pass that RAN produced, and must be a mapping. Two
+    neighbouring situations are deliberately NOT expressible here:
+
+    * a pass that ran and returned nothing usable → `merge_failed_extra_pass`,
+      which demands an explicit reason and demotes the primary;
+    * a pass `should_run_*` declined to schedule → do not merge it at all;
+      there is nothing to fold in, and the primary keeps its own verdict.
+
+    Passing `None` (or any non-mapping) raises instead of demoting, so no
+    caller can quietly turn a good review into an untrustworthy one by handing
+    this function the wrong thing. Within a merged record, `parse_ok` must be
+    exactly `True` to count as success: a record that merely omits the key is a
+    failed pass, not a clear one.
+
+    Returns a NEW record; `primary` is not mutated and none of the containers
+    this function builds are shared with it (DIVERGENCE 2 in the module
+    docstring spells out what *is* shared by reference and never written).
     """
+    if extra is None:
+        raise TypeError(
+            "merge_extra_pass() needs the record a pass produced; for a pass "
+            "that produced nothing use merge_failed_extra_pass(primary, "
+            "pass_name, failure_reason), and for a pass that never ran, merge "
+            "nothing at all")
+    if not isinstance(extra, Mapping):
+        raise TypeError(
+            "extra must be a mapping, got %s" % type(extra).__name__)
+    return _merge(primary, extra, pass_name, "")
+
+
+def merge_failed_extra_pass(
+    primary: Mapping[str, Any],
+    pass_name: str,
+    failure_reason: str,
+) -> dict:
+    """Fold a FAILED extra pass into a copy of the primary review record.
+
+    For a pass that was scheduled, ran, and produced no usable review at all.
+    It clears `parse_ok`, clears `trustworthy`, and appends `failure_reason` —
+    a demotion, so the reason is required and must not be blank (use
+    `failed_pass_reason(pass_name)` when there is nothing more specific to
+    say). DIVERGENCE 1 in the module docstring explains why this demotes at all
+    where the oracle records a no-op.
+    """
+    reason = str(failure_reason or "").strip()
+    if not reason:
+        raise ValueError(
+            "merge_failed_extra_pass() requires a non-empty failure_reason: "
+            "this demotes the review and the record has to say why")
+    return _merge(primary, None, pass_name, reason)
+
+
+def _merge(
+    primary: Mapping[str, Any],
+    extra: Mapping[str, Any] | None,
+    pass_name: str,
+    failure_reason: str,
+) -> dict:
+    """Shared body of `merge_extra_pass` / `merge_failed_extra_pass`."""
     if not isinstance(primary, dict):
         raise TypeError("primary must be a dict")
 
@@ -455,15 +566,19 @@ def merge_extra_pass(
     findings = _as_findings(out.get("findings"))
 
     if extra is None:
-        meta["skipped"] = True
+        # Not `skipped`: the pass ran and came back empty-handed, and the record
+        # must not read as a no-op next to the `parse_ok: False` it just caused.
+        meta["failed"] = True
         # DIVERGENCE 1: the oracle stops here. A pass we decided to run and got
         # nothing back from is a failure, not a no-op.
         out["parse_ok"] = False
         out["trustworthy"] = False
-        out["failure_reason"] = _appended(
-            out.get("failure_reason"),
-            "extra pass %s failed to produce a usable review" % pass_name)
+        out["failure_reason"] = _appended(out.get("failure_reason"),
+                                          failure_reason)
     else:
+        # `is True`, not truthiness and not `is not False`: a record that omits
+        # `parse_ok` has not told us the pass parsed, and an extra pass that
+        # cannot say so must not leave the primary clear.
         p_ok = extra.get("parse_ok") is True
         deg = extra.get("degraded") is True
         trunc = extra.get("diff_truncated") is True
@@ -482,7 +597,7 @@ def merge_extra_pass(
             out["failure_reason"] = _appended(
                 out.get("failure_reason"),
                 str(extra.get("failure_reason") or "")
-                or "extra pass %s failed to produce a usable review" % pass_name)
+                or failed_pass_reason(pass_name))
         if deg:
             out["degraded"] = True
             out["trustworthy"] = False

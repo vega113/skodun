@@ -13,6 +13,25 @@ SECURITY_PATH_SEGMENTS: tuple[str, ...] = (
     "auth", "secret", "credential", "token", "webhook", "payment", "billing",
 )
 
+# Generic default fragments for the security-pass PROMPT. The pass ships one
+# prompt body for every repo that runs skodun, so the parts of it that name what
+# "risky" means here are slots, not literals: these defaults name concerns that
+# exist in any stack. A repo whose risky surfaces have their own vocabulary
+# fills the slots in its own config (see examples/). Slot values may contain
+# newlines — the prompt is line-oriented and a slot may span a wrapped line.
+SECURITY_PROMPT_SLOTS: tuple[tuple[str, str], ...] = (
+    ("surfaces",
+     "authentication, authorization, public HTTP endpoints, data access,\n"
+     "webhooks, or payments"),
+    ("extra_checks",
+     "- webhook validation (shared secrets, signatures, unsigned public ingress)\n"
+     "- payment and quota integrity (privilege escalation, free usage)"),
+)
+#: The slot names `security_prompt_slots` accepts. The prompt template in
+#: `passes.py` must use exactly these (pinned by `tests/test_passes.py`).
+SECURITY_PROMPT_SLOT_NAMES: frozenset[str] = frozenset(
+    name for name, _ in SECURITY_PROMPT_SLOTS)
+
 @dataclass(frozen=True)
 class Defaults:
     severity_gate: str = "high"
@@ -42,11 +61,16 @@ class Defaults:
     security_path_segments: tuple[str, ...] = SECURITY_PATH_SEGMENTS
     # Basename/glob patterns that trigger the security pass. Default empty.
     security_basename_patterns: tuple[str, ...] = ()
+    # (slot-name, fragment) pairs filling the security prompt's variable parts.
+    # Default: the generic set. Partial tables are fine — an unfilled slot keeps
+    # its generic default.
+    security_prompt_slots: tuple[tuple[str, str], ...] = SECURITY_PROMPT_SLOTS
 
-# Matching semantics for the four tables above (how a prefix/pattern is
-# compared against a path) are deliberately NOT defined here — they belong to
-# the consuming modules (`checklist.py`, `passes.py`), which own the parity
-# tests that pin them. This module defines schema, defaults, and validation.
+# Matching semantics for the four path tables above (how a prefix/pattern is
+# compared against a path), and the prompt template `security_prompt_slots`
+# fills, are deliberately NOT defined here — they belong to the consuming
+# modules (`checklist.py`, `passes.py`), which own the parity tests that pin
+# them. This module defines schema, defaults, and validation.
 
 # Validation posture, on purpose — do not "fix" this to fail soft:
 #   * Loading a MALFORMED value is LOUD (ValueError naming the key) — a
@@ -102,6 +126,27 @@ def _pair_tuple(key: str, value: object) -> tuple[tuple[str, str], ...]:
         out.append((pair[0], pair[1]))
     return tuple(out)
 
+def _slot_pairs(key: str, value: object) -> tuple[tuple[str, str], ...]:
+    """Normalize `(slot-name, fragment)` pairs, or raise naming `key`.
+
+    A pair table like `checklist_map`, plus two checks that only make sense for
+    named slots: the name has to be one the prompt actually has, and it has to
+    appear once. Both are typos in the user's own config — a slot filled under a
+    misspelled name would otherwise vanish silently and ship the generic prompt.
+    """
+    pairs = _pair_tuple(key, value)
+    seen: set[str] = set()
+    for i, (name, _fragment) in enumerate(pairs):
+        if name not in SECURITY_PROMPT_SLOT_NAMES:
+            raise ValueError(
+                f"[defaults] {key}: entry {i} names unknown slot {name!r}; "
+                f"known slots are {sorted(SECURITY_PROMPT_SLOT_NAMES)}")
+        if name in seen:
+            raise ValueError(
+                f"[defaults] {key}: entry {i} repeats slot {name!r}")
+        seen.add(name)
+    return pairs
+
 def _bounded_int(key: str, value: object, minimum: int) -> int:
     """Validate a numeric `[defaults]` value, or raise naming `key`.
 
@@ -145,6 +190,7 @@ _DEFAULTS_NORMALIZERS = {
     "test_path_patterns": _str_tuple,
     "security_path_segments": _str_tuple,
     "security_basename_patterns": _str_tuple,
+    "security_prompt_slots": _slot_pairs,
 }
 
 @dataclass(frozen=True)

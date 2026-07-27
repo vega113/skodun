@@ -4,7 +4,8 @@ from pathlib import Path
 import pytest
 
 from skodun.config import (
-    _DEFAULTS_MINIMUMS, SECURITY_PATH_SEGMENTS, Defaults, load_config,
+    _DEFAULTS_MINIMUMS, SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOT_NAMES,
+    SECURITY_PROMPT_SLOTS, Defaults, load_config,
 )
 
 
@@ -379,4 +380,104 @@ def test_checklist_map_rejects_blank_member(tmp_path):
     g = _write(tmp_path / "g.toml", '[defaults]\nchecklist_map = [["a/", ""]]\n')
     with pytest.raises(
             ValueError, match=r"\[defaults\] checklist_map: entry 0 must not be empty"):
+        load_config(None, global_path=g)
+
+
+# --- security_prompt_slots: the security prompt's variable spans ------------
+# Same posture as the layout tables: malformed is loud here, at load time, and
+# naming the key; a well-formed table is consumed fail-soft by `passes.py`.
+
+def test_security_prompt_slots_default_to_the_generic_set():
+    d = Defaults()
+    assert d.security_prompt_slots == SECURITY_PROMPT_SLOTS
+    assert {name for name, _ in d.security_prompt_slots} == set(
+        SECURITY_PROMPT_SLOT_NAMES) == {"surfaces", "extra_checks"}
+    # The shipped prompt describes concerns, never one project's systems.
+    blob = " ".join(f for _, f in d.security_prompt_slots).lower()
+    for noun in ("telegram", "credits", "dao", "routeservice"):
+        assert noun not in blob, noun
+
+
+def test_security_prompt_slots_round_trip_and_stay_hashable(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[defaults]
+security_prompt_slots = [
+  ["surfaces", "widgets,\\nsprockets, or gears"],
+  ["extra_checks", "- sprocket integrity (over-torque)"],
+]
+""")
+    d = load_config(None, global_path=g).defaults
+    assert d.security_prompt_slots == (
+        ("surfaces", "widgets,\nsprockets, or gears"),
+        ("extra_checks", "- sprocket integrity (over-torque)"))
+    hash(d)
+
+
+def test_security_prompt_slots_accept_a_partial_table(tmp_path):
+    # One slot filled is well-formed; `passes.py` keeps the generic default for
+    # the other. Only unknown NAMES are an error.
+    g = _write(tmp_path / "g.toml",
+               '[defaults]\nsecurity_prompt_slots = [["surfaces", "widgets"]]\n')
+    assert load_config(None, global_path=g).defaults.security_prompt_slots == (
+        ("surfaces", "widgets"),)
+
+
+def test_security_prompt_slots_project_layer_wins(tmp_path):
+    g = _write(tmp_path / "g.toml",
+               '[defaults]\nsecurity_prompt_slots = [["surfaces", "global"]]\n')
+    repo = tmp_path / "repo"; repo.mkdir()
+    _write(repo / ".skodun.toml",
+           '[defaults]\nsecurity_prompt_slots = [["surfaces", "project"]]\n')
+    assert load_config(repo, global_path=g).defaults.security_prompt_slots == (
+        ("surfaces", "project"),)
+
+
+def test_security_prompt_slots_reject_an_unknown_slot_name(tmp_path):
+    # A slot filled under a misspelled name would vanish silently and ship the
+    # generic prompt — exactly the failure this key exists to prevent.
+    g = _write(tmp_path / "g.toml",
+               '[defaults]\nsecurity_prompt_slots = [["surfaces", "w"], '
+               '["surfacez", "typo"]]\n')
+    with pytest.raises(
+            ValueError,
+            match=r"\[defaults\] security_prompt_slots: entry 1 names unknown "
+                  r"slot 'surfacez'"):
+        load_config(None, global_path=g)
+
+
+def test_security_prompt_slots_reject_a_repeated_slot_name(tmp_path):
+    g = _write(tmp_path / "g.toml",
+               '[defaults]\nsecurity_prompt_slots = [["surfaces", "a"], '
+               '["surfaces", "b"]]\n')
+    with pytest.raises(
+            ValueError,
+            match=r"\[defaults\] security_prompt_slots: entry 1 repeats slot 'surfaces'"):
+        load_config(None, global_path=g)
+
+
+def test_security_prompt_slots_reject_a_scalar(tmp_path):
+    g = _write(tmp_path / "g.toml", '[defaults]\nsecurity_prompt_slots = "widgets"\n')
+    with pytest.raises(
+            ValueError,
+            match=r"\[defaults\] security_prompt_slots: expected an array of "
+                  r"2-element arrays, got str"):
+        load_config(None, global_path=g)
+
+
+def test_security_prompt_slots_reject_wrong_arity(tmp_path):
+    g = _write(tmp_path / "g.toml",
+               '[defaults]\nsecurity_prompt_slots = [["surfaces"]]\n')
+    with pytest.raises(
+            ValueError,
+            match=r"\[defaults\] security_prompt_slots: entry 0 must be a "
+                  r"2-element array, got 1 elements"):
+        load_config(None, global_path=g)
+
+
+def test_security_prompt_slots_reject_a_blank_fragment(tmp_path):
+    g = _write(tmp_path / "g.toml",
+               '[defaults]\nsecurity_prompt_slots = [["surfaces", "  "]]\n')
+    with pytest.raises(
+            ValueError,
+            match=r"\[defaults\] security_prompt_slots: entry 0 must not be empty"):
         load_config(None, global_path=g)

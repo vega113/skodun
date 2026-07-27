@@ -73,3 +73,20 @@ security_basename_patterns = [
   "*webhookrouteservice*",
   "*/api/services/*routeservice*",
 ]
+
+# What "risky surfaces" means in THIS repo, as told to the model on every
+# security pass. Each entry is [slot-name, fragment]; the two known slots are:
+#
+#   surfaces      — completes "…a pull request that touches risky surfaces
+#                   (<surfaces>). This is a dedicated security pass…"
+#   extra_checks  — the stack-specific bullets appended to the generic
+#                   "Look ONLY for concrete security problems" list.
+#
+# Fragments are inserted verbatim and may contain "\n" to span prompt lines —
+# keep lines under ~78 characters so the prompt stays readable. Slots you leave
+# out keep skodun's generic wording; a misspelled slot name is a load-time
+# error, so a fragment can never go missing silently.
+security_prompt_slots = [
+  ["surfaces", "auth, public HTTP routes, db/dao, Telegram webhooks,\nbilling, or credits"],
+  ["extra_checks", "- webhook validation (Telegram secret token, unsigned public ingress)\n- billing/credits integrity (privilege escalation, free usage)"],
+]
