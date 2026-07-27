@@ -25,10 +25,12 @@ rather than an import bug.
 So for every index row that would otherwise be trustworthy this module loads
 `<id>.json`, validates it with the same validator the gate uses, and
 cross-checks it against the summary. If the artifact is missing, unreadable,
-invalid, or disagrees with its own index row, the row is imported **demoted**
-(`parse_ok=False`, an explicit `failure_reason`) and counted. History is
-preserved; trust is not. The cost of a demotion is one re-review; the cost of
-a false trust is a jammed gate.
+invalid, or disagrees with its own index row in a direction that could hide
+findings, the row is imported **demoted** (`parse_ok=False`, an explicit
+`failure_reason`) and counted. History is preserved; trust is not. The cost of
+a demotion is one re-review; the cost of a false trust is a jammed gate. The
+one disagreement that does NOT demote is an artifact carrying MORE findings
+than its index row: see `_load_artifact`, where the asymmetry is argued.
 
 Nothing here ever aborts on bad input. The archive is appended to by concurrent
 workers and a crashing writer leaves a half-written final line, so a corrupt
@@ -75,12 +77,21 @@ class ImportStats:
     `reviews` counts every index row persisted, trusted or demoted --
     `demoted_no_artifact` is a subset of it, not a separate bucket, so that
     `reviews` always answers "how much history was preserved".
+
+    `findings_reconciled` counts the rows imported on the ARTIFACT's word
+    against a stale index summary: the artifact reported more findings than the
+    row did, and (see `_load_artifact`) that is trusted rather than demoted.
+    It is a subset of `reviews` and disjoint from `demoted_no_artifact`. It is
+    reported separately because "imported, but its count came from somewhere
+    other than the index" is a thing an operator should be able to see without
+    it being mistaken for a demotion.
     """
 
     reviews: int = 0
     triage: int = 0
     skipped_lines: int = 0
     demoted_no_artifact: int = 0
+    findings_reconciled: int = 0
 
 
 def _iter_records(path: Path):
@@ -202,8 +213,9 @@ def _load_artifact(archive: Path, row: dict, review_id: str) -> dict | None:
         history would silently vanish;
       * a `diff_hash` disagreement -- the gate selects on `diff_hash`, so this
         is the exact field whose corruption would certify the wrong content;
-      * a `findings_total` disagreement, including a row that fails to state
-        one: unverifiable is not the same as verified.
+      * an artifact reporting FEWER findings than its index row, including a
+        row that fails to state a count at all: unverifiable is not the same as
+        verified. An artifact reporting MORE is accepted -- see below.
     """
     # The `id` comes out of the archive's own JSON and is interpolated into a
     # filename, so it is untrusted path input. An id spelling `../../secrets`
@@ -228,7 +240,26 @@ def _load_artifact(archive: Path, row: dict, review_id: str) -> dict | None:
     total = row.get("findings_total")
     if isinstance(total, bool) or not isinstance(total, int):
         return None
-    if total != art["findings_total"]:
+    # ASYMMETRIC ON PURPOSE, and the asymmetry is the whole check.
+    #
+    # This comparison exists to stop an artifact that *under*-reports findings
+    # relative to its index row: hidden open findings are the only thing here
+    # that could produce a false gate PASS, so an artifact claiming fewer than
+    # the summary recorded is rejected and the row imports demoted.
+    #
+    # An artifact carrying MORE findings than a stale index summary cannot do
+    # that. The ARTIFACT is what gets imported and what the gate then reads, so
+    # its extra findings can only make the gate STRICTER -- exit 1 with those
+    # findings open, never exit 0. And it is not unverified: the artifact has
+    # already been proved self-consistent by `load_valid_artifact` above
+    # (`findings_total == len(findings)`) before this comparison runs. The
+    # disagreement is a property of the summary, not of the artifact -- the
+    # legacy writer appends the index row when the first pass finishes, before
+    # later passes merge their findings in, so this is the single commonest
+    # shape of index/artifact disagreement in a real archive. Demoting on it
+    # would discard already-reviewed findings to guard against a direction of
+    # error that cannot loosen the gate.
+    if art["findings_total"] < total:
         return None
     return art
 
@@ -259,6 +290,12 @@ def _import_index(store: Store, archive: Path, stats: dict) -> None:
             if artifact is None:
                 row = _demote(row, axes, DEMOTED_REASON, force_reason=True)
                 stats["demoted_no_artifact"] += 1
+            elif artifact["findings_total"] != row.get("findings_total"):
+                # `_load_artifact` only returns on `artifact >= row`, and it
+                # rejects a row whose count is not a plain int, so any surviving
+                # inequality is the accepted direction: the artifact out-reports
+                # a stale summary. Counted, not demoted.
+                stats["findings_reconciled"] += 1
 
         # The artifact wins every field it defines -- it is the record the
         # review actually produced -- and the index row fills in anything it
@@ -322,7 +359,8 @@ def import_legacy(store: Store, grok_reviews_dir: Path) -> ImportStats:
     ordinary outcome there, not an error.
     """
     archive = Path(grok_reviews_dir)
-    stats = dict(reviews=0, triage=0, skipped_lines=0, demoted_no_artifact=0)
+    stats = dict(reviews=0, triage=0, skipped_lines=0, demoted_no_artifact=0,
+                 findings_reconciled=0)
     _import_index(store, archive, stats)
     _import_ledger(store, archive, stats)
     return ImportStats(**stats)

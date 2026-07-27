@@ -166,8 +166,6 @@ def test_row_without_a_usable_id_is_skipped(tmp_path):
 
 @pytest.mark.parametrize("over, why", [
     (dict(diff_hash="e" * 40), "diff_hash"),
-    (dict(findings_total=3, findings=[dict(file="a", title="t")] * 3),
-     "findings_total"),
     (dict(id="somebody_else"), "id"),
 ])
 def test_artifact_disagreeing_with_the_index_row_is_demoted(tmp_path, over, why):
@@ -230,9 +228,65 @@ def test_artifact_with_findings_imports_them_all(tmp_path):
         tmp_path, rows=[{**ROW, "findings_total": 2}],
         artifacts={"loop_1": art}))
     assert stats.demoted_no_artifact == 0 and stats.reviews == 1
+    assert stats.findings_reconciled == 0, "index and artifact agreed"
     imported = st.latest_trustworthy_for("d" * 40)
     assert [f["title"] for f in imported["findings"]] == ["T1", "T2"]
     assert imported["findings_total"] == 2
+
+
+# --------------------------------------------------------------------------
+# The findings-count check is ASYMMETRIC, and both directions are pinned here
+# --------------------------------------------------------------------------
+
+
+def test_artifact_reporting_more_findings_than_the_index_row_is_trusted(tmp_path):
+    """A stale index summary does not invalidate the artifact it points at.
+
+    The legacy writer appended the index row before later passes merged their
+    findings in, so `findings_total: 0` beside a two-finding artifact is the
+    single commonest shape in the real archive. The artifact is what gets
+    imported and what the gate then reads, `load_valid_artifact` has already
+    proved it self-consistent, and its extra findings can only make the gate
+    STRICTER. Demoting it would discard already-reviewed history to guard
+    against a direction of error that cannot loosen the gate.
+    """
+    finds = [dict(file="a.py", line=1, severity="high", title="T1"),
+             dict(file="b.py", line=2, severity="low", title="T2")]
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(          # ROW still says findings_total=0
+        tmp_path, artifacts={"loop_1": _artifact(findings=finds,
+                                                 findings_total=2)}))
+    assert stats.reviews == 1
+    assert stats.demoted_no_artifact == 0, "a stale summary is not a demotion"
+    assert stats.findings_reconciled == 1
+    imported = st.latest_trustworthy_for("d" * 40)
+    assert imported is not None, "gate-eligible: the artifact is trustworthy"
+    load_valid_artifact(imported)                # a real artifact, not a summary
+    assert imported["parse_ok"] is True and imported["trustworthy"] is True
+    # The ARTIFACT's count wins, and every finding survives to be triaged.
+    assert imported["findings_total"] == 2
+    assert [f["title"] for f in imported["findings"]] == ["T1", "T2"]
+
+
+def test_artifact_reporting_fewer_findings_than_the_index_row_is_demoted(tmp_path):
+    """The direction the check exists for: an artifact that HIDES findings.
+
+    The index recorded two; the artifact admits none. Trusting it would let the
+    gate PASS on a review whose findings were never carried over -- the exact
+    false all-clear this module is built to refuse.
+    """
+    row = {**ROW, "findings_total": 2,
+           "severity": {"high": 1, "medium": 1, "low": 0}}
+    st = _store(tmp_path)
+    stats = import_legacy(st, _archive(
+        tmp_path, rows=[row],
+        artifacts={"loop_1": _artifact(row, findings=[], findings_total=0)}))
+    assert stats.reviews == 1 and stats.demoted_no_artifact == 1
+    assert stats.findings_reconciled == 0, "an under-report is never reconciled"
+    assert st.latest_trustworthy_for("d" * 40) is None   # never gate-eligible
+    kept = st.get_review("loop_1")
+    assert kept["parse_ok"] is False and kept["trustworthy"] is False
+    assert kept["failure_reason"] == "legacy import: artifact missing/invalid"
 
 
 # --------------------------------------------------------------------------
@@ -475,8 +529,14 @@ def test_re_import_after_the_artifact_appears_upgrades_the_row(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def _legacy_archive_for(repo, tmp_path, *, with_artifact=True, review_id="legacy_1"):
-    """A legacy archive describing the repo's real outgoing change."""
+def _legacy_archive_for(repo, tmp_path, *, with_artifact=True, review_id="legacy_1",
+                        artifact_findings=()):
+    """A legacy archive describing the repo's real outgoing change.
+
+    `artifact_findings` go into the ARTIFACT only; the index row keeps
+    `findings_total: 0`, which is how the legacy writer left the rows whose
+    later passes merged findings in after the summary was appended.
+    """
     base = gitio.resolve_base(repo)
     diff = gitio.capture_diff(repo, base.sha, 100)
     row = dict(id=review_id, reviewed_at="2026-07-01T00:00:00Z",
@@ -487,7 +547,9 @@ def _legacy_archive_for(repo, tmp_path, *, with_artifact=True, review_id="legacy
                diff_truncated=False, findings_total=0,
                severity={"high": 0, "medium": 0, "low": 0})
     arts = {review_id: {**row, "summary": "s", "stop_reason": "EndTurn",
-                        "findings": []}} if with_artifact else {}
+                        "findings": list(artifact_findings),
+                        "findings_total": len(artifact_findings)}
+            } if with_artifact else {}
     return _archive(tmp_path, rows=[row], artifacts=arts, triage_rows=None,
                     index_tail="", name=f"arch-{review_id}"), row
 
@@ -511,6 +573,34 @@ def test_e2e_imported_legacy_review_satisfies_the_gate(tmp_path):
     assert result.code == 0, result.message
     assert result.diff_hash == row["diff_hash"]
     assert "legacy_1" in result.message
+
+
+def test_e2e_artifact_out_reporting_its_index_row_gates_at_one(tmp_path):
+    """THE justification for the asymmetry, demonstrated end to end.
+
+    The index row says `findings_total: 0`; the artifact carries two findings.
+    Importing it on the artifact's word cannot produce a false all-clear -- the
+    gate reads the artifact, finds two untriaged findings, and returns 1 ("go
+    triage these"), not 0. Demoting the row instead would have returned 2 and
+    forced a re-review of content already reviewed, which is the cost this
+    module exists to avoid.
+    """
+    repo = _mkrepo(tmp_path)
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    st = _store(tmp_path)
+    finds = [dict(file="a.txt", line=1, severity="high", title="T1"),
+             dict(file="a.txt", line=2, severity="low", title="T2")]
+    d, row = _legacy_archive_for(repo, tmp_path, artifact_findings=finds)
+
+    stats = import_legacy(st, d)
+    assert (stats.reviews, stats.demoted_no_artifact) == (1, 0)
+    assert stats.findings_reconciled == 1
+
+    result = run_gate(st, repo, load_config(repo))
+    assert result.code == 1, result.message      # not 0 (false pass)...
+    assert "2 finding(s) open" in result.message  # ...and not 2 (re-review)
+    assert result.diff_hash == row["diff_hash"]
 
 
 def test_e2e_demoted_legacy_row_is_never_gate_eligible(tmp_path):
@@ -652,6 +742,10 @@ def test_real_archive_smoke(tmp_path):
     assert stats.reviews + stats.skipped_lines >= n
     assert stats.reviews > 0, "a real archive imported nothing"
     assert 0 <= stats.demoted_no_artifact <= stats.reviews
+    assert 0 <= stats.findings_reconciled <= stats.reviews
+    # Disjoint buckets: a row is either demoted or imported, never counted as
+    # both, so the two subsets cannot exceed the whole.
+    assert stats.demoted_no_artifact + stats.findings_reconciled <= stats.reviews
     assert stats.triage > 0, "a real ledger imported no dismissals"
 
     # Every row the import called trustworthy must be a real, valid artifact --
