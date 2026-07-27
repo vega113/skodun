@@ -293,6 +293,43 @@ def test_nul_parsing_preserves_exotic_filenames(tmp_path):
     assert d.statuses[untracked_odd] == "A"
 
 
+def test_quotepath_changes_diff_identity_for_nonascii_path(tmp_path):
+    """DOCUMENTS a known, fail-safe config sensitivity -- not a bug to fix.
+
+    `Diff.files`/`statuses` are correct either way (NUL parsing is immune to
+    `core.quotepath`), but `git diff --no-index` still renders the untracked
+    file's name in the diff HEADER under quotepath rules, and that header text
+    is part of the hashed bytes. So `diff_identity` for a diff touching a
+    non-ASCII path is itself a function of `core.quotepath`, independent of
+    `--no-ext-diff --no-textconv` (those only suppress external/textconv
+    drivers -- see the `gitio` module docstring). The direction is safe: a
+    differing hash only means a failed legacy-record join and one extra
+    review, never a wrong gate PASS.
+
+    The autouse `_neutralise_ambient_git_config` fixture strips
+    `GIT_CONFIG_*` env entries for the whole module so the runner's ambient
+    config can't shadow this; the config is pinned per-repo below so the
+    result is a property of that config, not of the machine running the test.
+    """
+    repo = _mkrepo(tmp_path)  # _mkrepo already pins core.quotepath=true
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "ä-new.txt").write_text("umlaut\n", encoding="utf-8")  # untracked, non-ASCII
+    base = resolve_base(repo)
+
+    assert _git(repo, "config", "--get", "core.quotepath") == "true"
+    quoted = diff_identity(capture_diff(repo, base.sha, 100).data)
+
+    _git(repo, "config", "core.quotepath", "false")
+    unquoted = diff_identity(capture_diff(repo, base.sha, 100).data)
+
+    # not vacuous: both hashes are well-formed 40-char hex digests...
+    for h in (quoted, unquoted):
+        assert len(h) == 40
+        int(h, 16)
+    # ...and they differ, which is the whole point of this test.
+    assert quoted != unquoted
+
+
 def test_untracked_cap_truncates_and_flags(tmp_path):
     repo = _mkrepo(tmp_path)
     _git(repo, "checkout", "-b", "feat")

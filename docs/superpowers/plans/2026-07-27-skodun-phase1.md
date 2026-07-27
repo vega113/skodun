@@ -555,88 +555,55 @@ def _mkrepo(tmp_path: Path) -> Path:
     repo = tmp_path / "r"; repo.mkdir()
     _git(repo, "init", "-b", "main")
     _git(repo, "config", "user.email", "t@t"); _git(repo, "config", "user.name", "t")
+    # Pinned, not inherited: core.quotepath decides how untracked non-ASCII
+    # names round-trip through the oracle's text-mode listing (see the known
+    # divergence below) and, independently, how they render in a --no-index
+    # diff HEADER — which is why diff_identity itself is quotepath-sensitive.
+    _git(repo, "config", "core.quotepath", "true")
     (repo / "a.txt").write_text("one\n", encoding="utf-8")
     _git(repo, "add", "."); _git(repo, "commit", "-m", "c0")
     return repo
-
-def test_blob_sha1_matches_git(tmp_path):
-    data = b"hello \xff diff bytes\n"
-    p = tmp_path / "x"; p.write_bytes(data)
-    expected = subprocess.run(["git", "hash-object", "--stdin"], input=data,
-                              capture_output=True, check=True).stdout.decode().strip()
-    assert blob_sha1(data) == expected
-
-def test_diff_includes_untracked_and_is_stable(tmp_path):
-    repo = _mkrepo(tmp_path)
-    _git(repo, "checkout", "-b", "feat")
-    (repo / "a.txt").write_text("two\n", encoding="utf-8")   # modified
-    (repo / "new.txt").write_text("brand new\n", encoding="utf-8")  # untracked
-    base = resolve_base(repo)
-    d1 = capture_diff(repo, base.sha, untracked_max=100)
-    d2 = capture_diff(repo, base.sha, untracked_max=100)
-    assert d1.data == d2.data                     # deterministic bytes
-    assert "new.txt" in d1.files and "a.txt" in d1.files
-    assert b"brand new" in d1.data
-
-def test_base_falls_back_with_warning(tmp_path):
-    repo = _mkrepo(tmp_path)
-    (repo / "b.txt").write_text("x\n", encoding="utf-8")
-    _git(repo, "add", "."); _git(repo, "commit", "-m", "c1")
-    # no origin/github remotes; 'main' is current branch => merge-base(main, HEAD)=HEAD
-    # simulate detached work on a branch without main: delete main pointer
-    _git(repo, "checkout", "-b", "feat"); _git(repo, "branch", "-D", "main")
-    base = resolve_base(repo)
-    assert base.ref == "HEAD^" and base.warning is not None
-
-def test_base_single_commit_repo_falls_back_to_head(tmp_path):
-    repo = _mkrepo(tmp_path)          # exactly one commit; HEAD^ does not exist
-    _git(repo, "checkout", "-b", "feat"); _git(repo, "branch", "-D", "main")
-    base = resolve_base(repo)
-    assert base.ref == "HEAD" and base.warning is not None
-
-def test_diff_identity_strips_trailing_newlines_like_shell():
-    from skodun.gitio import diff_identity
-    assert diff_identity(b"diff --git a b\n+x\n\n\n") == diff_identity(b"diff --git a b\n+x")
-
-from tests.conftest import oracle_dir
-ORACLE = (oracle_dir() / "scripts" / "grok-prepush-review.sh") if oracle_dir() else None
-
-def _oracle_hash(repo: Path) -> str:
-    import subprocess as sp
-    return sp.run(["sh", str(ORACLE), "--diff-hash"], cwd=repo,
-                  capture_output=True, text=True).stdout.strip().splitlines()[-1]
-
-def test_diff_identity_parity_with_oracle(tmp_path):
-    import pytest
-    if ORACLE is None or not ORACLE.exists():
-        pytest.skip("oracle checkout not present (set SKODUN_ORACLE_DIR)")
-    from skodun.gitio import resolve_base, capture_diff, diff_identity
-    repo = _mkrepo(tmp_path)
-    _git(repo, "checkout", "-b", "feat")
-    (repo / "a.txt").write_text("two\n", encoding="utf-8")           # tracked edit
-    base = resolve_base(repo)
-    assert diff_identity(capture_diff(repo, base.sha, 100).data) == _oracle_hash(repo)
-    (repo / "brand-new.txt").write_text("nu\n", encoding="utf-8")    # + untracked
-    assert diff_identity(capture_diff(repo, base.sha, 100).data) == _oracle_hash(repo)
-
-def test_diff_identity_parity_untracked_only(tmp_path):
-    import pytest
-    if ORACLE is None or not ORACLE.exists():
-        pytest.skip("oracle checkout not present (set SKODUN_ORACLE_DIR)")
-    from skodun.gitio import resolve_base, capture_diff, diff_identity
-    repo = _mkrepo(tmp_path)
-    _git(repo, "checkout", "-b", "feat")
-    (repo / "only-new.txt").write_text("nu\n", encoding="utf-8")     # untracked ONLY —
-    base = resolve_base(repo)                    # oracle output starts "\n" + udiff
-    assert diff_identity(capture_diff(repo, base.sha, 100).data) == _oracle_hash(repo)
-
-def test_primary_checkout_detection(tmp_path):
-    repo = _mkrepo(tmp_path)
-    assert is_primary_checkout(repo) is True
-    wt = tmp_path / "wt"
-    _git(repo, "worktree", "add", str(wt), "-b", "w1")
-    assert is_primary_checkout(wt) is False
 ```
+
+The implemented suite (`tests/test_gitio.py`) has substantially more cases than
+fit here without turning this block into noise; the mandatory ones, beyond the
+sketch above:
+
+- `blob_sha1` matches `git hash-object --stdin`; `diff_identity` strips only
+  *trailing* newlines (a leading one, from the untracked-only shape, survives).
+- Base resolution: merge-base-with-main, `HEAD^` fallback with warning,
+  single-commit `HEAD` fallback, and the existence-only-candidate /
+  no-fallthrough case (`test_base_first_existing_candidate_wins_no_fallthrough`).
+- `capture_diff`: untracked files included and stable across two calls;
+  untracked-only diffs start with a leading `\n`; a dangling symlink is
+  skipped and appends no separator; `D`/`A` statuses; rename records keep the
+  new path only; NUL parsing preserves non-ASCII and space-padded names;
+  the untracked cap truncates and flags `truncated_untracked`.
+- `test_diff_flags_suppress_textconv_and_external_drivers` — pins
+  `--no-ext-diff --no-textconv` by configuring a live `textconv`/external
+  driver in the test repo and asserting the driver fired on raw `git diff`
+  but left no trace in `capture_diff`'s bytes.
+- `test_capture_diff_normalises_subdirectory_to_worktree_root` — capturing
+  from a subdirectory must match capturing from the root, for both `files`
+  and the hash.
+- `test_git_failure_raises_giterror_carrying_the_command` — a failing git
+  invocation surfaces as `GitError` naming the command and `rc=`, never a
+  silent empty result.
+- `test_quotepath_changes_diff_identity_for_nonascii_path` — a non-ASCII
+  untracked path's `diff_identity` differs between `core.quotepath=true` and
+  `=false`, because the name appears in a `--no-index` diff header either
+  way; both hashes are asserted to be well-formed 40-char hex so the test
+  cannot pass vacuously. Documents a known, fail-safe sensitivity (see the
+  `gitio` module docstring), not a bug to fix.
+- Oracle parity (skipped without `SKODUN_ORACLE_DIR`): tracked + untracked
+  edit, untracked-only, many-sections (empty file, space-padded name,
+  non-ASCII tracked name, dangling symlink), unrelated-history base, rename,
+  capture-from-subdirectory, and `test_known_divergence_untracked_nonascii_name`
+  — the one input where skodun's hash is *expected* to diverge from the
+  oracle's, pinned rather than accidental.
+- Repo introspection: primary-checkout detection (incl. a path that merely
+  *contains* `worktrees`), shared `git_common_dir` across worktrees,
+  `current_branch`/`head_sha`.
 
 - [ ] **Step 2: Run to verify FAIL**
 - [ ] **Step 3: Implementation**
@@ -723,7 +690,9 @@ def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
     statuses: dict[str, str] = {}
     # -z: NUL-delimited records — "M\0path\0" / "R100\0old\0new\0". Never
     # text-parse + strip(): quotepath mangles non-ASCII, strip() eats real spaces.
-    toks = _run(repo, "diff", "--name-status", "-z",
+    # --no-ext-diff --no-textconv here too: --name-status is still `git diff`,
+    # so it is just as subject to external/textconv drivers as the tracked body.
+    toks = _run(repo, "diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z",
                 base_sha).stdout.decode("utf-8", "replace").split("\0")
     i = 0
     while i < len(toks) and toks[i]:
@@ -2240,4 +2209,5 @@ def test_union_surfaces_one_sided_hashes_and_newest_row_wins(tmp_path):
 - Explicitly out of scope (Global Constraints): batching (fail-closed truncation tested in T15), pre-push dispatcher + dedup probe (`--now` never dedups — tested in T15), same-branch supersede, rules-registry generation/sync (stays in tubescribes), the legacy `-p` re-shell fallback, MCP/scheduling/other adapters/retention.
 - Known intentional deviations from legacy: SQLite instead of JSONL sprawl; explicit `-m` model flag; `SKODUN`-prefixed banner/gate lines (cutover-compat shims are a later phase); phase-1 extra passes reuse the finder model (cross-provider refuter is Phase 2); no `-p` ARG_MAX fallback.
 - Known intentional deviation from legacy — **untracked files with non-ASCII names (Task 4)**: the oracle lists untracked files in *text* mode, so under git's default `core.quotepath=true` a brand-new file named e.g. `ä-new.txt` reaches its `[ -f "$_uf" ]` guard as the literal string `"\303\244-new.txt"`, the guard fails, and the file is dropped from the reviewed diff entirely — i.e. **it is silently never reviewed**. That is an oracle bug, and skodun does not reproduce it: it reads NUL-delimited names and includes the file, so for exactly this input class skodun's diff bytes are a *superset* of the oracle's and the two `diff_hash`es differ. The direction is fail-safe — a legacy record for such a change simply fails to join, so skodun asks for one extra review; it can never turn a missed join into a wrong gate PASS. Reproducing the bug instead would mean emulating git's `quote_c_style` in Python, a new and larger source of divergence. Pinned by `test_known_divergence_untracked_nonascii_name`, which pins `core.quotepath=true` repo-locally so it documents *which* configuration exhibits the bug rather than inheriting the runner's.
+- Known, fail-safe config sensitivity (not a deviation, and not a bug) — **`core.quotepath` moves `diff_identity` for non-ASCII paths (Task 4)**: `--no-ext-diff --no-textconv` only guarantee that no external-diff or textconv driver can alter the hashed bytes; they say nothing about `core.quotepath`, and `git diff --no-index` still renders a non-ASCII filename in the diff HEADER under quotepath rules either way. So a diff touching such a path hashes differently under `core.quotepath=true` vs `=false`, independent of the untracked-non-ASCII deviation above (`Diff.files`/`statuses` are correct either way; only the hashed bytes move). Same fail-safe direction: a differing hash costs a failed legacy-record join and one extra review, never a wrong gate PASS. Pinned by `test_quotepath_changes_diff_identity_for_nonascii_path`, which sets both config values repo-locally and asserts the two resulting hashes differ.
 - This plan was adversarially reviewed by codex (gpt-5.6-sol, high reasoning effort) over multiple rounds; all 26 round-1, 12 round-2, and 9 round-3 findings (incl. `bool("false")` coercion, NUL-delimited path parsing with `R`/`C` two-path records, section-stripped `\n` join for diff parity, byte-exact prompt port via the `--write-prompt` seam, FIFO-safe `_safe_open`, the complete inline `PLACEHOLDER_REASONS` set, and uuid-suffixed record IDs) are incorporated above.

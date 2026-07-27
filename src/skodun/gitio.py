@@ -11,7 +11,16 @@ of this module — see the ORACLE PARITY notes below, each pinned by a test in
 `--no-ext-diff --no-textconv` are mandatory on every diff invocation: `git diff`
 otherwise honours `diff.external` and per-driver `textconv` from config and
 `.gitattributes`, so the hashed bytes would depend on the developer's machine
-and the gate would enforce an identity nobody else can reproduce.
+and the gate would enforce an identity nobody else can reproduce. This is
+the ONLY guarantee those two flags buy: no external-diff or textconv driver
+can alter the hashed bytes. It is NOT a guarantee that the hashed bytes are
+independent of local git config in general — `core.quotepath` still moves
+them for a diff touching a non-ASCII path, because `git diff --no-index`
+renders the filename in the diff header under quotepath rules regardless of
+`--no-ext-diff --no-textconv`. That sensitivity is fail-safe, not a bug: a
+differing hash means a failed legacy-record join and one extra review, never
+a wrong gate PASS. See `test_quotepath_changes_diff_identity_for_nonascii_path`
+in `tests/test_gitio.py`.
 """
 
 from __future__ import annotations
@@ -21,7 +30,9 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Mandatory on every diff: keeps the hashed bytes independent of local config.
+# Mandatory on every diff: keeps no external-diff or textconv driver able to
+# alter the hashed bytes. Does NOT make the hashed bytes config-independent in
+# general — see the module docstring's core.quotepath note.
 _DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
 
 
