@@ -838,7 +838,8 @@ def ledger_key(branch: str, base_sha: str, fkey: str) -> str:
 **Interfaces:**
 - Consumes: `Store` (Task 3), `textnorm` (Task 5).
 - Produces: `validate_reason(reason: str) -> None` (raises `TriageError`); `dismiss(store, review: dict, index: int, reason: str, now: str) -> dict`; `load_valid_artifact(rec: dict) -> dict` (raises `ArtifactError` on every self-inconsistent shape); `open_findings(review: dict, triaged: dict[str, dict]) -> list[dict]`.
-- **Oracle:** `grok_review_triage.py` lines 58–63 and 93–107 (reason rules: min 20 chars post-normalization; reject the 27-item `PLACEHOLDER_REASONS` set, inlined verbatim below), 176–230 (artifact validation: reject non-object artifact, non-list findings, non-dict list members, boolean/float/string `findings_total`, and `findings_total != len(findings)`).
+- **Oracle:** `grok_review_triage.py` lines 58–63 and 93–107 (reason rules, **in this order**: reject empty; reject the 27-item `PLACEHOLDER_REASONS` set, inlined verbatim below, matched on the fully normalized reason; then a 20-char floor measured on the whitespace-collapsed but **not** lowercased form — the order and the un-lowercased measurement are both load-bearing, see Step 1's notes), 176–230 (artifact validation: reject non-object artifact, non-list findings, and non-dict list members).
+- **Oracle — read with the divergence note:** the oracle's `findings_total` rules are **conditional**, not unconditional: `load_review` skips the boolean/float/string type check *and* the `findings_total != len(findings)` check entirely when the key is missing or `None`, and likewise coerces a missing/`None` `findings` to `[]`. It also never inspects `id`/`branch`/`base_sha`. `load_valid_artifact` rejects all of those shapes instead — a deliberate, fail-safe divergence spelled out in the **"artifact validation is strict by design (Task 6)"** bullet under [Self-Review Notes](#self-review-notes) and pinned from both sides by `test_load_valid_artifact_divergence_from_legacy_is_deliberate`. Read that bullet before changing anything in `load_valid_artifact`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -890,14 +891,17 @@ def test_dismiss_and_open(tmp_path):
 ```python
 # src/skodun/triage.py
 from __future__ import annotations
+import re
 from .store import Store
 from .textnorm import finding_key, ledger_key, norm
 
 class TriageError(ValueError): ...
 class ArtifactError(ValueError): ...
 
-# PARITY: verbatim from tubescribes/scripts/grok_review_triage.py:58-63 —
-# the parity test below asserts exact set equality against the oracle module.
+# PARITY-CRITICAL: copied verbatim from the oracle's `PLACEHOLDER_REASONS`
+# (grok_review_triage.py:58-63) — the parity test below asserts exact set
+# equality against the real oracle module. (Committed code never names the
+# oracle's repo; it cites the module only.)
 PLACEHOLDER_REASONS = {
     "false positive", "fp", "not a bug", "wontfix", "won't fix", "no", "nope",
     "n/a", "na", "none", "ignore", "ignored", "skip", "skipped", "ok", "fine",
@@ -906,16 +910,37 @@ PLACEHOLDER_REASONS = {
 }
 MIN_REASON_CHARS = 20
 
+def _collapse(s) -> str:            # the oracle's `cleaned`: whitespace-collapsed,
+    return re.sub(r"\s+", " ", str(s or "")).strip()   # NOT lowercased
+
 def validate_reason(reason: str) -> None:
-    n = norm(reason)
-    if len(n) < MIN_REASON_CHARS:
-        raise TriageError(f"reason too short (<{MIN_REASON_CHARS} chars normalized)")
-    if n in PLACEHOLDER_REASONS:
-        raise TriageError(f"placeholder reason rejected: {n!r}")
+    # ORACLE ORDER — empty, then placeholder, then length. Checking length
+    # first makes the placeholder branch unreachable (every placeholder is
+    # <= 14 chars) and swaps the actionable message for "too short".
+    # The floor is measured on _collapse(), not norm(): str.lower() can
+    # LENGTHEN a string (U+0130 -> two codepoints), so measuring on the
+    # lowercased form lets a 10-char reason clear the 20-char floor.
+    cleaned = _collapse(reason)
+    if not cleaned:
+        raise TriageError("a dismissal reason is required (it was empty)")
+    if norm(cleaned) in PLACEHOLDER_REASONS:
+        raise TriageError(f"{cleaned!r} is a placeholder, not a reason. Say WHY "
+                          "the finding is wrong -- what the reviewer missed, or "
+                          "where the guard actually lives.")
+    if len(cleaned) < MIN_REASON_CHARS:
+        raise TriageError(f"reason is {len(cleaned)} chars; at least "
+                          f"{MIN_REASON_CHARS} are required. A dismissal nobody "
+                          "can audit later is indistinguishable from ignoring "
+                          "the finding.")
 
 def load_valid_artifact(rec) -> dict:
     if not isinstance(rec, dict):
         raise ArtifactError("artifact is not an object")
+    for field in ("id", "branch", "base_sha"):   # dismiss() consumes all three
+        if field not in rec:
+            raise ArtifactError(f"{field} is missing")
+        if not isinstance(rec[field], str):
+            raise ArtifactError(f"{field} is not a string ({rec[field]!r})")
     findings = rec.get("findings")
     if not isinstance(findings, list) or any(not isinstance(f, dict) for f in findings):
         raise ArtifactError("findings is not a list of objects")
@@ -930,6 +955,10 @@ def load_valid_artifact(rec) -> dict:
 def dismiss(store: Store, review: dict, index: int, reason: str, now: str) -> dict:
     review = load_valid_artifact(review)
     validate_reason(reason)
+    # isinstance(True, int) is True, so an unguarded bool INDEXES the list:
+    # dismiss(..., True, ...) would dismiss findings[1].
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise TriageError(f"finding index must be an int ({index!r})")
     if not (0 <= index < len(review["findings"])):   # negative indexes must not
         raise TriageError(f"finding index {index} out of range")  # silently alias
     f = review["findings"][index]
@@ -2209,6 +2238,6 @@ def test_union_surfaces_one_sided_hashes_and_newest_row_wins(tmp_path):
 - Explicitly out of scope (Global Constraints): batching (fail-closed truncation tested in T15), pre-push dispatcher + dedup probe (`--now` never dedups — tested in T15), same-branch supersede, rules-registry generation/sync (stays in tubescribes), the legacy `-p` re-shell fallback, MCP/scheduling/other adapters/retention.
 - Known intentional deviations from legacy: SQLite instead of JSONL sprawl; explicit `-m` model flag; `SKODUN`-prefixed banner/gate lines (cutover-compat shims are a later phase); phase-1 extra passes reuse the finder model (cross-provider refuter is Phase 2); no `-p` ARG_MAX fallback.
 - Known intentional deviation from legacy — **untracked files with non-ASCII names (Task 4)**: the oracle lists untracked files in *text* mode, so under git's default `core.quotepath=true` a brand-new file named e.g. `ä-new.txt` reaches its `[ -f "$_uf" ]` guard as the literal string `"\303\244-new.txt"`, the guard fails, and the file is dropped from the reviewed diff entirely — i.e. **it is silently never reviewed**. That is an oracle bug, and skodun does not reproduce it: it reads NUL-delimited names and includes the file, so for exactly this input class skodun's diff bytes are a *superset* of the oracle's and the two `diff_hash`es differ. The direction is fail-safe — a legacy record for such a change simply fails to join, so skodun asks for one extra review; it can never turn a missed join into a wrong gate PASS. Reproducing the bug instead would mean emulating git's `quote_c_style` in Python, a new and larger source of divergence. Pinned by `test_known_divergence_untracked_nonascii_name`, which pins `core.quotepath=true` repo-locally so it documents *which* configuration exhibits the bug rather than inheriting the runner's.
-- Known intentional deviation from legacy — **artifact validation is strict by design (Task 6)**: the oracle's `load_review` (`grok_review_triage.py:176-230`) is lenient about absent keys — a missing/`None` `findings` is coerced to `[]`, and the `findings_total != len(findings)` check is skipped entirely when `findings_total` is missing/`None`. `load_valid_artifact` rejects all four of those shapes instead. That leniency is safe at the oracle's own call sites, which re-derive `review.get("findings") or []` for display; it is not safe here, because in skodun this function is the fail-closed validator the **gate (Task 7)** runs before a stored review may certify a push, and the check the **legacy importer (Task 16)** explicitly leans on to stop a findings-less index row from satisfying the gate. Under the lenient rule an artifact carrying no `findings` key reads as "zero findings" — i.e. clean — and the gate can PASS a review whose findings were never recorded, inverting the project's central fail-closed posture. "The oracle wins" pins keys and review semantics to the legacy archive; it does not require importing the oracle's *weaker* validation into the gate path, and being stricter is fail-safe in this direction (worst case: a malformed artifact forces one fresh review). Pinned from both sides by `test_load_valid_artifact_divergence_from_legacy_is_deliberate`, which asserts the oracle really does accept each shape and that skodun raises `ArtifactError` for it; `test_load_valid_artifact_parity_with_legacy_on_fully_specified_artifacts` confirms the divergence has not leaked into artifacts that assert both keys.
+- Known intentional deviation from legacy — **artifact validation is strict by design (Task 6)**: the oracle's `load_review` (`grok_review_triage.py:176-230`) is lenient about absent keys — a missing/`None` `findings` is coerced to `[]`, and the `findings_total != len(findings)` check is skipped entirely when `findings_total` is missing/`None`. It also never inspects `id`, `branch`, or `base_sha`, which `dismiss` reads immediately after validation and which the ledger key is built from. `load_valid_artifact` rejects all of those shapes instead — the four missing/`None` ones, plus a missing or non-string identity field. That leniency is safe at the oracle's own call sites, which re-derive `review.get("findings") or []` for display; it is not safe here, because in skodun this function is the fail-closed validator the **gate (Task 7)** runs before a stored review may certify a push, and the check the **legacy importer (Task 16)** explicitly leans on to stop a findings-less index row from satisfying the gate. Under the lenient rule an artifact carrying no `findings` key reads as "zero findings" — i.e. clean — and the gate can PASS a review whose findings were never recorded, inverting the project's central fail-closed posture. "The oracle wins" pins keys and review semantics to the legacy archive; it does not require importing the oracle's *weaker* validation into the gate path, and being stricter is fail-safe in this direction (worst case: a malformed artifact forces one fresh review). Pinned from both sides by `test_load_valid_artifact_divergence_from_legacy_is_deliberate`, which asserts the oracle really does accept each shape and that skodun raises `ArtifactError` for it; `test_load_valid_artifact_parity_with_legacy_on_fully_specified_artifacts` confirms the divergence has not leaked into artifacts that assert both keys.
 - Known, fail-safe config sensitivity (not a deviation, and not a bug) — **`core.quotepath` moves `diff_identity` for non-ASCII paths (Task 4)**: `--no-ext-diff --no-textconv` only guarantee that no external-diff or textconv driver can alter the hashed bytes; they say nothing about `core.quotepath`, and `git diff --no-index` still renders a non-ASCII filename in the diff HEADER under quotepath rules either way. So a diff touching such a path hashes differently under `core.quotepath=true` vs `=false`, independent of the untracked-non-ASCII deviation above (`Diff.files`/`statuses` are correct either way; only the hashed bytes move). Same fail-safe direction: a differing hash costs a failed legacy-record join and one extra review, never a wrong gate PASS. Pinned by `test_quotepath_changes_diff_identity_for_nonascii_path`, which sets both config values repo-locally and asserts the two resulting hashes differ.
 - This plan was adversarially reviewed by codex (gpt-5.6-sol, high reasoning effort) over multiple rounds; all 26 round-1, 12 round-2, and 9 round-3 findings (incl. `bool("false")` coercion, NUL-delimited path parsing with `R`/`C` two-path records, section-stripped `\n` join for diff parity, byte-exact prompt port via the `--write-prompt` seam, FIFO-safe `_safe_open`, the complete inline `PLACEHOLDER_REASONS` set, and uuid-suffixed record IDs) are incorporated above.

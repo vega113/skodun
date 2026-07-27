@@ -22,11 +22,13 @@ import pytest
 
 from skodun.store import Store
 from skodun.textnorm import finding_key
+from skodun.textnorm import norm
 from skodun.triage import (
     MIN_REASON_CHARS,
     PLACEHOLDER_REASONS,
     ArtifactError,
     TriageError,
+    _collapse,
     dismiss,
     load_valid_artifact,
     open_findings,
@@ -65,10 +67,37 @@ def test_reason_rules():
 def test_reason_placeholder_case_and_whitespace_insensitive():
     # PLACEHOLDER_REASONS is matched against the normalized (lowercased,
     # whitespace-collapsed) reason, so shouting or padding it must not help.
-    with pytest.raises(TriageError):
-        validate_reason("  FALSE   POSITIVE  ")
-    with pytest.raises(TriageError):
-        validate_reason("Wontfix")
+    #
+    # Each assertion checks the MESSAGE, not merely that something raised:
+    # every placeholder is shorter than MIN_REASON_CHARS, so a "too short"
+    # rejection would satisfy `pytest.raises` while the placeholder branch sat
+    # unreachable and its actionable wording ("say WHY") was never emitted.
+    for reason in ("  FALSE   POSITIVE  ", "Wontfix", "false positive"):
+        with pytest.raises(TriageError) as exc:
+            validate_reason(reason)
+        assert "placeholder" in str(exc.value), reason
+        assert "chars" not in str(exc.value), reason
+
+
+def test_reason_placeholder_padded_past_the_length_floor_still_placeholder():
+    # 34 raw chars -- comfortably over MIN_REASON_CHARS before normalization --
+    # but the padding collapses away and the reason is still nothing but a
+    # placeholder. The oracle rejects this with its placeholder message (not
+    # its length message), and so must skodun.
+    padded = "false positive" + " " * 20
+    assert len(padded) >= MIN_REASON_CHARS
+    with pytest.raises(TriageError) as exc:
+        validate_reason(padded)
+    assert "placeholder" in str(exc.value)
+
+
+@pytest.mark.parametrize("reason", sorted(PLACEHOLDER_REASONS))
+def test_every_placeholder_is_rejected_as_a_placeholder(reason):
+    # The whole set is live, not decorative: if the length check ran first,
+    # all 27 would be rejected with the wrong (and unactionable) reason.
+    with pytest.raises(TriageError) as exc:
+        validate_reason(reason)
+    assert "placeholder" in str(exc.value)
 
 
 def test_reason_length_boundary_exact():
@@ -80,6 +109,30 @@ def test_reason_length_boundary_exact():
     validate_reason(exactly_20)  # must not raise
     with pytest.raises(TriageError):
         validate_reason("a" * (MIN_REASON_CHARS - 1))
+
+
+def test_collapse_is_the_pre_lowercase_half_of_norm():
+    # `_collapse` exists only because the length floor must be measured before
+    # case folding. It must stay the exact pre-lowercase half of the single
+    # `norm` definition in textnorm -- if the two ever drift, the placeholder
+    # lookup and the length check stop describing the same string.
+    for s in ["", "   ", "a b", "  FALSE   POSITIVE  ", "İ" * 3, "Straße",
+              "a\t\nb  c", None, 42]:
+        assert norm(s) == _collapse(s).lower(), repr(s)
+
+
+@pytest.mark.parametrize("reason", ["İ" * 10, "ABCDEFGHIJİABCDEFGH"])
+def test_reason_length_measured_before_lowercasing(reason):
+    # U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE) lowercases to TWO
+    # codepoints, so `len(norm(reason))` overcounts: "İ"*10 is 10 characters
+    # but normalizes to 20. Measuring the floor on the lowercased form would
+    # let a 10-character reason clear a 20-character audit bar. The floor is
+    # measured on the collapsed-not-lowercased form, exactly as the oracle
+    # measures it, so both of these must be rejected.
+    assert len(norm(reason)) >= MIN_REASON_CHARS   # lenient form would accept
+    assert len(_collapse(reason)) < MIN_REASON_CHARS
+    with pytest.raises(TriageError):
+        validate_reason(reason)
 
 
 def test_reason_long_enough_raw_but_collapses_under_normalization():
@@ -131,6 +184,35 @@ def test_artifact_findings_non_dict_members_rejected():
         load_valid_artifact(dict(GOOD, findings=["x", "y"], findings_total=2))
 
 
+IDENTITY_FIELDS = ("id", "branch", "base_sha")
+
+
+@pytest.mark.parametrize("field", IDENTITY_FIELDS)
+def test_artifact_missing_identity_field_rejected(field):
+    # `dismiss` reads all three straight after validation "passes", and builds
+    # the ledger key from branch + base_sha. A validator that skips the fields
+    # its own caller consumes just relocates the failure to a bare KeyError.
+    rec = {k: v for k, v in GOOD.items() if k != field}
+    with pytest.raises(ArtifactError, match=field):
+        load_valid_artifact(rec)
+
+
+@pytest.mark.parametrize("field", IDENTITY_FIELDS)
+@pytest.mark.parametrize("value", [None, 1, ["x"], {"a": 1}])
+def test_artifact_non_string_identity_field_rejected(field, value):
+    with pytest.raises(ArtifactError, match=field):
+        load_valid_artifact(dict(GOOD, **{field: value}))
+
+
+@pytest.mark.parametrize("field", IDENTITY_FIELDS)
+def test_dismiss_raises_artifact_error_not_keyerror_on_missing_identity(tmp_path, field):
+    st = Store.open(tmp_path / "s.db")
+    rec = {k: v for k, v in GOOD.items() if k != field}
+    with pytest.raises(ArtifactError):
+        dismiss(st, rec, 0, "a perfectly valid twenty-plus character reason here",
+                now="2026-07-27T10:00:00Z")
+
+
 def test_artifact_empty_but_complete_is_accepted():
     # The fail-closed rule is about *asserted* shape, not about forbidding a
     # clean review: an artifact that explicitly records zero findings and a
@@ -144,9 +226,9 @@ def test_artifact_empty_but_complete_is_accepted():
 # --- Deliberate divergence from the oracle -------------------------------
 #
 # The oracle's `load_review` ACCEPTS every artifact below: it coerces a
-# missing/None `findings` to `[]` and skips the `findings_total` check
-# entirely when that key is missing/None. skodun rejects all of them, on
-# purpose. `load_valid_artifact` guards the gate's fail-closed contract --
+# missing/None `findings` to `[]`, skips the `findings_total` check entirely
+# when that key is missing/None, and never inspects `id`/`branch`/`base_sha`.
+# skodun rejects all of them, on purpose. `load_valid_artifact` guards the gate's fail-closed contract --
 # under the lenient rule an artifact with no recorded `findings` reads as
 # "zero findings", i.e. clean, and the gate could PASS a review whose
 # findings were never stored. It is also the check the legacy importer
@@ -164,6 +246,12 @@ DIVERGENT = {
     "missing findings_total": {k: v for k, v in GOOD.items()
                                if k != "findings_total"},
     "null findings_total": dict(GOOD, findings_total=None),
+    # The oracle never looks at the identity trio at all, so it accepts these
+    # too -- and then `dismiss` would read review["branch"] and raise a bare
+    # KeyError, or build a ledger key from a non-string and scope the
+    # dismissal to the wrong review loop.
+    "missing branch": {k: v for k, v in GOOD.items() if k != "branch"},
+    "non-string base_sha": dict(GOOD, base_sha=40),
 }
 
 
@@ -204,6 +292,23 @@ def test_index_equal_to_length_rejected(tmp_path):
     with pytest.raises(TriageError):
         dismiss(st, GOOD, 1, "a perfectly valid twenty-plus character reason here",
                 now="2026-07-27T10:00:00Z")
+
+
+@pytest.mark.parametrize("index", [True, False, 0.0, "0", None, [0]])
+def test_non_int_index_rejected(tmp_path, index):
+    # `isinstance(True, int)` is True, so an unguarded bool INDEXES the list:
+    # True would dismiss findings[1] -- a different finding than the caller
+    # named -- and False would silently mean 0. Every other non-int must
+    # surface as TriageError rather than a raw TypeError/AttributeError.
+    two = dict(GOOD, findings_total=2,
+               findings=GOOD["findings"] + [dict(file="b.py", line=9, severity="low",
+                                                 category="style", title="unused import",
+                                                 detail="meh")])
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(TriageError):
+        dismiss(st, two, index, "a perfectly valid twenty-plus character reason here",
+                now="2026-07-27T10:00:00Z")
+    assert st.triage_for("feat", "s" * 40) == {}
 
 
 def test_dismiss_rejects_invalid_reason_before_writing(tmp_path):
@@ -281,6 +386,17 @@ def test_validate_reason_parity_with_legacy_module():
         "this is a perfectly legitimate reason with plenty of detail",
         "ok",
         "known",
+        # Non-ASCII, where `str.lower()` LENGTHENS the string: U+0130
+        # lowercases to two codepoints. Measuring the floor on the lowercased
+        # form accepts both of these while the oracle rejects both, so they
+        # are the exact inputs that catch that divergence.
+        "İ" * 10,
+        "ABCDEFGHIJİABCDEFGH",
+        "İ" * 20,
+        # A placeholder padded past the raw length floor: both sides must
+        # reject on the placeholder rule, which they only reach if the
+        # placeholder check precedes the length check.
+        "false positive" + " " * 20,
     ]
     for reason in cases:
         skodun_ok = True

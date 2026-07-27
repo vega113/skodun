@@ -14,6 +14,8 @@ above that function.
 
 from __future__ import annotations
 
+import re
+
 from .store import Store
 from .textnorm import finding_key, ledger_key, norm
 
@@ -26,8 +28,9 @@ class ArtifactError(ValueError):
     """A review artifact is self-inconsistent and must not be trusted."""
 
 
-# PARITY: verbatim from tubescribes/scripts/grok_review_triage.py:58-63 —
-# the parity test below asserts exact set equality against the oracle module.
+# PARITY-CRITICAL: copied verbatim from the oracle's `PLACEHOLDER_REASONS`
+# (grok_review_triage.py:58-63) — the parity test in tests/test_triage.py
+# asserts exact set equality against the real oracle module.
 PLACEHOLDER_REASONS = {
     "false positive", "fp", "not a bug", "wontfix", "won't fix", "no", "nope",
     "n/a", "na", "none", "ignore", "ignored", "skip", "skipped", "ok", "fine",
@@ -37,30 +40,66 @@ PLACEHOLDER_REASONS = {
 MIN_REASON_CHARS = 20
 
 
+def _collapse(s) -> str:
+    r"""Whitespace-collapsed but NOT lowercased form of `s`.
+
+    PARITY-CRITICAL: this is the oracle's `cleaned` in `validate_reason`
+    (grok_review_triage.py:95), which measures the reason's length *before*
+    case folding::
+
+        cleaned = re.sub(r"\s+", " ", str(reason or "")).strip()
+
+    It is exactly the pre-lowercase half of `textnorm.norm` — the identity
+    `norm(s) == _collapse(s).lower()` holds for every input and is pinned by
+    `test_collapse_is_the_pre_lowercase_half_of_norm`. The two forms are NOT
+    interchangeable for the length check: `str.lower()` can *lengthen* a
+    string (U+0130 lowercases to two codepoints), so measuring on the
+    lowercased form lets a 10-character reason clear the 20-character floor.
+    """
+    return re.sub(r"\s+", " ", str(s or "")).strip()
+
+
 def validate_reason(reason: str) -> None:
     """Raise TriageError unless `reason` clears the audit floor.
 
     A dismissal that says nothing is the failure mode this ledger exists to
-    prevent: the reason must survive normalization (whitespace collapse +
-    lowercase) to at least MIN_REASON_CHARS, and must not be one of the
-    PLACEHOLDER_REASONS verbatim.
+    prevent. PARITY-CRITICAL, in the oracle's order (grok_review_triage.py:
+    93-107) — empty, then placeholder, then length:
+
+    * an empty (or whitespace-only) reason is rejected first;
+    * a reason whose fully normalized form is one of PLACEHOLDER_REASONS is
+      rejected as a *placeholder*, with the oracle's actionable message.
+      This check must precede the length check: every placeholder is shorter
+      than MIN_REASON_CHARS, so checking length first would make this branch
+      unreachable and replace the actionable message with "too short";
+    * the length floor is measured on the whitespace-collapsed but NOT
+      lowercased form, exactly as the oracle measures it. See `_collapse`.
     """
-    n = norm(reason)
-    if len(n) < MIN_REASON_CHARS:
-        raise TriageError(f"reason too short (<{MIN_REASON_CHARS} chars normalized)")
-    if n in PLACEHOLDER_REASONS:
-        raise TriageError(f"placeholder reason rejected: {n!r}")
+    cleaned = _collapse(reason)
+    if not cleaned:
+        raise TriageError("a dismissal reason is required (it was empty)")
+    if norm(cleaned) in PLACEHOLDER_REASONS:
+        raise TriageError(
+            f"{cleaned!r} is a placeholder, not a reason. Say WHY the finding "
+            "is wrong -- what the reviewer missed, or where the guard actually "
+            "lives.")
+    if len(cleaned) < MIN_REASON_CHARS:
+        raise TriageError(
+            f"reason is {len(cleaned)} chars; at least {MIN_REASON_CHARS} are "
+            "required. A dismissal nobody can audit later is indistinguishable "
+            "from ignoring the finding.")
 
 
 # DELIBERATE, DOCUMENTED DIVERGENCE FROM THE ORACLE — read before "fixing"
 # this back to match `grok_review_triage.py:176-230`.
 #
 # The oracle's `load_review` is LENIENT about absent keys: a missing or None
-# `findings` is silently coerced to `[]`, and the `findings_total !=
-# len(findings)` check is skipped entirely when `findings_total` is missing or
-# None (it validates the count only when the artifact actually asserts one).
-# That leniency is safe at the oracle's OWN call sites, which re-derive
-# `review.get("findings") or []` for display.
+# `findings` is silently coerced to `[]`, the `findings_total` type and
+# `findings_total != len(findings)` checks are skipped entirely when
+# `findings_total` is missing or None (it validates the count only when the
+# artifact actually asserts one), and `id` / `branch` / `base_sha` are never
+# checked at all. That leniency is safe at the oracle's OWN call sites, which
+# re-derive `review.get("findings") or []` for display.
 #
 # It is NOT safe here. In skodun this function is the fail-closed validator the
 # GATE (Task 7) runs before a stored review is allowed to certify a push, and
@@ -80,17 +119,30 @@ def load_valid_artifact(rec) -> dict:
     """Return `rec` if it is a self-consistent review artifact, else raise.
 
     Rejects, each with an `ArtifactError` naming the specific problem: a
-    non-object artifact; a missing `findings`; a `findings` that is not a
-    list; any non-dict member of `findings`; a missing `findings_total`; a
+    non-object artifact; a missing or non-string `id`, `branch`, or
+    `base_sha`; a missing `findings`; a `findings` that is not a list; any
+    non-dict member of `findings`; a missing `findings_total`; a
     `findings_total` that is not a plain int (bool/float/str all rejected —
     `isinstance(True, int)` is True in Python, so the bool check must be
     explicit and must come first); and `findings_total != len(findings)`.
 
-    Stricter than the oracle on the two missing-key cases; see the comment
-    block above for why that divergence is deliberate and fail-safe.
+    The identity trio is validated here rather than at the call site because
+    `dismiss` indexes `review["id"]`, `review["branch"]`, and
+    `review["base_sha"]` straight after this function "passes" — and the
+    ledger key is built from `branch` + `base_sha`, so a non-string there
+    would silently scope a dismissal to the wrong review loop. Validating
+    only what a caller does not consume is a validator in name only.
+
+    Stricter than the oracle on the missing-key and identity cases; see the
+    comment block above for why that divergence is deliberate and fail-safe.
     """
     if not isinstance(rec, dict):
         raise ArtifactError("artifact is not an object")
+    for field in ("id", "branch", "base_sha"):
+        if field not in rec:
+            raise ArtifactError(f"{field} is missing")
+        if not isinstance(rec[field], str):
+            raise ArtifactError(f"{field} is not a string ({rec[field]!r})")
     if "findings" not in rec:
         raise ArtifactError("findings is missing")
     findings = rec["findings"]
@@ -116,6 +168,12 @@ def dismiss(store: Store, review: dict, index: int, reason: str, now: str) -> di
     validate_reason(reason)
     # load_valid_artifact guarantees `findings` is present and a list of dicts.
     findings = review["findings"]
+    # `isinstance(True, int)` is True in Python, so an unguarded bool indexes
+    # the list: `dismiss(..., True, ...)` would dismiss findings[1] — a
+    # different finding than the caller named. Any other non-int would leak a
+    # raw TypeError past this module's TriageError contract.
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise TriageError(f"finding index must be an int ({index!r})")
     if not (0 <= index < len(findings)):   # negative indexes must not
         raise TriageError(f"finding index {index} out of range")  # silently alias
     f = findings[index]
