@@ -5,7 +5,7 @@ import pytest
 
 from skodun.config import (
     _DEFAULTS_MINIMUMS, SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOT_NAMES,
-    SECURITY_PROMPT_SLOTS, Defaults, load_config,
+    SECURITY_PROMPT_SLOTS, Defaults, Reviewer, load_config,
 )
 
 
@@ -482,3 +482,262 @@ def test_security_prompt_slots_reject_a_blank_fragment(tmp_path):
             ValueError,
             match=r"\[defaults\] security_prompt_slots: entry 0 must not be empty"):
         load_config(None, global_path=g)
+
+
+# --- severity_gate / confidence_threshold: removed in Phase 2 --------------
+#
+# Both keys were declared-but-inert in Phase 1 (see the Phase 1 plan's
+# "Known intentional deviations"): they read like a severity/confidence
+# filter on the gate but never filtered anything -- `gate.open_findings`
+# blocks on ANY untriaged finding, by design. A key that looks like a filter
+# but silently is not is a safety trap, so Phase 2 removes both rather than
+# ever implement the filter. A config that still sets one must fail with a
+# message that reads as a decision, not a typo -- and it must come from the
+# dedicated removed-keys check, not the generic "unknown [defaults] keys"
+# error, which is why the match below pins the "removed in Phase 2" phrase
+# rather than just any ValueError.
+
+def test_severity_gate_removed_key_rejected_from_global_layer(tmp_path):
+    g = _write(tmp_path / "g.toml", "[defaults]\nseverity_gate = \"high\"\n")
+    with pytest.raises(
+            ValueError,
+            match=r"\[defaults\] severity_gate was removed in Phase 2: the "
+                  r"gate blocks on any open finding by design .* delete the key"):
+        load_config(None, global_path=g)
+
+
+def test_severity_gate_removed_key_rejected_from_project_layer(tmp_path):
+    repo = tmp_path / "repo"; repo.mkdir()
+    _write(repo / ".skodun.toml", "[defaults]\nseverity_gate = \"high\"\n")
+    with pytest.raises(ValueError, match=r"severity_gate was removed in Phase 2"):
+        load_config(repo, global_path=tmp_path / "absent.toml")
+
+
+def test_confidence_threshold_removed_key_rejected_from_global_layer(tmp_path):
+    g = _write(tmp_path / "g.toml", "[defaults]\nconfidence_threshold = 7\n")
+    with pytest.raises(
+            ValueError,
+            match=r"\[defaults\] confidence_threshold was removed in Phase 2: "
+                  r"the gate blocks on any open finding by design .* delete the key"):
+        load_config(None, global_path=g)
+
+
+def test_confidence_threshold_removed_key_rejected_from_project_layer(tmp_path):
+    repo = tmp_path / "repo"; repo.mkdir()
+    _write(repo / ".skodun.toml", "[defaults]\nconfidence_threshold = 7\n")
+    with pytest.raises(ValueError, match=r"confidence_threshold was removed in Phase 2"):
+        load_config(repo, global_path=tmp_path / "absent.toml")
+
+
+def test_removed_keys_no_longer_appear_on_defaults():
+    known = {f.name for f in fields(Defaults)}
+    assert "severity_gate" not in known
+    assert "confidence_threshold" not in known
+
+
+# --- Reviewer.fallbacks: the quota-fallback chain --------------------------
+#
+# This module only builds and validates the chain; Task 7 executes it. A
+# member's own `fallbacks` are never followed at runtime -- only the head
+# reviewer's list is used when its attempt classifies `unavailable` -- but
+# validation still walks every chain transitively so a mutual (or longer)
+# cycle is rejected at load time, not discovered mid-run.
+
+def test_fallback_chain_validated(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = ["backup"]
+[[reviewers]]
+name = "backup"
+provider = "openai"
+model = "n"
+""")
+    cfg = load_config(None, global_path=p)
+    assert cfg.reviewers[0].fallbacks == ("backup",)
+    assert isinstance(cfg.reviewers[0].fallbacks, tuple)
+
+
+def test_fallback_defaults_to_empty_tuple():
+    assert Reviewer(name="x").fallbacks == ()
+
+
+def test_fallback_target_can_be_defined_in_a_different_layer(tmp_path):
+    """Validation runs on the MERGED reviewer set, not per layer."""
+    g = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = ["backup"]
+""")
+    repo = tmp_path / "repo"; repo.mkdir()
+    _write(repo / ".skodun.toml", """
+[[reviewers]]
+name = "backup"
+provider = "openai"
+model = "n"
+""")
+    cfg = load_config(repo, global_path=g)
+    assert cfg.reviewers[0].fallbacks == ("backup",)
+
+
+def test_fallback_chain_of_exactly_three_is_legal(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = ["b1", "b2", "b3"]
+[[reviewers]]
+name = "b1"
+provider = "openai"
+model = "n"
+[[reviewers]]
+name = "b2"
+provider = "openai"
+model = "n"
+[[reviewers]]
+name = "b3"
+provider = "openai"
+model = "n"
+""")
+    cfg = load_config(None, global_path=p)
+    assert cfg.reviewers[0].fallbacks == ("b1", "b2", "b3")
+
+
+def test_fallback_chain_of_four_is_rejected(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = ["b1", "b2", "b3", "b4"]
+[[reviewers]]
+name = "b1"
+provider = "openai"
+model = "n"
+[[reviewers]]
+name = "b2"
+provider = "openai"
+model = "n"
+[[reviewers]]
+name = "b3"
+provider = "openai"
+model = "n"
+[[reviewers]]
+name = "b4"
+provider = "openai"
+model = "n"
+""")
+    with pytest.raises(
+            ValueError,
+            match=r"reviewer 'finder': fallback chain has 4 entries, at most 3"):
+        load_config(None, global_path=p)
+
+
+def test_fallback_unknown_name_rejected(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = ["ghost"]
+""")
+    with pytest.raises(
+            ValueError, match=r"reviewer 'finder': fallback 'ghost' does not exist"):
+        load_config(None, global_path=p)
+
+
+def test_fallback_self_reference_rejected(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = ["finder"]
+""")
+    with pytest.raises(
+            ValueError,
+            match=r"reviewer 'finder': cannot be its own fallback"):
+        load_config(None, global_path=p)
+
+
+def test_fallback_disabled_target_rejected(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = ["backup"]
+[[reviewers]]
+name = "backup"
+provider = "openai"
+model = "n"
+enabled = false
+""")
+    with pytest.raises(
+            ValueError, match=r"reviewer 'finder': fallback 'backup' is disabled"):
+        load_config(None, global_path=p)
+
+
+def test_fallback_duplicate_in_chain_rejected(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = ["backup", "backup"]
+[[reviewers]]
+name = "backup"
+provider = "openai"
+model = "n"
+""")
+    with pytest.raises(
+            ValueError,
+            match=r"reviewer 'finder': fallback 'backup' listed more than once"):
+        load_config(None, global_path=p)
+
+
+def test_fallback_cycle_rejected(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+fallbacks = ["b"]
+[[reviewers]]
+name = "b"
+provider = "openai"
+model = "n"
+fallbacks = ["a"]
+""")
+    with pytest.raises(ValueError, match="cycle"):
+        load_config(None, global_path=p)
+
+
+def test_fallback_transitive_cycle_rejected(tmp_path):
+    """A mutual (2-node) cycle is the obvious case; validation must also catch
+    a longer cycle reached only by walking a chain member's OWN fallbacks
+    (never followed at runtime, but still walked for this check)."""
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+fallbacks = ["b"]
+[[reviewers]]
+name = "b"
+provider = "openai"
+model = "n"
+fallbacks = ["c"]
+[[reviewers]]
+name = "c"
+provider = "openai"
+model = "n"
+fallbacks = ["a"]
+""")
+    with pytest.raises(ValueError, match="reviewer 'a':.*cycle"):
+        load_config(None, global_path=p)

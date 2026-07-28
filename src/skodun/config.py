@@ -34,30 +34,8 @@ SECURITY_PROMPT_SLOT_NAMES: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class Defaults:
-    """The `[defaults]` table of `.skodun.toml`.
+    """The `[defaults]` table of `.skodun.toml`."""
 
-    NO EFFECT IN PHASE 1: `severity_gate` and `confidence_threshold`. Both are
-    accepted and validated so a config written for a later phase loads today
-    without an "unknown [defaults] keys" error, but **nothing reads either
-    one**. In particular, `severity_gate` does NOT filter what blocks a push:
-    `gate.open_findings` returns every untriaged finding regardless of
-    severity, so a single `low` finding is exit 1 even under
-    `severity_gate = "high"`. The only way to clear a finding is to triage it
-    with an audited reason. `test_config.py` pins that documented no-effect
-    behavior end to end, so whoever implements these will be told to update
-    this docstring.
-    """
-
-    #: DECLARED FOR A LATER PHASE, NO EFFECT IN PHASE 1. Nothing reads this.
-    #: The gate blocks on ANY untriaged finding, whatever its severity --
-    #: setting this to "high" does not let `low` findings through. See the
-    #: class docstring.
-    severity_gate: str = "high"
-    #: DECLARED FOR A LATER PHASE, NO EFFECT IN PHASE 1. Nothing reads this;
-    #: no finding is ever filtered by a confidence score. It appears in
-    #: `_DEFAULTS_MINIMUMS` only so a nonsensical value is still rejected at
-    #: load time, which is bounds-checking, not consumption.
-    confidence_threshold: int = 7
     max_diff_bytes: int = 400_000
     timeout_sec: int = 420
     timeout_retries: int = 1
@@ -190,12 +168,10 @@ def _bounded_int(key: str, value: object, minimum: int) -> int:
 # review — thousands of lines into a run. Lower bounds only: an upper bound
 # would be a policy guess this module has no basis for.
 #   >= 1  the value is a capacity, and zero of it means the review cannot
-#         happen at all: no diff bytes, no seconds, no turns, no confidence
-#         level a finding could ever clear.
+#         happen at all: no diff bytes, no seconds, no turns.
 #   >= 0  zero is a coherent opt-out: do not retry, do not scan untracked
 #         files. Negative still is not.
 _DEFAULTS_MINIMUMS = {
-    "confidence_threshold": 1,
     "max_diff_bytes": 1,
     "timeout_sec": 1,
     "max_turns": 1,
@@ -215,6 +191,30 @@ _DEFAULTS_NORMALIZERS = {
     "security_prompt_slots": _slot_pairs,
 }
 
+# key -> migration message. `severity_gate` and `confidence_threshold` were
+# Phase 1's forward-looking stubs: declared and bounds-checked so a config
+# written for a later phase loaded without an "unknown [defaults] keys"
+# error, but nothing ever read either one -- `gate.open_findings` blocks on
+# ANY untriaged finding regardless of severity, by design. A key that looks
+# like it filters findings but does not is a safety trap, so Phase 2 removes
+# both rather than ever implement the filter. Loading a config that still
+# sets one must read as a decision, not a typo, so this check runs BEFORE the
+# generic unknown-key check in `load_config` and produces this dedicated
+# message instead of falling through to "unknown [defaults] keys".
+_REMOVED_DEFAULTS = {
+    "severity_gate": (
+        "[defaults] severity_gate was removed in Phase 2: the gate blocks "
+        "on any open finding by design — delete the key"),
+    "confidence_threshold": (
+        "[defaults] confidence_threshold was removed in Phase 2: the gate "
+        "blocks on any open finding by design — delete the key"),
+}
+
+# Fallback-chain shape limit: head reviewer + at most 3 fallback entries (4
+# total), matching the "head + <=3 fallbacks" budget Task 7's execution loop
+# is built around.
+_MAX_FALLBACK_CHAIN = 3
+
 @dataclass(frozen=True)
 class Reviewer:
     name: str
@@ -226,6 +226,18 @@ class Reviewer:
     persona: str | None = None
     max_cost_usd: float | None = None
     enabled: bool = True
+    #: Ordered quota-fallback chain: other reviewer entries (by name) to try,
+    #: in order, when THIS reviewer's own attempt classifies `unavailable`.
+    #: Runtime-only uses the HEAD reviewer's list -- a chain member's own
+    #: `fallbacks` are never followed while executing a fallback attempt, so
+    #: a chain is not transitively expanded at run time (Task 7). Validation
+    #: is stricter than execution on purpose: every referenced name must
+    #: exist after merging, be `enabled`, not be the reviewer itself, appear
+    #: at most once, and the chain (this list) may hold at most
+    #: `_MAX_FALLBACK_CHAIN` entries. Cycle validation, unlike execution,
+    #: DOES walk each member's own `fallbacks` transitively, so a mutual (or
+    #: longer) cycle is rejected at load time rather than discovered mid-run.
+    fallbacks: tuple[str, ...] = ()
 
 @dataclass(frozen=True)
 class Config:
@@ -251,6 +263,50 @@ def _validate(r: Reviewer) -> Reviewer:
         raise ValueError(f"reviewer {r.name!r}: provider and model are required")
     return r
 
+def _validate_fallbacks(reviewers: tuple[Reviewer, ...]) -> None:
+    """Validate every `fallbacks` chain against the full, merged reviewer set.
+
+    Every validation failure names both the reviewer whose chain is bad and
+    the specific problem, so a config error is locatable without reading this
+    module. Two passes on purpose: the first checks each reviewer's own list
+    in isolation (existence, self-reference, duplicates, length) so those
+    messages are as specific as possible; only once every list is known
+    well-formed does the second pass walk chains transitively for cycles --
+    a cycle walk that hit a still-unvalidated (e.g. nonexistent) target would
+    produce a confusing KeyError instead of a config error.
+    """
+    by_name = {r.name: r for r in reviewers}
+    for r in reviewers:
+        seen: set[str] = set()
+        for target in r.fallbacks:
+            if target == r.name:
+                raise ValueError(f"reviewer {r.name!r}: cannot be its own fallback")
+            if target in seen:
+                raise ValueError(
+                    f"reviewer {r.name!r}: fallback {target!r} listed more than once")
+            seen.add(target)
+            if target not in by_name:
+                raise ValueError(
+                    f"reviewer {r.name!r}: fallback {target!r} does not exist")
+            if not by_name[target].enabled:
+                raise ValueError(
+                    f"reviewer {r.name!r}: fallback {target!r} is disabled")
+        if len(r.fallbacks) > _MAX_FALLBACK_CHAIN:
+            raise ValueError(
+                f"reviewer {r.name!r}: fallback chain has {len(r.fallbacks)} "
+                f"entries, at most {_MAX_FALLBACK_CHAIN} are allowed")
+
+    def _walk(name: str, path: list[str]) -> None:
+        for target in by_name[name].fallbacks:
+            if target in path:
+                raise ValueError(
+                    f"reviewer {path[0]!r}: fallback chain has a cycle at {target!r}")
+            _walk(target, path + [target])
+
+    for r in reviewers:
+        if r.fallbacks:
+            _walk(r.name, [r.name])
+
 def load_config(repo_root: Path | None, global_path: Path | None = None) -> Config:
     if global_path is None:
         global_path = Path(os.environ.get(
@@ -272,6 +328,9 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
                 rmap[name] = {}; order.append(name)
             rmap[name].update(entry)   # later layer wins per-key, merged by name
 
+    removed = set(dvals) & set(_REMOVED_DEFAULTS)
+    if removed:
+        raise ValueError(_REMOVED_DEFAULTS[sorted(removed)[0]])
     known = {f.name for f in fields(Defaults)}
     unknown = set(dvals) - known
     if unknown:
@@ -291,5 +350,9 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
             raise ValueError(f"reviewer {name!r}: unknown keys {sorted(bad)}")
         if "dimensions" in e:
             e["dimensions"] = tuple(e["dimensions"])
+        if "fallbacks" in e:
+            e["fallbacks"] = tuple(e["fallbacks"])
         reviewers.append(_validate(Reviewer(**e)))
-    return Config(defaults=Defaults(**dvals), reviewers=tuple(reviewers))
+    reviewers = tuple(reviewers)
+    _validate_fallbacks(reviewers)
+    return Config(defaults=Defaults(**dvals), reviewers=reviewers)

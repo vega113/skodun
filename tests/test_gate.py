@@ -690,25 +690,24 @@ def test_cli_gate_from_a_subdirectory_accepts_a_review_taken_from_the_root(
     capsys.readouterr()
 
 
-def test_severity_gate_high_still_blocks_on_a_low_finding(tmp_path):
-    """`severity_gate` is DECLARED but has NO EFFECT in Phase 1.
+def test_any_open_finding_blocks_the_gate_regardless_of_severity(tmp_path):
+    """The gate blocks on ANY open finding, whatever its severity -- by design.
 
-    It is accepted and validated so a forward-looking config loads, and a user
-    writing `severity_gate = "high"` will reasonably conclude that `low`
-    findings do not block a push. They do: `gate.open_findings` returns every
-    untriaged finding regardless of severity, and the only way to clear one is
-    to triage it with an audited reason. `config.Defaults` says so in its
-    docstring and beside the field; this test is what tells whoever implements
-    the feature to update both.
+    Phase 1 declared `[defaults]` keys `severity_gate` and `confidence_threshold`
+    as forward-looking stubs: they were accepted and bounds-checked but nothing
+    read either one, so a user writing `severity_gate = "high"` could reasonably
+    (and wrongly) conclude that `low` findings would not block a push. Phase 2
+    removed both keys rather than ever implement that filter: a key that looks
+    like it filters findings but does not is a safety trap, and the gate design
+    is that severity never gates -- only triage does. (The removal itself, and
+    its migration error for a config that still sets either key, is pinned in
+    `tests/test_config.py`.) This test is the surviving pin of the actual
+    behavior: a single `low` finding still blocks, and only triage -- never
+    severity -- clears it.
     """
     repo = _outgoing(_mkrepo(tmp_path))
-    (repo / ".skodun.toml").write_text(
-        "[defaults]\nseverity_gate = \"high\"\nconfidence_threshold = 9\n",
-        encoding="utf-8")
     st = Store.open(tmp_path / "s.db")
     cfg = _cfg(repo)
-    assert cfg.defaults.severity_gate == "high"      # it really did load
-    assert cfg.defaults.confidence_threshold == 9
     _reviewed(st, repo, findings=[dict(_FINDING, severity="low")])
 
     r = run_gate(st, repo, cfg, env={})
