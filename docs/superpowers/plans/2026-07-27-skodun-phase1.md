@@ -211,7 +211,8 @@ effort = "high"
     cfg = load_config(repo, global_path=g)
     assert cfg.defaults.timeout_sec == 240
     assert cfg.defaults.max_turns == 40          # untouched default survives
-    f = cfg.reviewer("finder")
+    assert [r.name for r in cfg.reviewers] == ["finder"]   # merged, not appended
+    f = cfg.reviewers[0]
     assert f.model == "grok-4.20-0309-reasoning"  # inherited from global entry
     assert f.effort == "high"                     # overridden by project entry
 
