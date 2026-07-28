@@ -71,9 +71,13 @@ guarantees:
 ### 2. Trust across a provider fallback
 
 A fallback is a **fresh attempt by a different reviewer entry**, never a continuation.
-Each entry in `attempts[]` gains `provider` and `model`. The review's trust axes come
-solely from the single accepted attempt; the invariant and its store-chokepoint
-enforcement are untouched. Outputs of two providers are never merged into one payload.
+Each entry in `attempts[]` gains `{provider, model, effort}` and a persisted
+`classification`: the full `ClassifyResult` (`{kind, category, detail}`) for every
+completed attempt, synthetic `unavailable` objects for missing-binary and
+quota-cache-skip entries, and `null` for timed-out attempts (whose output was
+discarded — there is nothing to classify). The review's trust axes come solely from
+the single accepted attempt; the invariant and its store-chokepoint enforcement are
+untouched. Outputs of two providers are never merged into one payload.
 
 ### 3. Per-pass provenance
 
