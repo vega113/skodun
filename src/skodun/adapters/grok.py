@@ -144,6 +144,16 @@ _NO_EFFORT_PREFIXES = ("grok-build",)
 # would be dead code that quietly implies a third, undocumented opt-out.
 _EFFORT_OFF = (None, "none")
 
+# Everything `json`'s decoder can throw at a hostile blob. `ValueError` is the
+# documented one (`JSONDecodeError` subclasses it), but the C scanner signals
+# "too deeply nested" with `RecursionError`, which is a `RuntimeError` and so
+# sails past `except ValueError` untouched. stdout here is untrusted model
+# output: 65 KB of `[[[[...` is a plausible thing for a confused model to emit
+# and must be worth `parse_ok=False`, not an exception escaping into the gate
+# path. Both extractors below catch this tuple, which is what actually makes
+# `parse`/`classify` total — `_ask` only covers the contract predicates.
+_DECODE_FAILURES = (ValueError, RecursionError)
+
 
 def resolve_grok_bin() -> str:
     """`SKODUN_GROK_BIN` -> `~/.grok/bin/grok` if executable -> `grok` on PATH.
@@ -316,7 +326,7 @@ def _first_review_object(text: str,
     while pos != -1:
         try:
             obj, _ = decoder.raw_decode(text, pos)
-        except ValueError:
+        except _DECODE_FAILURES:
             pos = text.find("{", pos + 1)
             continue
         if _ask(eligible, obj):
@@ -352,7 +362,7 @@ def _root_envelope(text: str) -> object | None:
         return None
     try:
         root, _ = json.JSONDecoder().raw_decode(stripped, 0)
-    except ValueError:
+    except _DECODE_FAILURES:
         return None
     return root
 

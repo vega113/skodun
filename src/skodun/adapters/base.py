@@ -21,7 +21,13 @@ CLIs rather than being copied into each of them. Three ideas:
 `parse` and `classify` never raise, on any input. That is a trust property, not
 politeness: an exception escaping into the gate path would be reported as an
 unexpected error rather than as an untrustworthy review, and the two have very
-different consequences.
+different consequences. Totality is not one guard but two, in different places,
+and neither alone is enough:
+
+* `_ask` here covers the *contract predicates*, which are caller-supplied
+  callables this module cannot vouch for.
+* Each adapter's own JSON extraction covers the *decoder*, which raises
+  `RecursionError` — not a `ValueError` — on deeply nested untrusted output.
 """
 
 from __future__ import annotations
@@ -71,6 +77,11 @@ class ClassifyResult:
     `kind` is the decision Task 7's fallback chains switch on; `category` is
     only meaningful for `unavailable` and is empty otherwise. `detail` is for
     humans and logs and is never matched on.
+
+    `ok` means "no positive evidence of ill health", NOT "produced usable
+    output": a run with empty stdout and clean stderr is `ok` and yet worth
+    nothing. Whether the attempt yielded anything is `ParseResult.parse_ok`, on
+    the other axis, and a caller that needs both must check both.
     """
 
     kind: Literal["ok", "degraded", "unavailable"]
@@ -125,6 +136,11 @@ def _ask(pred: Callable[[object], bool], obj: object) -> bool:
     to raise, and that promise cannot be conditional on a third-party
     predicate being well-behaved. False is the fail-closed answer: an
     unanswerable payload is not a payload this program may act on.
+
+    This covers the predicates and nothing else. The JSON decode that produces
+    the object handed in here is the adapter's to guard — see grok's
+    `_DECODE_FAILURES` — so do not read this function as making the
+    never-raise promise total on its own.
     """
     try:
         return bool(pred(obj))
