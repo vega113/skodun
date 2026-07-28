@@ -31,29 +31,40 @@ per the research roadmap, later.
 ### 1. The adapter contract
 
 `ParseResult` and the `Adapter` protocol move to `adapters/base.py` (grok module
-re-exports for compatibility). The contract guarantees:
+re-exports for compatibility; `ParseResult` keeps its six Phase 1 fields
+backward-compatible and adds `payload` — the contract-validated payload verbatim,
+with `findings`/`summary` demoted to a review-contract-only projection). The runs a
+pipeline requests are described by an **`OutputContract`** (`name`, single-line JSON
+schema, eligibility + validation callables); two ship: `REVIEW_CONTRACT` (Phase 1
+review shape) and `REFUTER_CONTRACT` (the refuter's verdicts shape). The contract
+guarantees:
 
-- `build_cmd(prompt_file, reviewer, defaults, cwd) -> list[str]` — full argv; prompt
-  always travels as a file; **raises `ValueError` loudly** for an effort the
+- `build_cmd(prompt_file, reviewer, defaults, cwd, contract) -> list[str]` — full argv;
+  prompt always travels as a file; **raises `ValueError` loudly** for an effort the
   (provider, model) pair cannot honor — never a silent downgrade. Each adapter owns an
   explicit canonical-effort → CLI-flag mapping table.
-- `parse(stdout, stderr) -> ParseResult` — never raises on garbage; `parse_ok` requires
-  a schema-valid payload (same finding-shape validation grok enforces today).
-- `classify(rc, stdout, stderr) -> "ok" | "degraded" | "unavailable"` — NEW. `degraded`
-  means, provider-neutrally: *positive evidence this run's output was truncated or
-  corrupted by the harness* (each adapter defines its own signals from its CLI's failure
-  vocabulary). `unavailable` means: *the provider could not serve at all* — quota
-  exhausted, auth expired, binary missing (rc 127), model id unknown. The distinction
-  drives fallback: `unavailable` triggers the chain; `degraded` triggers the existing
-  same-reviewer retry.
-- **Conformance suite** (`tests/adapter_conformance.py`, a shared test mixin
-  parameterized over the registry): every adapter must (a) return `parse_ok=False`
-  without raising on garbage/empty/truncated input, (b) ship ≥2 real degradation
+- `parse(stdout, stderr, contract) -> ParseResult` — never raises on garbage;
+  `parse_ok` requires a contract-valid payload (review shape keeps grok's Phase 1
+  finding-shape validation).
+- `classify(rc, stdout, stderr, contract) -> ok | degraded | unavailable (+ category
+  + detail)` — NEW. `degraded` means, provider-neutrally: *positive evidence this
+  run's output was truncated or corrupted by the harness* (each adapter defines its
+  own signals from its CLI's failure vocabulary). `unavailable` means: *the provider
+  could not serve at all* — quota exhausted, auth expired, binary missing (rc 127),
+  model id unknown — with a `category` (`quota|auth|binary|model|other`) that decides
+  cacheability. Usable contract-valid terminal output always classifies `ok`
+  regardless of stderr noise. The kind drives fallback: `unavailable` triggers the
+  chain; `degraded` triggers the existing same-reviewer retry.
+- **Conformance suite** (`tests/adapter_conformance.py`, with a registry-parameterized
+  coverage gate): every adapter must (a) return `parse_ok=False` without raising on
+  garbage/empty/truncated input under both contracts, (b) ship ≥2 real degradation
   fixtures (healthy vs degraded envelope pairs) and detect them, (c) ship ≥1
-  `unavailable` fixture (incl. the rc-127 binary-missing case), (d) prove one loud
-  effort rejection or declare full effort support, (e) never mark `degraded` from
-  finding-text content alone. An adapter that cannot recognise its CLI failing is worse
-  than no adapter — the suite is the registration gate.
+  `unavailable` fixture with a category (incl. the rc-127 binary-missing case),
+  (d) prove one loud effort rejection or declare full effort support, (e) never mark
+  `degraded` or `unavailable` from finding-text content or from stderr noise beside
+  usable output, (f) request, classify and parse a valid `REFUTER_CONTRACT` fixture.
+  An adapter that cannot recognise its CLI failing is worse than no adapter — the
+  suite is the registration gate.
 
 ### 2. Trust across a provider fallback
 
@@ -110,11 +121,12 @@ provider (written on quota-style unavailability with a conservative TTL, consult
 skip a known-dead provider, atomically updated, always bypassable with
 `SKODUN_IGNORE_PROVIDER_STATE=1`). **Exhausted chain = explicit `failed` record**
 (`failure_reason` naming every entry and its classification), `trustworthy=false`,
-banner emitted. The failed record never erases older coverage: a prior trustworthy
-review of the identical `diff_hash` that still passes the gate's artifact checks
-(`base_sha` match included) keeps gating 0/1 — the diff-identity invariant working.
-Where no such coverage exists (fresh content), the gate answers exit 2. Never a pass
-minted by the failure itself.
+banner emitted. The failed record never erases older coverage, under the store's
+newest-wins selection: the gate reads the NEWEST trustworthy row for the diff_hash,
+and that row must pass the gate's artifact checks (`base_sha` match included) — the
+diff-identity invariant working, fail-closed when the newest row's base has moved.
+Where no trustworthy coverage exists (fresh content), the gate answers exit 2. Never
+a pass minted by the failure itself.
 
 ## Deferred-decision resolutions
 
@@ -134,8 +146,8 @@ minted by the failure itself.
 
 Fail-closed trust invariant and gate contract untouched. Stdlib-only runtime, pytest
 only. Public-repo hygiene: no machine paths, no upstream project names in `src/`
-(including prompt text — the refuter prompt is slot-based and generic like the security
-prompt). Oracle parity surfaces (diff identity, triage keys, prompt bytes) unchanged —
+(including prompt text — the refuter prompt is generic and slot-free; unlike the
+security prompt it names no repo-specific concepts, so it needs no slot interface). Oracle parity surfaces (diff identity, triage keys, prompt bytes) unchanged —
 Phase 2 adds no oracle-ported code, so no new parity tests; existing ones must stay
 green. Every file read/written passes `encoding="utf-8"`; prompts travel as files;
 model selection always explicit.
@@ -151,8 +163,9 @@ model selection always explicit.
 4. **Fallback drill**: chain `[dead-binary reviewer → real reviewer]` yields a
    trustworthy review whose `attempts[]` shows `unavailable` then success on the
    fallback provider. Exhausted chain `[dead → dead]` on fresh content yields a
-   `failed` record, banner `trustworthy=false`, gate exit 2 (older coverage of
-   identical bytes at the same base, where it exists, legitimately keeps gating).
+   `failed` record, banner `trustworthy=false`, gate exit 2 (where the newest
+   trustworthy row for those bytes matches the current base, it legitimately keeps
+   gating — newest-wins, pinned).
    The provider-state cache is exercised with a quota-category failure (dead
    binaries are deliberately uncached).
 5. **No regression**: whole-archive shadow comparison against the legacy archive
