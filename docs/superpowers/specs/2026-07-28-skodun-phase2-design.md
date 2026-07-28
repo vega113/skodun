@@ -110,7 +110,11 @@ provider (written on quota-style unavailability with a conservative TTL, consult
 skip a known-dead provider, atomically updated, always bypassable with
 `SKODUN_IGNORE_PROVIDER_STATE=1`). **Exhausted chain = explicit `failed` record**
 (`failure_reason` naming every entry and its classification), `trustworthy=false`,
-banner emitted, gate answers exit 2. Never a pass.
+banner emitted. The failed record never erases older coverage: a prior trustworthy
+review of the identical `diff_hash` that still passes the gate's artifact checks
+(`base_sha` match included) keeps gating 0/1 — the diff-identity invariant working.
+Where no such coverage exists (fresh content), the gate answers exit 2. Never a pass
+minted by the failure itself.
 
 ## Deferred-decision resolutions
 
@@ -146,7 +150,10 @@ model selection always explicit.
    flips the gate 1→0 (on a store copy); recorded artifact shows per-pass provenance.
 4. **Fallback drill**: chain `[dead-binary reviewer → real reviewer]` yields a
    trustworthy review whose `attempts[]` shows `unavailable` then success on the
-   fallback provider. Exhausted chain `[dead → dead]` yields a `failed` record, banner
-   `trustworthy=false`, gate exit 2.
+   fallback provider. Exhausted chain `[dead → dead]` on fresh content yields a
+   `failed` record, banner `trustworthy=false`, gate exit 2 (older coverage of
+   identical bytes at the same base, where it exists, legitimately keeps gating).
+   The provider-state cache is exercised with a quota-category failure (dead
+   binaries are deliberately uncached).
 5. **No regression**: whole-archive shadow comparison against the legacy archive
    reproduces Phase 1 counts (modulo documented classes and the `--since` window).
