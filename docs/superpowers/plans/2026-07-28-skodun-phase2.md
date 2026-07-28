@@ -142,10 +142,19 @@ class OutputContract:
     eligible: Callable[[object], bool] # envelope-extraction predicate
     validate: Callable[[object], bool]
 
-REVIEW_CONTRACT = OutputContract("review", _REVIEW_SCHEMA, _valid_payload)
-REFUTER_CONTRACT = OutputContract("refuter", _REFUTER_SCHEMA, _valid_verdicts)
-# _REVIEW_SCHEMA moves here from grok.SCHEMA (re-exported there);
-# _REFUTER_SCHEMA/_valid_verdicts are defined in full in this task — see below.
+def _review_eligible(obj: object) -> bool:
+    return isinstance(obj, dict) and ("summary" in obj or "findings" in obj)
+
+def _refuter_eligible(obj: object) -> bool:
+    return isinstance(obj, dict) and "verdicts" in obj
+
+REVIEW_CONTRACT = OutputContract("review", _REVIEW_SCHEMA,
+                                 _review_eligible, _valid_payload)
+REFUTER_CONTRACT = OutputContract("refuter", _REFUTER_SCHEMA,
+                                  _refuter_eligible, _valid_verdicts)
+# _REVIEW_SCHEMA moves here from grok.SCHEMA (re-exported there); _review_eligible
+# is the Phase 1 _eligible predicate relocated; _REFUTER_SCHEMA/_valid_verdicts are
+# defined in full in this task — see below.
 
 class Adapter(Protocol):
     name: str
@@ -182,12 +191,12 @@ Give `GrokAdapter` `provider = "xai"`, `name = "grok"`, `resolve_binary()` deleg
   1b. a `refuter_healthy` fixture exists; `parse(..., REFUTER_CONTRACT)` on it yields `parse_ok=True` with `payload["verdicts"]` a non-empty list, `classify(..., REFUTER_CONTRACT).kind == "ok"` (also with the noisy-stderr variant), AND `parse(..., REVIEW_CONTRACT)` on the same bytes yields `parse_ok=False` — every adapter must prove it can request, classify and parse the refuter shape, or Task 8 breaks only at runtime;
   2. every `*healthy*` fixture EXCEPT `refuter_*` → `classify(0, ..., REVIEW_CONTRACT).kind == "ok"` and `parse(..., REVIEW_CONTRACT).parse_ok is True` (refuter fixtures are checked by rule 1b under their own contract, never by the review selector);
   3. every `*degraded*` fixture → `degraded` from parse or `classify` — and ≥ 2 such fixtures exist;
-  4. every `*unavailable*` fixture → `classify(...).kind == "unavailable"` with a non-empty `category` — and ≥ 1 exists, plus the rc-127 → `binary` case;
+  4. every `*unavailable*` fixture → `classify(...).kind == "unavailable"` with `category` EXACTLY equal to the fixture's declared `category=` line and a member of `{quota, auth, binary, model, other}` — a mislabeled category is a conformance failure, because an auth failure classified `quota` would be cached provider-wide; ≥ 1 such fixture exists, plus the rc-127 → `binary` case. Conversely every ok/degraded classification must carry an EMPTY category;
   5. the effort contract: either one loud `ValueError` case or a total mapping over `config.EFFORTS`;
   6. `degraded` is never triggered by finding-text content: a healthy envelope whose finding titles contain the adapter's own stderr signal words still classifies `ok`;
   7. **usable output wins over stderr noise**: a healthy, schema-valid envelope on stdout accompanied by stderr containing the adapter's own auth/quota signal words still classifies `ok` — `unavailable` means the provider could not serve, and it demonstrably did. (This generalizes grok's Phase 1 auth-noise non-signal rule to every adapter; each supplies a `*healthy_noisy_stderr*` fixture.)
 - **The registry is the gate, mechanically:** a registry-parameterized test (`test_every_registered_adapter_has_conformance_coverage`) asserts that for every provider in `_REGISTRY` there exists a collected `AdapterConformance` subclass bound to that provider (discoverable via a `provider_id` class attr on each subclass). Registering an adapter without a conformance subclass fails CI by construction, not by convention.
-- Fixture file format: first line `rc=<int>`, then `--- stdout ---` / `--- stderr ---` sections, raw bytes, UTF-8. A tiny loader in the mixin parses it.
+- Fixture file format: first line `rc=<int>`, optional second line `category=<expected>` (REQUIRED on every `*unavailable*` fixture), then `--- stdout ---` / `--- stderr ---` sections, raw bytes, UTF-8. A tiny loader in the mixin parses it.
 - **Grok fixtures are captured from real archived envelopes**, not synthesized: the legacy archive at `Path(SKODUN_ORACLE_DIR) / ".grok-reviews"` (the same location the existing parity infrastructure and `test_real_archive_smoke` use) holds real `<id>.grok.txt` stdout envelopes from live runs — copy one healthy and one degraded (`stopReason: Cancelled`) envelope, sanitize (strip any repo paths/branch names from summaries and finding text, keep the structure byte-faithful), and commit. The stderr-signal and auth fixtures may be synthesized where the archive holds no stderr captures — note which fixtures are captured vs synthesized in a `fixtures/adapters/xai/README` line each. (Global Constraints' capture rule applies in full to the three NEW adapters, whose probe steps produce their fixtures.)
 
 - [ ] **Step 1: Write the mixin + registry-coverage test + grok subclass; run to verify FAIL** (missing fixtures/classify cases fail loudly).
@@ -428,10 +437,17 @@ def test_unknown_fallback_provider_refused_in_preflight(tmp_path, repo, store):
         _cli_review(repo, CFG_WITH_UNKNOWN_FALLBACK_PROVIDER)
     assert len(store.list_reviews(None, 1000)) == rec_count_before  # nothing ran
 
-def test_lock_ceiling_scales_with_chain_width():
+def test_runtime_and_lock_ceilings_scale_with_chain_width():
     d = Defaults()
-    single = worst_runtime_sec(d, max_chain_width=1)
-    assert worst_runtime_sec(d, max_chain_width=4) >= 4 * single
+    assert worst_runtime_sec(d, max_chain_width=4) >= 4 * worst_runtime_sec(d, max_chain_width=1)
+    assert lock_stale_ceiling_sec(d, max_chain_width=4) >= \
+        4 * lock_stale_ceiling_sec(d, max_chain_width=1)
+
+def test_run_review_derives_ceiling_from_configured_width(monkeypatch, repo, store):
+    # a 4-entry chain config must reach _acquire_fg_lock with the scaled stale
+    # ceiling — spy on the acquire call and assert the passed ceiling equals
+    # lock_stale_ceiling_sec(d, max_chain_width=4)
+    ...
 ```
 
 (Fake CLI helpers extend Phase 1's `_fake_grok`; each fake logs invocations. Config constants — `CFG_OPENAI_THEN_XAI` etc. — are module-level TOML snippets with the chain under test.)
