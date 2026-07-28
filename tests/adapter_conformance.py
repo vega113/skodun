@@ -17,6 +17,13 @@ Adding an adapter
 
 In `tests/test_adapter_<name>.py`::
 
+    from tests.adapter_conformance import (  # noqa: F401 - collected below
+        AdapterConformance,
+        test_coverage_gate_fails_without_a_conformance_subclass,
+        test_every_registered_adapter_has_conformance_coverage,
+        test_load_fixture_rejects_a_malformed_rc,
+    )
+
     class TestAcmeConformance(AdapterConformance):
         provider_id = "acme"                    # the `_REGISTRY` key
         fixture_dir = Path(__file__).parent / "fixtures" / "adapters" / "acme"
@@ -28,6 +35,13 @@ In `tests/test_adapter_<name>.py`::
             r = Reviewer(name="f", provider="acme", model="acme-mini",
                          role="finder", effort="max")
             return r, "effort"          # or None: see `effort_reject_case`
+
+The three imported `test_*` functions are NOT decorative and NOT re-declared
+per adapter: importing them into a collected module is what makes pytest run
+them at all, since this module is deliberately not collected (see above). They
+are the registry coverage gate, its own self-proof, and the fixture loader's
+contract — defined once, next to the suite they gate, so they cannot drift
+per adapter. Dropping them from the import silently removes the gate.
 
 The class name MUST start with `Test`, or pytest never collects it and the
 coverage gate — which checks exactly that — fails.
@@ -57,6 +71,26 @@ run::
     --- stderr ---
     <raw bytes>
 
+`rc=` is an ASCII integer, optionally negated, and is the only required
+header. `category=` is the `ClassifyResult.category` the adapter is expected
+to return, and the vocabulary is CLOSED — exactly one of::
+
+    quota    the provider is out of budget. The ONLY category that is a
+             property of the provider as a whole, and therefore the only one
+             a caller may remember beyond a single attempt: mislabel
+             something else as `quota` and a healthy provider drops out of
+             every later fallback chain in the run.
+    auth     credentials missing, expired or refused. Attempt-local.
+    binary   the CLI is not installed or not on PATH (rc 127). This is the
+             reviewer's configuration being wrong, never a provider outage.
+    model    the requested model id is unknown to the CLI. Attempt-local.
+    other    unavailable for a reason none of the above names. Deliberately
+             last: reach for it only when the stderr genuinely says nothing
+             more specific, because it caches nothing and explains nothing.
+
+Anything else fails rule 4 — a fixture may not invent a category, and the
+adapter's answer must equal the declared one exactly.
+
 Both section markers are mandatory even when a section is empty: an absent
 `--- stderr ---` is far more likely to be a typo than an intention, and
 defaulting it to `b""` would quietly weaken whichever rule the fixture exists
@@ -75,6 +109,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,6 +153,11 @@ _CONTRACTS: tuple[OutputContract, ...] = (REVIEW_CONTRACT, REFUTER_CONTRACT)
 
 _STDOUT_MARKER = b"--- stdout ---"
 _STDERR_MARKER = b"--- stderr ---"
+
+# The only spelling of `rc=` a fixture may use: ASCII digits, optionally
+# negated. One spelling per value, so two fixtures cannot declare the same exit
+# code in two ways. See `load_fixture`.
+_RC = re.compile(r"-?[0-9]+")
 
 
 # --------------------------------------------------------------------------
@@ -169,8 +209,16 @@ def load_fixture(path: Path) -> Fixture:
         assert eq, f"{path}:{lineno}: header line is not `key=value`: {line!r}"
         if key == "rc":
             assert rc is None, f"{path}:{lineno}: duplicate `rc=`"
-            assert value.strip().lstrip("-").isdigit(), (
-                f"{path}:{lineno}: rc must be an integer, got {value!r}")
+            # ASCII, exactly one optional sign, and nothing `int()` would take
+            # that a reader would not: `str.isdigit()` is true of `１` and of
+            # every other Unicode decimal, and `lstrip("-")` turns `--1` into
+            # something it approves of and `int()` then rejects — as a bare
+            # `ValueError` that names no file, breaking this loader's one
+            # promise. Match first, convert second, and the conversion can no
+            # longer fail.
+            assert _RC.fullmatch(value.strip()), (
+                f"{path}:{lineno}: rc must be an ASCII integer "
+                f"(optionally negated), got {value!r}")
             rc = int(value.strip())
         elif key == "category":
             assert category is None, f"{path}:{lineno}: duplicate `category=`"
@@ -182,6 +230,49 @@ def load_fixture(path: Path) -> Fixture:
     assert rc is not None, f"{path}: missing the required first line `rc=<int>`"
     return Fixture(name=path.stem, path=path, rc=rc, category=category,
                    stdout=body, stderr=_strip_one_newline(err))
+
+
+def test_load_fixture_rejects_a_malformed_rc(tmp_path):
+    """A bad `rc=` line fails as an AssertionError that NAMES the file.
+
+    Imported into each adapter's test module alongside the coverage gate, for
+    the same reason: the loader is what stops a fixture from loading as
+    something it is not, and `load_fixture`'s own docstring promises that every
+    failure names the path. A bare `ValueError: invalid literal for int()`
+    keeps that promise for nobody — the author of a 400-line captured envelope
+    is left grepping six files for the typo.
+
+    The accepted spellings are ASCII and exact. `１` (FULLWIDTH DIGIT ONE) is
+    the sharp case: `int()` takes it happily, so a lenient loader would read a
+    header nobody can see is odd and report no problem at all.
+    """
+    written_count = 0
+
+    def written(header: str) -> Path:
+        nonlocal written_count
+        written_count += 1
+        # A distinct file per case, and the name says which: the assertion
+        # below checks the path is IN the message, so two cases sharing a name
+        # could pass on each other's failure.
+        p = tmp_path / f"case_{written_count:02d}.txt"
+        p.write_bytes(header.encode("utf-8")
+                      + b"\n--- stdout ---\n\n--- stderr ---\n")
+        return p
+
+    for bad in ("rc=--1", "rc=１", "rc=+1", "rc=", "rc=1 2", "rc=0x10",
+                "rc=nan"):
+        path = written(bad)
+        with pytest.raises(AssertionError) as excinfo:
+            load_fixture(path)
+        assert str(path) in str(excinfo.value), (
+            f"{bad!r} failed without naming the fixture file: "
+            f"{excinfo.value}")
+
+    # …and the spellings a real fixture uses still load.
+    assert load_fixture(written("rc=0")).rc == 0
+    assert load_fixture(written("rc=127")).rc == 127
+    assert load_fixture(written("rc=-1")).rc == -1
+    assert load_fixture(written("rc= 2 ")).rc == 2
 
 
 # --------------------------------------------------------------------------
@@ -423,6 +514,22 @@ class AdapterConformance:
             assert isinstance(verdicts, list) and verdicts, (
                 f"{fx.name}: payload['verdicts'] must be a non-empty list, "
                 f"got {verdicts!r}")
+            # The `findings`/`summary` projection belongs to REVIEW_CONTRACT
+            # alone. A refuter payload reaching it is the SAME false all-clear
+            # as the negative half below, arriving by the other door: a Phase 1
+            # caller that reads only these two fields would take refuter
+            # verdicts for review findings, or an invented summary for a real
+            # one. The refuter's content is available on `payload`.
+            assert res.findings == [], (
+                f"{fx.name}: parse(..., REFUTER_CONTRACT) projected "
+                f"{len(res.findings)} item(s) into `findings` — that field is "
+                f"REVIEW_CONTRACT's, and a caller reading it sees refuter "
+                f"output as a review")
+            assert res.summary == "", (
+                f"{fx.name}: parse(..., REFUTER_CONTRACT) projected "
+                f"{res.summary!r} into `summary` — that field is "
+                f"REVIEW_CONTRACT's and must stay empty under any other "
+                f"contract")
             self._classified(
                 a.classify(fx.rc, fx.stdout, fx.stderr, REFUTER_CONTRACT),
                 f"{fx.name} refuter classify")
@@ -479,6 +586,16 @@ class AdapterConformance:
         witnesses are required because one signal passing is not evidence that
         the detection is general; in the oracle's corpus a single unrecognised
         `Cancelled` shape accounted for 116 silently-clean runs.
+
+        What it also may not do is call the degradation `unavailable`.
+        Degradation and unavailability are different questions —
+        "was this answer cut short?" versus "could the provider serve at all?"
+        — with different costs: `degraded` buys one same-reviewer retry, while
+        `unavailable` advances the fallback chain and, at category `quota`,
+        takes the provider out of every later chain in the run. A valid
+        envelope whose harness complained on stderr is a degradation of a
+        provider that demonstrably served, so conflating the two throws away a
+        working provider on evidence that never said it was down.
         """
         a = self.adapter()
         degraded = self.select(_is_degraded)
@@ -488,6 +605,13 @@ class AdapterConformance:
             res = self._classified(
                 a.classify(fx.rc, fx.stdout, fx.stderr, REVIEW_CONTRACT),
                 f"{fx.name} classify")
+            assert res.kind != "unavailable", (
+                f"{fx.name}: a degradation classified unavailable/"
+                f"{res.category} ({res.detail!r}) — availability and "
+                f"degradation are different axes. This run is a truncated "
+                f"answer from a provider that served; 'unavailable' advances "
+                f"the fallback chain instead of retrying, and at category "
+                f"'quota' removes the provider from every later chain")
             parsed = a.parse(fx.stdout, fx.stderr, REVIEW_CONTRACT)
             assert res.kind == "degraded" or parsed.degraded is True, (
                 f"{fx.name}: neither classify ({res.kind}) nor parse "
@@ -581,6 +705,20 @@ class AdapterConformance:
             "effort_reject_case() must return (Reviewer, str) or None")
         with pytest.raises(ValueError, match=message):
             a.build_cmd(Path("prompt.txt"), reviewer, Defaults(), Path("."))
+        # A reject case excuses exactly ONE effort — the one it declares. The
+        # rest of the mapping still has to be total, or an adapter could prove
+        # it refuses `max` loudly and then silently drop `high` as well: the
+        # design spec's "every mapping is pinned by the conformance suite"
+        # would hold for one value and nothing else. This is the same
+        # obligation the `None` branch above carries, minus the declared
+        # exception.
+        excused = {_EFFORT_OPT_OUT, reviewer.effort}
+        missing = sorted((EFFORTS - excused) - set(mapping))
+        assert not missing, (
+            f"effort_reject_case() declares only effort {reviewer.effort!r} "
+            f"unsupported, but effort_map() has no CLI value for {missing} "
+            f"either — an unmapped effort is a silent downgrade unless "
+            f"build_cmd refuses it too")
 
     # ---- rule 6: finding text is content, never signal ---------------------
 

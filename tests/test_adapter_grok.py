@@ -38,6 +38,7 @@ from tests.adapter_conformance import (  # noqa: F401 - see below
     AdapterConformance,
     test_coverage_gate_fails_without_a_conformance_subclass,
     test_every_registered_adapter_has_conformance_coverage,
+    test_load_fixture_rejects_a_malformed_rc,
 )
 from tests.conftest import oracle_dir
 
