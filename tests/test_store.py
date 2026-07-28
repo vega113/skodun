@@ -4,8 +4,36 @@ import sqlite3
 
 import pytest
 
-from skodun.store import Store
+from skodun.store import SCHEMA_VERSION, Store
 from skodun.trust import is_trustworthy
+
+# The Phase 1 `_SCHEMA` DDL, copied VERBATIM. This is what a store written by
+# Phase 1 skodun actually contains -- a true v0 database that has never had a
+# `provider_state` table and never had `user_version` stamped. Do NOT re-point
+# this at `store._SCHEMA`: the migration tests are only evidence if the
+# starting database is frozen at the shape the migration has to upgrade *from*.
+PHASE1_SCHEMA = """
+CREATE TABLE IF NOT EXISTS reviews (
+  id TEXT PRIMARY KEY, reviewed_at TEXT, branch TEXT, head TEXT,
+  base_ref TEXT, base_sha TEXT, diff_hash TEXT, context_hash TEXT,
+  mode TEXT, model TEXT, adapter TEXT, status TEXT,
+  parse_ok INTEGER, degraded INTEGER, diff_truncated INTEGER, trustworthy INTEGER,
+  stop_reason TEXT, findings_total INTEGER, sev_high INTEGER, sev_medium INTEGER,
+  sev_low INTEGER, summary TEXT, source TEXT DEFAULT 'skodun', artifact_json TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_reviews_diff ON reviews(diff_hash, trustworthy);
+CREATE INDEX IF NOT EXISTS ix_reviews_branch ON reviews(branch, reviewed_at);
+CREATE TABLE IF NOT EXISTS triage (
+  ledger_key TEXT PRIMARY KEY, finding_key TEXT, review_id TEXT, branch TEXT,
+  base_sha TEXT, file TEXT, line INTEGER, severity TEXT, title TEXT,
+  dismissed_reason TEXT, dismissed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_triage_scope ON triage(branch, base_sha);
+CREATE TABLE IF NOT EXISTS gate_events (
+  at TEXT, repo TEXT, branch TEXT, diff_hash TEXT, outcome TEXT,
+  code INTEGER, note TEXT
+);
+"""
 
 REC = dict(id="r1", reviewed_at="2026-07-27T10:00:00Z", branch="b", head="h"*20,
            base_ref="origin/main", base_sha="s"*40, diff_hash="d"*40, context_hash="",
@@ -299,3 +327,364 @@ def test_reopen_sees_persisted_rows(tmp_path):
     db = tmp_path / "s.db"
     Store.open(db).save_review(REC)
     assert Store.open(db).get_review("r1")["summary"] == "ok"
+
+
+# --- schema version + migration ladder --------------------------------------
+
+def _objects(path) -> set:
+    """Every table/index in the file, straight from sqlite_master."""
+    conn = sqlite3.connect(path)
+    try:
+        return {(r[0], r[1]) for r in conn.execute(
+            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
+    finally:
+        conn.close()
+
+
+def _user_version(path) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _phase1_db(path, reviews=("r1",)):
+    """A real Phase-1-shaped store: v0, Phase 1 DDL, rows in every table."""
+    raw = sqlite3.connect(path)
+    raw.executescript(PHASE1_SCHEMA)
+    for rid in reviews:
+        raw.execute(
+            "INSERT INTO reviews (id, diff_hash, trustworthy, artifact_json)"
+            " VALUES (?, ?, 1, ?)",
+            (rid, "d" * 40, json.dumps({"id": rid, "summary": "ok"})))
+    raw.execute(
+        "INSERT INTO triage (ledger_key, finding_key, review_id, branch, base_sha,"
+        " dismissed_reason) VALUES (?, 'k1', 'r1', 'b', ?, 'wontfix')",
+        ("b\0s\0k1", "s" * 40))
+    raw.execute(
+        "INSERT INTO gate_events (at, repo, branch, diff_hash, outcome, code, note)"
+        " VALUES ('2026-07-27T10:00:00Z', '/r', 'b', ?, 'fail', 1, '2 open')",
+        ("d" * 40,))
+    raw.commit()
+    raw.close()
+    return path
+
+
+def test_fresh_db_lands_at_schema_version(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    assert SCHEMA_VERSION == 2
+    assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert ("table", "provider_state") in _objects(db)
+
+
+def test_migration_ladder_is_ordered_and_reaches_schema_version():
+    """A delta added out of order, or a delta added without bumping
+    SCHEMA_VERSION, would run on the wrong databases or never be stamped."""
+    from skodun.store import _MIGRATIONS
+    targets = [t for t, _ in _MIGRATIONS]
+    assert targets == sorted(set(targets))
+    assert targets[-1] == SCHEMA_VERSION
+    assert all(t > 0 for t in targets)
+
+
+def test_migration_from_true_phase1_db(tmp_path):
+    db = tmp_path / "s.db"
+    raw = sqlite3.connect(db)
+    raw.executescript(PHASE1_SCHEMA)                  # verbatim Phase 1 DDL, v0
+    raw.execute("INSERT INTO reviews (id, diff_hash, trustworthy, artifact_json)"
+                " VALUES (?, ?, 1, ?)",
+                ("r1", "d" * 40, json.dumps({"id": "r1", "summary": "ok"})))
+    raw.commit()
+    raw.close()
+    assert _user_version(db) == 0                     # it really starts at v0
+    st = Store.open(db)
+    assert st._c.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert st.get_review("r1")["summary"] == "ok"     # rows preserved
+    st.mark_provider_unavailable("openai", "quota", "quota",
+                                 "2026-07-28T12:00:00Z")  # new table exists
+
+
+def test_phase1_store_upgrade_preserves_every_table_index_and_row(tmp_path):
+    """The live store holds thousands of imported reviews. Opening it with the
+    new code must add `provider_state` and nothing else: every Phase 1 table,
+    every Phase 1 index and every row survives."""
+    db = _phase1_db(tmp_path / "s.db", reviews=("r1", "r2", "r3"))
+    before = _objects(db)
+    assert ("table", "provider_state") not in before
+
+    st = Store.open(db)
+
+    after = _objects(db)
+    assert before <= after, before - after            # nothing dropped
+    assert after - before == {("table", "provider_state")}   # nothing else added
+    assert sorted(r["id"] for r in st.list_reviews(None, 100)) == ["r1", "r2", "r3"]
+    assert st.triage_for("b", "s" * 40)["k1"]["dismissed_reason"] == "wontfix"
+    assert st._c.execute("SELECT count(*) FROM gate_events").fetchone()[0] == 1
+    assert _user_version(db) == SCHEMA_VERSION
+
+
+def test_reopen_is_idempotent_and_keeps_version_and_rows(tmp_path):
+    db = tmp_path / "s.db"
+    Store.open(db).mark_provider_unavailable("openai", "quota", "quota",
+                                             "2026-07-28T12:00:00Z")
+    st = Store.open(db)                               # second open, already v2
+    assert _user_version(db) == SCHEMA_VERSION
+    assert [r["provider"] for r in st.provider_state_rows("2026-07-28T11:00:00Z")] \
+        == ["openai"]
+
+
+def test_future_schema_refused_before_any_ddl(tmp_path):
+    db = tmp_path / "s.db"
+    raw = sqlite3.connect(db)
+    raw.execute("PRAGMA user_version = 99")
+    raw.commit()
+    raw.close()
+    with pytest.raises(ValueError, match="newer"):
+        Store.open(db)
+    raw = sqlite3.connect(db)                         # and it really ran no DDL:
+    tables = {r[0] for r in raw.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    raw.close()
+    assert "reviews" not in tables and "provider_state" not in tables
+
+
+def test_future_schema_leaves_a_populated_store_byte_identical(tmp_path):
+    """The refusal must not merely skip DDL -- it must not write at all. A
+    store written by a newer skodun still holds the user's reviews, and even
+    flipping the journal mode rewrites its header."""
+    db = _phase1_db(tmp_path / "s.db")
+    raw = sqlite3.connect(db)
+    raw.execute("PRAGMA user_version = 99")
+    raw.commit()
+    raw.close()
+    before = db.read_bytes()
+
+    with pytest.raises(ValueError, match="newer"):
+        Store.open(db)
+
+    assert db.read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["s.db"]   # no -wal/-shm
+    assert _user_version(db) == 99                     # version not stamped down
+
+
+def test_future_schema_error_names_the_version(tmp_path):
+    db = tmp_path / "s.db"
+    raw = sqlite3.connect(db)
+    raw.execute("PRAGMA user_version = 99")
+    raw.commit()
+    raw.close()
+    with pytest.raises(ValueError) as e:
+        Store.open(db)
+    assert "v99" in str(e.value)
+
+
+# --- provider_state ---------------------------------------------------------
+
+def test_provider_state_ttl_bypass_and_rows(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("openai", "rate limited", "quota",
+                                 "2026-07-28T12:00:00Z")
+    assert st.provider_unavailable_reason("openai", "2026-07-28T11:00:00Z",
+                                          env={}) == "rate limited"
+    assert st.provider_unavailable_reason("openai", "2026-07-28T13:00:00Z",
+                                          env={}) is None
+    assert st.provider_unavailable_reason(
+        "openai", "2026-07-28T11:00:00Z",
+        env={"SKODUN_IGNORE_PROVIDER_STATE": "1"}) is None
+    rows = st.provider_state_rows("2026-07-28T11:00:00Z")
+    assert rows[0]["active"] is True and rows[0]["category"] == "quota"
+
+
+def test_provider_unavailable_reason_expiry_boundary_is_exclusive(tmp_path):
+    """`now == unavailable_until` means the TTL has elapsed: available."""
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("openai", "quota", "quota", "2026-07-28T12:00:00Z")
+    assert st.provider_unavailable_reason("openai", "2026-07-28T11:59:59Z",
+                                          env={}) == "quota"
+    assert st.provider_unavailable_reason("openai", "2026-07-28T12:00:00Z",
+                                          env={}) is None
+
+
+def test_provider_unavailable_reason_unknown_provider(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    assert st.provider_unavailable_reason("nope", "2026-07-28T11:00:00Z",
+                                          env={}) is None
+    assert st.provider_state_rows("2026-07-28T11:00:00Z") == []
+
+
+@pytest.mark.parametrize("value,applies", [
+    (None, True),        # unset -> state applies
+    ("0", True),
+    ("1", False),
+    ("false", False),    # bool("false") is True -- no truthiness coercion here
+    ("no", False),
+    ("", False),
+    ("00", False),
+])
+def test_provider_state_env_bypass_matrix(tmp_path, value, applies):
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("openai", "quota", "quota", "2026-07-28T12:00:00Z")
+    env = {} if value is None else {"SKODUN_IGNORE_PROVIDER_STATE": value}
+    got = st.provider_unavailable_reason("openai", "2026-07-28T11:00:00Z", env=env)
+    assert (got == "quota") is applies
+
+
+def test_provider_state_env_default_is_os_environ(tmp_path, monkeypatch):
+    """The `env=os.environ` default is the live mapping, not a snapshot taken
+    at import time."""
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("openai", "quota", "quota", "2026-07-28T12:00:00Z")
+    monkeypatch.delenv("SKODUN_IGNORE_PROVIDER_STATE", raising=False)
+    assert st.provider_unavailable_reason("openai", "2026-07-28T11:00:00Z") == "quota"
+    monkeypatch.setenv("SKODUN_IGNORE_PROVIDER_STATE", "1")
+    assert st.provider_unavailable_reason("openai", "2026-07-28T11:00:00Z") is None
+
+
+def test_env_bypass_does_not_hide_rows_from_the_listing(tmp_path, monkeypatch):
+    """`skodun providers` is a diagnostic: the bypass changes routing, not
+    what the operator can see."""
+    monkeypatch.setenv("SKODUN_IGNORE_PROVIDER_STATE", "1")
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("openai", "quota", "quota", "2026-07-28T12:00:00Z")
+    rows = st.provider_state_rows("2026-07-28T11:00:00Z")
+    assert [(r["provider"], r["active"]) for r in rows] == [("openai", True)]
+
+
+def test_provider_state_write_is_a_single_upsert(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("openai", "quota", "quota", "2026-07-28T12:00:00Z")
+    st.mark_provider_unavailable("openai", "auth expired", "auth",
+                                 "2026-07-28T18:00:00Z")
+    rows = st.provider_state_rows("2026-07-28T13:00:00Z")
+    assert len(rows) == 1
+    assert rows[0] == {"provider": "openai", "unavailable_until": "2026-07-28T18:00:00Z",
+                       "reason": "auth expired", "category": "auth", "active": True}
+
+
+def test_provider_state_rows_lists_expired_rows_too(tmp_path):
+    """It is the diagnostic listing, not a filter: every row, each flagged."""
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("openai", "quota", "quota", "2026-07-28T12:00:00Z")
+    st.mark_provider_unavailable("anthropic", "auth", "auth", "2026-07-28T20:00:00Z")
+    rows = st.provider_state_rows("2026-07-28T13:00:00Z")
+    assert [(r["provider"], r["active"]) for r in rows] == [
+        ("anthropic", True), ("openai", False)]        # deterministic order
+    assert set(rows[0]) == {"provider", "unavailable_until", "reason", "category",
+                            "active"}
+    assert rows[1]["reason"] == "quota"                # expired rows keep their data
+
+
+def test_provider_state_is_per_provider(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("openai", "quota", "quota", "2026-07-28T12:00:00Z")
+    assert st.provider_unavailable_reason("anthropic", "2026-07-28T11:00:00Z",
+                                          env={}) is None
+
+
+def test_provider_state_survives_reopen(tmp_path):
+    db = tmp_path / "s.db"
+    Store.open(db).mark_provider_unavailable("openai", "quota", "quota",
+                                             "2026-07-28T12:00:00Z")
+    assert Store.open(db).provider_unavailable_reason(
+        "openai", "2026-07-28T11:00:00Z", env={}) == "quota"
+
+
+@pytest.mark.parametrize("until", [
+    None,                     # no expiry is not a supported state
+    "",
+    "2026-07-28 12:00:00",    # space separator: not lexicographically comparable
+    "2026-7-8T12:00:00Z",     # not zero-padded: strptime accepts it, ordering breaks
+    "2026-07-28T12:00:00",    # no Z
+    "2026-07-28T12:00:00.5Z",
+    "2026-07-28T12:00:00+00:00",
+    "2026-13-01T00:00:00Z",   # not a real date
+    20260728,
+])
+def test_mark_provider_unavailable_rejects_non_canonical_until(tmp_path, until):
+    """Lexicographic TTL comparison is only sound for the fixed-width
+    `%Y-%m-%dT%H:%M:%SZ` form, so nothing else may be written."""
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(ValueError):
+        st.mark_provider_unavailable("openai", "quota", "quota", until)
+    assert st.provider_state_rows("2026-07-28T11:00:00Z") == []   # nothing written
+
+
+@pytest.mark.parametrize("provider,reason,category", [
+    ("", "quota", "quota"),
+    ("openai", "", "quota"),
+    ("openai", "quota", ""),
+    (None, "quota", "quota"),
+    ("openai", None, "quota"),
+    ("openai", "quota", None),
+])
+def test_mark_provider_unavailable_rejects_empty_fields(tmp_path, provider, reason,
+                                                        category):
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(ValueError):
+        st.mark_provider_unavailable(provider, reason, category,
+                                     "2026-07-28T12:00:00Z")
+
+
+def test_provider_unavailable_reason_rejects_non_canonical_now(tmp_path):
+    """A bad `now_iso` is a caller bug, not corrupt data: fail loudly rather
+    than silently comparing strings that do not order."""
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("openai", "quota", "quota", "2026-07-28T12:00:00Z")
+    for bad in ("2026-07-28 11:00:00", "2026-7-8T11:00:00Z", "", None):
+        with pytest.raises(ValueError):
+            st.provider_unavailable_reason("openai", bad, env={})
+        with pytest.raises(ValueError):
+            st.provider_state_rows(bad)
+
+
+@pytest.mark.parametrize("stored", [None, "", "later", "2026-7-8T12:00:00Z",
+                                    "2026-07-28 12:00:00"])
+def test_corrupt_unavailable_until_is_inert_not_a_permanent_ban(tmp_path, stored):
+    """A row whose TTL cannot be ordered is unusable. It must not be read as
+    "unavailable forever" -- that would permanently disable a working provider
+    with no way back except hand-editing the database. It reads as inert, and
+    the listing shows it as inactive so an operator can still see it."""
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    st.mark_provider_unavailable("openai", "quota", "quota", "2026-07-28T12:00:00Z")
+    st._c.execute("UPDATE provider_state SET unavailable_until=? WHERE provider=?",
+                  (stored, "openai"))
+
+    assert st.provider_unavailable_reason("openai", "2026-07-28T11:00:00Z",
+                                          env={}) is None
+    rows = st.provider_state_rows("2026-07-28T11:00:00Z")
+    assert [(r["provider"], r["active"]) for r in rows] == [("openai", False)]
+    assert rows[0]["reason"] == "quota"                # still visible to an operator
+
+
+@pytest.mark.parametrize("stored", [None, ""])
+def test_missing_reason_still_skips_an_unexpired_provider(tmp_path, stored):
+    """The opposite direction from a corrupt TTL: the TTL is sound, only the
+    explanation is gone. The provider is still unavailable, and the return
+    value must stay truthy so a caller's `if reason:` keeps working."""
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("openai", "quota", "quota", "2026-07-28T12:00:00Z")
+    st._c.execute("UPDATE provider_state SET reason=? WHERE provider=?",
+                  (stored, "openai"))
+    got = st.provider_unavailable_reason("openai", "2026-07-28T11:00:00Z", env={})
+    assert got and isinstance(got, str)
+
+
+def test_mark_provider_unavailable_records_when(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("openai", "quota", "quota", "2026-07-28T12:00:00Z",
+                                 recorded_at="2026-07-28T10:00:00Z")
+    assert st._c.execute(
+        "SELECT recorded_at FROM provider_state WHERE provider='openai'"
+    ).fetchone()[0] == "2026-07-28T10:00:00Z"
+
+
+def test_mark_provider_unavailable_defaults_recorded_at_to_canonical_now(tmp_path):
+    import re
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("openai", "quota", "quota", "2026-07-28T12:00:00Z")
+    got = st._c.execute(
+        "SELECT recorded_at FROM provider_state WHERE provider='openai'").fetchone()[0]
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", got)

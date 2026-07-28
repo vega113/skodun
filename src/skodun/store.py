@@ -5,17 +5,40 @@ computes the value from the record's three trust axes via
 :func:`skodun.trust.is_trustworthy` and writes it into both the indexed column
 and the stored artifact JSON, so an index row that disagrees with its artifact
 is impossible by construction.
+
+Schema changes go through the migration ladder in :func:`_migrate`, keyed on
+``PRAGMA user_version``. Existing stores hold thousands of imported reviews, so
+migrations are additive only: no Phase 1 table, index or row is ever dropped or
+rewritten, and a store stamped with a version this build does not understand is
+refused without being written to at all.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 import sqlite3
+import time
+from collections.abc import Mapping
 from pathlib import Path
 
 from .trust import is_trustworthy
 
 _TRUST_AXES = ("parse_ok", "degraded", "diff_truncated")
+
+#: The schema this build of skodun writes and understands. A store stamped
+#: higher was written by a newer skodun and is refused, untouched.
+SCHEMA_VERSION = 2
+
+#: Set to anything other than "0" to ignore `provider_state` entirely.
+IGNORE_PROVIDER_STATE_ENV = "SKODUN_IGNORE_PROVIDER_STATE"
+
+#: The store's one timestamp format: ISO-8601 UTC, seconds resolution, `Z`.
+#: Every field is zero-padded to a constant width, which is what makes a plain
+#: string comparison a correct time comparison. Nothing else may be stored.
+_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (
@@ -40,6 +63,117 @@ CREATE TABLE IF NOT EXISTS gate_events (
 );
 """
 
+# --- migration ladder -------------------------------------------------------
+#
+# v1 *is* the Phase 1 baseline -- the tables in `_SCHEMA` above, which every
+# store already has and which `executescript(_SCHEMA)` re-establishes
+# idempotently -- so there is no separate v0->v1 delta to run. v2 adds
+# `provider_state`. Deltas stay `IF NOT EXISTS` on purpose: the ladder is not
+# wrapped in a transaction, so a crash between "delta applied" and "version
+# stamped" must leave a database that simply replays the delta harmlessly on
+# the next open rather than one that needs repair.
+#
+# `provider_state` deliberately lives ONLY here and not in `_SCHEMA`: that is
+# what makes the ladder load-bearing rather than decorative.
+_MIGRATION_V2 = """
+CREATE TABLE IF NOT EXISTS provider_state (
+  provider TEXT PRIMARY KEY, unavailable_until TEXT, reason TEXT,
+  category TEXT, recorded_at TEXT
+);
+"""
+
+# `(target_version, ddl)`, applied in order. Keep it sorted ascending and keep
+# the last target equal to SCHEMA_VERSION -- both are pinned by a test.
+_MIGRATIONS: tuple[tuple[int, str], ...] = ((2, _MIGRATION_V2),)
+
+
+def _is_canonical_ts(value: object) -> bool:
+    """True only for exactly `2026-07-28T12:00:00Z`.
+
+    The regex is not redundant with `strptime`: `strptime` accepts
+    `2026-7-8T1:2:3Z`, whose narrower fields destroy the fixed-width property
+    that makes `<` on these strings a correct time comparison. Shape is
+    checked by the regex, calendar validity (month 13, day 32) by `strptime`.
+    """
+    if not isinstance(value, str) or not _TS_RE.fullmatch(value):
+        return False
+    try:
+        time.strptime(value, _TS_FORMAT)
+    except ValueError:
+        return False
+    return True
+
+
+def _require_ts(label: str, value: object) -> str:
+    if not _is_canonical_ts(value):
+        raise ValueError(
+            f"{label} must be an ISO-8601 UTC timestamp like 2026-07-28T12:00:00Z,"
+            f" got {value!r}")
+    return value            # type: ignore[return-value]
+
+
+def _require_text(label: str, value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty string, got {value!r}")
+    return value
+
+
+def _iso_now() -> str:
+    return time.strftime(_TS_FORMAT, time.gmtime())
+
+
+def _provider_state_bypassed(env: Mapping[str, str]) -> bool:
+    """Unset or exactly `"0"` -> provider state applies; anything else -> off.
+
+    No truthiness coercion anywhere near this: `bool("false")` is True, and a
+    kill switch that reads "false" as "yes" is the exact bug class Phase 1 had
+    to fix once already. The permissive direction (any other value bypasses)
+    is the safe one -- the worst case of bypassing is one wasted provider
+    attempt, whereas the worst case of ignoring the operator's opt-out is a
+    provider they cannot reach at all.
+    """
+    raw = env.get(IGNORE_PROVIDER_STATE_ENV)
+    return raw is not None and raw != "0"
+
+
+def _still_unavailable(until: object, now_iso: str) -> bool:
+    """Whether a stored TTL is in the future.
+
+    A TTL that is NULL or not in the canonical form cannot be ordered, so the
+    row is treated as **inert** (available), never as "unavailable forever".
+    One corrupt row must not be able to permanently disable a working provider.
+    """
+    return _is_canonical_ts(until) and now_iso < until   # type: ignore[operator]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an open connection's database up to `SCHEMA_VERSION`.
+
+    The order of these four steps is load-bearing and is pinned by
+    `test_future_schema_refused_before_any_ddl`:
+
+    1. read `user_version`;
+    2. refuse a store written by a newer skodun -- **before anything writes**.
+       Not merely before the DDL: `PRAGMA journal_mode=WAL` rewrites the file
+       header too, and a store we do not understand (holding reviews we cannot
+       interpret) must come back byte-identical;
+    3. apply the ordered deltas above the current version;
+    4. stamp the new version.
+    """
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version > SCHEMA_VERSION:
+        raise ValueError(f"store schema v{version} is newer than this skodun")
+
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(_SCHEMA)         # v1 baseline, idempotent
+    for target, ddl in _MIGRATIONS:
+        if version < target:
+            conn.executescript(ddl)
+    if version != SCHEMA_VERSION:
+        # PRAGMA takes no bound parameters; the value is an int constant.
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
+
 
 class Store:
     def __init__(self, conn: sqlite3.Connection):
@@ -51,9 +185,11 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path, isolation_level=None)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.executescript(_SCHEMA)
+        try:
+            _migrate(conn)
+        except BaseException:
+            conn.close()        # never leave a refused store open or locked
+            raise
         return cls(conn)
 
     def save_review(self, rec: dict) -> None:
@@ -141,6 +277,74 @@ class Store:
         rows = self._c.execute("SELECT * FROM triage WHERE branch=? AND base_sha=?",
                                (branch, base_sha)).fetchall()
         return {r["finding_key"]: dict(r) for r in rows}
+
+    # --- provider availability cache ---------------------------------------
+
+    def mark_provider_unavailable(self, provider: str, reason: str, category: str,
+                                  until_iso: str,
+                                  recorded_at: str | None = None) -> None:
+        """Record that `provider` is unusable until `until_iso`.
+
+        Everything is validated at the door so the read path only ever has to
+        cope with rows corrupted from outside skodun. In particular there is no
+        "unavailable forever" state: a TTL is mandatory, so a provider always
+        becomes eligible again on its own.
+        """
+        provider = _require_text("provider", provider)
+        reason = _require_text("reason", reason)
+        category = _require_text("category", category)
+        until_iso = _require_ts("until_iso", until_iso)
+        recorded_at = (_iso_now() if recorded_at is None
+                       else _require_ts("recorded_at", recorded_at))
+        self._c.execute(
+            """INSERT INTO provider_state
+                 (provider, unavailable_until, reason, category, recorded_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(provider) DO UPDATE SET
+                 unavailable_until=excluded.unavailable_until,
+                 reason=excluded.reason, category=excluded.category,
+                 recorded_at=excluded.recorded_at""",
+            (provider, until_iso, reason, category, recorded_at))
+
+    def provider_unavailable_reason(self, provider: str, now_iso: str,
+                                    env: Mapping[str, str] = os.environ) -> str | None:
+        """Why a fallback chain should skip `provider` right now, or None.
+
+        `env` defaults to the live `os.environ` mapping rather than a snapshot,
+        matching `run_gate`, so the bypass can be injected from a test without
+        monkeypatching global state.
+
+        A row with an unorderable `unavailable_until` returns None (see
+        `_still_unavailable`); a row with a sound TTL but no `reason` still
+        returns a non-empty string, so a caller's `if reason:` cannot be
+        fooled into using a provider that is genuinely unavailable.
+        """
+        now_iso = _require_ts("now_iso", now_iso)
+        if _provider_state_bypassed(env):
+            return None
+        row = self._c.execute(
+            "SELECT unavailable_until, reason FROM provider_state WHERE provider=?",
+            (provider,)).fetchone()
+        if row is None or not _still_unavailable(row["unavailable_until"], now_iso):
+            return None
+        return row["reason"] or "provider marked unavailable"
+
+    def provider_state_rows(self, now_iso: str) -> list[dict]:
+        """Every row, expired ones included, each flagged `active`.
+
+        This is the diagnostic listing behind `skodun providers`, not a filter,
+        and it deliberately ignores `SKODUN_IGNORE_PROVIDER_STATE`: the bypass
+        changes routing, not what an operator is allowed to see.
+        """
+        now_iso = _require_ts("now_iso", now_iso)
+        rows = self._c.execute(
+            "SELECT provider, unavailable_until, reason, category FROM provider_state"
+            " ORDER BY provider").fetchall()
+        return [{"provider": r["provider"],
+                 "unavailable_until": r["unavailable_until"],
+                 "reason": r["reason"], "category": r["category"],
+                 "active": _still_unavailable(r["unavailable_until"], now_iso)}
+                for r in rows]
 
     def list_reviews(self, branch: str | None, limit: int = 30) -> list[dict]:
         q = "SELECT artifact_json FROM reviews"
