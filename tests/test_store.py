@@ -371,6 +371,28 @@ def _phase1_db(path, reviews=("r1",)):
     return path
 
 
+def test_schema_is_frozen_at_the_phase1_baseline():
+    """`_SCHEMA` is the immutable v1 baseline every migration in `_MIGRATIONS`
+    assumes is already present. Editing it directly (e.g. adding `new_col
+    TEXT` to `reviews`) passes the whole suite silently: a fresh database
+    gets the column, but `CREATE TABLE IF NOT EXISTS` no-ops on every
+    existing store, so the live store never receives it and the next write
+    that references the column fails only in production, on the real store.
+
+    Do not fix a failure here by editing `PHASE1_SCHEMA` to match `_SCHEMA`.
+    Add a new migration delta to `_MIGRATIONS` instead (bump SCHEMA_VERSION,
+    add a `(target_version, ddl)` entry) so existing stores actually receive
+    the change."""
+    from skodun.store import _SCHEMA
+    assert _SCHEMA == PHASE1_SCHEMA, (
+        "store._SCHEMA has drifted from the frozen Phase 1 baseline "
+        "(PHASE1_SCHEMA above). _SCHEMA must never change: it is re-applied "
+        "via `CREATE TABLE IF NOT EXISTS` on every open and is a no-op "
+        "against existing stores, so an edit here is invisible to the "
+        "5000+-row live store until it breaks on a write. Add a new "
+        "migration delta to _MIGRATIONS instead of editing _SCHEMA.")
+
+
 def test_fresh_db_lands_at_schema_version(tmp_path):
     db = tmp_path / "s.db"
     st = Store.open(db)
@@ -469,6 +491,43 @@ def test_future_schema_leaves_a_populated_store_byte_identical(tmp_path):
     assert _user_version(db) == 99                     # version not stamped down
 
 
+def test_future_schema_leaves_a_wal_mode_populated_store_byte_identical(tmp_path):
+    """The non-WAL variant above only bites because its fixture starts in
+    rollback-journal mode: flipping `PRAGMA journal_mode=WAL` alone rewrites
+    header byte 18 (1 -> 2), and that byte flip is what the assertion
+    actually detects. The real store is already WAL (confirmed against the
+    live file), so `PRAGMA journal_mode=WAL` on it is a no-op -- byte 18
+    stays 2 either way, and on an already-Phase1-shaped store `executescript
+    (_SCHEMA)` and the (guarded-by-version) migration loop are also no-ops.
+    This variant builds the fixture already in WAL mode, so the coverage
+    matches deployment: nothing about journal-mode-switching is available to
+    mask a wrong refusal order here -- the only write the mutation described
+    below can still leak through is the version stamp itself.
+
+    Verified sensitive to a real ordering bug: moving the version check to
+    *after* the final `PRAGMA user_version=...` stamp (so a refused store
+    still gets stamped down to SCHEMA_VERSION before the ValueError is
+    raised) makes this assertion fail -- unlike a check merely moved past
+    the WAL pragma alone, which on an already-WAL, already-migrated fixture
+    writes nothing either way and so cannot be observed by byte comparison."""
+    db = _phase1_db(tmp_path / "s.db")
+    raw = sqlite3.connect(db)
+    raw.execute("PRAGMA journal_mode=WAL")
+    raw.execute("PRAGMA user_version = 99")
+    raw.commit()
+    raw.close()
+    assert db.read_bytes()[18] == 2                     # confirm the fixture is WAL
+    before_bytes = db.read_bytes()
+    before_files = sorted(p.name for p in tmp_path.iterdir())
+
+    with pytest.raises(ValueError, match="newer"):
+        Store.open(db)
+
+    assert db.read_bytes() == before_bytes
+    assert sorted(p.name for p in tmp_path.iterdir()) == before_files
+    assert _user_version(db) == 99                      # version not stamped down
+
+
 def test_future_schema_error_names_the_version(tmp_path):
     db = tmp_path / "s.db"
     raw = sqlite3.connect(db)
@@ -520,7 +579,8 @@ def test_provider_unavailable_reason_unknown_provider(tmp_path):
     ("1", False),
     ("false", False),    # bool("false") is True -- no truthiness coercion here
     ("no", False),
-    ("", False),
+    ("", True),           # materialized-empty (docker/CI) is unset, not bypass
+    ("   ", True),        # whitespace-only likewise
     ("00", False),
 ])
 def test_provider_state_env_bypass_matrix(tmp_path, value, applies):
@@ -670,6 +730,23 @@ def test_missing_reason_still_skips_an_unexpired_provider(tmp_path, stored):
                   (stored, "openai"))
     got = st.provider_unavailable_reason("openai", "2026-07-28T11:00:00Z", env={})
     assert got and isinstance(got, str)
+
+
+def test_mark_provider_unavailable_strips_stored_text_fields(tmp_path):
+    """`_require_text` strips only for the emptiness check today, but stores
+    the value unstripped. `mark_provider_unavailable(" openai ", ...)` then
+    creates a second, unreachable primary-key row: `" openai "` != `"openai"`,
+    so `provider_unavailable_reason("openai", ...)` can never match it. The
+    stored value must be the stripped one."""
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable(" openai ", " rate limited ", " quota ",
+                                 "2026-07-28T12:00:00Z")
+    assert st.provider_unavailable_reason("openai", "2026-07-28T11:00:00Z",
+                                          env={}) == "rate limited"
+    rows = st.provider_state_rows("2026-07-28T11:00:00Z")
+    assert [r["provider"] for r in rows] == ["openai"]   # not " openai "
+    assert rows[0]["reason"] == "rate limited"
+    assert rows[0]["category"] == "quota"
 
 
 def test_mark_provider_unavailable_records_when(tmp_path):

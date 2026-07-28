@@ -31,7 +31,8 @@ _TRUST_AXES = ("parse_ok", "degraded", "diff_truncated")
 #: higher was written by a newer skodun and is refused, untouched.
 SCHEMA_VERSION = 2
 
-#: Set to anything other than "0" to ignore `provider_state` entirely.
+#: Set to anything other than "0", unset, or blank to ignore `provider_state`
+#: entirely.
 IGNORE_PROVIDER_STATE_ENV = "SKODUN_IGNORE_PROVIDER_STATE"
 
 #: The store's one timestamp format: ISO-8601 UTC, seconds resolution, `Z`.
@@ -115,7 +116,7 @@ def _require_ts(label: str, value: object) -> str:
 def _require_text(label: str, value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be a non-empty string, got {value!r}")
-    return value
+    return value.strip()
 
 
 def _iso_now() -> str:
@@ -123,17 +124,30 @@ def _iso_now() -> str:
 
 
 def _provider_state_bypassed(env: Mapping[str, str]) -> bool:
-    """Unset or exactly `"0"` -> provider state applies; anything else -> off.
+    """Unset, empty/whitespace-only, or exactly `"0"` -> state applies;
+    anything else -> bypassed.
 
     No truthiness coercion anywhere near this: `bool("false")` is True, and a
     kill switch that reads "false" as "yes" is the exact bug class Phase 1 had
-    to fix once already. The permissive direction (any other value bypasses)
-    is the safe one -- the worst case of bypassing is one wasted provider
-    attempt, whereas the worst case of ignoring the operator's opt-out is a
-    provider they cannot reach at all.
+    to fix once already.
+
+    Empty and whitespace-only count as unset rather than as an explicit
+    bypass request: CI and container tooling routinely materialize an unset
+    variable as `""` (`docker run -e VAR` with no host value; a GitHub
+    Actions `env:` with an empty expression), and this cache exists
+    specifically to stop hammering a rate-limited provider -- silently
+    bypassing it on a materialized-empty value burns quota instead of saving
+    it. This matches the polarity `passes._killed` already uses: a vague or
+    blank value falls through to the default behaviour, not to the special
+    one. Genuinely non-empty, non-"0" values (`"1"`, `"false"`, `"no"`, ...)
+    still bypass -- the worst case there is one wasted provider attempt,
+    whereas ignoring an operator's *explicit* opt-out is a provider they
+    cannot reach at all.
     """
     raw = env.get(IGNORE_PROVIDER_STATE_ENV)
-    return raw is not None and raw != "0"
+    if raw is None or raw.strip() == "":
+        return False
+    return raw != "0"
 
 
 def _still_unavailable(until: object, now_iso: str) -> bool:
