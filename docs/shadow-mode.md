@@ -48,12 +48,15 @@ on the other, that is the design working, not a bug.
    [[reviewers]]
    name = "finder"
    provider = "xai"
-   model = "grok-4.20-0309-reasoning"
+   model = "grok-4.5"
    role = "finder"
    ```
 
    Use the same model the legacy scripts use, or the comparison measures the
-   model change rather than the port.
+   model change rather than the port — and check that the id is one the CLI
+   still offers (`grok models`). Provider model ids are retired without notice;
+   the id the legacy scripts carried when this runbook was written had already
+   been withdrawn, which is exactly what step 4 of Run 1 below records.
 
 3. **Optional — repo-layout tables.** skodun ships generic defaults: no
    path→checklist mapping, and a generic security-trigger set. To reproduce a
@@ -183,6 +186,26 @@ skodun found one more finding than the archive — and is still a MATCH, because
 ```
 shadow: 4792 compared, 4783 matched, 0 skodun-only, 3 legacy-only
 ```
+
+That is a **point-in-time** snapshot. The legacy system keeps running, so the
+legacy-only count grows on its own between comparisons — a legacy-only row means
+only "skodun has never reviewed that content", which is the normal state for
+anything reviewed before or outside a shadow run. It is not a disagreement.
+
+The nine non-matching rows in that snapshot were three legacy-only plus **six
+mismatches**, and every one falls into a documented class:
+
+| rows | class | skodun | legacy | why |
+|---|---|---|---|---|
+| 4 | `zz-spike-rollup__*` | not trustworthy | trustworthy | **Deliberate.** The index row claims trustworthy but its `<id>.json` artifact does not exist on disk (verified: all four missing). The importer stores them demoted, with `failure_reason="legacy import: artifact missing/invalid"`. skodun will not trust an index row it cannot back with a full artifact, because an artifact-less row would satisfy the gate and then fail its validation, stranding the gate at 2 forever. These are the four counted by `demoted_no_artifact`. |
+| 1 | `f624132f9608` | not trustworthy | trustworthy | **The stale-model-id failure**, described at the end of this run. skodun's record is the `failed` one from the first pass; the legacy side is its own older successful review of the same content. Fail-closed working as designed. |
+| 1 | `f534fdbe972c` | trustworthy, 2 findings | trustworthy, 0 findings | **Two independent model runs**, ten days apart — row 7 of the table above. Not a porting defect; skodun was the stricter side. |
+
+So of the six, four are skodun deliberately refusing to inherit unbacked trust,
+one is skodun's own fail-closed record of a broken run, and one is genuine
+model-to-model variation. **None is a porting defect.** The first two classes
+are one-directional by construction: skodun withholds trust the legacy archive
+granted, never the reverse.
 
 **Diff-identity parity, measured separately.** Across **205 real repository
 states** — every worktree with outgoing changes — skodun's `diff_identity` and

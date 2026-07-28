@@ -66,10 +66,16 @@ per-repository overrides in `<repo>/.skodun.toml`. The store lives at
 [[reviewers]]
 name     = "finder"
 provider = "xai"        # Phase 1 ships this one adapter, driving the `grok` CLI
-model    = "grok-4.20-0309-reasoning"
+model    = "grok-4.5"   # must be an id your CLI offers -- run `grok models`
 effort   = "high"
 role     = "finder"     # finder | refuter | security | triager | integrator
 ```
+
+`model` is always passed explicitly and is never inherited from the provider
+CLI's own settings file. Provider model ids change; if the configured id is not
+one the installed CLI offers, the run fails closed — an explicit `failed` record
+and `trustworthy=false`, never a silent pass. Check the current ids with
+`grok models`.
 
 `examples/scala-angular-monorepo.toml` is a commented, drop-in `.skodun.toml` for a
 mixed-language repository — checklist routing, test-path patterns, security paths.
