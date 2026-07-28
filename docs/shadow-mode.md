@@ -198,4 +198,52 @@ recorded `status=failed`, `parse_ok=false`, and emitted
 This is the failure mode the "model selection is explicit, never inherited from
 a settings file" rule exists to make visible.
 
+### Run 2 — 2026-07-28, concurrent-execution proof
+
+Run 1 exercised the two systems in sequence. This run exercised them
+**overlapping**, to show the shared foreground lock actually serializes them.
+
+Procedure: start a legacy review in the background; 20 s later, with the lock
+held, start `skodun review` on the same worktree; sample the process table once
+per second for the whole window, counting live reviewer processes.
+
+```
+lock: <git-common-dir>/grok-reviews-foreground.lock
+owner file written by the legacy script, read by skodun:
+    pid=48934
+    started=1785215631
+    worktree=<worktree>
+
+05:13:51  legacy review starts, takes the lock
+05:14:11  skodun review starts and reports:
+          "another foreground review is running (pid=48934); waiting --
+           serializing avoids the shared-inference timeout"
+05:18:58  skodun completes (287 s wall, most of it waiting)
+```
+
+**Result: 277 samples, zero showing more than one reviewer process. Maximum
+concurrency observed: 1.**
+
+skodun parsed the legacy script's own three-line owner file, recognised a live
+peer, and waited — the interop the byte-format compatibility exists for.
+
+This run also produced the cleanest possible comparison, since both systems
+reviewed the *same content at the same time* rather than days apart:
+
+| | id | verdict |
+|---|---|---|
+| legacy | `loop_claude_apply-sync-floors-db-2565__101eec10b__20260728T051351Z_48944` | trustworthy, 0 findings |
+| skodun | `sk_20260728T051611Z_50426_756b3b76` | trustworthy, 0 findings |
+
+Same `head` (`101eec10b`), same verdict, same finding count.
+
+### Imported dismissals remain effective
+
+Checked against the real imported archive (263 dismissals) using the gate's own
+decision function, `open_findings`, over `store.triage_for(branch, base_sha)`:
+imported legacy dismissals close findings on imported legacy reviews, including
+reviews where **every** finding is closed and the gate therefore returns `0`
+rather than `1`. A dismissal recorded in the previous system stays honoured
+after migration — no one has to re-triage.
+
 <!-- SHADOW-LOG-END -->
