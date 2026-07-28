@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, tomllib
+import math, os, tomllib
 from dataclasses import dataclass, fields
 from pathlib import Path
 
@@ -278,9 +278,53 @@ def _read(path: Path | None) -> dict:
     with open(path, "rb") as f:
         return tomllib.load(f)
 
+def _max_cost(name: str, value: object) -> float | int:
+    """Validate one reviewer's `max_cost_usd`, or raise naming the reviewer.
+
+    Phase 1 declared this field and nothing read it; the claude adapter is its
+    first consumer, where it becomes `--max-budget-usd <v>`. Validation starts
+    here because the failure it prevents is unrecoverable downstream: probed
+    live against Claude Code 2.1.118, that flag rejects `0`, `-1`, `abc` and
+    `nan` with
+
+        error: --max-budget-usd must be a positive number greater than 0
+
+    thrown as an UNCAUGHT exception — rc 1, a stack trace and a source dump on
+    stderr, and completely empty stdout. No result envelope is written at all,
+    so no adapter can tell that apart from a provider that produced nothing,
+    and the fail-closed answer it would reach ("no trustworthy review") hides a
+    one-character typo in the user's own config file.
+
+    The three checks, in this order and each for its own reason:
+
+    * `bool` FIRST, because it subclasses `int`: TOML `max_cost_usd = true`
+      would otherwise sail through as a one-dollar cap that nobody wrote.
+    * finite, because TOML has real `nan` and `inf` literals. `nan` fails every
+      comparison silently, so a bare `value > 0` would let it through; `inf` is
+      a cap that caps nothing, and "no cap" is already spelled by omitting the
+      key.
+    * strictly positive, matching the CLI's own rule. Zero is not a budget of
+      zero dollars, it is a run that cannot happen.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"reviewer {name!r}: max_cost_usd must be a positive number, got "
+            f"{type(value).__name__}")
+    if not math.isfinite(value):
+        raise ValueError(
+            f"reviewer {name!r}: max_cost_usd must be a finite number, got "
+            f"{value}")
+    if value <= 0:
+        raise ValueError(
+            f"reviewer {name!r}: max_cost_usd must be greater than 0, got "
+            f"{value}")
+    return value
+
 def _validate(r: Reviewer) -> Reviewer:
     if r.effort is not None and r.effort not in EFFORTS:
         raise ValueError(f"reviewer {r.name!r}: unknown effort {r.effort!r}")
+    if r.max_cost_usd is not None:
+        _max_cost(r.name, r.max_cost_usd)
     if r.role not in ROLES:
         raise ValueError(f"reviewer {r.name!r}: unknown role {r.role!r}")
     if not r.provider or not r.model:

@@ -879,3 +879,87 @@ fallbacks = []
 """)
     cfg = load_config(None, global_path=p)
     assert cfg.reviewers[0].fallbacks == ()
+
+
+# --------------------------------------------------------------------------
+# max_cost_usd — the budget cap, validated at load time
+# --------------------------------------------------------------------------
+#
+# Phase 1 declared `Reviewer.max_cost_usd` and nothing ever read it. The claude
+# adapter is its first consumer (it becomes `--max-budget-usd <v>`), so
+# validation starts here too, and the rule is the CLI's own: probed live against
+# Claude Code 2.1.118, `--max-budget-usd 0` / `-1` / `abc` / `nan` all die with
+#
+#     error: --max-budget-usd must be a positive number greater than 0
+#
+# thrown as an UNCAUGHT exception — rc 1, a Bun stack trace and a source dump on
+# stderr, and completely EMPTY stdout. There is no result envelope to classify,
+# so an adapter cannot tell that failure apart from a provider that produced
+# nothing. TOML will happily hand us every one of those values (`true` even
+# arrives as a `bool`, which is a subclass of `int`), so each is a loud
+# `ValueError` naming the reviewer, at load time, before any subprocess exists.
+
+def test_max_cost_usd_accepts_a_positive_number(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "sec"
+provider = "anthropic"
+model = "m"
+max_cost_usd = 0.50
+""")
+    assert load_config(None, global_path=p).reviewers[0].max_cost_usd == 0.50
+
+
+def test_max_cost_usd_accepts_a_positive_integer(tmp_path):
+    """TOML `1` is an int, not a float, and an int budget is not a typo."""
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "sec"
+provider = "anthropic"
+model = "m"
+max_cost_usd = 2
+""")
+    assert load_config(None, global_path=p).reviewers[0].max_cost_usd == 2
+
+
+def test_max_cost_usd_is_optional(tmp_path):
+    """Unset means "no cap", which is what every Phase 1 config already says."""
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "sec"
+provider = "anthropic"
+model = "m"
+""")
+    assert load_config(None, global_path=p).reviewers[0].max_cost_usd is None
+
+
+@pytest.mark.parametrize("literal, why", [
+    ("0", "zero is not a budget, and the CLI refuses it outright"),
+    ("-1", "a negative cap is a typo the CLI throws on"),
+    ("-0.5", "…including a fractional one"),
+    ("nan", "TOML has a real nan literal; it is not a finite budget"),
+    ("inf", "TOML has a real inf literal; an unbounded cap must say so by "
+            "being absent, not by being infinite"),
+    ("-inf", "…and the negative infinity likewise"),
+    ("true", "bool subclasses int, so `true` would otherwise load as 1"),
+    ("false", "…and `false` as 0"),
+    ('"0.50"', "a quoted number is a string, not a budget"),
+])
+def test_max_cost_usd_rejects_a_bad_value_loudly_naming_the_reviewer(
+        tmp_path, literal, why):
+    """Every rejection names the reviewer, because a config may hold several.
+
+    The alternative to failing here is failing in the child process, where the
+    CLI throws before writing a single byte of stdout — an empty-stdout rc 1
+    that no adapter can distinguish from a provider that simply said nothing.
+    """
+    p = _write(tmp_path / "g.toml", f"""
+[[reviewers]]
+name = "sec"
+provider = "anthropic"
+model = "m"
+max_cost_usd = {literal}
+""")
+    with pytest.raises(ValueError, match=r"reviewer 'sec': max_cost_usd") as e:
+        load_config(None, global_path=p)
+    assert "max_cost_usd" in str(e.value), why
