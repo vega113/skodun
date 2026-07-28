@@ -741,3 +741,141 @@ fallbacks = ["a"]
 """)
     with pytest.raises(ValueError, match="reviewer 'a':.*cycle"):
         load_config(None, global_path=p)
+
+
+def test_fallback_diamond_fan_in_is_not_a_cycle(tmp_path):
+    """Two reviewers whose chains reach a common target by different routes
+    is legitimate fan-in, not a cycle -- `_walk` tracks the PATH taken to
+    reach a node, not the set of every node visited anywhere in the walk, so
+    a shared descendant reached twice by different routes must not trip it."""
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+fallbacks = ["b", "c"]
+[[reviewers]]
+name = "b"
+provider = "openai"
+model = "n"
+fallbacks = ["d"]
+[[reviewers]]
+name = "c"
+provider = "openai"
+model = "n"
+fallbacks = ["d"]
+[[reviewers]]
+name = "d"
+provider = "openai"
+model = "n"
+""")
+    cfg = load_config(None, global_path=p)
+    by_name = {r.name: r for r in cfg.reviewers}
+    assert by_name["a"].fallbacks == ("b", "c")
+    assert by_name["b"].fallbacks == ("d",)
+    assert by_name["c"].fallbacks == ("d",)
+
+
+# --- Reviewer.fallbacks: shape validation, before any semantic check -------
+#
+# Hostile TOML shapes must raise a clean ValueError naming the reviewer and
+# the actual shape problem -- never an unhandled TypeError (an unhashable
+# nested list/inline-table reaching the duplicate-check's `set`), and never a
+# fabricated semantic diagnosis (a bare string silently iterated
+# character-by-character into single-letter "reviewer names").
+
+def test_fallback_bare_string_is_rejected_not_iterated_into_characters(tmp_path):
+    """`fallbacks = "backup"` is a plausible typo for `["backup"]`. It must
+    not silently iterate the string and report a fabricated missing
+    reviewer named e.g. 'b'."""
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = "backup"
+""")
+    with pytest.raises(
+            ValueError,
+            match=r"reviewer 'finder': fallbacks must be an array of strings, "
+                  r"got str"):
+        load_config(None, global_path=p)
+
+
+def test_fallback_nested_list_entry_is_rejected(tmp_path):
+    """A nested array entry is unhashable and must not crash the
+    duplicate-check's `set` with an unhandled TypeError."""
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = [["backup"]]
+""")
+    with pytest.raises(
+            ValueError,
+            match=r"reviewer 'finder': fallbacks entry 0 must be a string, "
+                  r"got list"):
+        load_config(None, global_path=p)
+
+
+def test_fallback_inline_table_entry_is_rejected(tmp_path):
+    """An inline table entry is unhashable, same failure mode as a nested
+    list, and must be rejected the same clean way."""
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = [{name = "backup"}]
+""")
+    with pytest.raises(
+            ValueError,
+            match=r"reviewer 'finder': fallbacks entry 0 must be a string, "
+                  r"got dict"):
+        load_config(None, global_path=p)
+
+
+def test_fallback_integer_entry_is_rejected(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = [5]
+""")
+    with pytest.raises(
+            ValueError,
+            match=r"reviewer 'finder': fallbacks entry 0 must be a string, "
+                  r"got int"):
+        load_config(None, global_path=p)
+
+
+def test_fallback_boolean_entry_is_rejected(tmp_path):
+    """`bool` is a subclass of `int` in Python, so a naive int-or-string
+    check could wrongly admit it; the check here is a strict `isinstance
+    str`, which already excludes `bool` without special-casing it."""
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = [true]
+""")
+    with pytest.raises(
+            ValueError,
+            match=r"reviewer 'finder': fallbacks entry 0 must be a string, "
+                  r"got bool"):
+        load_config(None, global_path=p)
+
+
+def test_fallback_empty_array_still_loads(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+fallbacks = []
+""")
+    cfg = load_config(None, global_path=p)
+    assert cfg.reviewers[0].fallbacks == ()

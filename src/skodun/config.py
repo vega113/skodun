@@ -263,8 +263,51 @@ def _validate(r: Reviewer) -> Reviewer:
         raise ValueError(f"reviewer {r.name!r}: provider and model are required")
     return r
 
+def _fallback_tuple(name: str, value: object) -> tuple[str, ...]:
+    """Normalize one reviewer's raw TOML `fallbacks` value into a tuple of
+    names, or raise naming the reviewer and the actual shape problem.
+
+    Runs per-reviewer, before `_validate_fallbacks`, so none of the semantic
+    checks (existence, enabled, self-reference, duplicates, length, cycles)
+    ever see a shape they don't expect. Two hostile shapes motivate this:
+
+    * A bare string (`fallbacks = "backup"`, a plausible typo for
+      `["backup"]`) is itself iterable -- without this check it would be
+      iterated character-by-character and reported as fabricated missing
+      reviewers named single letters, which is worse than a crash because it
+      sends the user looking for a reviewer that was never named.
+    * A nested array or inline table entry (`[["backup"]]`, `[{name =
+      "backup"}]`) is unhashable -- without this check it would reach the
+      duplicate-check's `set` in `_validate_fallbacks` and crash with an
+      unhandled `TypeError` instead of a clean config error.
+
+    The entry check is a strict `isinstance(item, str)`. `bool` is a
+    subclass of `int` in Python (elsewhere in this module `_bounded_int`
+    special-cases it), but `bool` is NOT a subclass of `str`, so this check
+    already excludes `fallbacks = [true]` correctly with no special-casing
+    needed.
+    """
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"reviewer {name!r}: fallbacks must be an array of strings, got "
+            f"{type(value).__name__}")
+    out: list[str] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            raise ValueError(
+                f"reviewer {name!r}: fallbacks entry {i} must be a string, "
+                f"got {type(item).__name__}")
+        out.append(item)
+    return tuple(out)
+
 def _validate_fallbacks(reviewers: tuple[Reviewer, ...]) -> None:
     """Validate every `fallbacks` chain against the full, merged reviewer set.
+
+    Callers must run `_fallback_tuple` on each reviewer's raw `fallbacks`
+    value before constructing `Reviewer` instances, so by the time chains
+    reach here every entry is already known to be a plain string -- this
+    function only does semantic validation (existence, enabled,
+    self-reference, duplicates, length, cycles), never shape validation.
 
     Every validation failure names both the reviewer whose chain is bad and
     the specific problem, so a config error is locatable without reading this
@@ -351,7 +394,7 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
         if "dimensions" in e:
             e["dimensions"] = tuple(e["dimensions"])
         if "fallbacks" in e:
-            e["fallbacks"] = tuple(e["fallbacks"])
+            e["fallbacks"] = _fallback_tuple(name, e["fallbacks"])
         reviewers.append(_validate(Reviewer(**e)))
     reviewers = tuple(reviewers)
     _validate_fallbacks(reviewers)
