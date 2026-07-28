@@ -51,9 +51,14 @@ required set is fixed, because each rule needs a witness and a rule with no
 witness proves nothing:
 
 ===========================  ============================================
-`*healthy*`                  rules 2, 6 (>= 1)
+`*healthy*`                  rules 1c, 2, 6 (>= 1; rule 6 needs one whose
+                             findings carry a JSON-clean `title`)
 `*degraded*`                 rule 3 (>= 2, and one of them `*_stderr*`)
-`*unavailable*`              rule 4 (>= 1, each with a `category=` line)
+`*unavailable*`              rule 4 (>= 1, each with a `category=` line;
+                             rule 6's failed-run half additionally needs at
+                             least one whose STDERR carries the wording, so
+                             a set in which every unavailable capture hides
+                             its evidence inside the stream is not enough)
 `*healthy_noisy_stderr*`     rule 7 (>= 1)
 `*refuter*healthy*`          rule 1b (>= 1)
 ===========================  ============================================
@@ -145,7 +150,29 @@ _EFFORT_OPT_OUT = "none"
 # mid-write capture), `b"\x00\xff" * 512` is invalid UTF-8 (which is what a
 # decoder-level crash needs), and `b"[]"` is valid JSON of the wrong shape —
 # the case a `json.loads(...)["findings"]` would die on.
-_GARBAGE: tuple[bytes, ...] = (b"", b"{", b"\x00\xff" * 512, b"[]")
+#
+# The last entry is ELIGIBLE but INVALID: `_review_eligible` accepts it (it has
+# both keys), `_valid_payload` rejects it (`summary` is not a string). Without
+# such an input, rule 1's `payload is None` clause is satisfied by extraction
+# finding nothing at all, and an adapter that returned its payload regardless of
+# `parse_ok` would pass the whole suite. It discriminates only for adapters
+# whose extractor scans raw stdout; the wire-format-agnostic version of the same
+# assertion is `test_no_payload_survives_a_failed_validation` below.
+_GARBAGE: tuple[bytes, ...] = (b"", b"{", b"\x00\xff" * 512, b"[]",
+                               b'{"summary": 5, "findings": []}')
+
+# Two probes over the REVIEW contract's own eligibility rule, differing only in
+# `validate`. Together they pin "payload is gated by `parse_ok`, not merely by
+# extraction" for ANY adapter, whatever its wire format: the permissive one
+# proves an eligible envelope really is extracted from a given capture, the
+# refusing one then proves that a payload the contract rejected is not handed
+# on. Neither is a contract any adapter ships — they exist to make the negative
+# assertion non-vacuous, which a literal malformed payload cannot do for an
+# adapter whose extractor only reads its own event envelopes.
+_PROBE_ANY_VALID = OutputContract("review-probe", REVIEW_CONTRACT.json_schema,
+                                  REVIEW_CONTRACT.eligible, lambda obj: True)
+_PROBE_NONE_VALID = OutputContract("review-probe", REVIEW_CONTRACT.json_schema,
+                                   REVIEW_CONTRACT.eligible, lambda obj: False)
 
 # Both contracts, every time. An adapter that only ever gets exercised on the
 # review shape breaks at Task 8 runtime, in the refuter pass, on a real review.
@@ -484,6 +511,51 @@ class AdapterConformance:
                         a.classify(rc, blob, blob, contract),
                         f"classify({rc}, {blob[:8]!r}..., {contract.name})")
 
+    # ---- rule 1c: nothing the contract rejected reaches the caller ---------
+
+    def test_no_payload_survives_a_failed_validation(self):
+        """`payload` is gated by `parse_ok`, not merely by extraction.
+
+        The distinction is invisible until an adapter extracts an envelope the
+        contract then REJECTS: `payload=payload` unconditionally and
+        `payload=payload if parse_ok else None` behave identically on every
+        input where extraction finds nothing, which is every garbage blob a
+        format-agnostic suite can write by hand. So the discriminating input is
+        built out of the adapter's own healthy capture instead, with two probe
+        contracts that share the real eligibility rule and differ only in
+        `validate`:
+
+        * the permissive probe proves an eligible envelope IS extracted from
+          these bytes — without it this rule would pass on an adapter that
+          extracted nothing, which is the vacuity it exists to close;
+        * the refusing probe then demands that the very same envelope reaches
+          the caller as `payload=None`.
+
+        A caller that checked the wrong flag must find nothing to act on, for
+        the same reason `findings`/`summary` stay empty: a rejected payload is
+        one this program may not act on, and handing it over anyway makes
+        `parse_ok` advisory.
+        """
+        a = self.adapter()
+        healthy = self.select(_is_healthy)
+        assert healthy, "no *healthy* fixture"
+        for fx in healthy:
+            extracted = a.parse(fx.stdout, fx.stderr, _PROBE_ANY_VALID)
+            assert extracted.payload is not None, (
+                f"{fx.name}: no eligible envelope was extracted even with a "
+                f"validator that accepts everything, so this rule would pass "
+                f"vacuously — the fixture, not the adapter, is at fault")
+            res = a.parse(fx.stdout, fx.stderr, _PROBE_NONE_VALID)
+            assert res.parse_ok is False, (
+                f"{fx.name}: parse_ok is True although contract.validate "
+                f"refused every object")
+            assert res.payload is None, (
+                f"{fx.name}: an envelope the contract REJECTED was still "
+                f"handed to the caller as `payload` — `parse_ok` is then "
+                f"advisory, and a caller reading `payload` acts on a review "
+                f"nothing validated")
+            assert res.findings == [] and res.summary == "", fx.name
+
     # ---- rule 1b: the refuter shape ---------------------------------------
 
     def test_refuter_shape_is_parsed_classified_and_not_a_review(self):
@@ -671,7 +743,7 @@ class AdapterConformance:
 
     # ---- rule 5: the effort contract --------------------------------------
 
-    def test_effort_is_mapped_or_loudly_rejected(self):
+    def test_effort_is_mapped_or_loudly_rejected(self, tmp_path):
         """No silent downgrade: either every effort maps, or it is refused.
 
         Quietly dropping an unknown `--effort` reviews at the CLI's own
@@ -703,8 +775,13 @@ class AdapterConformance:
         reviewer, message = case
         assert isinstance(reviewer, Reviewer), (
             "effort_reject_case() must return (Reviewer, str) or None")
+        # `tmp_path`, not a relative path: `build_cmd` may own sidecar files it
+        # writes beside the prompt (codex writes its `--output-schema` there),
+        # and a relative prompt path would put them in whatever directory
+        # pytest was started from the moment an adapter's guard stopped
+        # preceding its writes. A test must not be able to litter the repo.
         with pytest.raises(ValueError, match=message):
-            a.build_cmd(Path("prompt.txt"), reviewer, Defaults(), Path("."))
+            a.build_cmd(tmp_path / "prompt.txt", reviewer, Defaults(), tmp_path)
         # A reject case excuses exactly ONE effort — the one it declares. The
         # rest of the mapping still has to be total, or an adapter could prove
         # it refuses `max` loudly and then silently drop `high` as well: the
@@ -771,6 +848,77 @@ class AdapterConformance:
             "finding whose `title` appears verbatim in the captured bytes; "
             "none of "
             f"{[f.name for f in healthy]} qualifies")
+
+    def test_model_text_cannot_make_a_run_unavailable(self):
+        """Rule 6's other half, and the one that is not satisfied by luck.
+
+        The test above splices signal words into a review that still VALIDATES,
+        so every adapter whose `classify` short-circuits on a usable payload
+        passes it without its diagnostic reader ever being reached. That
+        short-circuit is correct, but it means the assertion proves nothing
+        about what the adapter would read if there were no payload — and "no
+        payload" is the common case for exactly the runs a classifier is for.
+
+        So the discriminating input is a run that FAILED: the model's words are
+        on the wire, they carry this adapter's own unavailability wording, and
+        the payload does not validate, so no short-circuit can hide the answer.
+        `unavailable` is then a claim about the provider that could only have
+        come from reading the model's message text — and the cost of getting it
+        wrong is a healthy provider dropped from the fallback chain, or, at
+        category `quota`, from every later chain in the run.
+
+        Every ingredient is the adapter's own: the wording comes from its
+        `*unavailable*` fixtures' stderr and is proved to be a real tell before
+        it is used, and the carrier is its own healthy capture.
+        """
+        a = self.adapter()
+        healthy = self.select(_is_healthy)
+        assert healthy, "no *healthy* fixture"
+        sources = self.select(_is_unavailable)
+        assert sources, "no *unavailable* fixture to borrow wording from"
+
+        proved = False
+        for src in sources:
+            signal = _json_safe(src.stderr)
+            if not signal:
+                # A capture whose evidence lives only in the stream (an empty
+                # stderr) offers no portable wording. Another fixture must.
+                continue
+            # …and these exact bytes really are a tell: on stderr, with nothing
+            # on stdout, they take the provider down. Without this the splice
+            # below could be harmless text and the rule would pass vacuously.
+            if a.classify(src.rc, b"", signal.encode("utf-8"),
+                          REVIEW_CONTRACT).kind != "unavailable":
+                continue
+            for fx in healthy:
+                mutated = self._splice_into_finding_title(fx.stdout, signal)
+                if mutated is None:
+                    continue
+                broken = _invalidate_payload(mutated)
+                where = f"{fx.name} + {src.name} wording, payload invalidated"
+                assert signal.encode("utf-8") in broken, where
+                # The two halves of "no short-circuit can hide this": the model
+                # text survived, and the payload no longer validates.
+                parsed = a.parse(broken, b"", REVIEW_CONTRACT)
+                if parsed.parse_ok:
+                    continue
+                for rc in (0, 1):
+                    res = self._classified(
+                        a.classify(rc, broken, b"", REVIEW_CONTRACT),
+                        f"{where} (rc {rc})")
+                    assert res.kind != "unavailable", (
+                        f"{where} (rc {rc}): classified unavailable/"
+                        f"{res.category} ({res.detail!r}) — the ONLY place "
+                        f"that wording appears is the model's own message "
+                        f"text, so this adapter reads review CONTENT as a "
+                        f"provider verdict and any review of auth or rate-"
+                        f"limit code takes the provider out of the chain")
+                proved = True
+        assert proved, (
+            "rule 6's failed-run half was never exercised: it needs an "
+            "*unavailable* fixture whose STDERR carries the wording (one whose "
+            "evidence is only in the stream cannot supply it) and a healthy "
+            "fixture with a spliceable finding title")
 
     def _splice_into_finding_title(self, stdout: bytes,
                                    signal: str) -> bytes | None:
@@ -843,6 +991,23 @@ class AdapterConformance:
                            REVIEW_CONTRACT).parse_ok is True, (
                 f"{fx.name}: stdout must carry a usable payload for this rule "
                 f"to mean anything")
+
+
+def _invalidate_payload(stdout: bytes) -> bytes:
+    """Break the review payload in-place, leaving the envelope well-formed.
+
+    `summary` is renamed rather than retyped, so the result is still a JSON
+    object carrying `findings` — `_review_eligible` accepts it and
+    `_valid_payload` refuses it (a missing `summary`), which is precisely the
+    "extracted but rejected" state rule 6's failed-run half needs.
+
+    A BARE word is replaced, with no surrounding quotes: a payload typically
+    appears at two escaping depths in one capture (`"summary"` at the root,
+    `\\"summary\\"` nested inside a JSON string), and only a needle that needs no
+    escaping is byte-identical at both. Renaming an incidental occurrence of the
+    word inside prose is harmless — it stays a word inside a string.
+    """
+    return stdout.replace(b"summary", b"summaryX")
 
 
 def _json_safe(blob: bytes) -> str:

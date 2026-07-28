@@ -26,12 +26,17 @@ and neither alone is enough:
 
 * `_ask` here covers the *contract predicates*, which are caller-supplied
   callables this module cannot vouch for.
-* Each adapter's own JSON extraction covers the *decoder*, which raises
-  `RecursionError` — not a `ValueError` — on deeply nested untrusted output.
+* `_DECODE_FAILURES` here covers the *decoder*, which raises `RecursionError`
+  — not a `ValueError` — on deeply nested untrusted output. It and the scan
+  that uses it (`_first_eligible_object`) live in this module rather than in
+  each adapter because that guard is the exact defect Task 1's review found:
+  two copies of a totality guard is one fix away from a provider that still
+  raises, and four adapters are planned.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Protocol
@@ -138,14 +143,79 @@ def _ask(pred: Callable[[object], bool], obj: object) -> bool:
     unanswerable payload is not a payload this program may act on.
 
     This covers the predicates and nothing else. The JSON decode that produces
-    the object handed in here is the adapter's to guard — see grok's
-    `_DECODE_FAILURES` — so do not read this function as making the
-    never-raise promise total on its own.
+    the object handed in here is guarded separately, by `_DECODE_FAILURES`
+    below — so do not read this function as making the never-raise promise
+    total on its own.
     """
     try:
         return bool(pred(obj))
     except Exception:  # noqa: BLE001 - deliberately total; see docstring
         return False
+
+
+# --------------------------------------------------------------------------
+# untrusted JSON: the decoder guard and the scan every adapter needs
+# --------------------------------------------------------------------------
+
+# Everything `json`'s decoder can throw at a hostile blob. `ValueError` is the
+# documented one (`JSONDecodeError` subclasses it), but the C scanner signals
+# "too deeply nested" with `RecursionError`, which is a `RuntimeError` and so
+# sails past `except ValueError` untouched. Every decode site in every adapter
+# sees untrusted model output — 64 KB of `[[[[` is a plausible thing for a
+# confused model to emit and must be worth `parse_ok=False`, not an exception
+# escaping into the gate path.
+#
+# It lives HERE, in one place, because it is the exact defect Task 1's review
+# found in the grok adapter, and a fix applied to one copy of a guard is a fix
+# that silently misses the others. Four adapters are planned; one tuple.
+_DECODE_FAILURES = (ValueError, RecursionError)
+
+
+def _first_eligible_object(
+    text: str,
+    eligible: Callable[[object], bool],
+    transform: Callable[[object], object] | None = None,
+) -> dict | None:
+    """First eligible top-level JSON object in `text`, or None. Never raises.
+
+    `eligible` is the requested contract's candidate predicate, applied
+    identically to every candidate, so extraction needs no
+    contract-conditionals. For `REVIEW_CONTRACT` it is `_review_eligible`, and
+    two failure modes hang off that single rule:
+
+    * An empty or hollow envelope slot (`{}`) is NOT eligible, so it falls
+      through instead of masking a perfectly good payload elsewhere.
+    * An individual *finding* (or *verdict*) object is not eligible, so a scan
+      over a truncated envelope does not lock onto the first element of the
+      array and record `parse_ok` with no real content.
+
+    `raw_decode` from each `{` rather than `json.loads` on the whole string:
+    every CLI observed so far sometimes wraps its answer in prose or a ```json
+    fence, and grok sometimes emits the object twice. All of those make a bare
+    `loads` die with "Extra data" and lose the answer entirely.
+
+    `transform` is applied to each decoded candidate BEFORE `eligible` sees it,
+    inside the same `try`, and is how an adapter translates its CLI's spelling
+    of a payload into the contract's. The codex adapter passes `_strip_nulls`
+    (OpenAI strict mode cannot express an absent key, only a null one); grok
+    passes nothing, because its envelope needs no translation. Keeping the call
+    inside the `try` is deliberate: a transform is fed decoded-but-untrusted
+    JSON, so whatever it throws must be as survivable as a decode failure.
+    """
+    decoder = json.JSONDecoder()
+    pos = text.find("{")
+    while pos != -1:
+        try:
+            obj, _ = decoder.raw_decode(text, pos)
+            if transform is not None:
+                obj = transform(obj)
+        except _DECODE_FAILURES:
+            pos = text.find("{", pos + 1)
+            continue
+        if _ask(eligible, obj):
+            return obj
+        pos = text.find("{", pos + 1)
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -206,7 +276,14 @@ def _valid_payload(obj: object) -> bool:
             # guard here keeps the rule uniform with the `line` check below.
             if not isinstance(v, str):
                 return False
-        if f.get("severity") not in _SEVERITIES:
+        # `isinstance` FIRST, and not for tidiness: `x not in frozenset` calls
+        # `hash(x)`, so `{"severity": {}}` — a plausible thing for a model to
+        # emit where the schema asked for a string — raises TypeError out of a
+        # validator whose whole job is to answer True or False. `_ask` contains
+        # that today, but a validator on the trust path must not depend on its
+        # caller to convert a shape error into an answer.
+        severity = f.get("severity")
+        if not isinstance(severity, str) or severity not in _SEVERITIES:
             return False
         if "line" in f:
             line = f["line"]
@@ -241,7 +318,12 @@ def _valid_verdicts(obj: object) -> bool:
         # finding number 1.
         if type(v.get("index")) is not int:
             return False
-        if v.get("verdict") not in _VERDICTS:
+        # `isinstance` first, for the reason spelled at the severity check
+        # above: membership in a frozenset hashes its left operand, and an
+        # unhashable one turns a malformed verdict into a TypeError instead of
+        # a `parse_ok=False`.
+        verdict = v.get("verdict")
+        if not isinstance(verdict, str) or verdict not in _VERDICTS:
             return False
         if not isinstance(v.get("reasoning"), str):
             return False

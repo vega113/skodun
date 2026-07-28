@@ -94,13 +94,22 @@ degraded_truncated.txt
     STRIPPED: `thread_id`.
 
 degraded_no_turn_completed.txt
-    CAPTURED (`healthy.txt`'s stream) then CUT at a line boundary, dropping
-    the final `turn.completed` line — exactly what a killed or timed-out run
-    leaves behind once the answer is already on the wire. This is the sharp
-    one: the payload is complete and schema-valid, so the run PARSES and
-    reports three findings, and only the missing terminal event says the run
-    never finished. It is codex's spelling of the silent false all-clear that
-    116 `stopReason: Cancelled` runs produced in the Phase 1 corpus.
+    CAPTURED stdout (`healthy.txt`'s stream, byte-exact prefix) then CUT at a
+    line boundary, dropping the final `turn.completed` line — exactly what a
+    killed or timed-out run leaves behind once the answer is already on the
+    wire. This is the sharp one: the payload is complete and schema-valid, so
+    the run PARSES and reports three findings, and only the missing terminal
+    event says the run never finished. It is codex's spelling of the silent
+    false all-clear that 116 `stopReason: Cancelled` runs produced in the
+    Phase 1 corpus.
+    The `rc=-9` header is ATTRIBUTED, not captured: the source run exited 0
+    (it is `healthy.txt`), and -9 is the exit a SIGKILLed child reports, taken
+    from `degraded_truncated.txt` where it WAS captured. It is the exit code
+    that goes with the stdout this file holds, but no single run produced both.
+    Nothing in this fixture's rules turns on it — the degradation here is the
+    missing terminal event, and the adapter reaches the same verdict at rc 0 —
+    but a header that looks captured and is not would be a lie in a file whose
+    whole value is that its bytes are real.
 
 degraded_turn_failed.txt
     CAPTURED, whole. A real `turn.failed`: the run was launched with the

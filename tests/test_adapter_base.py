@@ -400,6 +400,49 @@ def test_refuter_raw_scan_skips_verdict_shaped_objects():
     assert p.parse_ok and p.payload == VERDICTS
 
 
+GOOD_FINDING = {"file": "a.py", "severity": "low", "title": "t",
+                "detail": "d"}
+
+
+@pytest.mark.parametrize("bad, why", [
+    ({"summary": "s", "findings": [{**GOOD_FINDING, "severity": {}}]},
+     "unhashable dict severity"),
+    ({"summary": "s", "findings": [{**GOOD_FINDING, "severity": []}]},
+     "unhashable list severity"),
+    ({"summary": "s", "findings": [{**GOOD_FINDING, "severity": {"a": 1}}]},
+     "unhashable non-empty dict severity"),
+])
+def test_valid_payload_survives_an_unhashable_severity(bad, why):
+    """`x not in frozenset` raises TypeError when `x` is unhashable.
+
+    A JSON decode never produces a `set`, but it produces `{}` and `[]` freely,
+    and `{"severity": {}}` is exactly what a confused model emits when it tries
+    to be structured about a field the schema said was a string. `_ask` catches
+    the TypeError today, so no adapter's never-raise promise is broken by it —
+    but a validator on the trust path that raises for a *shape* reason rather
+    than answering False is one refactor away from being called somewhere `_ask`
+    is not, and the answer it owes here is a plain, loud False.
+    """
+    with_membership_guard = REVIEW_CONTRACT.validate(bad)
+    assert with_membership_guard is False, why
+
+
+@pytest.mark.parametrize("bad, why", [
+    ({"verdicts": [{**GOOD_VERDICT, "verdict": {}}]}, "unhashable dict verdict"),
+    ({"verdicts": [{**GOOD_VERDICT, "verdict": []}]}, "unhashable list verdict"),
+    ({"verdicts": [{**GOOD_VERDICT, "verdict": {"v": "confirmed"}}]},
+     "unhashable non-empty dict verdict"),
+])
+def test_valid_verdicts_survives_an_unhashable_verdict(bad, why):
+    """The refuter mirror of the severity case, and the same fix.
+
+    `_valid_verdicts` is Task 8's merge-trust boundary; a TypeError out of it is
+    an unexpected exception in the gate path rather than the `parse_ok=False`
+    that a malformed verdict is worth.
+    """
+    assert REFUTER_CONTRACT.validate(bad) is False, why
+
+
 def test_payload_is_none_when_an_extracted_envelope_fails_validation():
     """`payload` is pinned to None by `parse_ok`, not merely by extraction.
 

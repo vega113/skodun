@@ -77,6 +77,16 @@ one the installed CLI offers, the run fails closed — an explicit `failed` reco
 and `trustworthy=false`, never a silent pass. Check the current ids with
 `grok models`.
 
+`effort` is one of `none | low | medium | high | max`, and those are skodun's own
+names rather than any CLI's: each adapter translates them into whatever its binary
+spells them as, and an effort an adapter cannot translate is a loud error, never a
+quietly dropped flag. `"none"` means **the lowest reasoning that provider offers**,
+which for a CLI with no such setting is *no effort flag at all* and for one with a
+real lowest level is that level, requested explicitly. Omitting `effort` is a
+different thing: unset passes no flag on any provider. `"max"` is the ceiling and
+may map to the highest level every model that adapter serves accepts, rather than
+to one only some of them offer.
+
 `examples/scala-angular-monorepo.toml` is a commented, drop-in `.skodun.toml` for a
 mixed-language repository — checklist routing, test-path patterns, security paths.
 

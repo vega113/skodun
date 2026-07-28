@@ -63,17 +63,10 @@ from .base import (
     OutputContract,
     ParseResult,
     _ask,
+    _DECODE_FAILURES,
+    _first_eligible_object,
 )
 
-# Everything `json`'s decoder can throw at a hostile blob. `ValueError` is the
-# documented one (`JSONDecodeError` subclasses it), but the C scanner signals
-# "too deeply nested" with `RecursionError`, which is a `RuntimeError` and so
-# sails past `except ValueError` untouched. Every decode site below sees
-# untrusted model output — 64 KB of `[[[[` is a plausible thing for a confused
-# model to emit and must be worth `parse_ok=False`, not an exception escaping
-# into the gate path. This tuple is what actually makes `parse`/`classify`
-# total; `base._ask` only covers the contract predicates.
-_DECODE_FAILURES = (ValueError, RecursionError)
 
 # The v2 exec event types this adapter reasons about. A turn ends in exactly
 # one of these, or in nothing at all.
@@ -425,6 +418,16 @@ def _events(stdout: bytes) -> list[dict]:
     `UnicodeDecodeError` here would blind the degradation check on the very
     runs it exists to catch.
 
+    The split is on `\\n` BYTES, before decoding, and that is a correctness
+    requirement rather than a micro-optimisation. `str.splitlines()` also
+    breaks on U+2028, U+2029 and U+0085; serde_json — which writes this stream
+    — escapes none of the three, so a finding whose text quotes one of them
+    reaches the wire raw and a `splitlines()` split cuts the `item.completed`
+    event in two. Neither half decodes, the event disappears, and the run
+    reports `parse_ok=False, degraded=False` — no payload AND no degradation
+    signal — on a turn that completed. Fail-closed, but silently, and a review
+    of source containing U+2028 would fail that way every single time.
+
     A line that does not decode is skipped rather than fatal — a half-written
     final line is what a killed process actually leaves behind, and the events
     before it are still evidence. An object with no string `type` is not an
@@ -432,8 +435,8 @@ def _events(stdout: bytes) -> list[dict]:
     "some JSON appeared on stdout" must not be mistaken for "the turn ran".
     """
     out: list[dict] = []
-    for line in stdout.decode("utf-8", "replace").splitlines():
-        line = line.strip()
+    for raw in stdout.split(b"\n"):
+        line = raw.decode("utf-8", "replace").strip()
         if not line.startswith("{"):
             continue
         try:
@@ -466,30 +469,16 @@ def _strip_nulls(obj: object) -> object:
 
 
 def _first_payload(text: str, eligible: Callable[[object], bool]) -> dict | None:
-    """First eligible top-level JSON object in `text`, or None.
+    """`base._first_eligible_object`, with the strict-mode null translation.
 
-    `eligible` is the requested contract's candidate predicate, applied
-    identically to every candidate, so extraction needs no
-    contract-conditionals.
-
-    `raw_decode` from each `{` rather than `json.loads` on the whole string:
-    even under an output schema the model sometimes wraps its answer in prose
-    or a ```json fence, both of which make a bare `loads` die with "Extra data"
-    and lose the answer entirely.
+    The scan is shared — the "prose or a ```json fence around the answer" case
+    is not codex's alone — and `_strip_nulls` rides in as its `transform`, so
+    every candidate is translated out of the CLI's spelling of absence before
+    the contract's eligibility rule ever sees it. That ordering is the point:
+    an object whose only defect is strict mode's `null`s must be recognised as
+    the payload, not skipped over in favour of the next `{` in the stream.
     """
-    decoder = json.JSONDecoder()
-    pos = text.find("{")
-    while pos != -1:
-        try:
-            obj, _ = decoder.raw_decode(text, pos)
-            obj = _strip_nulls(obj)
-        except _DECODE_FAILURES:
-            pos = text.find("{", pos + 1)
-            continue
-        if _ask(eligible, obj):
-            return obj
-        pos = text.find("{", pos + 1)
-    return None
+    return _first_eligible_object(text, eligible, _strip_nulls)
 
 
 def _extract(events: list[dict],

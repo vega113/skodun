@@ -250,12 +250,21 @@ def test_unset_effort_passes_no_effort_flag(tmp_path):
 
 
 def test_unknown_effort_is_loud(tmp_path):
-    """A dropped `--effort` reviews at the CLI's default and lies about it."""
+    """A dropped `--effort` reviews at the CLI's default and lies about it.
+
+    The prompt path is under `tmp_path` even though this call is expected to
+    raise before anything is written: `build_cmd` OWNS the schema sidecar and
+    writes it next to the prompt, so a relative path here would drop
+    `p.schema.json` into whatever directory pytest was started from the moment
+    the effort guard stopped preceding the write.
+    """
     a = CodexAdapter()
     r = Reviewer(name="f", provider="openai", model=MODEL, role="finder")
     object.__setattr__(r, "effort", "turbo")   # bypass config validation
     with pytest.raises(ValueError, match="no CLI value for effort"):
-        a.build_cmd(Path("p.txt"), r, D, Path("."))
+        a.build_cmd(tmp_path / "p.txt", r, D, tmp_path)
+    assert list(tmp_path.iterdir()) == [], (
+        "build_cmd wrote a file on a path it refused")
 
 
 def test_effort_map_is_a_copy():
@@ -356,6 +365,46 @@ def test_a_malformed_line_does_not_lose_the_stream():
     stream = (b'{"type":"thread.star\n' + good.encode("utf-8")
               + b'\n{"type":"turn.completed"}\n')
     assert CodexAdapter().parse(stream, b"", REVIEW_CONTRACT).parse_ok is True
+
+
+@pytest.mark.parametrize("ch, name", [
+    (" ", "LINE SEPARATOR"),
+    (" ", "PARAGRAPH SEPARATOR"),
+    ("", "NEXT LINE"),
+])
+def test_unicode_line_breaks_inside_a_finding_do_not_split_the_event(ch, name):
+    """The event stream is delimited by `\\n` BYTES and by nothing else.
+
+    `str.splitlines()` also splits on U+2028, U+2029 and U+0085 (among others).
+    serde_json — which is what writes this stream — escapes none of them, so a
+    finding whose `detail` quotes any of the three lands in the stream raw, and
+    a line-splitter that honours them cuts the `item.completed` event in half.
+    Both halves then fail to decode, the event vanishes, and the run reports
+    `parse_ok=False, degraded=False` — no payload and no degradation signal —
+    on a run that carried a complete review and a `turn.completed`.
+
+    That direction is fail-closed (gate 2, not a false all-clear), but a pull
+    request containing U+2028 in reviewed source would make every codex attempt
+    yield nothing with no explanation at all.
+    """
+    payload = {"summary": "s", "findings": [{
+        "file": "a.py", "severity": "low", "title": "unicode separators",
+        "detail": f"the parser splits on{ch}this character"}]}
+    # `ensure_ascii=False` on BOTH levels: serde_json emits these characters
+    # raw, and an escaped ` ` would make this test pass against the bug.
+    line = json.dumps({"type": "item.completed", "item": {
+        "type": "agent_message",
+        "text": json.dumps(payload, ensure_ascii=False)}}, ensure_ascii=False)
+    stream = line.encode("utf-8") + b'\n{"type":"turn.completed"}\n'
+    assert ch.encode("utf-8") in stream, f"{name} must reach the wire raw"
+
+    res = CodexAdapter().parse(stream, b"", REVIEW_CONTRACT)
+    assert res.parse_ok is True, f"{name} split the event line"
+    assert res.stop_reason == "turn.completed", (
+        f"{name} lost the terminal event")
+    assert res.degraded is False
+    assert res.findings[0]["detail"].endswith("this character")
+    assert CodexAdapter().classify(0, stream, b"", REVIEW_CONTRACT).kind == "ok"
 
 
 @pytest.mark.parametrize("contract", [REVIEW_CONTRACT, REFUTER_CONTRACT])
@@ -516,7 +565,13 @@ def test_usable_output_does_not_win_over_degradation():
 
 def test_classify_never_reads_agent_message_text():
     """Signal words inside the model's own answer cannot make a run
-    unavailable — otherwise a review OF an auth bug takes the provider down."""
+    unavailable — otherwise a review OF an auth bug takes the provider down.
+
+    This is the EASY half and it is not, on its own, evidence: the payload here
+    validates, so `classify` short-circuits on usable output at step 2 and
+    never reaches `_diagnostics` at all. The half below is the one that
+    discriminates.
+    """
     payload = {"summary": "401 Unauthorized handling is missing",
                "findings": [{"file": "a.py", "severity": "low",
                              "title": "quota rate limit is not honoured",
@@ -526,6 +581,52 @@ def test_classify_never_reads_agent_message_text():
         + b'\n{"type":"turn.completed"}\n'
     res = CodexAdapter().classify(0, stream, b"", REVIEW_CONTRACT)
     assert res.kind == "ok"
+
+
+@pytest.mark.parametrize("text, why", [
+    ('{"summary":"the code ignores rate limit quota errors","findings":[',
+     "truncated mid-payload"),
+    ('{"summary":"401 Unauthorized is swallowed","findings":"not a list"}',
+     "complete but schema-invalid"),
+    ("I could not finish: the diff quotes 429 Too Many Requests and a "
+     "usage limit error, and I ran out of context.",
+     "prose, no payload at all"),
+])
+def test_a_failed_run_is_not_unavailable_because_of_what_the_model_said(
+        text, why):
+    """The half of rule 6 that `classify`'s short-circuit cannot answer for.
+
+    `classify` returns before `_diagnostics` whenever the payload validates
+    (step 2, usable output), so a signal-word test built on a VALID review
+    proves nothing about what the classifier reads — the reviewer's M3 mutation
+    (`_diagnostics` also folding in `item.completed → item.text`) passed the
+    entire suite.
+
+    These three are runs that produced no usable payload — a truncated answer,
+    a schema-invalid one, and an apology — each carrying auth or quota wording
+    in the model's own words and nothing on stderr. `_diagnostics` IS reached,
+    and it must still find only the harness's words, of which there are none.
+    A `quota` verdict here would be cached provider-wide and would take codex
+    out of every later fallback chain in the run, on the strength of a sentence
+    the model wrote about someone else's code.
+
+    rc 1 as well as rc 0: a failed attempt is the realistic carrier, and rc is
+    an input to the precedence order.
+    """
+    stream = json.dumps({"type": "item.completed", "item": {
+        "type": "agent_message", "text": text}}).encode("utf-8") \
+        + b'\n{"type":"turn.completed"}\n'
+    a = CodexAdapter()
+    # The premise: this run really did fail to produce a payload, so nothing
+    # short-circuits ahead of the diagnostics read.
+    assert a.parse(stream, b"", REVIEW_CONTRACT).parse_ok is False, why
+    for rc in (0, 1):
+        res = a.classify(rc, stream, b"", REVIEW_CONTRACT)
+        assert res.kind == "ok", (
+            f"{why} (rc {rc}): classified {res.kind}/{res.category} "
+            f"({res.detail!r}) on wording that appears only inside the "
+            f"model's own message")
+        assert res.category == ""
 
 
 # --------------------------------------------------------------------------

@@ -38,6 +38,8 @@ from .base import (
     OutputContract,
     ParseResult,
     _ask,
+    _DECODE_FAILURES,
+    _first_eligible_object,
     _valid_payload,
 )
 
@@ -143,16 +145,6 @@ _NO_EFFORT_PREFIXES = ("grok-build",)
 # before a `Reviewer` can reach this module, so an empty-string branch here
 # would be dead code that quietly implies a third, undocumented opt-out.
 _EFFORT_OFF = (None, "none")
-
-# Everything `json`'s decoder can throw at a hostile blob. `ValueError` is the
-# documented one (`JSONDecodeError` subclasses it), but the C scanner signals
-# "too deeply nested" with `RecursionError`, which is a `RuntimeError` and so
-# sails past `except ValueError` untouched. stdout here is untrusted model
-# output: 65 KB of `[[[[...` is a plausible thing for a confused model to emit
-# and must be worth `parse_ok=False`, not an exception escaping into the gate
-# path. Both extractors below catch this tuple, which is what actually makes
-# `parse`/`classify` total — `_ask` only covers the contract predicates.
-_DECODE_FAILURES = (ValueError, RecursionError)
 
 
 def resolve_grok_bin() -> str:
@@ -303,36 +295,18 @@ class GrokAdapter:
 
 def _first_review_object(text: str,
                          eligible: Callable[[object], bool]) -> dict | None:
-    """First eligible top-level JSON object in `text`, or None.
+    """`base._first_eligible_object`, with no payload translation.
 
-    `eligible` is the contract's predicate — the ONE candidate rule, applied
-    identically at all three fallback levels. For `REVIEW_CONTRACT` it is
-    `base._review_eligible` (the Phase 1 `_eligible`, relocated), and two
-    failure modes hang off that single rule:
+    The scan itself is shared — every adapter needs the same "find the first
+    object the contract will accept, in prose that may wrap or repeat it" — and
+    lives in `base` so the decoder guard around it exists once rather than once
+    per provider. grok passes no `transform`: its envelope carries the payload
+    in the contract's own spelling, and nothing has to be translated.
 
-    * An empty or hollow `structuredOutput` (`{}`) is NOT eligible, so it falls
-      through instead of masking a perfectly good payload sitting in `text`.
-    * An individual *finding* object is not eligible, so a raw scan over a
-      truncated envelope does not lock onto the first element of the findings
-      array and record `parse_ok` with no real content.
-
-    `raw_decode` from each `{` rather than `json.loads` on the whole blob:
-    grok wraps its answer in prose or ```json fences and sometimes emits the
-    object twice, all of which make a bare `loads` die with "Extra data" and
-    lose the review entirely.
+    The name is kept because the three-level fallback below reads better for
+    it, and because this is the level Phase 1's tests talk about.
     """
-    decoder = json.JSONDecoder()
-    pos = text.find("{")
-    while pos != -1:
-        try:
-            obj, _ = decoder.raw_decode(text, pos)
-        except _DECODE_FAILURES:
-            pos = text.find("{", pos + 1)
-            continue
-        if _ask(eligible, obj):
-            return obj
-        pos = text.find("{", pos + 1)
-    return None
+    return _first_eligible_object(text, eligible)
 
 
 def _root_envelope(text: str) -> object | None:

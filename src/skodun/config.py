@@ -3,6 +3,30 @@ import os, tomllib
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+#: The canonical reasoning-effort vocabulary a `[reviewers]` entry may use.
+#: These are skodun's OWN names, not any CLI's: each adapter maps them to
+#: whatever its binary spells them as (`base.Adapter.effort_map`), and an
+#: effort an adapter cannot map is a loud error rather than a dropped flag.
+#:
+#: `"none"` means **the least reasoning the provider offers**, and what that
+#: is depends on the provider — deliberately, because the alternative is a
+#: config value that fails on half the CLIs:
+#:
+#: * where the CLI has no such setting, `"none"` passes NO effort flag at all
+#:   and the provider's own default applies (this is what the grok adapter
+#:   does);
+#: * where the CLI has a real lowest level, `"none"` requests it explicitly
+#:   (the codex adapter passes `model_reasoning_effort=none`, which is a value
+#:   in the OpenAI API's own enum).
+#:
+#: Either way it is the floor, and it is the only canonical value an adapter is
+#: allowed to leave out of its `effort_map`. Omitting `effort` entirely is a
+#: different thing again: unset means "do not express an opinion", so no flag is
+#: passed regardless of what the CLI supports.
+#:
+#: `"max"` is the ceiling and is likewise mapped per provider — an adapter may
+#: map it to the highest level EVERY model it serves accepts rather than to a
+#: level only some of them offer.
 EFFORTS = {"none", "low", "medium", "high", "max"}
 ROLES = {"finder", "refuter", "security", "triager", "integrator"}
 
