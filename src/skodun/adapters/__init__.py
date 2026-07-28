@@ -3,42 +3,45 @@
 An adapter owns everything provider-specific about a single review attempt —
 the argv, the response envelope's shape, and which harness misbehaviours make
 that response untrustworthy. Everything upstream of it works in terms of
-`ParseResult` and never in terms of one CLI's flags.
+`ParseResult`/`ClassifyResult` and never in terms of one CLI's flags.
 
-Phase 1 ships one provider (`xai`). `get_adapter` raises rather than falling
-back to a default: silently reviewing with the wrong model is worse than not
-reviewing at all.
+The provider-neutral half of that bargain — the result shapes, the `Adapter`
+protocol, and the `OutputContract`s that say which response shape a run is
+asking for — lives in `base`. This module is the registry and the re-export
+surface; `get_adapter` raises rather than falling back to a default, because
+silently reviewing with the wrong model is worse than not reviewing at all.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Protocol
+from .base import (
+    REFUTER_CONTRACT,
+    REVIEW_CONTRACT,
+    UNAVAILABLE_RC,
+    Adapter,
+    ClassifyResult,
+    OutputContract,
+    ParseResult,
+)
+from .grok import GrokAdapter
 
-from ..config import Defaults, Reviewer
-from .grok import GrokAdapter, ParseResult
-
-__all__ = ["Adapter", "ParseResult", "GrokAdapter", "get_adapter"]
-
-
-class Adapter(Protocol):
-    """What every provider adapter must offer."""
-
-    name: str
-
-    def build_cmd(self, prompt_file: Path, r: Reviewer, d: Defaults,
-                  cwd: Path) -> list[str]:
-        """Full argv for one attempt. The prompt travels as a file."""
-        ...
-
-    def parse(self, stdout: bytes, stderr: bytes) -> ParseResult:
-        """Interpret one attempt's raw output. Never raises on garbage."""
-        ...
+__all__ = [
+    "Adapter",
+    "ClassifyResult",
+    "GrokAdapter",
+    "OutputContract",
+    "ParseResult",
+    "REFUTER_CONTRACT",
+    "REVIEW_CONTRACT",
+    "UNAVAILABLE_RC",
+    "get_adapter",
+]
 
 
-# Typed as `type[Adapter]`, not bare `type`: registering a class that does not
-# satisfy the protocol is then a type error at the table, not a surprise at the
-# first `parse()` of a real review.
+# Keyed by PROVIDER, not by adapter name: config names a provider, and one
+# provider may ship more than one CLI. Typed as `type[Adapter]`, not bare
+# `type`: registering a class that does not satisfy the protocol is then a type
+# error at the table, not a surprise at the first `parse()` of a real review.
 _REGISTRY: dict[str, type[Adapter]] = {"xai": GrokAdapter}
 
 

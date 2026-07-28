@@ -26,22 +26,30 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from ..config import Defaults, Reviewer
-
-# Verbatim from the oracle's `GROK_REVIEW_SCHEMA` (pinned byte-for-byte by
-# `test_schema_matches_oracle_verbatim`). Single line: it is one argv element.
-SCHEMA = (
-    '{"type":"object","properties":{"summary":{"type":"string"},"findings":'
-    '{"type":"array","items":{"type":"object","properties":{"file":{"type":'
-    '"string"},"line":{"type":"integer"},"severity":{"type":"string","enum":'
-    '["high","medium","low"]},"category":{"type":"string"},"title":{"type":'
-    '"string"},"detail":{"type":"string"}},"required":["file","severity",'
-    '"title","detail"]}}},"required":["summary","findings"]}'
+from .base import (
+    _REVIEW_SCHEMA,
+    REVIEW_CONTRACT,
+    UNAVAILABLE_RC,
+    ClassifyResult,
+    OutputContract,
+    ParseResult,
+    _ask,
+    _valid_payload,
 )
+
+# The review schema now lives in `base` (every adapter asks for the same
+# response shape); this name is kept so the byte-for-byte oracle-parity test
+# and every other Phase 1 caller keep working. Same object, not a copy.
+SCHEMA = _REVIEW_SCHEMA
+
+# `ParseResult` and `_valid_payload` above are imported for the same reason and
+# are NOT unused: they moved to `base` and are re-exported from here so that
+# every Phase 1 import site — `from skodun.adapters.grok import ParseResult` —
+# keeps resolving to the one shared object rather than to a copy.
 
 # stderr tells of a harness-side failure. Matched case-insensitively: the
 # oracle greps these with `grep -Eiq`, so `Tool_Error` must not slip through.
@@ -71,7 +79,59 @@ _MAX_TURNS = b"max turns reached"
 # silent false all-clear this exists to prevent.
 _STOP_REASON_OK = "EndTurn"
 
-_SEVERITIES = frozenset({"high", "medium", "low"})
+# --- unavailability tells (classify only; never inputs to `degraded`) ------
+#
+# All matched case-insensitively on stderr BYTES, and all consulted only when
+# stdout carried no usable payload — the Phase 1 non-signal rule: noisy stderr
+# alongside a healthy answer is noise, not a verdict. (`test_auth_noise_is_not_
+# degraded` pins exactly that case for `Auth(AuthorizationRequired)`.)
+#
+# Checked in this order, and the order is a safety decision rather than
+# alphabetical: `quota` is the ONLY provider-wide-cacheable category, so a
+# false `quota` takes a working provider out of every later chain in the run,
+# while a false `auth`/`model` costs one attempt. Anything that also looks like
+# a more specific, attempt-local failure is therefore reported as that instead.
+_AUTH_SIGNALS: tuple[bytes, ...] = (
+    b"authorizationrequired",
+    b"authorization required",
+    b"unauthorized",
+    b"authentication failed",
+    b"invalid api key",
+    b"not logged in",
+)
+
+_MODEL_SIGNALS: tuple[bytes, ...] = (
+    b"unknown model",
+    b"no such model",
+    b"model not found",
+    b"invalid model",
+    b"unsupported model",
+)
+
+# No bare `429` here, deliberately: stderr can carry line numbers and byte
+# offsets, and a numeric substring match would mint provider-wide quota
+# outages out of arithmetic.
+_QUOTA_SIGNALS: tuple[bytes, ...] = (
+    b"quota",
+    b"rate limit",
+    b"rate_limit",
+    b"ratelimit",
+    b"too many requests",
+    b"usage limit",
+    b"insufficient credit",
+    b"out of credits",
+)
+
+# Canonical effort (`config.EFFORTS`) -> grok's spelling. Pass-through today;
+# it exists so that a provider whose CLI spells these differently is a table
+# edit rather than a branch. `"none"` is absent on purpose: it is the opt-out
+# handled by `_EFFORT_OFF` before any lookup happens, not a CLI value.
+_EFFORT_MAP: dict[str, str] = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "max": "max",
+}
 
 # Models that reject `--effort`. Prefix match, so `grok-build-fast-1` and any
 # future `grok-build*` build are covered without another table edit.
@@ -83,23 +143,6 @@ _NO_EFFORT_PREFIXES = ("grok-build",)
 # before a `Reviewer` can reach this module, so an empty-string branch here
 # would be dead code that quietly implies a third, undocumented opt-out.
 _EFFORT_OFF = (None, "none")
-
-
-@dataclass(frozen=True)
-class ParseResult:
-    """What one attempt's output is worth.
-
-    `findings`/`summary` are only populated when `parse_ok` — a payload that
-    failed validation must not leak half-shaped findings to a caller that
-    checked the wrong flag.
-    """
-
-    parse_ok: bool
-    findings: list
-    summary: str
-    stop_reason: str | None
-    degraded: bool
-    degraded_reason: str
 
 
 def resolve_grok_bin() -> str:
@@ -122,14 +165,28 @@ class GrokAdapter:
     """Invocation + output interpretation for the xAI grok CLI."""
 
     name = "grok"
+    provider = "xai"
+    # grok takes the prompt via `--prompt-file`, so nothing goes on stdin.
+    stdin_from_prompt_file = False
+
+    def resolve_binary(self) -> str:
+        """The protocol's spelling of the existing `resolve_grok_bin`."""
+        return resolve_grok_bin()
+
+    def effort_map(self) -> dict[str, str]:
+        """Canonical effort -> grok's `--effort` value. A copy, so that a
+        caller inspecting the table cannot mutate this adapter's behaviour."""
+        return dict(_EFFORT_MAP)
 
     def build_cmd(self, prompt_file: Path, r: Reviewer, d: Defaults,
-                  cwd: Path) -> list[str]:
+                  cwd: Path,
+                  contract: OutputContract = REVIEW_CONTRACT) -> list[str]:
         """The full argv for one review attempt.
 
         The prompt travels as a FILE, never as a shell-interpolated string, and
         the model is always explicit (`-m`) rather than inherited from the
-        binary's own settings file.
+        binary's own settings file. The response shape comes from `contract`,
+        so the same invocation serves a review or a refuter pass.
         """
         effort = None if r.effort in _EFFORT_OFF else r.effort
         if effort is not None and r.model.startswith(_NO_EFFORT_PREFIXES):
@@ -137,10 +194,22 @@ class GrokAdapter:
                 f"model {r.model!r} does not support effort (configured "
                 f"{r.effort!r}) — remove it, set effort = \"none\", or "
                 f"choose a model that supports it")
+        cli_effort = None
+        if effort is not None:
+            mapping = self.effort_map()
+            if effort not in mapping:
+                # LOUD, never a dropped flag: silently reviewing at the CLI's
+                # own default effort is an unnoticed downgrade, and an
+                # unnoticed downgrade is how a weak review passes for a strong
+                # one.
+                raise ValueError(
+                    f"adapter {self.name!r} has no CLI value for effort "
+                    f"{effort!r} (known: {sorted(mapping)})")
+            cli_effort = mapping[effort]
         cmd = [
             resolve_grok_bin(),
             "--prompt-file", str(prompt_file),
-            "--json-schema", SCHEMA,
+            "--json-schema", contract.json_schema,
             "-m", r.model,
             "--disable-web-search",
             "--no-subagents",
@@ -151,22 +220,70 @@ class GrokAdapter:
             "--disallowed-tools", d.deny_tools,
             "--cwd", str(cwd),
         ]
-        if effort is not None:
-            cmd += ["--effort", effort]
+        if cli_effort is not None:
+            cmd += ["--effort", cli_effort]
         return cmd
 
-    def parse(self, stdout: bytes, stderr: bytes) -> ParseResult:
-        payload, stop_reason = _extract_review(stdout)
-        parse_ok = _valid_payload(payload)
+    def parse(self, stdout: bytes, stderr: bytes,
+              contract: OutputContract = REVIEW_CONTRACT) -> ParseResult:
+        payload, stop_reason = _extract_review(stdout, contract.eligible)
+        parse_ok = _ask(contract.validate, payload)
         degraded, reason = _detect_degraded(stdout, stderr, stop_reason)
+        # The `findings`/`summary` projection is REVIEW_CONTRACT's alone. Under
+        # any other contract those two stay empty rather than being filled from
+        # a foreign payload, so a Phase 1 caller that only knows them can never
+        # read a refuter response as a review; such callers get `payload`.
+        review = parse_ok and contract is REVIEW_CONTRACT
         return ParseResult(
             parse_ok=parse_ok,
-            findings=list(payload["findings"]) if parse_ok else [],
-            summary=payload["summary"] if parse_ok else "",
+            findings=list(payload["findings"]) if review else [],
+            summary=payload["summary"] if review else "",
             stop_reason=stop_reason,
             degraded=degraded,
             degraded_reason=reason,
+            payload=payload if parse_ok else None,
         )
+
+    def classify(self, rc: int, stdout: bytes, stderr: bytes,
+                 contract: OutputContract = REVIEW_CONTRACT) -> ClassifyResult:
+        """Run health, on its own axis from parsing. Never raises.
+
+        Precedence, and every step of it is a fail-safe choice:
+
+        1. `rc 127` — the binary is not there, so nothing else in the output
+           means anything.
+        2. Usable output wins over noisy stderr. This is the Phase 1 non-signal
+           rule: a run that produced a valid payload is not "unavailable"
+           because its harness grumbled on the way. Usability is judged by
+           `contract.validate`, so a valid refuter response counts as usable.
+        3. Unavailability tells, attempt-local ones first (see the tables).
+        4. `_detect_degraded`'s truncation evidence, byte-for-byte the same
+           signals `parse` reports.
+        5. Otherwise `ok` — including a run with empty stdout and clean stderr,
+           which is a failed attempt (`parse_ok=False`) but carries no positive
+           evidence of anything, and inventing a category for it would be the
+           inference-from-absence this module refuses to make.
+        """
+        if rc == UNAVAILABLE_RC:
+            return ClassifyResult(
+                "unavailable", "binary",
+                f"binary not found (rc {UNAVAILABLE_RC})")
+        payload, stop_reason = _extract_review(stdout, contract.eligible)
+        if not _ask(contract.validate, payload):
+            err_lower = stderr.lower()
+            for category, signals in (("auth", _AUTH_SIGNALS),
+                                      ("model", _MODEL_SIGNALS),
+                                      ("quota", _QUOTA_SIGNALS)):
+                for sig in signals:
+                    if sig in err_lower:
+                        return ClassifyResult(
+                            "unavailable", category,
+                            f"{category} failure in stderr ({sig.decode()}) "
+                            f"with no usable {contract.name} payload")
+        degraded, reason = _detect_degraded(stdout, stderr, stop_reason)
+        if degraded:
+            return ClassifyResult("degraded", "", reason)
+        return ClassifyResult("ok", "", "")
 
 
 # --------------------------------------------------------------------------
@@ -174,23 +291,20 @@ class GrokAdapter:
 # --------------------------------------------------------------------------
 
 
-def _eligible(obj: object) -> bool:
-    """The ONE candidate predicate, applied identically at all three levels.
+def _first_review_object(text: str,
+                         eligible: Callable[[object], bool]) -> dict | None:
+    """First eligible top-level JSON object in `text`, or None.
 
-    A candidate must carry `summary` or `findings`. Two failure modes hang off
-    this single rule:
+    `eligible` is the contract's predicate — the ONE candidate rule, applied
+    identically at all three fallback levels. For `REVIEW_CONTRACT` it is
+    `base._review_eligible` (the Phase 1 `_eligible`, relocated), and two
+    failure modes hang off that single rule:
 
     * An empty or hollow `structuredOutput` (`{}`) is NOT eligible, so it falls
       through instead of masking a perfectly good payload sitting in `text`.
     * An individual *finding* object is not eligible, so a raw scan over a
       truncated envelope does not lock onto the first element of the findings
       array and record `parse_ok` with no real content.
-    """
-    return isinstance(obj, dict) and ("summary" in obj or "findings" in obj)
-
-
-def _first_review_object(text: str) -> dict | None:
-    """First eligible top-level JSON object in `text`, or None.
 
     `raw_decode` from each `{` rather than `json.loads` on the whole blob:
     grok wraps its answer in prose or ```json fences and sometimes emits the
@@ -205,7 +319,7 @@ def _first_review_object(text: str) -> dict | None:
         except ValueError:
             pos = text.find("{", pos + 1)
             continue
-        if _eligible(obj):
+        if _ask(eligible, obj):
             return obj
         pos = text.find("{", pos + 1)
     return None
@@ -258,8 +372,15 @@ def _root_stop_reason(root: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _extract_review(stdout: bytes) -> tuple[dict | None, str | None]:
+def _extract_review(
+    stdout: bytes,
+    eligible: Callable[[object], bool],
+) -> tuple[dict | None, str | None]:
     """Three-level fallback: `structuredOutput` -> `text` -> raw scan.
+
+    `eligible` is the requested contract's candidate predicate and is the ONLY
+    contract-dependent thing here: the envelope is grok's regardless of what
+    shape we asked it to put inside.
 
     `errors="replace"` rather than a strict decode: grok's output routinely
     carries non-ASCII, and in exactly the truncated runs that matter it carries
@@ -284,63 +405,23 @@ def _extract_review(stdout: bytes) -> tuple[dict | None, str | None]:
     # authoritative structuredOutput.
     if isinstance(root, dict):
         so = root.get("structuredOutput")
-        if _eligible(so):
+        if _ask(eligible, so):
             return so, stop_reason
         inner = root.get("text")
         if isinstance(inner, str) and inner.strip():
-            found = _first_review_object(inner)
+            found = _first_review_object(inner, eligible)
             if found is not None:
                 return found, stop_reason
 
-    return _first_review_object(text), stop_reason
-
-
-# --------------------------------------------------------------------------
-# schema validation
-# --------------------------------------------------------------------------
-
-
-def _valid_payload(obj: object) -> bool:
-    """True iff `obj` is a review this program can act on without guessing."""
-    # `_eligible` already implies `isinstance(obj, dict)`, but this is the
-    # trust-critical validator: the narrowing is spelled as a real check rather
-    # than an `assert`, which `python -O` strips. Under -O a bare assert would
-    # leave `obj.get` unguarded and turn a hostile payload into an
-    # AttributeError inside the gate path instead of a clean `parse_ok=False`.
-    if not isinstance(obj, dict) or not _eligible(obj):
-        return False
-    if not isinstance(obj.get("summary"), str):
-        return False
-    findings = obj.get("findings")
-    if not isinstance(findings, list):
-        return False
-    for f in findings:
-        if not isinstance(f, dict):
-            return False
-        for key in ("file", "title", "detail"):
-            v = f.get(key)
-            # `isinstance(True, str)` is False already, but spelling the bool
-            # guard here keeps the rule uniform with the `line` check below.
-            if not isinstance(v, str):
-                return False
-        if f.get("severity") not in _SEVERITIES:
-            return False
-        if "line" in f:
-            line = f["line"]
-            # `bool` is a subclass of `int`, so `{"line": true}` would sail
-            # through a bare isinstance check and later be formatted as "1".
-            if isinstance(line, bool) or not isinstance(line, int):
-                return False
-    return True
+    return _first_review_object(text, eligible), stop_reason
 
 
 if TYPE_CHECKING:  # pragma: no cover - static conformance, no runtime cost
     # `GrokAdapter` explicitly declares that it satisfies the package's
-    # `Adapter` protocol. Under TYPE_CHECKING only, because the protocol lives
-    # in the package `__init__` that imports this module — a runtime import
-    # would be a cycle. A type checker fails HERE, at the definition site, if
-    # `build_cmd`/`parse` ever drift from the protocol.
-    from . import Adapter
+    # `Adapter` protocol. A type checker fails HERE, at the definition site, if
+    # any member ever drifts from the protocol — which matters more once four
+    # adapters exist and only one of them is exercised by a given config.
+    from .base import Adapter
 
     _CONFORMS: type[Adapter] = GrokAdapter
 
