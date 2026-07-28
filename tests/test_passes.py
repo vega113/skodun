@@ -160,9 +160,14 @@ def test_a_refuter_failure_does_not_soften_the_security_passs_demotion():
     """
     demoted = merge_failed_extra_pass(_primary(), "security",
                                       failed_pass_reason("security"))
+    # `finder_findings_total` explicit: `demoted["extra_passes"]` is already
+    # non-empty (the security failure's own meta), so the unsafe
+    # "default to len(findings)" path is refused past that point -- see
+    # `test_omitting_finder_findings_total_after_a_merge_raises` in
+    # `test_refuter.py`. `_primary()`'s finder produced zero findings.
     out = merge_refuter_pass(demoted, None,
                              {"provider": None, "model": None, "effort": None,
-                              "note": "provider B was unavailable"})
+                              "note": "provider B was unavailable"}, 0)
     assert out["parse_ok"] is False and out["trustworthy"] is False
     assert "security" in out["failure_reason"]
     assert out["extra_passes"]["security"]["failed"] is True

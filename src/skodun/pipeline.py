@@ -923,6 +923,15 @@ def _reviewer_for(cfg: Config, role: str) -> Reviewer | None:
 #: the order the passes are scheduled. ONE table: `_pass_reviewer` reads it to
 #: pick the reviewer and preflight reads it to validate every reviewer this run
 #: may reach for, so a new pass cannot be wired up on one side only.
+#:
+#: `skeptic` and `refuter` collide on the role name `refuter` — pre-existing
+#: (the skeptic already preferred that role before this pass existed) and
+#: still safe now that `refuter` is a real, separately-scheduled pass: the two
+#: are mutually exclusive by `should_run_skeptic`/`refuter_decision`'s own
+#: eligibility (the skeptic only runs on a trustworthy CLEAN finder, the
+#: refuter only on a trustworthy finder WITH findings), so at most one of them
+#: ever reads this table in a given run. If that mutual exclusion ever
+#: changes, this shared name needs a second look.
 _EXTRA_PASS_ROLES = {"security": "security", "skeptic": "refuter",
                      "refuter": "refuter"}
 
@@ -1234,7 +1243,16 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                     _pass_reviewer(cfg, "refuter", finder), cfg, d, root,
                     store, scratch, finder_provider)
             elif skip_note:
-                _note(skip_note)
+                # `skip_note` is non-empty for exactly one case: an eligible
+                # review with no refuter configured (`refuter_decision`'s own
+                # contract). The brief calls that "silently skipped with a
+                # note" — the note belongs on the record
+                # (`extra_passes.refuter.status == "skipped"`), not on
+                # stderr, so it stays off `_note` here. A genuine refuter
+                # FAILURE — configured but unavailable, degraded, or
+                # unparseable — is a different path (`_refuter_pass`) and IS
+                # narrated there: that is an event the operator wants to
+                # know about, not a no-op default configuration.
                 rec = passes.skipped_refuter_pass(rec, skip_note)
 
         # --- 11. persist the final record, then banner from what was stored

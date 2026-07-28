@@ -149,6 +149,17 @@ it. The measurement uses `textnorm.collapse_ws` — the same helper
 `triage.validate_reason` uses, and NOT `textnorm.norm`, which lowercases and
 can therefore *lengthen* a string past a floor it should not clear.
 
+The channel is unauthenticated by construction, so the module authenticates
+it on the way in. `_annotated` is the only place a `refuter` annotation is
+WRITTEN, but a finding's `refuter` key can also arrive already present, since
+the finder's parsed findings are untrusted model output handed to this module
+verbatim. `_strip_finder_refuter_keys` drops any such incoming key before
+`merge_refuter_pass` or `skipped_refuter_pass` runs — even on the skip path,
+which writes no verdicts of its own and so has nothing else to overwrite a
+forgery with. Same defensive class as `_finding_lines`'s title-collapsing:
+untrusted, model-authored text must not be able to forge structure a reader
+(here, a later `triage --adopt-refuter`) would trust.
+
 DIVERGENCES from the oracle
 ---------------------------
 1. **A pass that produced nothing demotes, and says so by name.** The oracle
@@ -963,7 +974,9 @@ def merge_refuter_pass(
     which is correct only when nothing has been merged into the record yet —
     the pipeline always passes it explicitly, and passing it is how a verdict
     is kept off a finding some later pass appended. A value wider than the
-    record is clamped rather than trusted.
+    record is clamped rather than trusted. Omitting it is refused with a
+    `ValueError` when `primary["extra_passes"]` is already non-empty: the
+    unsafe default would otherwise silently widen to the merged record.
 
     Returns a NEW record. `findings` is a fresh list of fresh shallow copies
     (an annotation writes INTO a finding, so unlike `_merge` this cannot share
@@ -986,10 +999,41 @@ def merge_refuter_pass(
     # this function cannot annotate is carried through exactly as it arrived,
     # holding its index open. ("Annotation only" also means the findings list
     # comes out the same length it went in.)
+    #
+    # A finder's parsed findings are untrusted model output that reaches this
+    # function verbatim — the same class of problem `_finding_lines` guards
+    # against when it collapses titles and indents detail lines so a finding
+    # cannot forge a `[9]` entry or close the findings fence (passes.py:604 in
+    # `_finding_lines`'s docstring). Here the forgery is a `refuter` key: a
+    # finder could ship one on its own finding to fabricate a verdict and its
+    # provenance before this pass ever runs. Stripping any incoming `refuter`
+    # key on copy — before this function writes its own — is what keeps
+    # `_annotated` the ONLY place a `refuter` annotation is written, and what
+    # keeps this merge's own counters (`annotated`, `dropped`, `note`) the
+    # complete truth about what happened. `_strip_finder_refuter_keys` does
+    # the same thing for `skipped_refuter_pass`, which has no verdicts of its
+    # own to write but must not let a forged one ride through unrun.
     raw_findings = primary.get("findings")
-    findings = [dict(f) if isinstance(f, dict) else f
-                for f in (raw_findings if isinstance(raw_findings, list) else [])]
+    findings = _strip_finder_refuter_keys(
+        raw_findings if isinstance(raw_findings, list) else [])
     if finder_findings_total is None:
+        # Defaulting to `len(findings)` is only correct when NOTHING has been
+        # merged into `primary` yet — the finder snapshot and the record are
+        # then the same thing. Once a security/skeptic merge has appended its
+        # own findings, that default silently widens to include them, and a
+        # finding the finder never produced becomes eligible for a refuter
+        # annotation: exactly the misattribution the finder-snapshot rule
+        # exists to prevent. The pipeline's one caller always passes this
+        # argument explicitly; refusing the unsafe default here makes the
+        # omission unreachable instead of merely unused.
+        extra_passes = primary.get("extra_passes")
+        if isinstance(extra_passes, dict) and extra_passes:
+            raise ValueError(
+                "finder_findings_total is required once primary['extra_passes']"
+                " is non-empty: defaulting to len(findings) here would widen "
+                "the finder snapshot to the merged record and let a "
+                "security/skeptic finding receive a refuter annotation the "
+                "finder never earned")
         limit = len(findings)
     elif isinstance(finder_findings_total, bool) or not isinstance(
             finder_findings_total, int):
@@ -1099,8 +1143,17 @@ def skipped_refuter_pass(primary: Mapping[str, Any], note: str) -> dict:
 
     For the one skip worth recording — a review that earned a refuter and had
     none configured. A demand for a reason, like `merge_failed_extra_pass`'s,
-    but nothing else about it is the same: this changes no finding, no count
-    and no trust axis.
+    but nothing else about it is the same: this changes no finding's CONTENT,
+    no count and no trust axis.
+
+    It does, however, still run every finding through
+    `_strip_finder_refuter_keys`: no refuter pass is scheduled here at all,
+    so without this a finder that shipped its own forged `refuter` key on a
+    finding would have that key ride straight into the stored record,
+    misattributed to a provider that never ran, with `extra_passes.refuter`
+    (correctly) reporting `skipped`. That gap is exactly what a bare
+    `dict(primary)` would reproduce, since a skip has no verdicts of its own
+    to overwrite it with.
     """
     reason = str(note or "").strip()
     if not reason:
@@ -1108,10 +1161,36 @@ def skipped_refuter_pass(primary: Mapping[str, Any], note: str) -> dict:
             "skipped_refuter_pass() requires a non-empty note: a record that "
             "mentions the refuter without saying why it did not run is worse "
             "than one that never mentions it")
+    raw_findings = primary.get("findings")
+    findings = (_strip_finder_refuter_keys(raw_findings)
+                if isinstance(raw_findings, list) else None)
     meta = _refuter_meta("skipped", False)
     meta["skipped"] = True
     meta["note"] = reason
-    return _annotated(primary, None, meta)
+    return _annotated(primary, findings, meta)
+
+
+def _strip_finder_refuter_keys(findings: list) -> list:
+    """Copy `findings`, dropping any `refuter` key already present on one.
+
+    A finder's parsed findings are untrusted model output that reaches
+    `merge_refuter_pass` and `skipped_refuter_pass` verbatim — the same class
+    of problem `_finding_lines` guards against when it collapses titles and
+    indents detail lines so a finding cannot forge a `[9]` entry or close the
+    findings fence (see that function's docstring). Here the forgery is a
+    `refuter` key: a finder could ship one on its own finding to fabricate a
+    verdict and its provenance before any refuter pass ever runs, or even
+    when none is configured at all. Stripping it on every copy — before
+    `merge_refuter_pass` writes its own, and even when `skipped_refuter_pass`
+    writes none — is what keeps `_annotated` the ONLY place a `refuter`
+    annotation is written, and what keeps this module's own accounting
+    (`annotated`, `dropped`, `note`, or simply `skipped`) the complete truth
+    about what happened.
+    """
+    return [
+        ({k: v for k, v in f.items() if k != REFUTER_PASS}
+         if isinstance(f, dict) else f)
+        for f in findings]
 
 
 def _annotated(primary: Mapping[str, Any], findings: list[dict] | None,
