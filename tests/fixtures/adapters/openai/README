@@ -1,0 +1,149 @@
+openai / codex conformance fixtures
+===================================
+
+Witnesses for the rules in `tests/adapter_conformance.py`, which is where the
+file format is documented. In short: `rc=<int>` first, an optional
+`category=<expected>` (required on every `*unavailable*` file), then
+`--- stdout ---` and `--- stderr ---` sections holding raw UTF-8 bytes.
+
+stdout here is a JSONL EVENT STREAM (`codex exec --json`), not a single
+envelope: one JSON object per line, `thread.started` / `turn.started` /
+`item.started` / `item.updated` / `item.completed` / `turn.completed` /
+`turn.failed`, plus stream-level `{"type":"error","message":...}` lines. The
+review payload rides inside the LAST `item.completed` whose `item.type` is
+`agent_message`, as a JSON string in `item.text`.
+
+The loader consumes exactly one trailing newline per section, as the separator
+before the next marker. Every stream below genuinely ended with a newline on
+the wire, so their stdout sections end with a blank line — that blank line is
+the stream's own final newline, not formatting.
+
+Provenance
+----------
+
+Every file marked CAPTURED came from a live `codex exec` run against
+codex-cli 0.144.5 during this task's Step 0 probe, and was then sanitized.
+SYNTHESIZED means written by hand. The distinction matters: a hand-written
+envelope proves the adapter can parse what its author imagined, which is
+exactly the thing an adapter is most likely to get wrong.
+
+All captures were taken with `--ephemeral --ignore-user-config` and a scratch
+`CODEX_HOME`, so no developer configuration, project instructions or session
+files are inside these bytes.
+
+healthy.txt
+    CAPTURED, whole. A completed review of a small synthetic diff: three
+    findings, `turn.completed` present, empty stderr. `line` and `category`
+    are real integers/strings here. Every finding `title` is plain ASCII with
+    no quotes or backslashes, which is what conformance rule 6 needs — rule 6
+    splices the adapter's own stderr signal words into a title *in the raw
+    bytes*, and only a title that survives `json.dumps` unchanged appears
+    there verbatim.
+    STRIPPED: `thread_id` (replaced by a fixed all-zero UUIDv7). The reviewed
+    diff was synthetic and names nothing real; token counts are the capture's
+    and identify nothing.
+
+healthy_noisy_stderr.txt
+    CAPTURED stdout + CAPTURED stderr, recombined. Rule 7's witness, and a
+    second thing besides.
+    The stdout is a different real review whose findings carry `"line":null`
+    and `"category":null`. That is not an accident of prompting: the OpenAI
+    structured-output mode the CLI's `--output-schema` feeds requires every
+    property to be listed in `required`, so the adapter's strict projection
+    spells the contract's OPTIONAL properties as nullable-and-required, and
+    the model then answers `null` where the contract would have omitted the
+    key. This capture is the proof that real bytes look like that, and the
+    reason `parse` strips JSON nulls before validating.
+    The stderr is the real 401 tracing output captured from the no-auth run
+    below. The run must still classify `ok`, because the provider
+    demonstrably served; the suite proves the fixture is not vacuous by
+    classifying the SAME stderr with empty stdout and requiring
+    `unavailable` there.
+    STRIPPED: `thread_id`, `cf-ray` values, request ids, log timestamps.
+
+refuter_healthy.txt
+    CAPTURED, whole. A live run asked for `REFUTER_CONTRACT` — the same
+    invocation with the refuter schema in `--output-schema` — answering three
+    findings with `confirmed`, `confirmed`, `refuted`. It must parse under
+    `REFUTER_CONTRACT` and must NOT parse under `REVIEW_CONTRACT`; a refuter
+    response a Phase 1 caller could read as a review would read as a review
+    with no findings, which is a clean bill of health.
+    STRIPPED: `thread_id`.
+
+degraded_stderr.txt
+    CAPTURED stdout (identical to `healthy.txt`) + SYNTHESIZED stderr. The
+    harness-degradation case: a valid, schema-clean stream on stdout —
+    `turn.completed` and all — with stream-disconnect wording on stderr. It
+    must classify `degraded`, NOT `unavailable`: usable output wins on the
+    availability axis only.
+    The stderr is synthesized because a mid-turn transport disconnect is not
+    reproducible on demand. It is written in the tracing format the captured
+    401 stderr uses, and every message string in it
+    (`stream disconnected before completion`,
+    `stream disconnected - retrying sampling request`,
+    `stream closed before response.completed`) is present verbatim in the
+    installed `codex` binary, so these are the CLI's own words rather than
+    invented ones. It is also the source of the signal words rule 6 splices
+    into a finding title.
+
+degraded_truncated.txt
+    CAPTURED, whole, from a run killed mid-flight: the process group was sent
+    SIGKILL nine seconds in, so the stream stops after `turn.started` and the
+    child reports rc -9. Events, but no terminal event and no payload — the
+    plain "the run did not get to say anything" shape.
+    STRIPPED: `thread_id`.
+
+degraded_no_turn_completed.txt
+    CAPTURED (`healthy.txt`'s stream) then CUT at a line boundary, dropping
+    the final `turn.completed` line — exactly what a killed or timed-out run
+    leaves behind once the answer is already on the wire. This is the sharp
+    one: the payload is complete and schema-valid, so the run PARSES and
+    reports three findings, and only the missing terminal event says the run
+    never finished. It is codex's spelling of the silent false all-clear that
+    116 `stopReason: Cancelled` runs produced in the Phase 1 corpus.
+
+degraded_turn_failed.txt
+    CAPTURED, whole. A real `turn.failed`: the run was launched with the
+    contract's schema passed through UNPROJECTED, and the backend rejected it
+    (`'additionalProperties' is required to be supplied and to be false`).
+    That 400 is why the adapter projects the contract schema into strict mode
+    at all, and the stream it produced is a genuine stream-level `error`
+    event followed by `turn.failed`. It carries no auth, model or quota
+    wording, so it must land on `degraded` rather than `unavailable`.
+    STRIPPED: `thread_id`.
+
+unavailable_auth.txt
+    CAPTURED, whole, from a run with `CODEX_HOME` pointed at an empty
+    directory: no credentials, rc 1, the CLI's retry ladder on both the
+    WebSocket and HTTPS transports, `turn.failed`, and matching `401
+    Unauthorized` tracing lines on stderr. Declares `category=auth`.
+    The category is asserted EXACTLY: `auth` is attempt-local, `quota` is
+    cached provider-wide, and confusing the two takes a healthy provider out
+    of every later fallback chain.
+    STRIPPED: `thread_id`, every `cf-ray` value, every request id, and the
+    log timestamps. No token was ever in these bytes — the point of the run
+    is that there was none.
+
+unavailable_model.txt
+    CAPTURED, whole, from a run asking for a model id that does not exist.
+    Declares `category=model`. stderr is EMPTY here, which is the interesting
+    part: the only evidence is inside the stream, in the stream-level
+    `{"type":"error"}` line and in `turn.failed`'s `error.message`. Those are
+    harness-authored fields; the adapter reads them and never reads
+    `agent_message` text, which is what keeps review CONTENT from ever
+    driving a classification.
+    The model id in this file (`gpt-9.9-nonexistent`) is deliberately not a
+    real one — it is the id the CLI rejected, and rejecting it is what the
+    fixture witnesses. Every model id that appears in a passing invocation
+    (in the tests and the example config) is one this CLI accepted live.
+
+Sanitization
+------------
+
+These files are committed to a public repository. Every capture was checked to
+contain no tokens, usernames, machine paths, home directories, repo or
+project names, session ids or request ids. The reviewed material in the
+healthy and refuter captures is synthetic code written for the probe, so the
+finding text names nothing real. What the captures still carry is provider
+constants (event type names, `api.openai.com` endpoints, HTTP status wording)
+and usage numbers, which identify nothing.

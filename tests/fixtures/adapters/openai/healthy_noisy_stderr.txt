@@ -1,0 +1,14 @@
+rc=0
+--- stdout ---
+{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000000"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"summary\":\"The helper introduces unbounded retry behavior with no backoff and suppresses all failures, which can create a tight infinite loop and mask outages.\",\"findings\":[{\"file\":\"net.py\",\"line\":null,\"severity\":\"high\",\"category\":null,\"title\":\"Infinite retry loop can hammer the remote endpoint\",\"detail\":\"retry_forever retries in a tight while True loop with no delay or backoff. If the remote endpoint is down or rate limited, this will continuously send requests at maximum speed and can amplify an outage.\"},{\"file\":\"net.py\",\"line\":null,\"severity\":\"high\",\"category\":null,\"title\":\"Unbounded retries can block callers forever\",\"detail\":\"There is no attempt ceiling or timeout path, so a transient or permanent failure can keep the caller stuck indefinitely. That makes the helper unsafe to use in request paths where progress or failure reporting is required.\"},{\"file\":\"net.py\",\"line\":null,\"severity\":\"medium\",\"category\":null,\"title\":\"Swallowing all exceptions hides real failures\",\"detail\":\"Catching every exception without logging or re-raising prevents operators and callers from seeing why the remote call is failing. This makes debugging impossible and can also mask programming errors that should not be retried.\"}]}"}}
+{"type":"turn.completed","usage":{"input_tokens":9185,"cached_input_tokens":0,"output_tokens":342,"reasoning_output_tokens":81}}
+--- stderr ---
+2026-01-01T00:00:00.000000Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses
+2026-01-01T00:00:00.000000Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses
+2026-01-01T00:00:00.000000Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses
+2026-01-01T00:00:00.000000Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses
+2026-01-01T00:00:00.000000Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses
+2026-01-01T00:00:00.000000Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses
+2026-01-01T00:00:00.000000Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses

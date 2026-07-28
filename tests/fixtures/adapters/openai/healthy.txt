@@ -1,0 +1,7 @@
+rc=0
+--- stdout ---
+{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000000"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"summary\":\"The patch introduces a SQL injection risk and two correctness regressions in the new helper functions.\",\"findings\":[{\"file\":\"store.py\",\"line\":2,\"severity\":\"high\",\"category\":\"security\",\"title\":\"Unsafe SQL string concatenation in lookup\",\"detail\":\"Building the query with str(user_id) removes parameter binding and makes the call vulnerable if user_id can ever be influenced by untrusted input. It also changes query typing semantics compared with the previous parameterized version.\"},{\"file\":\"store.py\",\"line\":6,\"severity\":\"medium\",\"category\":\"correctness\",\"title\":\"Mean function crashes on empty input\",\"detail\":\"sum(values) / len(values) will raise ZeroDivisionError when values is empty. Callers need either an explicit empty case or a defined fallback behavior.\"},{\"file\":\"store.py\",\"line\":9,\"severity\":\"medium\",\"category\":\"correctness\",\"title\":\"first_page returns one extra row\",\"detail\":\"rows[0:size + 1] returns size plus one elements instead of the requested page size. This off by one will cause pagination to leak an extra item on every page.\"}]}"}}
+{"type":"turn.completed","usage":{"input_tokens":9228,"cached_input_tokens":0,"output_tokens":459,"reasoning_output_tokens":222}}
+--- stderr ---
