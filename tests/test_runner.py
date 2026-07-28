@@ -285,6 +285,108 @@ def test_first_output_sec_is_recorded_for_a_timed_out_run(tmp_path):
     assert r.first_output_sec < 1.5
 
 
+def _spy_open(monkeypatch):
+    """Record every file object `runner` opens, so a leak is assertable.
+
+    `runner` calls the builtin `open`, and a builtin is resolved through the
+    module's own globals, so patching the name on the module intercepts every
+    call this run makes -- stdout, stderr and (once it exists) the stdin file.
+    The point is not the count but the closure: an fd this module opens and
+    does not close outlives the run and, for the stdin file specifically, keeps
+    a prompt file open for as long as the process lives.
+    """
+    opened = []
+    real = open
+
+    def spy(*a, **kw):
+        f = real(*a, **kw)
+        opened.append(f)
+        return f
+
+    import skodun.runner as runner_mod
+    monkeypatch.setattr(runner_mod, "open", spy, raising=False)
+    return opened
+
+
+def test_stdin_path_is_fed_to_the_child(tmp_path):
+    # The prompt travels as a FILE either way; `stdin_path` only says who opens
+    # it. An adapter whose CLI takes the prompt on stdin (codex: argv ends in
+    # `-`) HANGS until the watchdog kills it if this is not wired up.
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_bytes("héllo from the prompt file\n".encode("utf-8"))
+    r = run_with_watchdog(
+        [sys.executable, "-c",
+         "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+        10, tmp_path, tmp_path / "out", tmp_path / "err", stdin_path=prompt,
+    )
+    assert r.rc == 0 and not r.timed_out
+    assert (tmp_path / "out").read_bytes() == prompt.read_bytes()
+
+
+def test_stdin_defaults_to_devnull(tmp_path):
+    # The Phase 1 default, unchanged: a child that reads stdin gets EOF at
+    # once rather than blocking on an inherited terminal.
+    code = ("import sys; d = sys.stdin.buffer.read();"
+            " sys.stdout.write('EOF' if d == b'' else repr(d))")
+    r = run_with_watchdog(
+        [sys.executable, "-c", code], 10, tmp_path, tmp_path / "out",
+        tmp_path / "err",
+    )
+    assert r.rc == 0 and not r.timed_out
+    assert (tmp_path / "out").read_text(encoding="utf-8") == "EOF"
+
+
+def test_the_stdin_file_is_closed_on_the_normal_path(tmp_path, monkeypatch):
+    opened = _spy_open(monkeypatch)
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("x\n", encoding="utf-8")
+    run_with_watchdog(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"], 10, tmp_path,
+        tmp_path / "out", tmp_path / "err", stdin_path=prompt,
+    )
+    assert len(opened) == 3          # stdout, stderr, stdin
+    assert all(f.closed for f in opened)
+
+
+def test_the_stdin_file_is_closed_on_the_timeout_path(tmp_path, monkeypatch):
+    opened = _spy_open(monkeypatch)
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("x\n", encoding="utf-8")
+    r = run_with_watchdog(
+        [sys.executable, "-c", "import time; time.sleep(60)"], 1, tmp_path,
+        tmp_path / "out", tmp_path / "err", stdin_path=prompt,
+    )
+    assert r.timed_out
+    assert len(opened) == 3
+    assert all(f.closed for f in opened)
+
+
+def test_the_stdin_file_is_closed_when_the_parent_is_interrupted(tmp_path,
+                                                                 monkeypatch):
+    import skodun.runner as runner_mod
+
+    opened = _spy_open(monkeypatch)
+    real_sleep = time.sleep
+    calls = {"n": 0}
+
+    def _sleep_then_interrupt(seconds):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt
+        real_sleep(seconds)
+
+    monkeypatch.setattr(runner_mod.time, "sleep", _sleep_then_interrupt)
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("x\n", encoding="utf-8")
+    with pytest.raises(KeyboardInterrupt):
+        run_with_watchdog(
+            [sys.executable, "-c", "import time; time.sleep(60)"], 10, tmp_path,
+            tmp_path / "out", tmp_path / "err", stdin_path=prompt,
+        )
+    assert len(opened) == 3
+    assert all(f.closed for f in opened)
+
+
 def test_finishing_just_before_the_deadline_is_not_a_timeout(tmp_path):
     # The oracle re-checks liveness after its final tick so a run that lands in
     # the last moment keeps its (valid) output instead of being killed.

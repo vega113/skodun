@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from skodun import pipeline, runner
+from skodun.adapters import REVIEW_CONTRACT
 from skodun.cli import main
 from skodun.config import load_config
 from skodun.gitio import capture_diff, diff_identity, git_common_dir, resolve_base
@@ -957,14 +958,15 @@ def test_a_broken_extra_pass_demotes_the_review_instead_of_destroying_it(
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
     _fake_grok(tmp_path, _emit(CLEAN))
     repo = _repo(tmp_path)
-    real = pipeline._run_reviewer
+    real = pipeline._run_chain
 
-    def only_the_skeptic_explodes(reviewer, d, prompt, cwd, scratch, tag):
+    def only_the_skeptic_explodes(head, cfg, d, prompt, cwd, store, scratch,
+                                  tag, contract=REVIEW_CONTRACT):
         if tag == "skeptic":
             raise RuntimeError("adapter exploded mid-pass")
-        return real(reviewer, d, prompt, cwd, scratch, tag)
+        return real(head, cfg, d, prompt, cwd, store, scratch, tag, contract)
 
-    monkeypatch.setattr(pipeline, "_run_reviewer", only_the_skeptic_explodes)
+    monkeypatch.setattr(pipeline, "_run_chain", only_the_skeptic_explodes)
     rec = _run(repo, _store(tmp_path))
     assert rec["extra_passes"]["skeptic"]["failed"] is True
     assert rec["parse_ok"] is False and rec["trustworthy"] is False

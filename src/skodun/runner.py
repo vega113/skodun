@@ -3,8 +3,11 @@
 Ported from the oracle's ``run_grok_with_timeout``. Three properties matter and
 are the reason this module exists at all:
 
-1. **No pipes.** stdout/stderr stream *directly* to files. A pipe to the parent
-   would fill on a large review and deadlock the child forever.
+1. **No pipes.** stdout/stderr stream *directly* to files, and the prompt, when
+   a CLI wants it on stdin, arrives as an opened FILE rather than as bytes this
+   process writes. A pipe to the parent would fill on a large review and
+   deadlock the child forever; a pipe *into* the child would deadlock the same
+   way, since nothing here reads the child's output while it writes.
 2. **No orphans.** The child is spawned as its own session/process-group leader,
    so the watchdog can signal the whole tree (the model CLI plus any helper it
    spawned) instead of orphaning grandchildren.
@@ -45,6 +48,7 @@ def run_with_watchdog(
     cwd: Path,
     stdout_path: Path,
     stderr_path: Path,
+    stdin_path: Path | None = None,
 ) -> RunResult:
     """Run `cmd` with a hard wall-clock timeout, streaming output to files.
 
@@ -54,6 +58,19 @@ def run_with_watchdog(
     phase signal: no output by the timeout means the model stalled *before* any
     inference; output but no completion means it stalled mid-generation). See
     `_size` for a caveat on what `None` actually proves.
+
+    `stdin_path`, when given, is opened READ-ONLY IN BINARY and becomes the
+    child's stdin; otherwise stdin is `DEVNULL`, as it has always been. It
+    exists for the adapters whose CLI has no input-file flag and takes the
+    prompt on stdin instead (`codex exec ... -`): the prompt still travels as a
+    FILE either way, and this only decides who opens it. Without it such a
+    child reads an immediately-EOF `DEVNULL` -- or, for a CLI that waits for
+    input on a terminal, hangs until this watchdog kills it.
+
+    The descriptor is closed on EVERY path -- normal exit, timeout, and any
+    exception, including a `Popen` that never started -- so a long-lived
+    caller cannot accumulate open prompt files. `DEVNULL` is deliberately NOT
+    routed through the same open: `subprocess` manages that descriptor itself.
 
     Note: if `cmd[0]` does not exist, `subprocess.Popen` raises
     `FileNotFoundError` before the watchdog loop starts. That exception
@@ -68,67 +85,75 @@ def run_with_watchdog(
     timed_out = False
     rc: int
 
-    with open(stdout_path, "wb") as out, open(stderr_path, "wb") as err:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=cwd,
-            stdout=out,
-            stderr=err,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
+    # Opened before the output files and closed in the `finally` below, so
+    # every exit path -- including one where `open(stdout_path)` itself fails
+    # -- releases it.
+    stdin_file = open(stdin_path, "rb") if stdin_path is not None else None
+    try:
+        with open(stdout_path, "wb") as out, open(stderr_path, "wb") as err:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                stdout=out,
+                stderr=err,
+                stdin=subprocess.DEVNULL if stdin_file is None else stdin_file,
+                start_new_session=True,
+            )
+            # start_new_session=True makes the child a session+group leader, so its
+            # PGID equals its pid. Capture it NOW: os.getpgid(proc.pid) races with
+            # the child exiting and would raise once it is reaped.
+            pg = proc.pid
+            deadline = t0 + timeout_sec
+
+            try:
+                while True:
+                    status = proc.poll()
+                    if first_out is None and _size(stdout_path) > 0:
+                        # `_size` swallows OSError and reports 0 on a stat failure,
+                        # same as an empty file. So this branch never firing is not
+                        # proof the child stayed silent -- "never wrote" and "stat
+                        # failed" are indistinguishable in the `None` this function
+                        # returns. See `_size`.
+                        first_out = time.monotonic() - t0
+                    if status is not None:
+                        # Checked *before* the deadline, so a run that finishes in the
+                        # final tick keeps its valid output instead of being recorded as
+                        # a timeout (the oracle re-checks liveness after its last tick
+                        # for exactly this reason).
+                        rc = status
+                        break
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        rc = _terminate_group(proc, pg)
+                        break
+                    time.sleep(_POLL_SEC)
+            except BaseException:
+                # The parent was interrupted mid-wait -- an exception raised by our
+                # own code, or a signal such as Ctrl-C. start_new_session=True
+                # makes the child a detached session/process-group leader, so it
+                # is outside the terminal's foreground group: an interactive
+                # SIGINT does not reach it on its own, and nothing else will ever
+                # reap it. Take the group down exactly as a timeout would, then
+                # let the original interruption keep propagating. (Only a SIGKILL
+                # of this process itself is out of reach here; that belongs to
+                # future CLI signal handling, not this function.)
+                _terminate_group(proc, pg)
+                raise
+
+        if timed_out:
+            # Truncate only after the group is dead, so nothing can re-extend the
+            # file behind our back through an inherited descriptor.
+            stdout_path.write_bytes(b"")
+
+        return RunResult(
+            rc=rc,
+            timed_out=timed_out,
+            duration_sec=max(0.0, time.monotonic() - t0),
+            first_output_sec=first_out,
         )
-        # start_new_session=True makes the child a session+group leader, so its
-        # PGID equals its pid. Capture it NOW: os.getpgid(proc.pid) races with
-        # the child exiting and would raise once it is reaped.
-        pg = proc.pid
-        deadline = t0 + timeout_sec
-
-        try:
-            while True:
-                status = proc.poll()
-                if first_out is None and _size(stdout_path) > 0:
-                    # `_size` swallows OSError and reports 0 on a stat failure,
-                    # same as an empty file. So this branch never firing is not
-                    # proof the child stayed silent -- "never wrote" and "stat
-                    # failed" are indistinguishable in the `None` this function
-                    # returns. See `_size`.
-                    first_out = time.monotonic() - t0
-                if status is not None:
-                    # Checked *before* the deadline, so a run that finishes in the
-                    # final tick keeps its valid output instead of being recorded as
-                    # a timeout (the oracle re-checks liveness after its last tick
-                    # for exactly this reason).
-                    rc = status
-                    break
-                if time.monotonic() >= deadline:
-                    timed_out = True
-                    rc = _terminate_group(proc, pg)
-                    break
-                time.sleep(_POLL_SEC)
-        except BaseException:
-            # The parent was interrupted mid-wait -- an exception raised by our
-            # own code, or a signal such as Ctrl-C. start_new_session=True
-            # makes the child a detached session/process-group leader, so it
-            # is outside the terminal's foreground group: an interactive
-            # SIGINT does not reach it on its own, and nothing else will ever
-            # reap it. Take the group down exactly as a timeout would, then
-            # let the original interruption keep propagating. (Only a SIGKILL
-            # of this process itself is out of reach here; that belongs to
-            # future CLI signal handling, not this function.)
-            _terminate_group(proc, pg)
-            raise
-
-    if timed_out:
-        # Truncate only after the group is dead, so nothing can re-extend the
-        # file behind our back through an inherited descriptor.
-        stdout_path.write_bytes(b"")
-
-    return RunResult(
-        rc=rc,
-        timed_out=timed_out,
-        duration_sec=max(0.0, time.monotonic() - t0),
-        first_output_sec=first_out,
-    )
+    finally:
+        if stdin_file is not None:
+            stdin_file.close()
 
 
 def _terminate_group(proc: subprocess.Popen, pg: int) -> int:

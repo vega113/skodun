@@ -153,8 +153,10 @@ def resolve_grok_bin() -> str:
     There is deliberately no legacy `-p` re-shell fallback (global constraint):
     a run with empty stdout is simply a failed attempt (`parse_ok=False`), and
     the prompt is never re-invoked as a CLI argument. It is not retried either
-    -- `pipeline._run_reviewer` retries only a `timed_out` attempt or a
-    `degraded` one, and empty stdout with a clean stderr is neither.
+    -- `pipeline._run_chain` retries only a `timed_out` attempt or a
+    `degraded` one, and empty stdout with a clean stderr is neither. Nor does
+    it advance a fallback chain: that is reserved for `classify` reporting
+    `unavailable`, and empty output with clean stderr is `ok`.
     """
     override = os.environ.get("SKODUN_GROK_BIN")
     if override:
