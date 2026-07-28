@@ -585,6 +585,39 @@ def test_every_attempt_row_carries_the_complete_schema(tmp_path, monkeypatch,
     assert timeout_row["timed_out"] is True and timeout_row["duration_sec"] >= 1.0
 
 
+def test_unusable_ok_output_does_not_claim_the_record_identity(
+        tmp_path, monkeypatch, capsys):
+    """`classify` returning `ok` means "no positive evidence of ill health",
+    NOT "produced usable output": an empty stdout with a clean stderr
+    classifies `ok` and is worth nothing. Acceptance must gate on
+    `parsed.parse_ok`, not on `verdict.kind == "ok"`.
+
+    The head's binary is missing, so the chain advances to the (last) xai
+    fallback, whose fake CLI exits 0 with empty stdout and clean stderr --
+    `ok`, but unusable. The record must NOT credit that attempt: the indexed
+    `adapter`/`model` columns stay the head's, exactly as the record was
+    initialised, because nothing ever produced an accepted payload.
+
+    Kills the mutation at `pipeline.py:842` (`if parsed.parse_ok:` ->
+    `if verdict.kind == "ok":`): with the mutation, the fallback's `ok`
+    verdict is accepted and `rec["adapter"]` reads `"grok"` instead of
+    staying `"codex"` -- this test fails.
+    """
+    monkeypatch.setenv("SKODUN_CODEX_BIN", "/nonexistent/skodun-dead")
+    _fake_cli(tmp_path, "grok", "")     # exits 0, empty stdout, clean stderr
+    repo = _repo(tmp_path, CFG_OPENAI_THEN_XAI)
+
+    rec = _run(repo, _store(tmp_path))
+
+    last = rec["attempts"][-1]
+    assert last["provider"] == "xai"
+    assert last["classification"] == {"kind": "ok", "category": "", "detail": ""}
+    assert last["rc"] == 0
+    # Unusable: the attempt never claims the identity columns.
+    assert rec["adapter"] == "codex" and rec["model"] == FAKE_OPENAI_MODEL
+    assert rec["status"] == "failed" and rec["trustworthy"] is False
+
+
 # --------------------------------------------------------------------------
 # the provider-availability cache
 # --------------------------------------------------------------------------
@@ -627,7 +660,57 @@ def test_an_expired_cache_row_does_not_skip_the_entry(tmp_path, capsys):
     assert rec["trustworthy"] is True
 
 
-def test_non_quota_unavailability_is_not_cached(tmp_path, monkeypatch, capsys):
+def test_mid_chain_cache_expiry_is_honoured_without_sleep(tmp_path, monkeypatch,
+                                                          capsys):
+    """A cache entry that expires BETWEEN entries is honoured -- deterministically.
+
+    `_cached_unavailable` is consulted once per entry (`pipeline.py:718`), each
+    time with a fresh `_iso_now()`. A two-entry chain on the SAME provider
+    (`CFG_XAI_THEN_XAI`) checks the cache twice for `xai`; a spy on
+    `Store.provider_unavailable_reason` rewrites the `now_iso` the SECOND call
+    sees to a time past the TTL, simulating the clock advancing between
+    entries with no `sleep` and no flakiness. Entry 0 must be skipped (the
+    cache is still live at the first read) and entry 1 must run (the cache has
+    "expired" by the second read).
+    """
+    _fake_cli(tmp_path, "grok", _emit(CLEAN))
+    repo = _repo(tmp_path, CFG_XAI_THEN_XAI)
+    st = _store(tmp_path)
+    st.mark_provider_unavailable("xai", "rate limited", "quota", _iso(60))
+
+    real = Store.provider_unavailable_reason
+    calls: list[str] = []
+
+    def spy(self, provider, now_iso, env=os.environ):
+        calls.append(now_iso)
+        if len(calls) >= 2:
+            now_iso = _iso(3600)   # simulate the clock advancing past the TTL
+        return real(self, provider, now_iso, env)
+
+    monkeypatch.setattr(Store, "provider_unavailable_reason", spy)
+
+    rec = _run(repo, st)
+
+    assert len(calls) == 2
+    assert rec["attempts"][0]["skipped"].startswith("provider marked unavailable")
+    assert "skipped" not in rec["attempts"][1]
+    assert _calls(tmp_path) == ["grok"]
+    assert rec["trustworthy"] is True
+
+
+def test_pre_spawn_missing_binary_path_does_not_cache(tmp_path, monkeypatch,
+                                                       capsys):
+    """The PRE-SPAWN missing-binary shortcut (`_binary_is_absent`) never even
+    reaches the quota-only guard: it `continue`s straight past
+    `_remember_unavailable`, without a classification, without a spawn.
+
+    This pins that narrow path only. It does NOT exercise the guard in
+    `_remember_unavailable` (`if verdict.category != "quota": return` at
+    `pipeline.py:648-649`) -- deleting that guard still passes this test,
+    because this test's failure never reaches it. The guard itself is pinned
+    by `test_spawned_auth_failure_is_not_cached` below, via a REAL spawn that
+    classifies `auth`.
+    """
     monkeypatch.setenv("SKODUN_CODEX_BIN", "/nonexistent/a")   # binary, not quota
     _fake_cli(tmp_path, "grok", _emit(CLEAN))
     repo = _repo(tmp_path, CFG_OPENAI_THEN_XAI)
@@ -637,6 +720,39 @@ def test_non_quota_unavailability_is_not_cached(tmp_path, monkeypatch, capsys):
 
     assert st.provider_unavailable_reason("openai", _iso(), env={}) is None
     assert st.provider_state_rows(_iso()) == []
+
+
+def test_spawned_auth_failure_is_not_cached(tmp_path, monkeypatch, capsys):
+    """The quota-only guard, pinned via a REAL spawn that gets classified.
+
+    Unlike the pre-spawn test above, the head's fake CLI here actually runs:
+    it exits 1 with `401 unauthorized` on stderr, so `classify` returns
+    `kind == "unavailable", category == "auth"` -- and THAT is what
+    `_remember_unavailable` must refuse to cache. `auth`, unlike `quota`,
+    describes this one reviewer entry's configuration (a bad key, a rotated
+    token); caching it would black-hole the whole provider for every other
+    reviewer entry that uses it, for the full 30-minute TTL, over one bad
+    credential.
+
+    Kills the mutation at `pipeline.py:648-649` (delete
+    `if verdict.category != "quota": return`): with the guard gone, this
+    `auth` verdict gets cached and `provider_state_rows` picks up an `openai`
+    row -- this test fails.
+    """
+    _fake_cli(tmp_path, "codex", 'echo "401 unauthorized" >&2\nexit 1')
+    _fake_cli(tmp_path, "grok", _emit(CLEAN))
+    repo = _repo(tmp_path, CFG_OPENAI_THEN_XAI)
+    st = _store(tmp_path)
+
+    rec = _run(repo, st)
+
+    first = rec["attempts"][0]
+    assert first["provider"] == "openai"
+    assert first["classification"]["kind"] == "unavailable"
+    assert first["classification"]["category"] == "auth"
+    assert st.provider_unavailable_reason("openai", _iso(), env={}) is None
+    assert st.provider_state_rows(_iso()) == []
+    assert rec["trustworthy"] is True   # the fallback still recovered
 
 
 def test_a_quota_outage_is_cached_for_the_whole_provider(tmp_path, monkeypatch,

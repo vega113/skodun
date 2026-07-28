@@ -730,8 +730,10 @@ def _run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
         if _binary_is_absent(binary):
             n += 1
             verdict = adapter.classify(UNAVAILABLE_RC, b"", b"", contract)
+            next_step = ("trying the next entry" if i + 1 < len(chain)
+                         else "no entries remain")
             _note(f"{entry.name} ({entry.provider}): binary not found at "
-                  f"{binary}; trying the next entry")
+                  f"{binary}; {next_step}")
             attempts.append(_attempt(
                 n, entry, skipped=f"binary not found: {binary}",
                 classification=_classification(verdict)))
