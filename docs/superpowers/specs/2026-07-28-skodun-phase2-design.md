@@ -57,8 +57,10 @@ guarantees:
   chain; `degraded` triggers the existing same-reviewer retry.
 - **Conformance suite** (`tests/adapter_conformance.py`, with a registry-parameterized
   coverage gate): every adapter must (a) return `parse_ok=False` without raising on
-  garbage/empty/truncated input under both contracts, (b) ship ≥2 real degradation
-  fixtures (healthy vs degraded envelope pairs) and detect them, (c) ship ≥1
+  garbage/empty/truncated input under both contracts, (b) ship ≥2 degradation
+  fixtures (healthy vs degraded envelope pairs) and detect them — captured from real
+  CLI output wherever a real capture can exist, synthesized otherwise, with
+  capture-vs-synthesized provenance recorded per fixture, (c) ship ≥1
   `unavailable` fixture with a category (incl. the rc-127 binary-missing case),
   (d) prove one loud effort rejection or declare full effort support, (e) never mark
   `degraded` or `unavailable` from finding-text content or from stderr noise beside
