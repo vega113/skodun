@@ -10,16 +10,35 @@ placeholder set, the reason floor, and the accept/reject verdict of
 `load_valid_artifact` is the one deliberate, documented exception: it is
 strictly *stronger* than the oracle's `load_review`. See the comment block
 above that function.
+
+`adopt_refuter` and the two display helpers around it are skodun's own; the
+oracle had no refuter pass. They are the ONLY path by which a refuter verdict
+can ever dismiss a finding, and that path is explicit and per-finding on
+purpose: a `refuted` annotation changes no count, no severity and no trust
+axis, and a review whose only finding is annotated `refuted` still gates 1
+until a human adopts it by name. There is deliberately no "adopt all", and
+nothing anywhere adopts by itself.
 """
 
 from __future__ import annotations
 
 from .store import Store
 from .textnorm import collapse_ws, finding_key, ledger_key, norm
+from .trust import one_line
 
 
 class TriageError(ValueError):
     """A dismissal reason or finding index failed validation."""
+
+
+class FindingNotFound(TriageError):
+    """The named finding index does not resolve to a finding on this review.
+
+    A `TriageError` so that every existing caller keeps catching every index
+    failure exactly as before, and a distinct type so the CLI can tell the two
+    halves of the adoption contract apart: `2` is "the thing you named does
+    not exist", `1` is "it exists and the dismissal was refused".
+    """
 
 
 class ArtifactError(ValueError):
@@ -36,6 +55,29 @@ PLACEHOLDER_REASONS = {
     "already fixed", "by design", "intentional", "known", "irrelevant",
 }
 MIN_REASON_CHARS = 20
+
+#: The key a refuter annotation lives under on a finding, and the name of the
+#: pass in `extra_passes`. Spelled here rather than imported from `passes`
+#: because that module already imports THIS one (`MIN_REASON_CHARS`), and a
+#: cycle is worse than a duplicated four-letter string.
+#: `test_the_annotation_key_matches_the_pass_that_writes_it` pins the two
+#: spellings together: drift would make every annotation invisible to adoption
+#: while every hand-built fixture kept passing.
+REFUTER_KEY = "refuter"
+
+#: The one refuter verdict a human may adopt as a dismissal. `confirmed` and
+#: `uncertain` are refused by name — adopting either would mean recording a
+#: dismissal whose own stated grounds do not dismiss anything.
+ADOPTABLE_VERDICT = "refuted"
+
+#: How much of one annotation field `triage --list` prints. The reasoning is
+#: arbitrary model text and the listing is one line per item, so it is
+#: newline-flattened and then truncated; `provider`, `model` and `verdict` go
+#: through the same rule, because a 10,000-character provider name drowns the
+#: listing just as thoroughly as a 10,000-character reasoning would. This is a
+#: DISPLAY rule only: the artifact and any adopted ledger reason keep the
+#: original, untruncated string.
+MAX_ANNOTATION_DISPLAY_CHARS = 120
 
 
 def validate_reason(reason: str) -> None:
@@ -142,21 +184,31 @@ def load_valid_artifact(rec) -> dict:
     return rec
 
 
+def _finding_at(findings: list, index) -> dict:
+    """`findings[index]`, or raise `FindingNotFound`.
+
+    ONE definition, used by `dismiss` and by `adopt_refuter`, so the two paths
+    cannot drift on what counts as a nameable finding.
+
+    `isinstance(True, int)` is True in Python, so an unguarded bool indexes
+    the list: `dismiss(..., True, ...)` would dismiss findings[1] — a
+    different finding than the caller named. Any other non-int would leak a
+    raw TypeError past this module's TriageError contract.
+    """
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise FindingNotFound(f"finding index must be an int ({index!r})")
+    if not (0 <= index < len(findings)):   # negative indexes must not
+        raise FindingNotFound(f"finding index {index} out of range")  # alias
+    return findings[index]
+
+
 def dismiss(store: Store, review: dict, index: int, reason: str, now: str) -> dict:
     """Record an audited dismissal of one finding and return the ledger row."""
     review = load_valid_artifact(review)
     validate_reason(reason)
     # load_valid_artifact guarantees `findings` is present and a list of dicts.
     findings = review["findings"]
-    # `isinstance(True, int)` is True in Python, so an unguarded bool indexes
-    # the list: `dismiss(..., True, ...)` would dismiss findings[1] — a
-    # different finding than the caller named. Any other non-int would leak a
-    # raw TypeError past this module's TriageError contract.
-    if isinstance(index, bool) or not isinstance(index, int):
-        raise TriageError(f"finding index must be an int ({index!r})")
-    if not (0 <= index < len(findings)):   # negative indexes must not
-        raise TriageError(f"finding index {index} out of range")  # silently alias
-    f = findings[index]
+    f = _finding_at(findings, index)
     fkey = finding_key(f.get("file", ""), f.get("title", ""))
     rec = dict(ledger_key=ledger_key(review["branch"], review["base_sha"], fkey),
                finding_key=fkey, id=review["id"], branch=review["branch"],
@@ -174,3 +226,232 @@ def open_findings(review: dict, triaged: dict[str, dict]) -> list[dict]:
         if finding_key(f.get("file", ""), f.get("title", "")) not in triaged:
             out.append(f)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Refuter annotations: reading them, showing them, and adopting one
+# ---------------------------------------------------------------------------
+#
+# An annotation is model output that has been through `passes.merge_refuter_
+# pass` and then through JSON and SQLite. Everything below therefore treats
+# `verdict`, `reasoning`, `provider` and `model` as untrusted DATA: types are
+# checked, and no field's *content* steers control flow beyond the explicit
+# checks written here. The display helpers additionally may never raise —
+# rendering a listing must not be the thing that crashes it.
+
+
+def refuter_annotation(finding) -> dict | None:
+    """The refuter annotation on `finding`, or None if there is nothing usable.
+
+    None for a finding with no annotation at all AND for one whose annotation
+    is not an object: `refuter: "refuted"` is a shape no reader can interpret,
+    and inventing a verdict from it is exactly the kind of guess this module
+    does not make.
+    """
+    if not isinstance(finding, dict):
+        return None
+    annotation = finding.get(REFUTER_KEY)
+    return annotation if isinstance(annotation, dict) else None
+
+
+def _shown(value) -> str:
+    """One annotation field, bounded for a one-line-per-item listing.
+
+    `trust.one_line` — the project's single "this value may not break out of a
+    single-line record" rule, which replaces CR/LF with spaces and does
+    nothing else — and then a hard length cap. Both halves are needed: the
+    flattening stops a reasoning with a newline in it from forging an extra
+    row, and the cap stops a 10,000-character field from burying the rest of
+    the listing under itself.
+    """
+    return one_line(value)[:MAX_ANNOTATION_DISPLAY_CHARS]
+
+
+def refuter_line(annotation) -> str:
+    """The one extra `triage --list` line for a refuter annotation.
+
+    `refuter(<provider>/<model>): <verdict> — <reasoning>`, every field
+    bounded by `_shown`. A missing field renders as the empty string rather
+    than the literal "None", the same convention `trust.one_line` already
+    uses everywhere else.
+    """
+    if not isinstance(annotation, dict):
+        annotation = {}
+    return ("refuter(%s/%s): %s — %s"
+            % (_shown(annotation.get("provider")), _shown(annotation.get("model")),
+               _shown(annotation.get("verdict")), _shown(annotation.get("reasoning"))))
+
+
+def refuter_pass_ran(review) -> bool:
+    """Whether a refuter pass actually EXECUTED on this review record.
+
+    THE AUTHENTICATION CHECK for the annotation channel, and it is not
+    theoretical — read this before relaxing it.
+
+    Task 8 hardened `merge_refuter_pass` and `skipped_refuter_pass` to strip
+    any `refuter` key already present on a finding, because a finder's parsed
+    findings are untrusted model output that reaches those functions verbatim
+    and the adapter's payload validator checks the required keys without
+    removing extra ones. That hardening covers the paths where a refuter pass
+    was SCHEDULED. It cannot cover the paths where one was not: when
+    `refuter_decision` declines (the `SKODUN_REFUTER_PASS` kill switch, a mode
+    other than `now`, an untrustworthy finder), NEITHER merge function runs,
+    and a `refuter` key the finder wrote about its own finding — verdict,
+    reasoning, and a provider and model naming a vendor that was never
+    invoked — rides straight into the stored artifact.
+
+    So `refuter.verdict == "refuted"` on a finding is, on its own, not
+    evidence that any refuter said anything. `extra_passes` is the other half:
+    the pipeline builds it, a model's payload cannot contribute to it, and it
+    is `{}` on exactly the records where no pass ran. Where a pass DID run,
+    every annotation on the record went through the stripping merge and is
+    therefore the pass's own.
+
+    `ran is True` — never truthiness — because the value survives a JSON and
+    SQLite round trip, and the string `"false"` is truthy.
+    """
+    if not isinstance(review, dict):
+        return False
+    extras = review.get("extra_passes")
+    if not isinstance(extras, dict):
+        return False
+    meta = extras.get(REFUTER_KEY)
+    return isinstance(meta, dict) and meta.get("ran") is True
+
+
+def refuter_same_provider_as_finder(review) -> bool:
+    """Whether the refuter pass answered from the FINDER's own provider.
+
+    Read off `extra_passes.refuter`, which the pass writes and a finder cannot
+    forge (`passes._strip_finder_refuter_keys` drops any incoming annotation,
+    so the pass's own counters are the record's truth). Strictly `is True`, and
+    defended at every level: the value comes out of stored JSON, and a
+    truthiness test would read the string `"false"` as yes.
+    """
+    if not isinstance(review, dict):
+        return False
+    extras = review.get("extra_passes")
+    if not isinstance(extras, dict):
+        return False
+    meta = extras.get(REFUTER_KEY)
+    return isinstance(meta, dict) and meta.get("same_provider_as_finder") is True
+
+
+def _attribution(annotation: dict, field: str) -> str:
+    """One half of the `refuter(<provider>/<model>)` prefix, or raise.
+
+    The prefix exists to say WHOSE verdict is being adopted. `refuter(None/
+    None): ...` is attribution theatre, and it would be written into an audit
+    ledger and read back years later, so an annotation that cannot say who
+    answered is refused rather than rendered with a hole in it. Flattened with
+    `one_line` for the same reason every other single-line record is: a
+    provider carrying a newline must not be able to forge a second line inside
+    one ledger reason.
+    """
+    value = annotation.get(field)
+    if not isinstance(value, str) or not collapse_ws(value):
+        raise TriageError(
+            f"the refuter annotation's {field} is missing or unusable "
+            f"({value!r}); a dismissal cannot be attributed to nobody")
+    return one_line(value)
+
+
+def adopt_refuter(store: Store, review: dict, index: int, now: str) -> dict:
+    """Dismiss one finding on the strength of its refuter annotation.
+
+    THE ONLY path by which a refuter verdict becomes a dismissal, and it is
+    driven by a human naming one finding. Nothing here is automatic and there
+    is deliberately no bulk form.
+
+    Refuses, each as a `TriageError`: a finding with no usable annotation; a
+    verdict that is not `refuted` (named in the message, because "your model
+    said `confirmed`" is the actionable fact); an annotation the pass marked
+    `thin_reasoning`; a `reasoning` that is not a string; and an annotation
+    that cannot say which provider and model answered. A finding index that
+    does not resolve raises `FindingNotFound`, and a self-inconsistent
+    artifact raises `ArtifactError` — before anything is written, in every
+    case.
+
+    VALIDATION HAPPENS TWICE, DELIBERATELY
+    --------------------------------------
+    The RAW reasoning is validated first and ALONE. Only then is the
+    synthesized `refuter(<provider>/<model>): <reasoning>` string validated
+    and persisted through the ordinary `dismiss` path.
+
+    The order is the whole point. `refuter(openai/some-model): race` is 29
+    characters and clears the 20-character audit floor comfortably — on the
+    strength of a provider name. Validating only the synthesized string would
+    let a one-word refutation buy its way past the floor with attribution,
+    which is precisely the failure the floor exists to prevent: a finding
+    dismissed because a well-known model's name was long. Validating the raw
+    reasoning first makes the prefix unable to rescue anything, and it puts
+    the *whole* of `validate_reason` — including the placeholder set — on the
+    model's own words, so a refuter that answered "false positive" is refused
+    with the placeholder message.
+
+    The second pass is not decorative either: the string that is actually
+    persisted is the string that was actually validated, so no future change
+    to the prefix can quietly put an unvalidated reason in the ledger.
+
+    Trustworthiness is deliberately NOT checked, exactly as `dismiss` has
+    never checked it: the gate re-asserts trust against the artifact itself
+    and never even reaches an untrustworthy review, so a check here would be a
+    second, implicit policy that changes nothing the gate decides.
+    """
+    review = load_valid_artifact(review)
+    finding = _finding_at(review["findings"], index)
+
+    # BEFORE the annotation is read at all: an annotation on a record where no
+    # refuter pass ran has no provenance and may simply be something the FINDER
+    # wrote about its own finding. See `refuter_pass_ran`.
+    if not refuter_pass_ran(review):
+        raise TriageError(
+            "no refuter pass ran on this review, so any refuter annotation on "
+            "it is unattributed and cannot be adopted; re-review with a "
+            "reviewer in role 'refuter', or dismiss the finding with your own "
+            "reason")
+
+    annotation = refuter_annotation(finding)
+    if annotation is None:
+        raise TriageError(
+            f"finding {index} carries no refuter annotation, so there is no "
+            "verdict to adopt; dismiss it with your own reason instead")
+
+    verdict = annotation.get("verdict")
+    if not isinstance(verdict, str):
+        raise TriageError(
+            f"the refuter annotation on finding {index} carries no verdict "
+            f"({verdict!r})")
+    if verdict != ADOPTABLE_VERDICT:
+        raise TriageError(
+            f"the refuter's verdict on finding {index} is {verdict!r}, not "
+            f"{ADOPTABLE_VERDICT!r}; only a refutation can be adopted as a "
+            "dismissal")
+
+    # The pass marks this when the reasoning is under MIN_REASON_CHARS,
+    # measured with `textnorm.collapse_ws` — the same helper `validate_reason`
+    # measures its floor with. Refused on the flag AND, independently, by the
+    # raw validation below: the flag is written by the pass and could be
+    # absent from a hand-edited artifact, so it may not be the only thing
+    # standing here.
+    if annotation.get("thin_reasoning") is True:
+        raise TriageError(
+            f"the refuter's reasoning on finding {index} is marked "
+            "thin_reasoning and cannot be adopted; dismiss it with your own "
+            "reason if you agree with it")
+
+    reasoning = annotation.get("reasoning")
+    if not isinstance(reasoning, str):
+        # `validate_reason` would stringify anything (`collapse_ws` calls
+        # `str()`), so `{'r': 'x'}` would become a 12-character "reason" and a
+        # list of words a perfectly auditable-looking one.
+        raise TriageError(
+            f"the refuter's reasoning on finding {index} is not text "
+            f"({reasoning!r})")
+
+    validate_reason(reasoning)          # FIRST, and on the raw words alone
+
+    reason = "%s(%s/%s): %s" % (REFUTER_KEY, _attribution(annotation, "provider"),
+                                _attribution(annotation, "model"), reasoning)
+    validate_reason(reason)             # then on exactly what gets persisted
+    return dismiss(store, review, index, reason, now)

@@ -93,6 +93,13 @@ def build_parser() -> argparse.ArgumentParser:
     tri.add_argument("reason", nargs="?", default=None)
     tri.add_argument("--list", action="store_true", dest="list_only",
                      help="list a review's findings instead of dismissing one")
+    # Explicit, per-finding, and deliberately WITHOUT a bulk form: a refuter
+    # verdict is an annotation, and the only way one may ever dismiss a
+    # finding is a human naming that finding. `--adopt-all` would be exactly
+    # the auto-dismissal this path exists to keep out of the product.
+    tri.add_argument("--adopt-refuter", action="store_true", dest="adopt_refuter",
+                     help="dismiss ONE finding by adopting its refuter "
+                          "annotation as the audited reason")
     return p
 
 
@@ -529,6 +536,20 @@ def _cmd_triage(args) -> int:
     raises `BrokenPipeError`, and letting that escape would hand the shell the
     interpreter's own exit code of 1 -- indistinguishable from a real error
     about a decision that in fact was never even reached.
+
+    `--adopt-refuter` has its own exit contract, and the split is the point:
+
+      0  the dismissal was recorded
+      1  REFUSED -- the finding is right there and the adoption was declined
+         (wrong verdict, thin reasoning, a reasoning that fails the audit
+         floor, an annotation that cannot say who answered)
+      2  NOT FOUND -- no such review, no such finding, an artifact that does
+         not validate, a store that will not open, or plain misuse
+
+    A refusal is a fact about the annotation and is worth acting on; a 2 means
+    the command never got as far as having an opinion. Collapsing them would
+    make "your refuter said `confirmed`" indistinguishable from "you typed the
+    wrong review id".
     """
     from .store import Store
 
@@ -537,10 +558,29 @@ def _cmd_triage(args) -> int:
     # the index and the reason away. Someone who typed a reason believes a
     # finding was dismissed; they get a listing and a 0. Reject the mixture
     # instead of picking one of the two meanings.
+    if args.list_only and args.adopt_refuter:
+        return _emit(
+            "skodun triage: --list and --adopt-refuter are two different "
+            "commands; pick one", 2)
     if args.list_only and not (args.finding_index is None and args.reason is None):
         return _emit(
             "skodun triage: --list takes only a review id; drop the finding "
             "index and the reason to list, or drop --list to dismiss", 2)
+    if args.adopt_refuter:
+        # Same class of mixture, and the same refusal to guess. The reason is
+        # SYNTHESIZED from the annotation, so a reason typed alongside the flag
+        # is silently discarded -- and its author would have every right to
+        # believe their words were the ones recorded in the ledger.
+        if args.reason is not None:
+            return _emit(
+                "skodun triage: --adopt-refuter takes only a review id and a "
+                "finding index; the reason comes from the refuter's own "
+                "annotation, so drop yours or drop the flag", 2)
+        if args.finding_index is None:
+            return _emit(
+                "skodun triage: usage: skodun triage --adopt-refuter "
+                "<review-id> <finding-index>  (one finding at a time, on "
+                "purpose)", 2)
 
     try:
         store = Store.open(_store_path())
@@ -552,7 +592,10 @@ def _cmd_triage(args) -> int:
         return _emit(f"skodun triage: no such review: {args.review_id!r}", 2)
 
     from .textnorm import finding_key
-    from .triage import ArtifactError, TriageError, dismiss, load_valid_artifact
+    from .triage import (ArtifactError, FindingNotFound, TriageError,
+                         adopt_refuter, dismiss, load_valid_artifact,
+                         refuter_annotation, refuter_line, refuter_pass_ran,
+                         refuter_same_provider_as_finder)
 
     try:
         review = load_valid_artifact(review)
@@ -561,12 +604,62 @@ def _cmd_triage(args) -> int:
 
     if args.list_only:
         triaged = store.triage_for(review["branch"], review["base_sha"])
+        # An annotation is shown only on a record where a refuter pass
+        # actually ran. On a record where none did, a `refuter` key is
+        # something the FINDER wrote about its own finding (see
+        # `triage.refuter_pass_ran`), and printing it as
+        # `refuter(<provider>/<model>)` would be this program vouching for a
+        # second opinion that was never sought -- which is the same misleading
+        # line whether or not `--adopt-refuter` goes on to refuse it.
+        annotated = refuter_pass_ran(review)
         for i, f in enumerate(review["findings"]):
             fkey = finding_key(f.get("file", ""), f.get("title", ""))
             status = "DISMISSED" if fkey in triaged else "OPEN"
             _emit(f"[{i}] {f.get('severity')} {f.get('file')}:{f.get('line')} "
                   f"{f.get('title')} ({status})", 0)
+            # One extra line for an annotated finding, and never more than
+            # one: `refuter_line` flattens and bounds every field it prints,
+            # so arbitrary model text cannot forge a second `[n]` row. An
+            # annotation is shown whatever its verdict says -- the listing
+            # reports what the refuter answered; only `--adopt-refuter`
+            # decides what may be acted on.
+            annotation = refuter_annotation(f) if annotated else None
+            if annotation is not None:
+                _emit(refuter_line(annotation), 0)
         return 0
+
+    if args.adopt_refuter:
+        try:
+            adopt_refuter(store, review, args.finding_index,
+                          now=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        except (FindingNotFound, ArtifactError) as e:
+            return _emit(f"skodun triage: {e}", 2)
+        except TriageError as e:
+            return _emit(f"skodun triage: refused: {e}", 1)
+        except BaseException as e:
+            # A store that stopped accepting writes is not a refusal about the
+            # annotation -- nothing was decided and nothing was recorded.
+            return _emit(
+                f"skodun triage: could not record the dismissal: {e!r}", 2)
+
+        # The refuter exists so that a DIFFERENT provider examines the
+        # findings; a model asked to check its own work is agreeable about it.
+        # A config may still put the refuter on the finder's provider -- the
+        # operator's call, and better than no re-examination -- and the pass
+        # records that it happened. This is the one moment where that fact has
+        # consequences, so it is said out loud here rather than left in the
+        # artifact for nobody to read. A WARNING and not a refusal: adoption is
+        # an explicit human act, and the human is the authority this path
+        # exists to consult; turning an operator's own configuration into a
+        # hard block would be a second, implicit policy on top of the explicit
+        # per-finding one.
+        if refuter_same_provider_as_finder(review):
+            _emit("skodun triage: WARNING the refuter answered from the same "
+                  "provider as the finder, so this verdict is a model "
+                  "re-examining its own work", 0)
+        return _emit(
+            f"skodun triage: adopted the refuter's dismissal of finding "
+            f"{args.finding_index} on review {args.review_id}", 0)
 
     if args.finding_index is None or args.reason is None:
         return _emit(
