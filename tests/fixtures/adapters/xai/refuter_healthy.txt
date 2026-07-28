@@ -1,0 +1,49 @@
+rc=0
+--- stdout ---
+{
+  "text": "{\"verdicts\":[{\"index\":0,\"verdict\":\"confirmed\",\"reasoning\":\"The guard really does accept any message carrying a source field: the type check was dropped in the same hunk, so an unrelated parent message reaches the handler.\"},{\"index\":1,\"verdict\":\"refuted\",\"reasoning\":\"The flag is set inside the same synchronous block that queues the first post, so the ordering the finding describes cannot occur; the caller-side guard is not load bearing here.\"},{\"index\":2,\"verdict\":\"uncertain\",\"reasoning\":\"The diff does not show the caller, so whether the second invocation is reachable at all cannot be decided from what was provided.\"}]}",
+  "stopReason": "EndTurn",
+  "sessionId": "019f0000-0000-7000-8000-000000000006",
+  "requestId": "00000000-0000-4000-8000-000000000007",
+  "usage": {
+    "input_tokens": 8123,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 141,
+    "reasoning_tokens": 0,
+    "total_tokens": 8264
+  },
+  "num_turns": 1,
+  "total_cost_usd": 0.0102,
+  "total_cost_usd_ticks": 102000,
+  "modelUsage": {
+    "grok-4.5": {
+      "inputTokens": 8123,
+      "outputTokens": 141,
+      "cacheReadInputTokens": 0,
+      "modelCalls": 1,
+      "costUSD": 0.0102
+    }
+  },
+  "structuredOutput": {
+    "verdicts": [
+      {
+        "index": 0,
+        "verdict": "confirmed",
+        "reasoning": "The guard really does accept any message carrying a source field: the type check was dropped in the same hunk, so an unrelated parent message reaches the handler."
+      },
+      {
+        "index": 1,
+        "verdict": "refuted",
+        "reasoning": "The flag is set inside the same synchronous block that queues the first post, so the ordering the finding describes cannot occur; the caller-side guard is not load bearing here."
+      },
+      {
+        "index": 2,
+        "verdict": "uncertain",
+        "reasoning": "The diff does not show the caller, so whether the second invocation is reachable at all cannot be decided from what was provided."
+      }
+    ]
+  }
+}
+
+--- stderr ---
+

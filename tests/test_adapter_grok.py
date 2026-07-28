@@ -34,7 +34,17 @@ from skodun.adapters.grok import (
     resolve_grok_bin,
 )
 from skodun.config import Defaults, Reviewer
+from tests.adapter_conformance import (  # noqa: F401 - see below
+    AdapterConformance,
+    test_coverage_gate_fails_without_a_conformance_subclass,
+    test_every_registered_adapter_has_conformance_coverage,
+)
 from tests.conftest import oracle_dir
+
+# The two `test_*` functions above are imported, not re-declared: they are the
+# registry coverage gate, defined once next to the suite it gates. Importing
+# them into a collected module is what makes pytest run them —
+# `adapter_conformance.py` is a mixin module and is deliberately not collected.
 
 R = Reviewer(name="f", provider="xai", model="grok-4.20-0309-reasoning", role="finder")
 D = Defaults()
@@ -935,3 +945,38 @@ def test_oracle_extraction_is_not_vacuous(tmp_path):
     assert "grep -Eiq" in text and "grok_stop_reason" in text
     assert _run_oracle(tmp_path, CLEAN, b"tool_error") is True
     assert _run_oracle(tmp_path, CLEAN, b"") is False
+
+
+# --------------------------------------------------------------------------
+# the shared conformance suite
+# --------------------------------------------------------------------------
+
+
+class TestGrokConformance(AdapterConformance):
+    """grok is the first adapter through the registration gate.
+
+    Everything asserted here is provider-neutral and lives in
+    `tests/adapter_conformance.py`; this class supplies only the four things
+    the mixin cannot know. The cases above stay as they are: they pin grok's
+    own wire details (argv, the three-level extractor, each degraded signal in
+    isolation, oracle parity), which the shared suite deliberately does not
+    look at.
+    """
+
+    provider_id = "xai"
+    fixture_dir = Path(__file__).parent / "fixtures" / "adapters" / "xai"
+
+    def adapter(self) -> GrokAdapter:
+        return GrokAdapter()
+
+    def effort_reject_case(self) -> tuple[Reviewer, str] | None:
+        """grok maps every canonical effort, but refuses `grok-build` models.
+
+        The reject case is offered rather than `None` because a loud refusal is
+        the stronger of the two proofs: it exercises the raise, where a total
+        mapping only exercises a table. grok's mapping totality is pinned
+        separately by `test_effort_appended_when_set` above.
+        """
+        r = Reviewer(name="f", provider="xai", model="grok-build",
+                     role="finder", effort="high")
+        return r, "does not support effort"

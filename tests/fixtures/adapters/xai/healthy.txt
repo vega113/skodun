@@ -1,0 +1,47 @@
+rc=0
+--- stdout ---
+{
+  "text": "{\"summary\":\"Changes to the request-signing helper and its client wrapper are correct, well covered by tests, and safe; one small regression in the message event handler.\",\"findings\":[{\"file\":\"src/client/event_bridge.js\",\"severity\":\"medium\",\"title\":\"Overly broad message source check accepts unrelated messages\",\"detail\":\"The new `if (!data || data.source !== 'host')` guard in onParentMessage (and the matching one in the runtime) now accepts any message from the parent that carries a source field, even unrelated ones. The previous check also required type === 'focus'. This widens the surface for postMessage injection from the embedding page; restore a combined source+type guard.\"},{\"file\":\"src/client/event_bridge.js\",\"severity\":\"low\",\"title\":\"configured flag and send race\",\"detail\":\"`configured` is set only after a successful configure(), but send() on 'ready' can fire before the caller has invoked configure(), so the flag can produce duplicate or stale posts. The same-origin guard added on the caller side is good, but the runtime side could be tightened.\"}]}",
+  "stopReason": "EndTurn",
+  "sessionId": "019f0000-0000-7000-8000-000000000001",
+  "requestId": "00000000-0000-4000-8000-000000000002",
+  "usage": {
+    "input_tokens": 37711,
+    "cache_read_input_tokens": 128,
+    "output_tokens": 227,
+    "reasoning_tokens": 0,
+    "total_tokens": 38066
+  },
+  "num_turns": 1,
+  "total_cost_usd": 0.04773185,
+  "total_cost_usd_ticks": 477318500,
+  "modelUsage": {
+    "grok-4.20-0309-non-reasoning": {
+      "inputTokens": 37711,
+      "outputTokens": 227,
+      "cacheReadInputTokens": 128,
+      "modelCalls": 1,
+      "costUSD": 0.04773185
+    }
+  },
+  "structuredOutput": {
+    "summary": "Changes to the request-signing helper and its client wrapper are correct, well covered by tests, and safe; one small regression in the message event handler.",
+    "findings": [
+      {
+        "file": "src/client/event_bridge.js",
+        "severity": "medium",
+        "title": "Overly broad message source check accepts unrelated messages",
+        "detail": "The new `if (!data || data.source !== 'host')` guard in onParentMessage (and the matching one in the runtime) now accepts any message from the parent that carries a source field, even unrelated ones. The previous check also required type === 'focus'. This widens the surface for postMessage injection from the embedding page; restore a combined source+type guard."
+      },
+      {
+        "file": "src/client/event_bridge.js",
+        "severity": "low",
+        "title": "configured flag and send race",
+        "detail": "`configured` is set only after a successful configure(), but send() on 'ready' can fire before the caller has invoked configure(), so the flag can produce duplicate or stale posts. The same-origin guard added on the caller side is good, but the runtime side could be tightened."
+      }
+    ]
+  }
+}
+
+--- stderr ---
+

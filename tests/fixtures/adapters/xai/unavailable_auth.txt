@@ -1,0 +1,7 @@
+rc=1
+category=auth
+--- stdout ---
+
+--- stderr ---
+2026-07-28T10:15:03.117420Z ERROR request failed: Auth(AuthorizationRequired) status=401
+error: not logged in - run `grok auth login` and try again

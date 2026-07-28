@@ -1,0 +1,97 @@
+xai / grok conformance fixtures
+===============================
+
+Witnesses for the rules in `tests/adapter_conformance.py`, which is where the
+file format is documented. In short: `rc=<int>` first, an optional
+`category=<expected>` (required on every `*unavailable*` file), then
+`--- stdout ---` and `--- stderr ---` sections holding raw UTF-8 bytes.
+
+The loader consumes exactly one trailing newline per section, as the separator
+before the next marker. The captured envelopes below genuinely ended with a
+newline on the wire, so their stdout sections end with a blank line — that
+blank line is the envelope's own final newline, not formatting.
+
+Provenance
+----------
+
+Anything marked CAPTURED was taken from a real Phase 1 grok run recorded in the
+legacy archive and then sanitized; anything marked SYNTHESIZED was written by
+hand. The distinction matters: a hand-written envelope proves the adapter can
+parse what its author imagined, which is exactly the thing an adapter is most
+likely to get wrong.
+
+healthy.txt
+    CAPTURED (structure) / SANITIZED (all content). A real completed review:
+    `stopReason: EndTurn`, the payload present BOTH as a compact JSON string in
+    `text` and as an object in `structuredOutput`, two findings, no `line`
+    keys. The key order, the nesting, the doubled payload, the compact inner
+    serialization and the 2-space outer indent are the capture's own — that
+    duplication at two escaping depths is what the extractor has to survive,
+    and it is not a thing anyone writes by hand correctly.
+    STRIPPED: the summary, both findings' `file`, `title` and `detail` values
+    (they discussed the upstream project's own source), and the real
+    `sessionId`/`requestId`. The replacement review is generic and of similar
+    shape and length. Token counts, costs and the recorded model id are the
+    capture's, and identify nothing.
+
+degraded_stopreason.txt
+    CAPTURED (structure) / SANITIZED (all content). The silent false all-clear
+    this whole axis exists to catch: `stopReason: Cancelled`, yet `text`
+    carries a perfectly valid review with an empty `findings` list, so the run
+    PARSES and reports zero findings. `structuredOutput` is null and
+    `structuredOutputError` explains why — both verbatim from the capture.
+    In the oracle's corpus 116 runs of this shape were recorded clean.
+    STRIPPED: the inner summary, the whole `thought` field (it narrated the
+    upstream project's classes and endpoints) and the real
+    `sessionId`/`requestId`. The replacement `thought` keeps the capture's own
+    shape: chunks concatenated without separators, some newline-terminated,
+    several truncated mid-sentence with `...`.
+
+degraded_stderr.txt
+    CAPTURED stdout (identical to `healthy.txt`) + SYNTHESIZED stderr. The
+    harness-degradation case: a valid, schema-clean envelope on stdout with
+    `tool_error` / `execution_failure` on stderr. It must classify `degraded`,
+    NOT `unavailable` — usable output wins on the availability axis only.
+    The stderr is modelled line-for-line on the archive's real `tool_error`
+    records (281 of them), minus the ANSI colour codes and the machine paths
+    those records carry. It is also the source of the signal words rule 6
+    splices into a finding title.
+
+unavailable_auth.txt
+    SYNTHESIZED. rc 1, empty stdout, auth-fatal stderr; declares
+    `category=auth`. The category is asserted EXACTLY: `auth` is
+    attempt-local, `quota` is cached provider-wide, and confusing the two
+    takes a healthy provider out of every later fallback chain. Synthesized
+    because the archive's real auth-failure stderr is dense with the
+    developer's machine paths and plugin directories.
+
+healthy_noisy_stderr.txt
+    CAPTURED stdout (identical to `healthy.txt`) + SYNTHESIZED stderr. Rule 7,
+    which generalizes grok's Phase 1 auth-noise non-signal rule: the stderr
+    carries both an `AuthorizationRequired` and a `rate limit` line, and the
+    run must still classify `ok`, because the provider demonstrably served.
+    The suite proves this fixture is not vacuous by classifying the SAME
+    stderr with empty stdout and requiring `unavailable` there.
+
+refuter_healthy.txt
+    SYNTHESIZED, necessarily: the Phase 1 archive predates the refuter
+    contract and cannot contain its shape. Written in the same grok envelope
+    the captures use (same key set and order, payload doubled in `text` and
+    `structuredOutput`), carrying three verdicts — one of each of `confirmed`,
+    `refuted`, `uncertain`. It must parse under `REFUTER_CONTRACT` and must
+    NOT parse under `REVIEW_CONTRACT`; a refuter response a Phase 1 caller
+    could read as a review would read as a review with no findings, which is a
+    clean bill of health. The three new adapters capture theirs from live
+    probe runs instead.
+
+Sanitization
+------------
+
+These files are committed to a public repository and the archive they came
+from belongs to a private upstream project. Every capture was checked to
+contain no repo paths, branch names, project or service names, usernames,
+machine paths or tokens — including in the finding text, which discussed that
+project's own source. The check was done by diffing the token sets of the
+capture and the fixture: everything they still share is a JSON key, a provider
+constant (`EndTurn`, `Cancelled`, a model id), a usage number, or an ordinary
+English word.

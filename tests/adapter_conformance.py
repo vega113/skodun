@@ -1,0 +1,803 @@
+"""The registration gate: what every adapter must prove before it may ship.
+
+This module is a MIXIN, not a test module — its filename deliberately does not
+match pytest's `test_*.py` pattern, so nothing here is collected on its own.
+`AdapterConformance` has no adapter bound to it and would fail every rule if it
+were; it becomes live only when an adapter's own test module subclasses it.
+
+An adapter that cannot recognise its CLI failing is worse than no adapter: a
+provider that silently returns nothing looks exactly like a clean review, and a
+clean review is what the gate exits 0 on. So the suite below is not a courtesy
+check on a new adapter — it is the condition for being in `_REGISTRY` at all,
+and `test_every_registered_adapter_has_conformance_coverage` makes that
+mechanical rather than a matter of reviewer diligence.
+
+Adding an adapter
+-----------------
+
+In `tests/test_adapter_<name>.py`::
+
+    class TestAcmeConformance(AdapterConformance):
+        provider_id = "acme"                    # the `_REGISTRY` key
+        fixture_dir = Path(__file__).parent / "fixtures" / "adapters" / "acme"
+
+        def adapter(self):
+            return AcmeAdapter()
+
+        def effort_reject_case(self):
+            r = Reviewer(name="f", provider="acme", model="acme-mini",
+                         role="finder", effort="max")
+            return r, "effort"          # or None: see `effort_reject_case`
+
+The class name MUST start with `Test`, or pytest never collects it and the
+coverage gate — which checks exactly that — fails.
+
+Then supply the fixture files described under "Fixture file format" below. The
+required set is fixed, because each rule needs a witness and a rule with no
+witness proves nothing:
+
+===========================  ============================================
+`*healthy*`                  rules 2, 6 (>= 1)
+`*degraded*`                 rule 3 (>= 2, and one of them `*_stderr*`)
+`*unavailable*`              rule 4 (>= 1, each with a `category=` line)
+`*healthy_noisy_stderr*`     rule 7 (>= 1)
+`*refuter*healthy*`          rule 1b (>= 1)
+===========================  ============================================
+
+Fixture file format
+-------------------
+
+A fixture is one captured (or, where the archive cannot supply it, synthesized)
+run::
+
+    rc=0
+    category=auth              # optional; REQUIRED on every *unavailable* file
+    --- stdout ---
+    <raw bytes>
+    --- stderr ---
+    <raw bytes>
+
+Both section markers are mandatory even when a section is empty: an absent
+`--- stderr ---` is far more likely to be a typo than an intention, and
+defaulting it to `b""` would quietly weaken whichever rule the fixture exists
+to witness. Each section's content is the bytes between its marker line and the
+next marker line (or EOF), minus exactly one trailing newline — the separator
+every text file ends with. Everything else is byte-faithful, which is the whole
+point of capturing rather than hand-writing envelopes.
+
+Fixtures captured from real runs must be sanitized before they are committed:
+no tokens, no usernames, no machine paths, no upstream-project names inside the
+bytes. Record capture-vs-synthesized provenance per fixture in the fixture
+directory's `README`.
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+
+from skodun.adapters import (
+    _REGISTRY,
+    REFUTER_CONTRACT,
+    REVIEW_CONTRACT,
+    UNAVAILABLE_RC,
+    Adapter,
+    ClassifyResult,
+    OutputContract,
+)
+from skodun.config import EFFORTS, Defaults, Reviewer
+
+# The complete `ClassifyResult.category` vocabulary. Spelled here rather than
+# imported so that a category quietly added to `base` still has to be argued
+# for HERE, where the cacheability consequences live: only `quota` is a
+# property of the provider as a whole and may be remembered beyond one attempt.
+_UNAVAILABLE_CATEGORIES = frozenset({"quota", "auth", "binary", "model", "other"})
+
+_KINDS = frozenset({"ok", "degraded", "unavailable"})
+
+# The canonical effort value that means "do not pass the flag at all". It is a
+# member of `config.EFFORTS` but is deliberately NOT expected in any adapter's
+# `effort_map`: it is the user's explicit opt-out, handled before any lookup
+# happens, not a CLI spelling. See `base.Adapter.effort_map`.
+_EFFORT_OPT_OUT = "none"
+
+# Inputs no adapter may raise on. `b"{"` is a truncated object (a real
+# mid-write capture), `b"\x00\xff" * 512` is invalid UTF-8 (which is what a
+# decoder-level crash needs), and `b"[]"` is valid JSON of the wrong shape —
+# the case a `json.loads(...)["findings"]` would die on.
+_GARBAGE: tuple[bytes, ...] = (b"", b"{", b"\x00\xff" * 512, b"[]")
+
+# Both contracts, every time. An adapter that only ever gets exercised on the
+# review shape breaks at Task 8 runtime, in the refuter pass, on a real review.
+_CONTRACTS: tuple[OutputContract, ...] = (REVIEW_CONTRACT, REFUTER_CONTRACT)
+
+_STDOUT_MARKER = b"--- stdout ---"
+_STDERR_MARKER = b"--- stderr ---"
+
+
+# --------------------------------------------------------------------------
+# the fixture file format
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Fixture:
+    """One recorded run: what the CLI exited with, said, and complained about.
+
+    `category` is the EXPECTED `ClassifyResult.category`, declared by the
+    fixture author rather than read back from the adapter — a conformance
+    suite that asked the adapter what it meant would agree with it by
+    construction.
+    """
+
+    name: str
+    path: Path
+    rc: int
+    category: str | None
+    stdout: bytes
+    stderr: bytes
+
+
+def _strip_one_newline(blob: bytes) -> bytes:
+    return blob[:-1] if blob.endswith(b"\n") else blob
+
+
+def load_fixture(path: Path) -> Fixture:
+    """Parse one fixture file. Loud on any malformation.
+
+    Every failure here is an `AssertionError` naming the file: a fixture that
+    silently loads as empty would let the rule it witnesses pass vacuously,
+    which is the one outcome this whole module exists to prevent.
+    """
+    raw = path.read_bytes()
+    head, sep, rest = raw.partition(_STDOUT_MARKER + b"\n")
+    assert sep, f"{path}: no {_STDOUT_MARKER.decode()!r} section marker"
+    body, sep, err = rest.partition(b"\n" + _STDERR_MARKER + b"\n")
+    assert sep, (
+        f"{path}: no {_STDERR_MARKER.decode()!r} section marker — both "
+        f"sections are mandatory even when one is empty")
+
+    rc: int | None = None
+    category: str | None = None
+    for lineno, line in enumerate(head.decode("utf-8").splitlines(), start=1):
+        key, eq, value = line.partition("=")
+        assert eq, f"{path}:{lineno}: header line is not `key=value`: {line!r}"
+        if key == "rc":
+            assert rc is None, f"{path}:{lineno}: duplicate `rc=`"
+            assert value.strip().lstrip("-").isdigit(), (
+                f"{path}:{lineno}: rc must be an integer, got {value!r}")
+            rc = int(value.strip())
+        elif key == "category":
+            assert category is None, f"{path}:{lineno}: duplicate `category=`"
+            category = value.strip()
+        else:
+            raise AssertionError(
+                f"{path}:{lineno}: unknown header key {key!r} "
+                f"(known: rc, category)")
+    assert rc is not None, f"{path}: missing the required first line `rc=<int>`"
+    return Fixture(name=path.stem, path=path, rc=rc, category=category,
+                   stdout=body, stderr=_strip_one_newline(err))
+
+
+# --------------------------------------------------------------------------
+# fixture selectors — deliberately explicit, never incidental
+# --------------------------------------------------------------------------
+#
+# Each rule below picks its witnesses by NAME. The selectors are written so
+# that the refuter exclusion is a stated rule rather than a side effect of how
+# the files happen to sort: `refuter_healthy` is a healthy REFUTER envelope,
+# and asking the review contract to parse it is precisely the assertion rule 1b
+# makes in the negative direction. Selecting it under rule 2 as well would turn
+# that into a contradiction.
+
+
+def _is_refuter(name: str) -> bool:
+    """Any fixture whose name mentions the refuter at all.
+
+    Substring, not the `refuter_*` prefix the plan spells: a future
+    `healthy_refuter_noisy` must not leak into the review selector because of
+    where in the name the word landed.
+    """
+    return "refuter" in name
+
+
+def _is_healthy(name: str) -> bool:
+    """A healthy REVIEW fixture: rules 2 and 6. Refuter fixtures excluded."""
+    return "healthy" in name and not _is_refuter(name)
+
+
+def _is_degraded(name: str) -> bool:
+    return "degraded" in name
+
+
+def _is_unavailable(name: str) -> bool:
+    return "unavailable" in name
+
+
+def _is_noisy_healthy(name: str) -> bool:
+    """Rule 7's witness: a healthy run whose stderr carries a false alarm."""
+    return _is_healthy(name) and "noisy_stderr" in name
+
+
+def _is_refuter_healthy(name: str) -> bool:
+    return _is_refuter(name) and "healthy" in name
+
+
+def _is_degraded_stderr(name: str) -> bool:
+    """Rule 6's SOURCE of signal words: the adapter's own harness tells."""
+    return _is_degraded(name) and "stderr" in name
+
+
+# --------------------------------------------------------------------------
+# the mixin
+# --------------------------------------------------------------------------
+
+
+class AdapterConformance:
+    """Every rule an adapter must pass to be allowed into `_REGISTRY`.
+
+    Subclasses supply four things and nothing else:
+
+    * `provider_id` — the `_REGISTRY` key this class claims coverage for. The
+      coverage gate reads it; it is not decorative.
+    * `fixture_dir` — where this adapter's captured runs live.
+    * `adapter()` — a fresh adapter instance.
+    * `effort_reject_case()` — see its docstring.
+    """
+
+    #: The `skodun.adapters._REGISTRY` key this subclass proves coverage for.
+    provider_id: str = ""
+
+    #: Directory of fixture files, in the format documented at module level.
+    fixture_dir: Path | None = None
+
+    # ---- extension points -------------------------------------------------
+
+    def adapter(self) -> Adapter:
+        """A fresh instance of the adapter under test."""
+        raise NotImplementedError(
+            "conformance subclasses must implement `adapter()`")
+
+    def effort_reject_case(self) -> tuple[Reviewer, str] | None:
+        """One `Reviewer` whose effort this adapter must LOUDLY reject, or None.
+
+        Return `(reviewer, expected_message_regex)` when the adapter has a
+        configuration it refuses — a model that does not take an effort flag,
+        an effort its CLI has no spelling for. `build_cmd` must then raise
+        `ValueError` whose message matches the regex (it is handed to
+        `pytest.raises(match=...)`, so escape any metacharacters), because the
+        alternative — dropping the flag — reviews at the CLI's own default
+        effort and reports the result as the configured one.
+
+        Return None to claim TOTAL effort support, which rule 5 then verifies
+        against `config.EFFORTS` rather than taking on trust.
+        """
+        raise NotImplementedError(
+            "conformance subclasses must implement `effort_reject_case()`")
+
+    # ---- machinery --------------------------------------------------------
+
+    @pytest.fixture(autouse=True)
+    def _pinned_adapter_binary(self, monkeypatch, tmp_path):
+        """Never let a conformance run stat the developer's real CLI config.
+
+        Adapters resolve their binary as `SKODUN_<NAME>_BIN` -> a path under
+        `~` -> the bare name. Pinning the override keeps `build_cmd` off the
+        real home directory and keeps `argv[0]` from varying by machine.
+        """
+        name = self.adapter().name
+        monkeypatch.setenv(f"SKODUN_{name.upper()}_BIN",
+                           str(tmp_path / "pinned" / name))
+
+    def fixtures(self) -> list[Fixture]:
+        """Every fixture in `fixture_dir`, sorted by name."""
+        d = self.fixture_dir
+        assert d is not None, (
+            f"{type(self).__name__} must set `fixture_dir` to its adapter's "
+            f"fixture directory")
+        d = Path(d)
+        assert d.is_dir(), f"fixture directory does not exist: {d}"
+        files = sorted(p for p in d.iterdir()
+                       if p.is_file() and p.suffix == ".txt")
+        assert files, f"no *.txt fixtures in {d}"
+        return [load_fixture(p) for p in files]
+
+    def select(self, pred) -> list[Fixture]:
+        return [f for f in self.fixtures() if pred(f.name)]
+
+    def _classified(self, res: ClassifyResult, where: str) -> ClassifyResult:
+        """Assert the invariants every `ClassifyResult` owes, then return it.
+
+        The empty-category half is rule 4's converse and is checked on EVERY
+        classification this suite makes, not only on the unavailable fixtures:
+        a stray category on an `ok` verdict is a caching decision waiting to be
+        read by code that only looks at `category`.
+        """
+        assert res.kind in _KINDS, f"{where}: unknown kind {res.kind!r}"
+        if res.kind == "unavailable":
+            assert res.category in _UNAVAILABLE_CATEGORIES, (
+                f"{where}: unavailable category {res.category!r} is not one of "
+                f"{sorted(_UNAVAILABLE_CATEGORIES)}")
+        else:
+            assert res.category == "", (
+                f"{where}: a {res.kind!r} classification must carry an EMPTY "
+                f"category, got {res.category!r}")
+        return res
+
+    # ---- rule 0: the class is wired to a real, registered adapter ----------
+
+    def test_subclass_is_bound_to_its_registry_provider(self):
+        """`provider_id` names this adapter, and `_REGISTRY` agrees.
+
+        Without this a subclass could satisfy the coverage gate for `"acme"`
+        while exercising a completely different adapter — coverage by string
+        rather than by test.
+        """
+        a = self.adapter()
+        assert self.provider_id, (
+            f"{type(self).__name__} must set `provider_id` to the "
+            f"`_REGISTRY` key it covers")
+        assert a.provider == self.provider_id, (
+            f"{type(self).__name__}.provider_id is {self.provider_id!r} but "
+            f"the adapter it returns declares provider {a.provider!r}")
+        assert self.provider_id in _REGISTRY, (
+            f"provider {self.provider_id!r} is not registered")
+        assert type(a) is _REGISTRY[self.provider_id], (
+            f"_REGISTRY[{self.provider_id!r}] is "
+            f"{_REGISTRY[self.provider_id].__name__}, but this suite exercises "
+            f"{type(a).__name__}")
+
+    def test_every_fixture_is_claimed_by_at_least_one_rule(self):
+        """No fixture sits in the directory being checked by nothing.
+
+        A file nobody selects is worse than a missing one: it reads like
+        coverage in a diff and asserts nothing at all.
+        """
+        selectors = (_is_healthy, _is_degraded, _is_unavailable,
+                     _is_refuter_healthy)
+        orphans = [f.name for f in self.fixtures()
+                   if not any(s(f.name) for s in selectors)]
+        assert not orphans, (
+            f"fixtures selected by no rule: {orphans} — a fixture name must "
+            f"contain 'healthy', 'degraded' or 'unavailable' (and 'refuter' "
+            f"for the refuter shape) or it is never exercised")
+
+    # ---- rule 1: totality --------------------------------------------------
+
+    def test_parse_and_classify_are_total_on_garbage(self):
+        """Neither entry point may raise, on any bytes, under any contract.
+
+        This is a trust property, not politeness: an exception escaping into
+        the gate path is reported as an unexpected error (exit 2 by a
+        different route, with a traceback) rather than as an untrustworthy
+        review, and the two have very different consequences for a human
+        reading CI output.
+        """
+        a = self.adapter()
+        for contract in _CONTRACTS:
+            for blob in _GARBAGE:
+                where = f"parse({blob[:8]!r}..., {contract.name})"
+                res = a.parse(blob, blob, contract)
+                assert res.parse_ok is False, (
+                    f"{where}: garbage must never be parse_ok")
+                assert res.findings == [] and res.summary == "", where
+                assert res.payload is None, (
+                    f"{where}: no payload may survive a failed parse")
+                for rc in (0, 1, UNAVAILABLE_RC):
+                    self._classified(
+                        a.classify(rc, blob, blob, contract),
+                        f"classify({rc}, {blob[:8]!r}..., {contract.name})")
+
+    # ---- rule 1b: the refuter shape ---------------------------------------
+
+    def test_refuter_shape_is_parsed_classified_and_not_a_review(self):
+        """The adapter can request, classify and parse the refuter response.
+
+        Every adapter must prove this now, on a fixture, or Task 8's refuter
+        pass breaks at runtime on a real review — the one moment there is no
+        second opinion available to notice.
+
+        The negative half matters as much as the positive: the same bytes
+        under `REVIEW_CONTRACT` must NOT parse. A refuter response that a
+        Phase 1 caller could read as a review is a review with no findings,
+        which is a clean bill of health.
+        """
+        a = self.adapter()
+        found = self.select(_is_refuter_healthy)
+        assert found, (
+            "no *refuter*healthy* fixture: every adapter must witness the "
+            "refuter shape it will be asked for in Task 8")
+        noisy = self.select(_is_noisy_healthy)
+        for fx in found:
+            res = a.parse(fx.stdout, fx.stderr, REFUTER_CONTRACT)
+            assert res.parse_ok is True, (
+                f"{fx.name}: refuter envelope did not parse under "
+                f"REFUTER_CONTRACT")
+            assert isinstance(res.payload, dict), f"{fx.name}: no payload"
+            verdicts = res.payload.get("verdicts")
+            assert isinstance(verdicts, list) and verdicts, (
+                f"{fx.name}: payload['verdicts'] must be a non-empty list, "
+                f"got {verdicts!r}")
+            self._classified(
+                a.classify(fx.rc, fx.stdout, fx.stderr, REFUTER_CONTRACT),
+                f"{fx.name} refuter classify")
+            assert a.classify(fx.rc, fx.stdout, fx.stderr,
+                              REFUTER_CONTRACT).kind == "ok", (
+                f"{fx.name}: a healthy refuter run must classify ok")
+
+            # The same envelope with a false-alarm stderr borrowed from rule
+            # 7's fixture: usable output wins on the unavailable axis for
+            # EVERY contract, not only for reviews.
+            for n in noisy:
+                res2 = self._classified(
+                    a.classify(0, fx.stdout, n.stderr, REFUTER_CONTRACT),
+                    f"{fx.name} + {n.name} stderr")
+                assert res2.kind == "ok", (
+                    f"{fx.name} with {n.name}'s noisy stderr classified "
+                    f"{res2.kind}/{res2.category}: a valid refuter payload is "
+                    f"proof the provider served")
+
+            review = a.parse(fx.stdout, fx.stderr, REVIEW_CONTRACT)
+            assert review.parse_ok is False, (
+                f"{fx.name}: a refuter response parsed as a REVIEW — a Phase "
+                f"1 caller would read it as a review with no findings")
+            assert review.findings == [] and review.summary == ""
+
+    # ---- rule 2: healthy runs ---------------------------------------------
+
+    def test_healthy_fixtures_classify_ok_and_parse(self):
+        """A run the provider served well is `ok` and yields a review."""
+        a = self.adapter()
+        healthy = self.select(_is_healthy)
+        assert healthy, "no *healthy* fixture"
+        for fx in healthy:
+            res = self._classified(
+                a.classify(0, fx.stdout, fx.stderr, REVIEW_CONTRACT),
+                f"{fx.name} classify")
+            assert res.kind == "ok", (
+                f"{fx.name}: healthy run classified {res.kind} "
+                f"({res.detail!r})")
+            parsed = a.parse(fx.stdout, fx.stderr, REVIEW_CONTRACT)
+            assert parsed.parse_ok is True, (
+                f"{fx.name}: healthy envelope did not parse")
+            assert parsed.degraded is False, (
+                f"{fx.name}: healthy envelope reported degraded "
+                f"({parsed.degraded_reason!r})")
+
+    # ---- rule 3: degradation ----------------------------------------------
+
+    def test_degraded_fixtures_are_recognised(self):
+        """Truncation must show up on one of the two axes, and be witnessed twice.
+
+        `parse` and `classify` are independent axes and an adapter may report
+        degradation on either — what it may not do is report it on neither. Two
+        witnesses are required because one signal passing is not evidence that
+        the detection is general; in the oracle's corpus a single unrecognised
+        `Cancelled` shape accounted for 116 silently-clean runs.
+        """
+        a = self.adapter()
+        degraded = self.select(_is_degraded)
+        assert len(degraded) >= 2, (
+            f"need >= 2 *degraded* fixtures, found {[f.name for f in degraded]}")
+        for fx in degraded:
+            res = self._classified(
+                a.classify(fx.rc, fx.stdout, fx.stderr, REVIEW_CONTRACT),
+                f"{fx.name} classify")
+            parsed = a.parse(fx.stdout, fx.stderr, REVIEW_CONTRACT)
+            assert res.kind == "degraded" or parsed.degraded is True, (
+                f"{fx.name}: neither classify ({res.kind}) nor parse "
+                f"(degraded={parsed.degraded}) noticed the degradation")
+            if parsed.degraded:
+                assert parsed.degraded_reason, (
+                    f"{fx.name}: degraded with an empty reason — the human "
+                    f"reading CI has nothing to act on")
+
+    # ---- rule 4: unavailability, and its exact category --------------------
+
+    def test_unavailable_fixtures_carry_the_declared_category(self):
+        """The category is a CACHING decision, so it must be exactly right.
+
+        `quota` is the only category that is a property of the provider as a
+        whole and therefore the only one that may be remembered beyond one
+        attempt. An auth failure mislabelled `quota` takes a perfectly healthy
+        provider out of every later fallback chain in the run; a quota failure
+        mislabelled `auth` burns the rest of the budget rediscovering it.
+        """
+        a = self.adapter()
+        unavailable = self.select(_is_unavailable)
+        assert unavailable, "no *unavailable* fixture"
+        for fx in unavailable:
+            assert fx.category, (
+                f"{fx.name}: every *unavailable* fixture must declare the "
+                f"expected `category=` line")
+            assert fx.category in _UNAVAILABLE_CATEGORIES, (
+                f"{fx.name}: declared category {fx.category!r} is not one of "
+                f"{sorted(_UNAVAILABLE_CATEGORIES)}")
+            for contract in _CONTRACTS:
+                res = self._classified(
+                    a.classify(fx.rc, fx.stdout, fx.stderr, contract),
+                    f"{fx.name} classify ({contract.name})")
+                assert res.kind == "unavailable", (
+                    f"{fx.name} ({contract.name}): classified {res.kind}, "
+                    f"expected unavailable")
+                assert res.category == fx.category, (
+                    f"{fx.name} ({contract.name}): classified category "
+                    f"{res.category!r}, fixture declares {fx.category!r}")
+
+    def test_missing_binary_is_unavailable_binary(self):
+        """rc 127 is the shell's command-not-found, for every CLI alike.
+
+        `binary` and not `other`: a missing binary is this reviewer's
+        configuration being wrong, which is attempt-local and must never be
+        cached as a provider outage.
+        """
+        a = self.adapter()
+        for contract in _CONTRACTS:
+            res = self._classified(
+                a.classify(UNAVAILABLE_RC, b"", b"", contract),
+                f"classify(127, ..., {contract.name})")
+            assert res.kind == "unavailable" and res.category == "binary", (
+                f"rc {UNAVAILABLE_RC} ({contract.name}) classified "
+                f"{res.kind}/{res.category}, expected unavailable/binary")
+
+    # ---- rule 5: the effort contract --------------------------------------
+
+    def test_effort_is_mapped_or_loudly_rejected(self):
+        """No silent downgrade: either every effort maps, or it is refused.
+
+        Quietly dropping an unknown `--effort` reviews at the CLI's own
+        default and reports the result as if the configured effort had been
+        used, which is how a weak review passes for a strong one.
+        """
+        a = self.adapter()
+        mapping = a.effort_map()
+        assert isinstance(mapping, dict), "effort_map() must return a dict"
+        unknown = sorted(set(mapping) - EFFORTS)
+        assert not unknown, (
+            f"effort_map() invents canonical efforts {unknown} that "
+            f"config.EFFORTS does not define")
+        for canonical, cli in mapping.items():
+            assert isinstance(cli, str) and cli, (
+                f"effort_map()[{canonical!r}] is {cli!r}; a CLI spelling must "
+                f"be a non-empty string")
+
+        case = self.effort_reject_case()
+        if case is None:
+            # Total support claimed — verify it. `"none"` is excluded by
+            # design: it is the opt-out, handled before any lookup, not a CLI
+            # value (see `base.Adapter.effort_map`).
+            missing = sorted((EFFORTS - {_EFFORT_OPT_OUT}) - set(mapping))
+            assert not missing, (
+                f"effort_reject_case() returned None (total support) but "
+                f"effort_map() has no CLI value for {missing}")
+            return
+        reviewer, message = case
+        assert isinstance(reviewer, Reviewer), (
+            "effort_reject_case() must return (Reviewer, str) or None")
+        with pytest.raises(ValueError, match=message):
+            a.build_cmd(Path("prompt.txt"), reviewer, Defaults(), Path("."))
+
+    # ---- rule 6: finding text is content, never signal ---------------------
+
+    def test_finding_text_never_triggers_degraded(self):
+        """A review that DISCUSSES a harness failure is not a harness failure.
+
+        Reviews quote the code and the logs they are reviewing. An adapter
+        that greps its stderr tells out of stdout would flag every review of
+        its own error-handling code as truncated — and, worse, would do it
+        non-deterministically, depending on what the diff happened to contain.
+
+        The mutated envelope is built by splicing the adapter's OWN stderr
+        signal words (taken from its `*degraded*stderr*` fixture, so no
+        adapter-specific table is needed here) into a finding title of its own
+        healthy capture, byte-for-byte in place. That keeps the envelope
+        genuinely well-formed rather than approximately so.
+        """
+        a = self.adapter()
+        sources = self.select(_is_degraded_stderr)
+        assert sources, (
+            "no *degraded*stderr* fixture to borrow signal words from")
+        healthy = self.select(_is_healthy)
+        assert healthy, "no *healthy* fixture"
+
+        spliced_any = False
+        for src in sources:
+            signal = _json_safe(src.stderr)
+            assert signal, f"{src.name}: stderr carries no printable signal"
+            for fx in healthy:
+                mutated = self._splice_into_finding_title(fx.stdout, signal)
+                if mutated is None:
+                    continue
+                spliced_any = True
+                where = f"{fx.name} + {src.name} signal words in a title"
+                assert signal.encode("utf-8") in mutated, where
+                parsed = a.parse(mutated, b"", REVIEW_CONTRACT)
+                assert parsed.parse_ok is True, (
+                    f"{where}: splicing text into a title broke the envelope; "
+                    f"the fixture, not the adapter, is at fault")
+                assert parsed.degraded is False, (
+                    f"{where}: parse reported degraded "
+                    f"({parsed.degraded_reason!r}) on finding TEXT")
+                res = self._classified(
+                    a.classify(0, mutated, b"", REVIEW_CONTRACT), where)
+                assert res.kind == "ok", (
+                    f"{where}: classified {res.kind} ({res.detail!r}) — "
+                    f"stdout content is not a harness signal")
+        assert spliced_any, (
+            "rule 6 needs a healthy fixture that parses and has at least one "
+            "finding whose `title` appears verbatim in the captured bytes; "
+            "none of "
+            f"{[f.name for f in healthy]} qualifies")
+
+    def _splice_into_finding_title(self, stdout: bytes,
+                                   signal: str) -> bytes | None:
+        """Append `signal` to a finding title, in place, in the raw bytes.
+
+        Returns None when this envelope offers no title that can be edited
+        without re-encoding it — the caller then tries the next fixture.
+
+        Byte replacement rather than decode-edit-reencode, and `signal` is
+        pre-filtered to characters that need no JSON escaping, for one reason:
+        an envelope typically carries the payload TWICE (once as a nested JSON
+        string, once as a structured object) at two different escaping depths.
+        A plain substring that needs no escaping is identical at every depth,
+        so a single `replace` keeps both copies valid and consistent.
+        """
+        a = self.adapter()
+        parsed = a.parse(stdout, b"", REVIEW_CONTRACT)
+        if not parsed.parse_ok:
+            return None
+        for finding in parsed.findings:
+            if not isinstance(finding, dict):
+                continue
+            title = finding.get("title")
+            if not isinstance(title, str) or not title:
+                continue
+            # Only a title that survives JSON encoding unchanged appears in the
+            # raw bytes verbatim and can be edited there.
+            if json.dumps(title)[1:-1] != title:
+                continue
+            needle = title.encode("utf-8")
+            if needle not in stdout:
+                continue
+            return stdout.replace(needle, (title + " " + signal).encode("utf-8"))
+        return None
+
+    # ---- rule 7: usable output wins over stderr noise ----------------------
+
+    def test_usable_output_wins_over_stderr_noise(self):
+        """`unavailable` means the provider could not serve, and it did.
+
+        Provider CLIs write warnings, retries and recovered auth handshakes to
+        stderr while the run succeeds. Reading those as an outage discards a
+        perfectly good review and — for `quota` — takes the provider out of
+        every later chain in the run.
+
+        The fixture proves itself: the SAME stderr with no payload on stdout
+        must classify `unavailable`. Without that, a fixture whose stderr said
+        nothing alarming would satisfy this rule vacuously.
+        """
+        a = self.adapter()
+        noisy = self.select(_is_noisy_healthy)
+        assert noisy, (
+            "no *healthy_noisy_stderr* fixture: every adapter must witness "
+            "the non-signal rule with its own auth/quota wording")
+        for fx in noisy:
+            alone = self._classified(
+                a.classify(fx.rc, b"", fx.stderr, REVIEW_CONTRACT),
+                f"{fx.name} stderr with empty stdout")
+            assert alone.kind == "unavailable", (
+                f"{fx.name}: its stderr classified {alone.kind} even with NO "
+                f"stdout, so this fixture does not actually witness the "
+                f"non-signal rule — put real auth/quota wording in it")
+            res = self._classified(
+                a.classify(0, fx.stdout, fx.stderr, REVIEW_CONTRACT),
+                f"{fx.name} classify")
+            assert res.kind == "ok", (
+                f"{fx.name}: classified {res.kind}/{res.category} "
+                f"({res.detail!r}) although stdout carried a valid payload")
+            assert a.parse(fx.stdout, fx.stderr,
+                           REVIEW_CONTRACT).parse_ok is True, (
+                f"{fx.name}: stdout must carry a usable payload for this rule "
+                f"to mean anything")
+
+
+def _json_safe(blob: bytes) -> str:
+    """`blob` reduced to characters that need no JSON escaping at any depth."""
+    text = blob.decode("utf-8", "replace")
+    return "".join(ch for ch in text
+                   if ch.isprintable() and ch not in '"\\').strip()
+
+
+# --------------------------------------------------------------------------
+# the coverage gate
+# --------------------------------------------------------------------------
+#
+# These two functions are IMPORTED into each adapter's test module, which is
+# what makes pytest collect them. They live here so that the gate is defined
+# once, next to the suite it gates, and cannot drift per adapter.
+
+
+def _load_sibling_adapter_test_modules() -> None:
+    """Import every `tests/test_adapter_*.py` that is not already loaded.
+
+    A gate that only holds when the whole suite happens to be selected is not
+    a gate: `pytest tests/test_adapter_codex.py` would otherwise report the
+    grok adapter as uncovered merely because its module was never imported.
+    Modules pytest already imported are left alone, under whatever name it
+    gave them, so nothing is executed twice in a normal run.
+    """
+    here = Path(__file__).resolve().parent
+    loaded = {name.rsplit(".", 1)[-1] for name in list(sys.modules)}
+    for path in sorted(here.glob("test_adapter_*.py")):
+        if path.stem not in loaded:
+            importlib.import_module(f"tests.{path.stem}")
+
+
+def _conformance_subclasses() -> list[type]:
+    """Every subclass of `AdapterConformance`, transitively."""
+    out: list[type] = []
+    seen: set[int] = set()
+    stack = list(AdapterConformance.__subclasses__())
+    while stack:
+        cls = stack.pop()
+        if id(cls) in seen:
+            continue
+        seen.add(id(cls))
+        out.append(cls)
+        stack.extend(cls.__subclasses__())
+    return out
+
+
+def test_every_registered_adapter_has_conformance_coverage():
+    """Registering an adapter without a conformance suite fails CI.
+
+    By construction rather than by convention: the alternative is a checklist
+    in a plan document, which the next contributor has no way of being
+    reminded of. An unconformed adapter is one whose ability to notice its own
+    CLI failing has never been demonstrated, and that adapter reporting "no
+    findings" is indistinguishable from a clean review.
+    """
+    _load_sibling_adapter_test_modules()
+    covered: dict[str, list[str]] = {}
+    for cls in _conformance_subclasses():
+        where = f"{cls.__module__}.{cls.__qualname__}"
+        provider = getattr(cls, "provider_id", "")
+        assert provider, (
+            f"{where} subclasses AdapterConformance without setting "
+            f"`provider_id`, so it proves coverage for nothing")
+        # pytest collects `Test*` classes only. A subclass named otherwise is
+        # never run, and a suite that never runs is not coverage.
+        assert cls.__name__.startswith("Test"), (
+            f"{where} is a conformance subclass pytest will never collect: "
+            f"rename it to Test{cls.__name__}")
+        covered.setdefault(provider, []).append(where)
+
+    missing = sorted(set(_REGISTRY) - set(covered))
+    assert not missing, (
+        f"registered providers with no AdapterConformance subclass: "
+        f"{missing} — add one in tests/test_adapter_<name>.py before "
+        f"registering the adapter")
+    unknown = sorted(set(covered) - set(_REGISTRY))
+    assert not unknown, (
+        f"conformance subclasses claim providers that are not registered: "
+        f"{ {p: covered[p] for p in unknown} }")
+
+
+def test_coverage_gate_fails_without_a_conformance_subclass(monkeypatch):
+    """The gate is proved to bite, on a provider that has no suite.
+
+    A coverage gate nobody has watched fail is an assertion about itself.
+    """
+    class _UnconformedAdapter:
+        name = "unconformed"
+        provider = "acme-unconformed"
+
+    monkeypatch.setitem(_REGISTRY, "acme-unconformed", _UnconformedAdapter)
+    with pytest.raises(AssertionError, match="acme-unconformed"):
+        test_every_registered_adapter_has_conformance_coverage()
