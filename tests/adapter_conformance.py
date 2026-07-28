@@ -132,6 +132,11 @@ from skodun.adapters import (
 )
 from skodun.config import EFFORTS, Defaults, Reviewer
 
+# `tests.test_adapter_codex` already imports this the same way for its own
+# decode-site regression test — reused here rather than duplicated. See its
+# one use in `_GARBAGE` below for why.
+from tests.test_adapter_base import _recursion_bomb
+
 # The complete `ClassifyResult.category` vocabulary. Spelled here rather than
 # imported so that a category quietly added to `base` still has to be argued
 # for HERE, where the cacheability consequences live: only `quota` is a
@@ -146,10 +151,22 @@ _KINDS = frozenset({"ok", "degraded", "unavailable"})
 # happens, not a CLI spelling. See `base.Adapter.effort_map`.
 _EFFORT_OPT_OUT = "none"
 
+# Deep-enough JSON nesting to defeat the decoder with a `RecursionError`
+# rather than a `ValueError` — the exact defect `base._DECODE_FAILURES`
+# exists to guard, and the one entry `_GARBAGE` below needs so that a Task
+# 6/10 adapter with its own decode site (as codex's `_events` has) cannot
+# pass this registration gate with no `RecursionError` guard at all: removing
+# `RecursionError` from `base._DECODE_FAILURES` fails zero conformance-mixin
+# tests without it. `_recursion_bomb` itself is imported, not duplicated —
+# see the top of this file.
+
 # Inputs no adapter may raise on. `b"{"` is a truncated object (a real
 # mid-write capture), `b"\x00\xff" * 512` is invalid UTF-8 (which is what a
-# decoder-level crash needs), and `b"[]"` is valid JSON of the wrong shape —
-# the case a `json.loads(...)["findings"]` would die on.
+# decoder-level crash needs), `b"[]"` is valid JSON of the wrong shape — the
+# case a `json.loads(...)["findings"]` would die on — and `_recursion_bomb()`
+# (built once, here, at import time: `_GARBAGE` is exercised across every
+# contract and rc value the mixin tries, and probing per-case would slow an
+# already quadratic scan for no reason) is the deep-nesting bomb above.
 #
 # The last entry is ELIGIBLE but INVALID: `_review_eligible` accepts it (it has
 # both keys), `_valid_payload` rejects it (`summary` is not a string). Without
@@ -159,7 +176,8 @@ _EFFORT_OPT_OUT = "none"
 # whose extractor scans raw stdout; the wire-format-agnostic version of the same
 # assertion is `test_no_payload_survives_a_failed_validation` below.
 _GARBAGE: tuple[bytes, ...] = (b"", b"{", b"\x00\xff" * 512, b"[]",
-                               b'{"summary": 5, "findings": []}')
+                               b'{"summary": 5, "findings": []}',
+                               _recursion_bomb())
 
 # Two probes over the REVIEW contract's own eligibility rule, differing only in
 # `validate`. Together they pin "payload is gated by `parse_ok`, not merely by
@@ -351,6 +369,20 @@ def _is_degraded_stderr(name: str) -> bool:
     return _is_degraded(name) and "stderr" in name
 
 
+# Rule 6's failed-run half asks "is `signal` alone, with no payload, a REAL
+# unavailability tell for this adapter?" It must ask that at a FIXED rc,
+# never at the fixture's own `rc`: an `*unavailable*` fixture may (and
+# naturally does — it is the single most obvious first `*unavailable*`
+# fixture an adapter author writes) declare `rc=127`, and every registered
+# adapter's `classify` returns `unavailable/binary` at rc 127 BEFORE it ever
+# looks at stderr (see `test_missing_binary_is_unavailable_binary`). Probing
+# with the fixture's own rc would then certify even completely inert stderr
+# as "a real tell" whenever the fixture happens to carry rc=127, and the
+# splice loop below would run on a signal that proves nothing. `0` matches
+# one of the rc values the splice loop itself probes at.
+_PREMISE_PROBE_RC = 0
+
+
 # --------------------------------------------------------------------------
 # the mixin
 # --------------------------------------------------------------------------
@@ -427,6 +459,15 @@ class AdapterConformance:
 
     def select(self, pred) -> list[Fixture]:
         return [f for f in self.fixtures() if pred(f.name)]
+
+    def _is_real_unavailability_tell(self, a: Adapter, signal: str) -> bool:
+        """True iff `signal` ALONE, at a FIXED rc, makes `a` report unavailable.
+
+        See `_PREMISE_PROBE_RC`'s docstring for why the rc must be fixed
+        rather than taken from whichever fixture `signal` was borrowed from.
+        """
+        return a.classify(_PREMISE_PROBE_RC, b"", signal.encode("utf-8"),
+                          REVIEW_CONTRACT).kind == "unavailable"
 
     def _classified(self, res: ClassifyResult, where: str) -> ClassifyResult:
         """Assert the invariants every `ClassifyResult` owes, then return it.
@@ -554,7 +595,15 @@ class AdapterConformance:
                 f"handed to the caller as `payload` — `parse_ok` is then "
                 f"advisory, and a caller reading `payload` acts on a review "
                 f"nothing validated")
-            assert res.findings == [] and res.summary == "", fx.name
+            # No `findings`/`summary` assertion here: both probe contracts are
+            # `OutputContract("review-probe", ...)`, never `is REVIEW_CONTRACT`
+            # by identity, so every adapter's projection guard already forces
+            # those two fields empty regardless of `parse_ok` or of the
+            # mutation under test — an assertion here could not fail and would
+            # read as evidence when it is not. Rule 1b
+            # (`test_refuter_shape_is_parsed_classified_and_not_a_review`)
+            # exercises that projection guard non-vacuously, against a real
+            # foreign contract.
 
     # ---- rule 1b: the refuter shape ---------------------------------------
 
@@ -887,8 +936,10 @@ class AdapterConformance:
             # …and these exact bytes really are a tell: on stderr, with nothing
             # on stdout, they take the provider down. Without this the splice
             # below could be harmless text and the rule would pass vacuously.
-            if a.classify(src.rc, b"", signal.encode("utf-8"),
-                          REVIEW_CONTRACT).kind != "unavailable":
+            # Probed at a FIXED rc (see `_is_real_unavailability_tell`), never
+            # at `src.rc`: an *unavailable* fixture may declare rc=127, at
+            # which every adapter is unavailable/binary regardless of stderr.
+            if not self._is_real_unavailability_tell(a, signal):
                 continue
             for fx in healthy:
                 mutated = self._splice_into_finding_title(fx.stdout, signal)
@@ -919,6 +970,42 @@ class AdapterConformance:
             "*unavailable* fixture whose STDERR carries the wording (one whose "
             "evidence is only in the stream cannot supply it) and a healthy "
             "fixture with a spliceable finding title")
+
+    def test_rule_6_premise_probe_ignores_an_unavailable_fixtures_own_rc(self):
+        """Regression: an `*unavailable*` fixture declaring `rc=127` must not
+        make the premise probe above certify inert text as a real tell.
+
+        `binary` (rc 127) is the single most natural first `*unavailable*`
+        fixture an adapter author writes, and every registered adapter's
+        `classify` returns `unavailable/binary` at rc 127 before it even
+        looks at stderr. A premise probe that asked "is this wording a real
+        tell?" using such a fixture's OWN `rc` would answer yes for
+        completely inert stderr — measured directly here as the reviewer
+        measured it: `classify(127, b"", b"...inert...")` is `unavailable`
+        regardless of what the inert text says. `_is_real_unavailability_tell`
+        must therefore probe at a FIXED rc (`_PREMISE_PROBE_RC`), not at
+        whatever rc the fixture under test happens to declare.
+        """
+        a = self.adapter()
+        inert = "the weather is nice today, and this stderr line names no " \
+                "provider failure of any kind"
+        # Sanity + the defect's precondition: rc 127 alone is unavailable/
+        # binary for every adapter, independent of stderr content — this is
+        # exactly what a rc=127 *unavailable* fixture's rc would supply to a
+        # premise probe that (wrongly) used `src.rc` instead of a fixed rc.
+        assert a.classify(UNAVAILABLE_RC, b"", inert.encode("utf-8"),
+                          REVIEW_CONTRACT).kind == "unavailable", (
+            f"{type(self).__name__}: sanity failed — rc {UNAVAILABLE_RC} did "
+            f"not classify unavailable/binary regardless of stderr; see "
+            f"test_missing_binary_is_unavailable_binary")
+        # The premise probe itself must not reach that same wrong conclusion:
+        # inert wording is not a real tell at the FIXED probe rc.
+        assert not self._is_real_unavailability_tell(a, inert), (
+            f"{type(self).__name__}: inert text was certified as a real "
+            f"unavailability tell — the premise probe must use a fixed rc "
+            f"({_PREMISE_PROBE_RC}), not a fixture's own rc=127, or an "
+            f"*unavailable* fixture with rc=127 reopens the vacuity rule 6 "
+            f"exists to close")
 
     def _splice_into_finding_title(self, stdout: bytes,
                                    signal: str) -> bytes | None:

@@ -195,23 +195,35 @@ def _first_eligible_object(
     `loads` die with "Extra data" and lose the answer entirely.
 
     `transform` is applied to each decoded candidate BEFORE `eligible` sees it,
-    inside the same `try`, and is how an adapter translates its CLI's spelling
-    of a payload into the contract's. The codex adapter passes `_strip_nulls`
-    (OpenAI strict mode cannot express an absent key, only a null one); grok
-    passes nothing, because its envelope needs no translation. Keeping the call
-    inside the `try` is deliberate: a transform is fed decoded-but-untrusted
-    JSON, so whatever it throws must be as survivable as a decode failure.
+    and is how an adapter translates its CLI's spelling of a payload into the
+    contract's. The codex adapter passes `_strip_nulls` (OpenAI strict mode
+    cannot express an absent key, only a null one); grok passes nothing,
+    because its envelope needs no translation. `transform` is arbitrary
+    adapter-supplied code fed decoded-but-untrusted JSON — a shape it does not
+    control — so its call is guarded by its OWN `except Exception`, broader
+    than `_DECODE_FAILURES`: nothing pins a transform to raising only
+    `ValueError`/`RecursionError`, and this function's whole job is that
+    NOTHING it does, decode or transform, escapes as an exception. A
+    candidate the transform chokes on is treated exactly like one the decoder
+    itself could not read: skipped, in favour of the next `{`.
     """
     decoder = json.JSONDecoder()
     pos = text.find("{")
     while pos != -1:
         try:
             obj, _ = decoder.raw_decode(text, pos)
-            if transform is not None:
-                obj = transform(obj)
         except _DECODE_FAILURES:
             pos = text.find("{", pos + 1)
             continue
+        if transform is not None:
+            try:
+                obj = transform(obj)
+            except Exception:  # noqa: BLE001 - deliberately total; a
+                # transform is caller-supplied code over untrusted-shaped
+                # data, so it gets the same fail-closed treatment `_ask`
+                # gives contract predicates, not just `_DECODE_FAILURES`.
+                pos = text.find("{", pos + 1)
+                continue
         if _ask(eligible, obj):
             return obj
         pos = text.find("{", pos + 1)

@@ -20,7 +20,12 @@ import json
 import pytest
 
 from skodun.adapters import ParseResult, REVIEW_CONTRACT, REFUTER_CONTRACT, get_adapter
-from skodun.adapters.base import UNAVAILABLE_RC, OutputContract
+from skodun.adapters.base import (
+    UNAVAILABLE_RC,
+    OutputContract,
+    _first_eligible_object,
+    _review_eligible,
+)
 from skodun.adapters.grok import GrokAdapter
 from skodun.config import EFFORTS, Defaults, Reviewer
 
@@ -266,6 +271,28 @@ def test_deeply_nested_json_does_not_escape_as_an_exception(contract):
     assert p.findings == [] and p.summary == ""
     assert a.classify(0, bomb, b"", contract).kind in (
         "ok", "degraded", "unavailable")
+
+
+@pytest.mark.parametrize("exc", [TypeError, KeyError, AttributeError, MemoryError])
+def test_a_transform_that_raises_a_non_decode_exception_is_survived(exc):
+    """`_first_eligible_object`'s transform guard, pinned against drift.
+
+    `transform` is arbitrary adapter-supplied code (codex's `_strip_nulls`
+    today) fed decoded-but-untrusted JSON — a shape it does not control.
+    Nothing pins it to raising only `ValueError`/`RecursionError`
+    (`_DECODE_FAILURES`), and this module's docstring says a transform's
+    throw "must be as survivable as a decode failure" — so a `TypeError`,
+    `KeyError`, `AttributeError` or `MemoryError` out of a transform must be
+    survived exactly like a decode failure: the candidate is skipped, not
+    raised into the gate path. This is the module `parse`'s never-raise
+    promise lives in; it has no other net once a transform is wired in.
+    """
+    def _boom(obj: object) -> object:
+        raise exc("adapter transform bug")
+
+    text = '{"summary": "s", "findings": []}'
+    assert _first_eligible_object(text, _review_eligible,
+                                  transform=_boom) is None
 
 
 def _explode(obj: object) -> bool:
