@@ -338,7 +338,16 @@ def test_provider_state_ttl_bypass_and_rows(tmp_path):
   Record in the task's commit message which flags the installed version actually accepted.
 - `build_cmd`: shell interpolation of the prompt is forbidden, always. If the probe shows the installed CLI has an input-file flag, use it; otherwise set the class attr `stdin_from_prompt_file = True` (now part of the Task 1 protocol) and return argv ending in the CLI's stdin marker (`[bin, "exec", "-", ...flags]`) — Task 7's runner change feeds the prompt file as the child's stdin. Decide from the probe; document the choice in the adapter docstring.
 - Binary: `resolve_binary()` per the Task 1 convention — `SKODUN_CODEX_BIN` → `codex` on PATH.
-- `effort_map()`: `{"none": "minimal", "low": "low", "medium": "medium", "high": "high", "max": "xhigh"}` — total, no rejection case (pass `effort_reject_case() -> None` and prove totality).
+- `effort_map()`: `{"none": "none", "low": "low", "medium": "medium", "high": "high", "max": "xhigh"}` — total, no rejection case (pass `effort_reject_case() -> None` and prove totality).
+  **Deviation recorded at implementation time (Task 5):** the plan and spec both said
+  `none → minimal`. The installed CLI rejects `minimal` for every model it offers, so the
+  target value is `none`; the map stays total and nothing silently downgrades. The binary
+  outranks the plan. Two further Task 5 deviations, same cause: `--output-schema` is OpenAI
+  **strict** mode, so `contract.json_schema` verbatim is a 400 — `build_cmd` writes a strict
+  *projection* of the contract schema (objects closed, properties required, contract-optionals
+  widened to accept `null`) and `parse` strips JSON nulls before validating; and the payload
+  source is the JSONL event scan rather than `-o/--output-last-message`, because the `Adapter`
+  protocol hands `parse` bytes and never a path.
 - `parse(stdout, stderr, contract)`: stdout is a JSONL event stream; scan for the final agent-message item (`item.completed` with the message payload, or the `-o`-style last message if the probe shows a simpler shape), then validate via `contract.validate` and the shared `base` helpers (moved there in Task 1). The `--output-schema` file content is `contract.json_schema`: **`build_cmd` itself is responsible for writing it** (UTF-8, always overwritten) to `prompt_file.with_suffix(".schema.json")` and referencing that path in the returned argv — the caller creates no schema file. The pipeline owns the prompt file's directory, so the sidecar needs no extra cleanup. Document this in the adapter docstring.
 - `classify -> ClassifyResult`: **usable terminal output wins** — when the stream carries a schema-valid final message, classify `ok` regardless of stderr noise (conformance rule 7; grok's Phase 1 auth-noise rule, generalized). Otherwise: `unavailable` on rc 127 (`binary`), stderr auth/login signals (`login`, `unauthorized`, `401`) (`auth`), quota signals (`rate limit`, `quota`, `429`) (`quota`), unknown-model errors (`model`); `degraded` on a stream with events but **no** terminal turn-completion event, or an explicit stream-error event; else `ok`. All matched case-insensitively on stderr and on event `type` fields — never on message text content (conformance rule 6).
 
