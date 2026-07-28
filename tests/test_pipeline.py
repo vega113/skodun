@@ -235,7 +235,14 @@ def test_persisted_record_carries_the_full_artifact_schema(tmp_path, capsys):
     assert [a["n"] for a in rec["attempts"]] == [1]
     assert rec["severity"] == {"high": 1, "medium": 0, "low": 0}
     assert rec["rule_ids"] == ["no-foo"]
-    assert rec["extra_passes"] == {}
+    # No extra pass RAN. The one entry is the refuter saying it was never
+    # configured: this review has findings, so it earned a cross-provider
+    # re-examination and got none, and a record that never mentions the refuter
+    # is indistinguishable from one whose refuter confirmed everything. It
+    # annotates nothing and demotes nothing — see tests/test_refuter.py.
+    assert set(rec["extra_passes"]) == {"refuter"}
+    assert rec["extra_passes"]["refuter"]["status"] == "skipped"
+    assert rec["extra_passes"]["refuter"]["ran"] is False
     assert rec["failure_reason"] == ""
     # ...and the gate's fail-closed artifact validator accepts it.
     assert load_valid_artifact(rec) is rec
@@ -840,8 +847,11 @@ def test_skeptic_pass_is_not_scheduled_for_a_review_with_findings(
     _fake_grok(tmp_path, _emit(DIRTY))
     repo = _repo(tmp_path)
     rec = _run(repo, _store(tmp_path))
-    assert _calls(tmp_path) == 1
-    assert rec["extra_passes"] == {}
+    assert _calls(tmp_path) == 1              # one model call: the finder's
+    # ...and the only `extra_passes` entry is the refuter recording that this
+    # config has none. Nothing ran, nothing merged.
+    assert set(rec["extra_passes"]) == {"refuter"}
+    assert rec["extra_passes"]["refuter"]["status"] == "skipped"
 
 
 def test_skeptic_pass_is_not_scheduled_for_an_untrustworthy_review(

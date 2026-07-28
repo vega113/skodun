@@ -72,7 +72,11 @@ _REFUTER_SCHEMA = (
 
 _SEVERITIES = frozenset({"high", "medium", "low"})
 
-_VERDICTS = frozenset({"confirmed", "refuted", "uncertain"})
+#: The refuter's verdict vocabulary. PUBLIC and imported rather than re-spelled:
+#: `passes.merge_refuter_pass` re-checks a verdict before annotating a finding
+#: with it, and a second copy of this set is one edit away from a merge that
+#: accepts a word the contract validator rejects (or the reverse).
+REFUTER_VERDICTS = frozenset({"confirmed", "refuted", "uncertain"})
 
 
 @dataclass(frozen=True)
@@ -335,7 +339,7 @@ def _valid_verdicts(obj: object) -> bool:
         # unhashable one turns a malformed verdict into a TypeError instead of
         # a `parse_ok=False`.
         verdict = v.get("verdict")
-        if not isinstance(verdict, str) or verdict not in _VERDICTS:
+        if not isinstance(verdict, str) or verdict not in REFUTER_VERDICTS:
             return False
         if not isinstance(v.get("reasoning"), str):
             return False

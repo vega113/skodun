@@ -1,4 +1,4 @@
-"""Two extra review passes, and how their results fold back into the primary.
+"""Three extra review passes, and how their results fold back into the primary.
 
 * **security** — a dedicated, security-only pass, scheduled only in `now` mode
   and only when the change touches a risky path.
@@ -6,10 +6,18 @@
   only when the primary review came back trustworthy with zero findings. One
   extra call on the rounds that are about to clear the gate is cheap; a false
   clear is not.
+* **refuter** — a *different provider* re-examines the finder's findings,
+  because a model asked to check its own work is agreeable about it. Scheduled
+  only in `now` mode, only when the finder came back trustworthy WITH findings,
+  and only when a reviewer with role `refuter` is configured. Unlike the other
+  two it is **annotation only**: see "The refuter is annotation only" below.
 
-Both are opt-out via env kill switches (`SKODUN_SECURITY_PASS=0`,
-`SKODUN_SKEPTIC_PASS=0`), so a wedged pass can be turned off without a config
-edit or a code change.
+All three are opt-out via env kill switches (`SKODUN_SECURITY_PASS=0`,
+`SKODUN_SKEPTIC_PASS=0`, `SKODUN_REFUTER_PASS=0`), so a wedged pass can be
+turned off without a config edit or a code change. All three read the switch
+through `_killed`, which compares against the exact string `"0"` — `bool("0")`
+and `bool("false")` are both True in Python, and treating the env value as a
+truthy string is how a kill switch silently stops killing.
 
 PARITY-CRITICAL: vendored from the oracle's `scripts/grok-extra-passes.py`
 (`path_is_risky`, `should_run_security`, `should_run_skeptic`,
@@ -107,6 +115,40 @@ mean different things and the gate reads them separately:
 Either demotion drives `trustworthy` false — set here, and recomputed from the
 axes by `store.save_review` regardless.
 
+The refuter is annotation only, and that is a decision, not an omission
+-----------------------------------------------------------------------
+`merge_refuter_pass` is deliberately NOT `merge_extra_pass`. A refuter verdict
+attaches to the finding it judges and moves nothing else: `findings_total`,
+`severity`, `rule_ids`, `summary` and all three trust axes come out of the
+merge exactly as they went in. A review whose only finding is marked `refuted`
+still gates 1. Only a human, through `skodun triage --adopt-refuter`, can turn
+a verdict into a dismissal — a model's opinion annotates, it never clears.
+
+Two consequences follow, and both are the opposite of what the other passes do:
+
+* **A failed refuter is a note, never a demotion.** Provider B being
+  unavailable is an ABSENT ANNOTATION, not a broken review, so
+  `merge_refuter_pass(primary, None, ...)` records `status: "failed"` and
+  leaves `parse_ok`/`degraded`/`trustworthy` alone. The contrast with the
+  security pass is deliberate: a failed security pass still demotes, whichever
+  provider ran it. **Role semantics decide demotion, never provider identity.**
+* **Indexes and eligibility come from a FINDER SNAPSHOT**, which is the
+  caller's job to take (the pipeline snapshots `(finder_trustworthy,
+  finder_findings)` immediately after the finder's parse, before any
+  security/skeptic merge) and this module's job to respect:
+  `finder_findings_total` bounds which findings a verdict may reach. Finder
+  findings keep indexes `0..n-1` in the merged list because extra-pass merges
+  APPEND — a verdict pointing past that range is a verdict about a finding the
+  refuter was never shown, and it is dropped with a note rather than
+  misattributed.
+
+The reasoning floor is `triage`'s, measured `triage`'s way. A verdict whose
+reasoning is shorter than `MIN_REASON_CHARS` once whitespace-collapsed is kept
+for the human but marked `thin_reasoning`, which is what later refuses to adopt
+it. The measurement uses `textnorm.collapse_ws` — the same helper
+`triage.validate_reason` uses, and NOT `textnorm.norm`, which lowercases and
+can therefore *lengthen* a string past a floor it should not clear.
+
 DIVERGENCES from the oracle
 ---------------------------
 1. **A pass that produced nothing demotes, and says so by name.** The oracle
@@ -148,12 +190,19 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
+from .adapters import REFUTER_VERDICTS
 from .config import SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOTS, Defaults
 from .promptbuild import Prompt
+from .textnorm import collapse_ws
+from .triage import MIN_REASON_CHARS
 
-#: Env kill switches. Set either to `0` to never schedule that pass.
+#: Env kill switches. Set any of them to `0` to never schedule that pass.
 SECURITY_PASS_ENV = "SKODUN_SECURITY_PASS"
 SKEPTIC_PASS_ENV = "SKODUN_SKEPTIC_PASS"
+REFUTER_PASS_ENV = "SKODUN_REFUTER_PASS"
+
+#: The refuter pass's name, in `extra_passes` and in every note it writes.
+REFUTER_PASS = "refuter"
 
 #: The diff budget, sourced from config so there is exactly one of this number
 #: (it is also the oracle's own `GROK_MAX_DIFF_BYTES` default).
@@ -272,6 +321,82 @@ def should_run_skeptic(
     return n == 0
 
 
+def _enabled_refuter(cfg: Any) -> bool:
+    """Whether `cfg` names an enabled reviewer with role `refuter`.
+
+    Duck-typed and total: a config this function cannot read at all means "no
+    refuter", which is a silent skip. The refuter is an annotation pass, so
+    fail-soft here costs an annotation and never a trust decision — the exact
+    opposite of the fail-closed reading every trust axis gets.
+    """
+    for r in getattr(cfg, "reviewers", None) or ():
+        if getattr(r, "enabled", False) and getattr(r, "role", "") == "refuter":
+            return True
+    return False
+
+
+#: What the record says when a review earned a refuter pass and no reviewer was
+#: configured to run one. Recorded rather than raised: an unconfigured pass is
+#: not an error, and a review that silently never mentions the refuter looks
+#: exactly like one whose refuter agreed with everything.
+NO_REFUTER_CONFIGURED = (
+    "no enabled reviewer with role 'refuter' is configured, so the "
+    "cross-provider refuter pass was skipped")
+
+
+def refuter_decision(
+    mode: str,
+    finder_trustworthy: bool,
+    finder_findings_total: int,
+    cfg: Any,
+    env: Mapping[str, str] | None = None,
+) -> tuple[bool, str]:
+    """`(run, skip_note)` for the refuter pass, from the FINDER SNAPSHOT.
+
+    `finder_trustworthy` and `finder_findings_total` describe the finder's own
+    result, taken before any extra-pass merge. That is what makes this decision
+    mean "the finder produced findings worth a second opinion" rather than
+    "the record currently has findings from somewhere": a security finding must
+    not trigger a refuter the finder did not earn, and a security demotion must
+    not suppress one it did.
+
+    `skip_note` is non-empty for EXACTLY ONE skip: a review that was otherwise
+    eligible and has no refuter configured. Every other skip — killed, not
+    `now`, untrustworthy finder, nothing found — records nothing at all, the
+    same way an unscheduled security or skeptic pass does; a `refuter` key on
+    every clean review would say nothing and mean less.
+    """
+    if _killed(env, REFUTER_PASS_ENV):
+        return False, ""
+    if (mode or "").strip() != "now":
+        return False, ""
+    if not finder_trustworthy:
+        return False, ""
+    try:
+        n = int(finder_findings_total)
+    except (TypeError, ValueError):
+        # "Unknown" is not "some": a count that will not parse never fires the
+        # pass, exactly as in `should_run_skeptic`.
+        n = -1
+    if n <= 0:
+        return False, ""
+    if not _enabled_refuter(cfg):
+        return False, NO_REFUTER_CONFIGURED
+    return True, ""
+
+
+def should_run_refuter(
+    mode: str,
+    finder_trustworthy: bool,
+    finder_findings_total: int,
+    cfg: Any,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Whether to spend a second provider's call re-examining the findings."""
+    return refuter_decision(mode, finder_trustworthy, finder_findings_total,
+                            cfg, env)[0]
+
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
@@ -332,6 +457,52 @@ _SKEPTIC_LEAD: tuple[str, ...] = (
 )
 _SKEPTIC_PASS_LINE = 'Pass:   skeptic / adversarial clean-check (#3284)'
 # --- ORACLE TEXT END ---
+
+# The refuter prompt is skodun's own; the oracle had no such pass, so there is
+# nothing here to keep byte-compatible.
+#
+# PUBLIC OSS HYGIENE — this text is shipped data, sent to a model in every repo
+# that runs skodun, and is held to the same rule as any other committed string:
+# no upstream-project names, no one repo's layout vocabulary, no machine paths.
+# Unlike the security prompt it names no repo-specific concept at all — it talks
+# about "the diff" and "the findings" and nothing else — so it needs no slot
+# interface and takes no config. There is deliberately no `%(slot)s` span here
+# to fill, and `test_the_shipped_refuter_prompt_is_generic_and_slot_free` pins
+# that.
+#
+# The floor is interpolated from `MIN_REASON_CHARS` rather than typed in, so
+# the number the model is asked for and the number the merge measures cannot
+# drift apart.
+_REFUTER_LEAD: tuple[str, ...] = (
+    'You are re-examining another reviewer\'s findings on a pull-request diff.',
+    'You did not write them and you are not being asked to agree with them.',
+    'A finding that is wrong costs a human real time, so saying so is the job.',
+    '',
+    'For EACH numbered finding below, decide from the diff alone:',
+    '- "confirmed" - the diff really does contain the problem described',
+    '- "refuted"   - the finding is wrong: the code does not do what it says,',
+    '                the concern is already handled, or it does not apply here',
+    '- "uncertain" - the diff alone does not settle it',
+    '',
+    'Justify every verdict with the evidence that decided it: the line or',
+    'construct in the diff, never a restatement of the finding. At least',
+    '%d characters of real justification per verdict -- a verdict that does'
+    % MIN_REASON_CHARS,
+    'not justify itself is discarded. Do not add new findings, do not',
+    're-review the change, and do not soften a verdict to be agreeable.',
+    '',
+    'Do NOT modify files or run commands. Judge ONLY the unified diff below.',
+    '',
+    'Respond with ONLY a single JSON object (no prose, no markdown fences):',
+    '{"verdicts":[{"index":0,"verdict":"confirmed|refuted|uncertain",'
+    '"reasoning":"the evidence in the diff that decided it"}]}',
+    'Use each finding\'s own bracketed index. Return exactly one verdict per',
+    'finding, in any order; judge every one, and omit none.',
+    '',
+)
+_REFUTER_PASS_LINE = 'Pass:   refuter / cross-provider re-examination'
+_FINDINGS_BEGIN = '----- BEGIN FINDINGS UNDER RE-EXAMINATION -----'
+_FINDINGS_END = '----- END FINDINGS UNDER RE-EXAMINATION -----'
 
 
 def security_lead(
@@ -423,6 +594,84 @@ def skeptic_prompt(
     """The adversarial clean-check prompt: "prove them wrong if you can"."""
     return _render(_SKEPTIC_LEAD, _SKEPTIC_PASS_LINE, branch, base_ref,
                    base_sha, head, diff, max_diff_bytes)
+
+
+def refuter_lead() -> tuple[str, ...]:
+    """The refuter prompt's lead lines. No slots, no config, one text.
+
+    Present as a function for symmetry with `security_lead` and so that the
+    hygiene test has one thing to read — but it takes no arguments, and that
+    is the point: nothing a repo configures can change what this prompt says.
+    """
+    return _REFUTER_LEAD
+
+
+def _finding_lines(findings: Sequence[Any]) -> list[str]:
+    """The findings block: one `[i]` entry per finding, indented detail.
+
+    The bracketed number is the finding's position in the list it was handed —
+    the FINDER's own numbering — and it is what `merge_refuter_pass` keys a
+    verdict's `index` back onto. Every element gets an entry, including one
+    that is not a mapping at all: skipping a malformed finding would shift
+    every later index by one and silently re-point every verdict after it.
+
+    Titles are whitespace-collapsed so one finding is one `[i]` line; details
+    keep their own line structure, INDENTED, because a multi-line explanation
+    is the normal shape and flattening it costs the model context.
+
+    Both of those also bound what a finding can forge. A finding's text comes
+    from a model, so it is untrusted content being pasted into another model's
+    prompt: a title carrying a newline would otherwise open a second `[i]`
+    entry, and a detail line reading `----- END FINDINGS ... -----` at column 0
+    would close the block early. Collapsing the title and indenting every
+    detail line keeps both at the structural level of a detail — visible to a
+    reader, not a forged frame.
+    """
+    lines = [_FINDINGS_BEGIN]
+    for i, raw in enumerate(findings or ()):
+        f = raw if isinstance(raw, Mapping) else {}
+        where = collapse_ws(f.get("file")) or "(file not stated)"
+        line_no = f.get("line")
+        if isinstance(line_no, int) and not isinstance(line_no, bool):
+            where = "%s:%d" % (where, line_no)
+        severity = collapse_ws(f.get("severity")) or "unrated"
+        title = collapse_ws(f.get("title")) or "(no title)"
+        lines.append("[%d] (%s) %s -- %s" % (i, severity, where, title))
+        detail = str(f.get("detail") or "").strip()
+        lines.extend("    " + d for d in detail.splitlines() if d.strip())
+    if len(lines) == 1:
+        # `should_run_refuter` never schedules this, but a caller may still
+        # build the prompt; an empty block would read as "nothing to judge"
+        # while the instructions demand a verdict per finding.
+        lines.append("(no findings were supplied)")
+    lines.append(_FINDINGS_END)
+    return lines
+
+
+def refuter_prompt(
+    finder_findings: Sequence[Any],
+    diff: bytes,
+    branch: str,
+    base_ref: str,
+    base_sha: str,
+    head: str,
+    max_diff_bytes: int = DEFAULT_MAX_DIFF_BYTES,
+) -> Prompt:
+    """The cross-provider re-examination prompt: the diff, plus the findings.
+
+    Takes the diff BYTES, like `security_prompt` and `skeptic_prompt`: the
+    pipeline already holds `diff.data`, no diff file exists anywhere in this
+    path, and introducing one to pass a value that is already in scope would
+    be a filesystem round trip for nothing.
+
+    Returns a `Prompt` rather than bare bytes, for the reason DIVERGENCE 3 in
+    the module docstring gives for the other two builders: the truncation flag
+    belongs next to the bytes it describes, and the caller records it as this
+    pass's partial coverage.
+    """
+    lead = _REFUTER_LEAD + tuple(_finding_lines(finder_findings)) + ("",)
+    return _render(lead, _REFUTER_PASS_LINE, branch, base_ref, base_sha, head,
+                   diff, max_diff_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -639,4 +888,245 @@ def _merge(
     if extra is not None and note not in summary:
         out["summary"] = _appended(summary, note)
 
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The refuter merge — annotation only
+# ---------------------------------------------------------------------------
+
+#: How many dropped-verdict indexes one note names before it stops listing
+#: them. A note is for a human; a hundred integers is not.
+_MAX_LISTED_INDEXES = 10
+
+
+def _listed(indexes: Sequence[int]) -> str:
+    shown = ", ".join(str(i) for i in indexes[:_MAX_LISTED_INDEXES])
+    if len(indexes) > _MAX_LISTED_INDEXES:
+        shown += ", ..."
+    return shown
+
+
+def _refuter_meta(status: str, ran: bool) -> dict:
+    """The fixed skeleton of every `extra_passes.refuter` object.
+
+    One shape for all five outcomes (ran, degraded, failed, skipped, and the
+    absent case where nothing is recorded at all), so a reader — and Task 9's
+    adoption command — never has to ask whether a key is missing because the
+    pass did not get that far or because this outcome spells it differently.
+    """
+    return {
+        "pass": REFUTER_PASS,
+        "ran": ran,
+        "status": status,
+        "degraded": False,
+        "verdicts_total": 0,
+        "annotated": 0,
+        "dropped": 0,
+        "provider": None,
+        "model": None,
+        "effort": None,
+        "note": "",
+    }
+
+
+def merge_refuter_pass(
+    primary: Mapping[str, Any],
+    refuter_result: Mapping[str, Any] | None,
+    provenance: Mapping[str, Any],
+    finder_findings_total: int | None = None,
+    *,
+    degraded: bool = False,
+    partial_coverage: bool = False,
+    notes: Sequence[str] = (),
+) -> dict:
+    """Annotate a copy of `primary` with one refuter pass's verdicts.
+
+    CONTRACT
+    --------
+    `refuter_result` is the `REFUTER_CONTRACT` payload — `{"verdicts": [...]}`
+    — that a pass which RAN and PARSED produced, or `None` for a pass that
+    produced nothing usable. `None` is a legitimate argument here, unlike in
+    `merge_extra_pass`: a refuter that could not answer is an absent
+    annotation, and there is nothing for the caller to get wrong by passing it,
+    because neither branch demotes anything. Anything else that is not a
+    mapping raises.
+
+    `provenance` is `{provider, model, effort}` for the attempt that answered
+    (plus an optional `note`), exactly as `pipeline._provenance` builds it. The
+    provider and model are copied onto every annotation as well as into the
+    meta object: a verdict is only worth as much as the model behind it, and a
+    reader of one finding must not have to go looking for that elsewhere.
+
+    `finder_findings_total` is the FINDER SNAPSHOT's count and bounds which
+    findings a verdict may reach. It defaults to `len(primary["findings"])`,
+    which is correct only when nothing has been merged into the record yet —
+    the pipeline always passes it explicitly, and passing it is how a verdict
+    is kept off a finding some later pass appended. A value wider than the
+    record is clamped rather than trusted.
+
+    Returns a NEW record. `findings` is a fresh list of fresh shallow copies
+    (an annotation writes INTO a finding, so unlike `_merge` this cannot share
+    the dicts with the caller), and `extra_passes` is a fresh dict. Everything
+    else — counts, severity, rule ids, summary, and all three trust axes — is
+    carried over untouched. This function cannot make a review untrustworthy
+    and cannot change what the gate decides.
+    """
+    if not isinstance(primary, dict):
+        raise TypeError("primary must be a dict")
+    if refuter_result is not None and not isinstance(refuter_result, Mapping):
+        raise TypeError(
+            "refuter_result must be the REFUTER_CONTRACT payload as a mapping, "
+            "or None for a pass that produced nothing; got %s"
+            % type(refuter_result).__name__)
+
+    # POSITIONAL, and deliberately NOT `_as_findings`: that helper DROPS a
+    # non-mapping entry, which would renumber every finding after it and point
+    # every later verdict at the wrong one. Nothing is dropped here — an entry
+    # this function cannot annotate is carried through exactly as it arrived,
+    # holding its index open. ("Annotation only" also means the findings list
+    # comes out the same length it went in.)
+    raw_findings = primary.get("findings")
+    findings = [dict(f) if isinstance(f, dict) else f
+                for f in (raw_findings if isinstance(raw_findings, list) else [])]
+    if finder_findings_total is None:
+        limit = len(findings)
+    elif isinstance(finder_findings_total, bool) or not isinstance(
+            finder_findings_total, int):
+        raise TypeError(
+            "finder_findings_total must be an int or None, got %r"
+            % (finder_findings_total,))
+    else:
+        limit = max(0, min(finder_findings_total, len(findings)))
+
+    prov = dict(provenance or {})
+    prov_note = str(prov.pop("note", "") or "").strip()
+    provider = prov.get("provider")
+    model = prov.get("model")
+
+    verdicts: list = []
+    out_of_range: list[int] = []
+    duplicates: list[int] = []
+    malformed = 0
+    annotated = 0
+    seen: set[int] = set()
+    own_notes: list[str] = []
+
+    if refuter_result is not None:
+        raw = refuter_result.get("verdicts")
+        if isinstance(raw, list):
+            verdicts = raw
+        else:
+            own_notes.append("the refuter response carried no verdicts list")
+
+    for v in verdicts:
+        if not isinstance(v, Mapping):
+            malformed += 1
+            continue
+        index = v.get("index")
+        # `type(...) is int`, not `isinstance`: `bool` subclasses `int`, so
+        # `{"index": true}` would otherwise annotate finding number 1 with a
+        # verdict about something else entirely.
+        if type(index) is not int:
+            malformed += 1
+            continue
+        if not 0 <= index < limit:
+            out_of_range.append(index)
+            continue
+        if not isinstance(findings[index], dict):
+            # An artifact whose findings are not all objects is rejected by
+            # `triage.load_valid_artifact` long before the gate reads it; there
+            # is nothing here to write an annotation into either way.
+            malformed += 1
+            continue
+        if index in seen:
+            duplicates.append(index)
+            continue
+        verdict = v.get("verdict")
+        if not isinstance(verdict, str) or verdict not in REFUTER_VERDICTS:
+            malformed += 1
+            continue
+        reasoning = v.get("reasoning")
+        if not isinstance(reasoning, str):
+            malformed += 1
+            continue
+        seen.add(index)
+        annotation = {"verdict": verdict, "reasoning": reasoning,
+                      "provider": provider, "model": model}
+        # `collapse_ws`, the helper `triage.validate_reason` measures its floor
+        # with -- NOT `norm`, which lowercases and can lengthen a string past a
+        # floor it should not clear. The annotation is KEPT either way: the
+        # human still gets to read it, and it is adoption that is refused.
+        if len(collapse_ws(reasoning)) < MIN_REASON_CHARS:
+            annotation["thin_reasoning"] = True
+        findings[index][REFUTER_PASS] = annotation
+        annotated += 1
+
+    if out_of_range:
+        own_notes.append(
+            "dropped %d verdict(s) whose index is outside the finder's "
+            "0..%d range: %s" % (len(out_of_range), limit - 1,
+                                 _listed(out_of_range)))
+    if duplicates:
+        own_notes.append(
+            "dropped %d duplicate verdict(s) (the first verdict for an index "
+            "wins): %s" % (len(duplicates), _listed(duplicates)))
+    if malformed:
+        own_notes.append("dropped %d malformed verdict(s)" % malformed)
+
+    status = ("failed" if refuter_result is None
+              else "degraded" if degraded else "ran")
+    meta = _refuter_meta(status, refuter_result is not None)
+    meta["degraded"] = bool(degraded)
+    meta["verdicts_total"] = len(verdicts)
+    meta["annotated"] = annotated
+    meta["dropped"] = len(out_of_range) + len(duplicates) + malformed
+    if refuter_result is None:
+        # The same word `merge_failed_extra_pass` uses, and deliberately NOT
+        # the demotion that goes with it there.
+        meta["failed"] = True
+    if partial_coverage:
+        meta["partial_coverage"] = True
+    meta.update(prov)
+    meta["note"] = "; ".join(
+        n for n in ([prov_note] + list(notes) + own_notes) if n)
+
+    return _annotated(primary, findings, meta)
+
+
+def skipped_refuter_pass(primary: Mapping[str, Any], note: str) -> dict:
+    """Record that an eligible refuter pass was skipped, and why.
+
+    For the one skip worth recording — a review that earned a refuter and had
+    none configured. A demand for a reason, like `merge_failed_extra_pass`'s,
+    but nothing else about it is the same: this changes no finding, no count
+    and no trust axis.
+    """
+    reason = str(note or "").strip()
+    if not reason:
+        raise ValueError(
+            "skipped_refuter_pass() requires a non-empty note: a record that "
+            "mentions the refuter without saying why it did not run is worse "
+            "than one that never mentions it")
+    meta = _refuter_meta("skipped", False)
+    meta["skipped"] = True
+    meta["note"] = reason
+    return _annotated(primary, None, meta)
+
+
+def _annotated(primary: Mapping[str, Any], findings: list[dict] | None,
+               meta: dict) -> dict:
+    """Copy `primary` with new `findings` (if any) and the refuter's meta.
+
+    The one place the refuter writes to a record, so the "annotation only"
+    property is enforceable by reading a single function: it assigns exactly
+    two keys, and neither is a count, a severity, a summary or a trust axis.
+    """
+    out = dict(primary)
+    if findings is not None:
+        out["findings"] = findings
+    extras = out.get("extra_passes")
+    extras = dict(extras) if isinstance(extras, dict) else {}
+    extras[REFUTER_PASS] = meta
+    out["extra_passes"] = extras
     return out

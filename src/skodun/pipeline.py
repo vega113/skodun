@@ -94,8 +94,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import checklist, contextpack, gitio, passes, promptbuild, runner
-from .adapters import (REVIEW_CONTRACT, UNAVAILABLE_RC, OutputContract,
-                       ParseResult, get_adapter)
+from .adapters import (REFUTER_CONTRACT, REVIEW_CONTRACT, UNAVAILABLE_RC,
+                       OutputContract, ParseResult, get_adapter)
 from .config import Config, Defaults, Reviewer
 from .store import Store
 from .trust import banner, is_trustworthy
@@ -115,8 +115,16 @@ LOCK_WRITE_GRACE_SEC = 30.0
 STALE_RECORD_GRACE_SEC = 60
 
 #: How many full reviewer runs one held lock can cover: the primary review plus
-#: the security and skeptic passes, each of which runs INSIDE the lock with its
-#: own complete retry budget. See `lock_stale_ceiling_sec`.
+#: the security pass plus ONE of the skeptic/refuter pair, each of which runs
+#: INSIDE the lock with its own complete retry budget. See
+#: `lock_stale_ceiling_sec`.
+#:
+#: Three, not four, with three extra passes wired up: the skeptic needs the
+#: merged record to have ZERO findings and the refuter needs the FINDER to have
+#: had at least one, and extra-pass merges only ever append — so a run that
+#: schedules one can never schedule the other. `test_refuter.py::
+#: test_the_refuter_and_the_skeptic_are_mutually_exclusive` pins that, because
+#: this number is what keeps a peer from reclaiming a live holder's lock.
 _MAX_PASSES_UNDER_LOCK = 3
 
 #: `Store.list_reviews` passes this straight to SQLite's `LIMIT`, where a
@@ -915,7 +923,8 @@ def _reviewer_for(cfg: Config, role: str) -> Reviewer | None:
 #: the order the passes are scheduled. ONE table: `_pass_reviewer` reads it to
 #: pick the reviewer and preflight reads it to validate every reviewer this run
 #: may reach for, so a new pass cannot be wired up on one side only.
-_EXTRA_PASS_ROLES = {"security": "security", "skeptic": "refuter"}
+_EXTRA_PASS_ROLES = {"security": "security", "skeptic": "refuter",
+                     "refuter": "refuter"}
 
 
 def _pass_reviewer(cfg: Config, pass_name: str, finder: Reviewer) -> Reviewer:
@@ -1163,7 +1172,29 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
             rec["attempts"] = outcome.attempts
             _apply(rec, outcome)
 
-            # --- 8. the extra passes, still under the lock ----------------
+            # --- 8. THE FINDER SNAPSHOT, taken before any merge -----------
+            # The refuter's eligibility, its prompt, and the meaning of every
+            # verdict index are all fixed HERE, on what the finder itself
+            # produced — never on the merged record. Three things ride on
+            # that, and each of them is a real failure the merged record would
+            # cause: a security finding must not trigger a refuter the finder
+            # did not earn; a security demotion must not suppress one the
+            # finder did earn; and a verdict's `index` must mean the finder's
+            # own numbering, which stays `0..n-1` in the merged list only
+            # because extra-pass merges APPEND.
+            finder_trustworthy = is_trustworthy(
+                rec["parse_ok"], rec["degraded"], rec["diff_truncated"])
+            finder_findings = list(rec["findings"])
+            finder_findings_total = rec["findings_total"]
+            # Whoever ACTUALLY answered, not whoever was asked: after a
+            # fallback the finder's own entry may never have run, and "did a
+            # second provider look at this?" is a question about the answering
+            # provider.
+            finder_provider = (outcome.accepted["provider"]
+                               if outcome.accepted is not None
+                               else finder.provider)
+
+            # --- 9. the extra passes, still under the lock ----------------
             if hold_for_security:
                 rec = _extra_pass(
                     rec, "security",
@@ -1186,7 +1217,27 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                     _pass_reviewer(cfg, "skeptic", finder), cfg, d, root,
                     store, scratch)
 
-        # --- 9. persist the final record, then banner from what was stored
+            # --- 10. the refuter: a DIFFERENT provider re-examines the
+            # finder's findings. It EXECUTES last, so the published record is
+            # complete in one write and the banner is printed once — but every
+            # input it uses is the snapshot above, not the record it is about
+            # to annotate. No fail-closed hold: a refuter that could not answer
+            # is an absent annotation, never a demotion.
+            run_refuter, skip_note = passes.refuter_decision(
+                mode, finder_trustworthy, finder_findings_total, cfg)
+            if run_refuter:
+                rec = _refuter_pass(
+                    rec, finder_findings_total,
+                    lambda: passes.refuter_prompt(
+                        finder_findings, diff.data, branch, base.ref, base.sha,
+                        f"{head} (working tree)", d.max_diff_bytes),
+                    _pass_reviewer(cfg, "refuter", finder), cfg, d, root,
+                    store, scratch, finder_provider)
+            elif skip_note:
+                _note(skip_note)
+                rec = passes.skipped_refuter_pass(rec, skip_note)
+
+        # --- 11. persist the final record, then banner from what was stored
         rec["trustworthy"] = is_trustworthy(
             rec["parse_ok"], rec["degraded"], rec["diff_truncated"])
         rec["status"] = _status_for(rec)
@@ -1195,7 +1246,7 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
         _emit_banner(stored)
         return stored
     finally:
-        # --- 10. never leave a `running` record or a held lock behind -----
+        # --- 12. never leave a `running` record or a held lock behind -----
         if persisted and not finalized:
             try:
                 store.set_status(rid, "failed")
@@ -1390,3 +1441,99 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
     # with its own fallback chain may have been answered by any entry in it.
     return _with_provenance(passes.merge_extra_pass(rec, extra, name), name,
                             _provenance(outcome))
+
+
+def _refuter_failed(rec: dict, finder_findings_total: int, note: str,
+                    provenance: dict | None = None,
+                    **kw) -> dict:
+    """Record a refuter that produced nothing. It demotes NOTHING.
+
+    Every no-verdicts outcome ends here — a prompt that would not build, an
+    exception out of the chain, an exhausted chain, an unparseable answer — and
+    each one is a note on an otherwise untouched review. That is the whole
+    difference from `_failed_pass`, which is the security/skeptic path and
+    clears `parse_ok` on the way past. Role semantics decide demotion, never
+    provider identity: this is not a laxer copy of that function, it is the
+    other rule.
+    """
+    prov = dict(provenance or {"provider": None, "model": None, "effort": None})
+    if not str(prov.get("note") or "").strip():
+        prov["note"] = note
+    return passes.merge_refuter_pass(rec, None, prov, finder_findings_total,
+                                     **kw)
+
+
+def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
+                  reviewer: Reviewer, cfg: Config, d: Defaults, cwd: Path,
+                  store: Store, scratch: Path,
+                  finder_provider: str) -> dict:
+    """Run the refuter pass and annotate `rec`, returning the new record.
+
+    Structurally a sibling of `_extra_pass` and semantically its opposite in
+    the one way that matters: NOTHING on any path through this function can
+    make the review less trustworthy than the finder left it. The record is
+    annotated, or it is annotated with the news that the refuter could not
+    answer.
+
+    `build_prompt` is a callable for the same reason it is one in
+    `_extra_pass`: the prompt build sits inside the guard, so a prompt that
+    will not render is a failed pass rather than an exception that destroys a
+    review already in hand.
+
+    The chain runs under `REFUTER_CONTRACT`, which is what makes every adapter
+    request, classify and validate the verdicts shape — and what gives this
+    pass Task 7's fallback support for free.
+    """
+    _note("refuter pass (annotation only) ...")
+    try:
+        prompt = build_prompt()
+    except Exception as e:
+        _note(f"refuter prompt build failed; the review keeps its verdict: {e!r}")
+        return _refuter_failed(
+            rec, finder_findings_total,
+            f"the refuter prompt could not be prepared: {e!r}")
+
+    notes: list[str] = []
+    if prompt.diff_truncated:
+        _note(f"NOTE refuter pass diff capped at {d.max_diff_bytes} bytes "
+              f"(partial coverage, one-call bound)")
+        notes.append("the refuter saw a size-capped diff (partial coverage)")
+
+    try:
+        outcome = _run_chain(reviewer, cfg, d, prompt.text, cwd, store, scratch,
+                             "refuter", contract=REFUTER_CONTRACT)
+    except Exception as e:
+        _note(f"refuter pass failed; the review keeps its verdict: {e!r}")
+        return _refuter_failed(rec, finder_findings_total,
+                               f"the refuter pass failed: {e!r}",
+                               partial_coverage=prompt.diff_truncated,
+                               notes=notes)
+
+    prov = _provenance(outcome)
+    p = outcome.parsed
+    if p is None or not p.parse_ok or not isinstance(p.payload, dict):
+        _note("the refuter produced no usable verdicts; the review is "
+              "unannotated and otherwise unchanged")
+        return _refuter_failed(
+            rec, finder_findings_total,
+            outcome.failure_reason or "the refuter produced no usable verdicts",
+            prov, partial_coverage=prompt.diff_truncated, notes=notes)
+
+    if p.degraded:
+        notes.append("the refuter run was degraded: %s"
+                     % (p.degraded_reason or "no reason given"))
+    merged = passes.merge_refuter_pass(
+        rec, p.payload, prov, finder_findings_total, degraded=p.degraded,
+        partial_coverage=prompt.diff_truncated, notes=notes)
+
+    # The entire point of this pass is that a DIFFERENT provider looks at the
+    # findings; a model asked to check its own work is agreeable about it. A
+    # config may still put the refuter on the finder's provider — that is the
+    # operator's call, and it is better than no re-examination — but the record
+    # says so, because that is exactly what makes a verdict less worth
+    # adopting. Compared on the answering providers, not the configured ones:
+    # either side may have fallen through to a different entry.
+    if prov.get("provider") is not None and prov["provider"] == finder_provider:
+        merged = _with_provenance(merged, "refuter",
+                                  {"same_provider_as_finder": True})
+    return merged

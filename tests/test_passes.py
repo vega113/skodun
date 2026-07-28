@@ -25,10 +25,12 @@ from pathlib import Path
 import pytest
 
 from skodun.config import (SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOT_NAMES,
-                           SECURITY_PROMPT_SLOTS, load_config)
+                           SECURITY_PROMPT_SLOTS, Config, Defaults, Reviewer,
+                           load_config)
 from skodun.passes import (_SECURITY_LEAD_TEMPLATE, failed_pass_reason,
                            merge_extra_pass, merge_failed_extra_pass,
-                           security_lead, security_prompt, should_run_security,
+                           merge_refuter_pass, security_lead, security_prompt,
+                           should_run_refuter, should_run_security,
                            should_run_skeptic, skeptic_prompt)
 from tests.conftest import oracle_dir
 
@@ -122,6 +124,49 @@ def test_skeptic_kill_switch(monkeypatch):
     assert not should_run_skeptic("now", True, 0)
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
     assert should_run_skeptic("now", True, 0)
+
+
+def test_each_pass_has_its_own_kill_switch(monkeypatch):
+    """One wedged pass is turned off without taking the others with it.
+
+    Three switches, one reader (`_killed`), and no shared state between them —
+    the refuter arrived last and must not have been wired to a neighbour's
+    variable, which would silently disable a fail-closed pass when an operator
+    turns off an annotation one.
+    """
+    cfg = Config(defaults=Defaults(),
+                 reviewers=(Reviewer(name="f", provider="xai", model="m",
+                                     role="finder"),
+                            Reviewer(name="r", provider="openai", model="m",
+                                     role="refuter")))
+    monkeypatch.setenv("SKODUN_REFUTER_PASS", "0")
+    assert not should_run_refuter("now", True, 1, cfg)
+    assert should_run_skeptic("now", True, 0)
+    assert should_run_security("now", ["app/auth/Login.scala"])
+
+    monkeypatch.setenv("SKODUN_REFUTER_PASS", "1")
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "0")
+    monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "0")
+    assert should_run_refuter("now", True, 1, cfg)
+
+
+def test_a_refuter_failure_does_not_soften_the_security_passs_demotion():
+    """ROLE SEMANTICS DECIDE DEMOTION, NEVER PROVIDER IDENTITY.
+
+    The refuter is annotation-only and its failure is a note. That is a
+    property of the REFUTER ROLE, and it must not leak into the security pass —
+    whose Phase 1 fail-closed demotion stands whichever provider ran it, and
+    whether or not a refuter also ran on the same record.
+    """
+    demoted = merge_failed_extra_pass(_primary(), "security",
+                                      failed_pass_reason("security"))
+    out = merge_refuter_pass(demoted, None,
+                             {"provider": None, "model": None, "effort": None,
+                              "note": "provider B was unavailable"})
+    assert out["parse_ok"] is False and out["trustworthy"] is False
+    assert "security" in out["failure_reason"]
+    assert out["extra_passes"]["security"]["failed"] is True
+    assert out["extra_passes"]["refuter"]["status"] == "failed"
 
 
 # ---------------------------------------------------------------------------

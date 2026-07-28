@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from .base import (
     REFUTER_CONTRACT,
+    REFUTER_VERDICTS,
     REVIEW_CONTRACT,
     UNAVAILABLE_RC,
     Adapter,
@@ -34,6 +35,7 @@ __all__ = [
     "OutputContract",
     "ParseResult",
     "REFUTER_CONTRACT",
+    "REFUTER_VERDICTS",
     "REVIEW_CONTRACT",
     "UNAVAILABLE_RC",
     "get_adapter",
