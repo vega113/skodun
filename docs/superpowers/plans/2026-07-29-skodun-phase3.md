@@ -189,9 +189,11 @@ docs/phase3-acceptance.md                                       # T16
 
 **Files:** `tests/test_dispatch.py`.
 
-Executable drills with fake CLIs in tmp repos: SIGKILL a worker mid-run → `recover_stale` marks failed (via persisted budget) → gate 2; zero-delay race → one terminal reviewed record per content; backdated running record → recovered; branch deleted then another dispatched → no interference; a worker finishing AFTER being superseded leaves the superseded status intact.
+Executable drills with fake CLIs in tmp repos: SIGKILL a worker mid-run → `recover_stale` marks failed (via persisted budget) → gate 2; zero-delay race (barrier-driven: dispatcher 2 pauses after its probe until dispatcher 1 finalizes) → exactly ONE non-superseded terminal review per content plus superseded audit rows; backdated running record → recovered; branch deleted then another dispatched → no interference; a worker finishing AFTER being superseded leaves the superseded status intact.
 
-- [ ] Write; green. Commit: `test: dispatcher trust-boundary drills (refs EPIC)`
+- [ ] Write; green.
+- [ ] **Mutations** (against the production code the drills exercise): make `recover_stale` ignore the persisted `worst_runtime_sec` (backdated-record drill must fail); make `finalize_review` unconditional (superseded-resurrection drill must fail).
+- [ ] Commit: `test: dispatcher trust-boundary drills (refs EPIC)`
 
 ### Task 12: Delivery — undelivered query, `surface`, hook templates
 
@@ -239,7 +241,9 @@ Executable drills with fake CLIs in tmp repos: SIGKILL a worker mid-run → `rec
 **Files:** tests.
 
 - Seam matrix parameterized over the six new surfaces (Global Constraints list); `gate.py`/`trust.py` byte-identity pin (sha256 constants recorded at phase start, asserted).
-- [ ] Write; green. Commit: `test: seam matrices for phase 3 surfaces, trust-boundary byte pin (refs EPIC)`
+- [ ] Write; green.
+- [ ] **Mutations:** make one new subcommand re-raise on closed stdout (its matrix row must fail); append a comment byte to `gate.py` in a scratch checkout (the byte pin must fail there).
+- [ ] Commit: `test: seam matrices for phase 3 surfaces, trust-boundary byte pin (refs EPIC)`
 
 ### Task 16: Docs, examples, live acceptance
 
@@ -247,7 +251,8 @@ Executable drills with fake CLIs in tmp repos: SIGKILL a worker mid-run → `rec
 
 - README: `install-hooks` setup, surface/hook wiring, MCP client config snippets (claude/codex CLIs), new subcommand rows.
 - Live acceptance runbook — **prerequisites first** (each CLI responds, model ids valid, quota present), then the spec's seven criteria with pasted evidence each (suite counts reconciled both modes; live push → record → fresh-session surface → dedup on re-push with event → re-review after edit; failure round (a NO-FALLBACK reviewer with a dead binary — a chain head with a live fallback would recover, not fail) surfaces with exact wording; supersede race + SIGKILL recovery live; over-budget real diff batched + integration, seeded truncated batch gates 2, seeded integration failure gates 2; real MCP client end-to-end incl. one audited dismissal visible from the CLI, protocol suite zero-residue; reopen flips gate 0→1 with history).
-- [ ] Execute; paste evidence; full suite both modes; commit: `docs: phase 3 live acceptance evidence (refs EPIC)`
+- [ ] Execute; paste evidence; full suite both modes. (**Mutations: N/A** — this task produces documentation and live evidence, not production code; the global mutation requirement binds implementation/test tasks.)
+- [ ] Commit: `docs: phase 3 live acceptance evidence (refs EPIC)`
 
 ---
 
