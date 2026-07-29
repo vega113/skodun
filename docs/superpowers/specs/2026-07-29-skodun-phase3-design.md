@@ -89,14 +89,15 @@ since Phase 1). The probe is the oracle's 3-way protocol, ported:
   `trustworthy` (which by construction already excludes `parse_ok=False`, `degraded`,
   `diff_truncated`) AND its context matches: a record with a non-empty `context_hash`
   suppresses only after packing the candidate's context and matching the dual hash; a
-  legacy record with **absent** context (`NULL` — legacy-imported rows only)
-  suppresses without packing; a record with **empty-string** context (`""`) NEVER
-  suppresses — in the shipped pipeline `""` is written when packing was disabled or
-  the diff was empty, which is ambiguous evidence, and ambiguity must not skip a
-  review. Batched aggregates deliberately persist `context_hash=""` and are therefore
-  never dedup-suppressible: a redundant re-review of a rare oversized diff is the
-  accepted cost. The store has preserved the NULL-vs-`""` distinction since Phase 1
-  for exactly this.
+  legacy record whose ARTIFACT `context_hash` key is **absent or JSON `null`**
+  (legacy-imported rows only; the probe reads the artifact returned by the lookup —
+  the SQL column is never consulted, since the shipped store writes a missing value
+  as `""` there) suppresses without packing; a record with artifact `context_hash`
+  **`""`** NEVER suppresses — the shipped pipeline writes `""` when packing was
+  disabled or the diff empty, which is ambiguous evidence, and ambiguity must not
+  skip a review. Batched aggregates deliberately persist `context_hash=""` and are
+  therefore never dedup-suppressible: a redundant re-review of a rare oversized diff
+  is the accepted cost.
 - **Any probe error, any ambiguity, any partial state ⇒ review.** The probe's only
   failure mode is a redundant review; there is no code path from probe failure to
   suppression. Suppressions are recorded (a `dedup` event with the matched review id)
@@ -201,8 +202,9 @@ Tool results carry the same text the CLI prints plus a small structured envelope
   are seeded as events at migration, and re-dismissal no longer overwrites history,
   which the shipped single-row table did). Effective state = last event by sequence;
   same ≥ 20-char audited-reason validator; surfaced in `triage --list`. No bulk form.
-- **`_TS_FORMAT` literals** in `pipeline.py`/`gate.py` and the
-  `_fmt_binary`/`_binary_is_absent` duplication — folded in as mechanical cleanups.
+- **`_TS_FORMAT` literal** in `pipeline.py` and the `_fmt_binary`/`_binary_is_absent`
+  duplication — folded in as mechanical cleanups. The `gate.py` literal is explicitly
+  DEFERRED: the byte-identity pledge wins.
 - **`chain.py` extraction** — folded in, before dispatcher work grows `pipeline.py`:
   behavior-preserving move of the chain executor, suite green, mutation-checked.
 - **Quadratic JSON scan** — deferred to Phase 4 (documented; no new hot consumer).
@@ -228,12 +230,14 @@ mechanical gates, not conventions.
    background review lands as a store record; a fresh `skodun surface` delivers it
    once (marked, not re-delivered); a second identical push is dedup-suppressed with
    a recorded dedup event; a third push after an edit reviews again.
-3. **Failure surfacing drill**: a background round forced to fail (dead binary at the
-   head of a real chain) surfaces via `skodun surface` with the explicit
-   "NO REVIEW HAPPENED" wording — never silence.
-4. **Race and crash drills**: two pushes in quick succession → the older worker is
-   superseded (recorded), exactly one terminal record per content; a SIGKILLed worker
-   → `recover_stale` marks it failed and the gate answers 2 for that content.
+3. **Failure surfacing drill**: a background round forced to fail (a NO-FALLBACK
+   reviewer with a dead binary — a chain head with a live fallback would recover,
+   not fail) surfaces via `skodun surface` with the explicit "NO REVIEW HAPPENED"
+   wording — never silence.
+4. **Race and crash drills**: two pushes in quick succession → exactly ONE
+   non-superseded terminal review per content, plus the superseded audit row(s) with
+   `superseded_by` recorded; a SIGKILLed worker → `recover_stale` marks it failed and
+   the gate answers 2 for that content.
 5. **Batching drill**: an over-budget real diff reviews as N batches + integration
    pass, one aggregated trustworthy artifact at the full diff_hash; a seeded
    truncated batch makes the aggregate untrustworthy (gate 2), never a silent pass.
