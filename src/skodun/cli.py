@@ -267,18 +267,19 @@ def _cmd_gate(args) -> int:
     except BaseException as e:
         return _emit(f"SKODUN GATE: FAIL(2) could not open the store: {e!r}", 2)
 
-    try:
-        # The ROOT, not `--repo`: the config and the diff identity must be
-        # resolved against the same directory or the gate decides about a
-        # different change depending on the cwd. See `_repo_root`.
-        root = _repo_root(repo)
-        cfg = load_config(root)
-        result = run_gate(store, root, cfg)   # records its own event; never raises
-    except BaseException as e:
-        note = f"SKODUN GATE: FAIL(2) could not run the gate: {e!r}"
-        _record_setup_failure(store, repo, note)
-        return _emit(note, 2)
-    return _emit(result.message, result.code)
+    with store:
+        try:
+            # The ROOT, not `--repo`: the config and the diff identity must be
+            # resolved against the same directory or the gate decides about a
+            # different change depending on the cwd. See `_repo_root`.
+            root = _repo_root(repo)
+            cfg = load_config(root)
+            result = run_gate(store, root, cfg)  # records its own event; never raises
+        except BaseException as e:
+            note = f"SKODUN GATE: FAIL(2) could not run the gate: {e!r}"
+            _record_setup_failure(store, repo, note)
+            return _emit(note, 2)
+        return _emit(result.message, result.code)
 
 
 def _cmd_review(args) -> int:
@@ -329,61 +330,63 @@ def _cmd_review(args) -> int:
     except BaseException as e:
         # No store means no record, which is exactly what 4 says.
         return _emit(banner_failure(f"could not open the review store: {e!r}"), 4)
-    try:
-        # Before the config, and for the same reason the gate does it: the
-        # config has to be read from the same directory the diff identity is
-        # computed against. See `_repo_root`. A `--repo` that is not inside a
-        # worktree at all raises here, which is a preflight refusal -- nothing
-        # ran -- and lands on the same 2 the `GitError` handler below gives.
-        root = _repo_root(repo)
-    except KeyboardInterrupt:
-        raise
-    except BaseException as e:
-        return _emit(banner_failure(f"{e}; no review ran"), 2)
-    try:
-        cfg = load_config(root)
-    except KeyboardInterrupt:
-        raise
-    except BaseException as e:
-        # A config that will not load is a refusal before anything ran, not a
-        # review that came back badly: 2, the preflight code.
-        return _emit(banner_failure(f"could not load the config: {e!r}"), 2)
 
-    try:
-        rec = run_review(root, cfg, store)
-    except PreflightRefused as e:
-        return _emit(banner_failure(str(e)), 2)
-    except LockTimeout as e:
-        return _emit(banner_failure(str(e)), 3)
-    except PersistenceFailed:
-        return _emit(banner_failure("no review was recorded"), 4)
-    except GitError as e:
-        # A directory that is not a git checkout at all, a git that will not
-        # run, a repo with no HEAD: every git call the pipeline makes happens
-        # before the reviewer is launched, so this is a preflight failure --
-        # nothing ran -- and preflight refusals are 2, not "the review failed".
-        return _emit(banner_failure(f"{e}; no review ran"), 2)
-    except KeyboardInterrupt:
-        # `run_review`'s own `finally` has already downgraded the `running`
-        # record to `failed` and released the foreground lock (pipeline.py,
-        # "never leave a `running` record or a held lock behind") by the time
-        # this exception reaches here -- this guard only has to let it keep
-        # going rather than let the `except BaseException` below turn it into
-        # a lying "the review failed" 4.
-        raise
-    except BaseException as e:
-        # Anything else: the review did not complete, so it certifies nothing.
-        return _emit(banner_failure(f"the review failed: {e!r}"), 4)
+    with store:
+        try:
+            # Before the config, and for the same reason the gate does it: the
+            # config has to be read from the same directory the diff identity is
+            # computed against. See `_repo_root`. A `--repo` that is not inside a
+            # worktree at all raises here, which is a preflight refusal -- nothing
+            # ran -- and lands on the same 2 the `GitError` handler below gives.
+            root = _repo_root(repo)
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:
+            return _emit(banner_failure(f"{e}; no review ran"), 2)
+        try:
+            cfg = load_config(root)
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:
+            # A config that will not load is a refusal before anything ran, not a
+            # review that came back badly: 2, the preflight code.
+            return _emit(banner_failure(f"could not load the config: {e!r}"), 2)
 
-    # The banner is already out; only the exit code is left, and it is read
-    # back off the persisted record like everything else.
-    if rec.get("trustworthy") is not True:
-        return 4
-    try:
-        total = int(rec.get("findings_total") or 0)
-    except (TypeError, ValueError):
-        total = 1     # an uncountable findings list is not a clean review
-    return 1 if total > 0 else 0
+        try:
+            rec = run_review(root, cfg, store)
+        except PreflightRefused as e:
+            return _emit(banner_failure(str(e)), 2)
+        except LockTimeout as e:
+            return _emit(banner_failure(str(e)), 3)
+        except PersistenceFailed:
+            return _emit(banner_failure("no review was recorded"), 4)
+        except GitError as e:
+            # A directory that is not a git checkout at all, a git that will not
+            # run, a repo with no HEAD: every git call the pipeline makes happens
+            # before the reviewer is launched, so this is a preflight failure --
+            # nothing ran -- and preflight refusals are 2, not "the review failed".
+            return _emit(banner_failure(f"{e}; no review ran"), 2)
+        except KeyboardInterrupt:
+            # `run_review`'s own `finally` has already downgraded the `running`
+            # record to `failed` and released the foreground lock (pipeline.py,
+            # "never leave a `running` record or a held lock behind") by the time
+            # this exception reaches here -- this guard only has to let it keep
+            # going rather than let the `except BaseException` below turn it into
+            # a lying "the review failed" 4.
+            raise
+        except BaseException as e:
+            # Anything else: the review did not complete, so it certifies nothing.
+            return _emit(banner_failure(f"the review failed: {e!r}"), 4)
+
+        # The banner is already out; only the exit code is left, and it is read
+        # back off the persisted record like everything else.
+        if rec.get("trustworthy") is not True:
+            return 4
+        try:
+            total = int(rec.get("findings_total") or 0)
+        except (TypeError, ValueError):
+            total = 1     # an uncountable findings list is not a clean review
+        return 1 if total > 0 else 0
 
 
 def _fmt_binary(binary: str) -> str:
@@ -395,8 +398,10 @@ def _fmt_binary(binary: str) -> str:
     grok's own `~/.grok/bin/grok` default) is checked directly; a bare name
     goes through `PATH`, exactly how the adapter's own `Popen` call would
     resolve it -- `shutil.which` already requires `os.X_OK` along the way, so
-    a match there is never merely "a file exists". This mirrors
-    `pipeline._binary_is_absent`'s path-vs-PATH split but additionally checks
+    a match there is never merely "a file exists". The path-vs-PATH split
+    itself is `pipeline._is_path_shaped`, imported rather than re-inlined, so
+    it stays the ONE definition `pipeline._binary_is_absent` also uses; this
+    function's job on top of that shared split is to additionally check
     EXECUTABILITY, not just existence: `providers` is read by a human deciding
     whether a review can actually run, and "there but not runnable" is a
     different, more specific fact than "not found" for them to act on.
@@ -408,9 +413,15 @@ def _fmt_binary(binary: str) -> str:
     immediately -- exactly the wrong answer for a diagnostic whose whole
     point is "can a review actually run".
     """
+    # Imported here, not at module scope: this keeps every OTHER `skodun`
+    # subcommand from paying `pipeline`'s (heavier) import graph just because
+    # `providers` needs one split it shares with it -- the same reasoning
+    # `_cmd_review` already applies to its own `pipeline` import.
+    from .pipeline import _is_path_shaped
+
     if not binary:
         return "NOT FOUND"
-    if "/" in binary or (os.sep != "/" and os.sep in binary):
+    if _is_path_shaped(binary):
         p = Path(binary)
         if not p.exists():
             return "NOT FOUND"
@@ -519,49 +530,52 @@ def _cmd_providers(args) -> int:
     except BaseException as e:
         return _emit(f"skodun providers: could not open the store: {e!r}", 2)
 
-    now = time.strftime(store_mod._TS_FORMAT, time.gmtime())
-    try:
-        state_rows = {row["provider"]: row for row in store.provider_state_rows(now)}
-    except BaseException as e:
-        return _emit(f"skodun providers: could not read provider state: {e!r}", 2)
+    with store:
+        now = time.strftime(store_mod._TS_FORMAT, time.gmtime())
+        try:
+            state_rows = {row["provider"]: row
+                          for row in store.provider_state_rows(now)}
+        except BaseException as e:
+            return _emit(f"skodun providers: could not read provider state: {e!r}", 2)
 
-    if store_mod._provider_state_bypassed(os.environ):
-        raw = os.environ.get(store_mod.IGNORE_PROVIDER_STATE_ENV, "")
-        _emit(f"skodun providers: NOTE {store_mod.IGNORE_PROVIDER_STATE_ENV}="
-              f"{shown_field(raw)!r} is set -- the provider_state rows below "
-              f"are informational only; a review run right now would ignore "
-              f"every one of them", 0)
+        if store_mod._provider_state_bypassed(os.environ):
+            raw = os.environ.get(store_mod.IGNORE_PROVIDER_STATE_ENV, "")
+            _emit(f"skodun providers: NOTE {store_mod.IGNORE_PROVIDER_STATE_ENV}="
+                  f"{shown_field(raw)!r} is set -- the provider_state rows below "
+                  f"are informational only; a review run right now would ignore "
+                  f"every one of them", 0)
 
-    for provider in sorted(_REGISTRY):
-        adapter = _REGISTRY[provider]()
-        binary = adapter.resolve_binary()
-        status = _fmt_binary(binary)
-        state = _fmt_provider_state(state_rows.get(provider), shown_field)
-        shown_binary = _shown_binary(binary, shown_field, MAX_ANNOTATION_DISPLAY_CHARS)
-        _emit(f"{provider} | adapter={adapter.name} | "
-              f"binary={shown_binary} ({status}) | state={state}", 0)
+        for provider in sorted(_REGISTRY):
+            adapter = _REGISTRY[provider]()
+            binary = adapter.resolve_binary()
+            status = _fmt_binary(binary)
+            state = _fmt_provider_state(state_rows.get(provider), shown_field)
+            shown_binary = _shown_binary(binary, shown_field,
+                                         MAX_ANNOTATION_DISPLAY_CHARS)
+            _emit(f"{provider} | adapter={adapter.name} | "
+                  f"binary={shown_binary} ({status}) | state={state}", 0)
 
-    for provider, row in sorted(state_rows.items()):
-        if provider not in _REGISTRY:
-            _emit(f"skodun providers: NOTE cached provider_state for "
-                  f"{shown_field(provider)!r} has no registered adapter -- "
-                  f"{_fmt_provider_state(row, shown_field)}", 0)
+        for provider, row in sorted(state_rows.items()):
+            if provider not in _REGISTRY:
+                _emit(f"skodun providers: NOTE cached provider_state for "
+                      f"{shown_field(provider)!r} has no registered adapter -- "
+                      f"{_fmt_provider_state(row, shown_field)}", 0)
 
-    unregistered = [(r.name, r.provider) for r in cfg.reviewers
-                    if r.provider and r.provider not in _REGISTRY]
-    if not unregistered:
-        return 0
-    for name, provider in unregistered:
-        # `name`/`provider` are config-authored text of unbounded length,
-        # same class of risk as every other untrusted field this command
-        # prints -- `repr` alone stops a raw ESC or a forged row but has no
-        # length cap, so a 10,000-char `provider` would still bury the rest
-        # of the listing under itself. `shown_field` first, same as
-        # everywhere else, `!r` after for the quoting.
-        _emit(f"skodun providers: FAILED reviewer {shown_field(name)!r} uses "
-              f"provider {shown_field(provider)!r}, which has no registered "
-              f"adapter (known: {sorted(_REGISTRY)})", 0)
-    return 1
+        unregistered = [(r.name, r.provider) for r in cfg.reviewers
+                        if r.provider and r.provider not in _REGISTRY]
+        if not unregistered:
+            return 0
+        for name, provider in unregistered:
+            # `name`/`provider` are config-authored text of unbounded length,
+            # same class of risk as every other untrusted field this command
+            # prints -- `repr` alone stops a raw ESC or a forged row but has no
+            # length cap, so a 10,000-char `provider` would still bury the rest
+            # of the listing under itself. `shown_field` first, same as
+            # everywhere else, `!r` after for the quoting.
+            _emit(f"skodun providers: FAILED reviewer {shown_field(name)!r} uses "
+                  f"provider {shown_field(provider)!r}, which has no registered "
+                  f"adapter (known: {sorted(_REGISTRY)})", 0)
+        return 1
 
 
 def _cmd_import_legacy(args) -> int:
@@ -595,8 +609,8 @@ def _cmd_import_legacy(args) -> int:
 
     archive = Path(args.dir) if args.dir else Path(args.repo) / _LEGACY_DIR
     try:
-        store = Store.open(_store_path())
-        stats = import_legacy(store, archive)
+        with Store.open(_store_path()) as store:
+            stats = import_legacy(store, archive)
     except BaseException as e:
         return _emit(f"skodun import-legacy: FAILED on {archive}: {e!r}", 2)
     failed = stats.store_failures > 0
@@ -709,8 +723,8 @@ def _cmd_shadow_compare(args) -> int:
     # already validated above, so this call can only raise on a genuine data
     # or I/O problem -- caught below and reported at exit 0, same as ever.
     try:
-        store = Store.open(_store_path())
-        result = compare(store, archive, args.diff_hash, since=since)
+        with Store.open(_store_path()) as store:
+            result = compare(store, archive, args.diff_hash, since=since)
     except BaseException as e:
         return _emit(f"skodun shadow-compare: FAILED on {archive}: {e!r}", 0)
 
@@ -782,8 +796,8 @@ def _cmd_log(args) -> int:
     try:
         from .store import Store
         from .trust import coerce_count, one_line
-        store = Store.open(_store_path())
-        rows = store.list_reviews(args.branch, args.limit)
+        with Store.open(_store_path()) as store:
+            rows = store.list_reviews(args.branch, args.limit)
     except BaseException as e:
         return _emit(f"skodun log: could not read the store: {e!r}", 2)
 
@@ -868,101 +882,103 @@ def _cmd_triage(args) -> int:
     except BaseException as e:
         return _emit(f"skodun triage: could not open the store: {e!r}", 2)
 
-    review = store.get_review(args.review_id)
-    if review is None:
-        return _emit(f"skodun triage: no such review: {args.review_id!r}", 2)
+    with store:
+        review = store.get_review(args.review_id)
+        if review is None:
+            return _emit(f"skodun triage: no such review: {args.review_id!r}", 2)
 
-    from .textnorm import finding_key
-    from .triage import (ArtifactError, FindingNotFound, TriageError,
-                         adopt_refuter, dismiss, load_valid_artifact,
-                         refuter_annotation, refuter_line, refuter_pass_ran,
-                         refuter_same_provider_as_finder, shown_field)
+        from .textnorm import finding_key
+        from .triage import (ArtifactError, FindingNotFound, TriageError,
+                             adopt_refuter, dismiss, load_valid_artifact,
+                             refuter_annotation, refuter_line, refuter_pass_ran,
+                             refuter_same_provider_as_finder, shown_field)
 
-    try:
-        review = load_valid_artifact(review)
-    except ArtifactError as e:
-        return _emit(f"skodun triage: invalid review artifact: {e}", 2)
-
-    if args.list_only:
-        triaged = store.triage_for(review["branch"], review["base_sha"])
-        # An annotation is shown only on a record where a refuter pass
-        # actually ran. On a record where none did, a `refuter` key is
-        # something the FINDER wrote about its own finding (see
-        # `triage.refuter_pass_ran`), and printing it as
-        # `refuter(<provider>/<model>)` would be this program vouching for a
-        # second opinion that was never sought -- which is the same misleading
-        # line whether or not `--adopt-refuter` goes on to refuse it.
-        annotated = refuter_pass_ran(review)
-        for i, f in enumerate(review["findings"]):
-            fkey = finding_key(f.get("file", ""), f.get("title", ""))
-            status = "DISMISSED" if fkey in triaged else "OPEN"
-            # EVERY field on this line is finder-authored, untrusted model
-            # text reaching the terminal the same way a refuter's `reasoning`
-            # does -- `severity`, `file` and `line` are read straight off the
-            # parsed payload, exactly like `title`. `shown_field` strips the
-            # same control/ANSI exposure and bounds the same way, so no field
-            # can forge an extra row or rewrite this line's own status the
-            # instant it is printed. Only `[{i}]` and `({status})` are ours.
-            _emit(f"[{i}] {shown_field(f.get('severity'))} "
-                  f"{shown_field(f.get('file'))}:{shown_field(f.get('line'))} "
-                  f"{shown_field(f.get('title'))} ({status})", 0)
-            # One extra line for an annotated finding, and never more than
-            # one: `refuter_line` flattens and bounds every field it prints,
-            # so arbitrary model text cannot forge a second `[n]` row. An
-            # annotation is shown whatever its verdict says -- the listing
-            # reports what the refuter answered; only `--adopt-refuter`
-            # decides what may be acted on.
-            annotation = refuter_annotation(f) if annotated else None
-            if annotation is not None:
-                _emit(refuter_line(annotation), 0)
-        return 0
-
-    if args.adopt_refuter:
         try:
-            adopt_refuter(store, review, args.finding_index,
-                          now=time.strftime(_TS_FORMAT, time.gmtime()))
-        except (FindingNotFound, ArtifactError) as e:
-            return _emit(f"skodun triage: {e}", 2)
-        except TriageError as e:
-            return _emit(f"skodun triage: refused: {e}", 1)
-        except BaseException as e:
-            # A store that stopped accepting writes is not a refusal about the
-            # annotation -- nothing was decided and nothing was recorded.
+            review = load_valid_artifact(review)
+        except ArtifactError as e:
+            return _emit(f"skodun triage: invalid review artifact: {e}", 2)
+
+        if args.list_only:
+            triaged = store.triage_for(review["branch"], review["base_sha"])
+            # An annotation is shown only on a record where a refuter pass
+            # actually ran. On a record where none did, a `refuter` key is
+            # something the FINDER wrote about its own finding (see
+            # `triage.refuter_pass_ran`), and printing it as
+            # `refuter(<provider>/<model>)` would be this program vouching for a
+            # second opinion that was never sought -- which is the same misleading
+            # line whether or not `--adopt-refuter` goes on to refuse it.
+            annotated = refuter_pass_ran(review)
+            for i, f in enumerate(review["findings"]):
+                fkey = finding_key(f.get("file", ""), f.get("title", ""))
+                status = "DISMISSED" if fkey in triaged else "OPEN"
+                # EVERY field on this line is finder-authored, untrusted model
+                # text reaching the terminal the same way a refuter's `reasoning`
+                # does -- `severity`, `file` and `line` are read straight off the
+                # parsed payload, exactly like `title`. `shown_field` strips the
+                # same control/ANSI exposure and bounds the same way, so no field
+                # can forge an extra row or rewrite this line's own status the
+                # instant it is printed. Only `[{i}]` and `({status})` are ours.
+                _emit(f"[{i}] {shown_field(f.get('severity'))} "
+                      f"{shown_field(f.get('file'))}:{shown_field(f.get('line'))} "
+                      f"{shown_field(f.get('title'))} ({status})", 0)
+                # One extra line for an annotated finding, and never more than
+                # one: `refuter_line` flattens and bounds every field it prints,
+                # so arbitrary model text cannot forge a second `[n]` row. An
+                # annotation is shown whatever its verdict says -- the listing
+                # reports what the refuter answered; only `--adopt-refuter`
+                # decides what may be acted on.
+                annotation = refuter_annotation(f) if annotated else None
+                if annotation is not None:
+                    _emit(refuter_line(annotation), 0)
+            return 0
+
+        if args.adopt_refuter:
+            try:
+                adopt_refuter(store, review, args.finding_index,
+                              now=time.strftime(_TS_FORMAT, time.gmtime()))
+            except (FindingNotFound, ArtifactError) as e:
+                return _emit(f"skodun triage: {e}", 2)
+            except TriageError as e:
+                return _emit(f"skodun triage: refused: {e}", 1)
+            except BaseException as e:
+                # A store that stopped accepting writes is not a refusal about the
+                # annotation -- nothing was decided and nothing was recorded.
+                return _emit(
+                    f"skodun triage: could not record the dismissal: {e!r}", 2)
+
+            # The refuter exists so that a DIFFERENT provider examines the
+            # findings; a model asked to check its own work is agreeable about it.
+            # A config may still put the refuter on the finder's provider -- the
+            # operator's call, and better than no re-examination -- and the pass
+            # records that it happened. This is the one moment where that fact has
+            # consequences, so it is said out loud here rather than left in the
+            # artifact for nobody to read. A WARNING and not a refusal: adoption is
+            # an explicit human act, and the human is the authority this path
+            # exists to consult; turning an operator's own configuration into a
+            # hard block would be a second, implicit policy on top of the explicit
+            # per-finding one.
+            if refuter_same_provider_as_finder(review):
+                _emit("skodun triage: WARNING the refuter answered from the same "
+                      "provider as the finder, so this verdict is a model "
+                      "re-examining its own work", 0)
             return _emit(
-                f"skodun triage: could not record the dismissal: {e!r}", 2)
+                f"skodun triage: adopted the refuter's dismissal of finding "
+                f"{args.finding_index} on review {args.review_id}", 0)
 
-        # The refuter exists so that a DIFFERENT provider examines the
-        # findings; a model asked to check its own work is agreeable about it.
-        # A config may still put the refuter on the finder's provider -- the
-        # operator's call, and better than no re-examination -- and the pass
-        # records that it happened. This is the one moment where that fact has
-        # consequences, so it is said out loud here rather than left in the
-        # artifact for nobody to read. A WARNING and not a refusal: adoption is
-        # an explicit human act, and the human is the authority this path
-        # exists to consult; turning an operator's own configuration into a
-        # hard block would be a second, implicit policy on top of the explicit
-        # per-finding one.
-        if refuter_same_provider_as_finder(review):
-            _emit("skodun triage: WARNING the refuter answered from the same "
-                  "provider as the finder, so this verdict is a model "
-                  "re-examining its own work", 0)
+        if args.finding_index is None or args.reason is None:
+            return _emit(
+                "skodun triage: usage: skodun triage <review-id> <finding-index> "
+                "\"<reason>\"  |  skodun triage --list <review-id>", 2)
+
+        try:
+            dismiss(store, review, args.finding_index, args.reason,
+                    now=time.strftime(_TS_FORMAT, time.gmtime()))
+        except (TriageError, ArtifactError) as e:
+            return _emit(f"skodun triage: rejected: {e}", 2)
+
         return _emit(
-            f"skodun triage: adopted the refuter's dismissal of finding "
-            f"{args.finding_index} on review {args.review_id}", 0)
-
-    if args.finding_index is None or args.reason is None:
-        return _emit(
-            "skodun triage: usage: skodun triage <review-id> <finding-index> "
-            "\"<reason>\"  |  skodun triage --list <review-id>", 2)
-
-    try:
-        dismiss(store, review, args.finding_index, args.reason,
-                now=time.strftime(_TS_FORMAT, time.gmtime()))
-    except (TriageError, ArtifactError) as e:
-        return _emit(f"skodun triage: rejected: {e}", 2)
-
-    return _emit(f"skodun triage: dismissed finding {args.finding_index} on review "
-                 f"{args.review_id}", 0)
+            f"skodun triage: dismissed finding {args.finding_index} on review "
+            f"{args.review_id}", 0)
 
 
 def main(argv: list[str] | None = None) -> int:

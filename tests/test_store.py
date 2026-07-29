@@ -1,6 +1,10 @@
 import itertools
 import json
+import os
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -772,3 +776,146 @@ def test_mark_provider_unavailable_defaults_recorded_at_to_canonical_now(tmp_pat
     got = st._c.execute(
         "SELECT recorded_at FROM provider_state WHERE provider='openai'").fetchone()[0]
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", got)
+
+
+# --- store lifetime: close(), context manager -------------------------------
+#
+# Phase 3 makes a `Store`'s connection lifetime real: the dispatcher and MCP
+# server (later tasks) hold one open far longer than any one-shot CLI
+# invocation ever did, so "does closing actually happen, and does using a
+# closed store fail loudly" stops being academic.
+
+def test_close_is_idempotent(tmp_path):
+    """Calling `close()` twice -- or on a store nothing was ever written
+    through -- must not raise. `sqlite3.Connection.close()` is already
+    idempotent; `Store.close()` only has to forward to it without adding a
+    guard that could get in the way of that."""
+    st = Store.open(tmp_path / "s.db")
+    st.close()
+    st.close()   # must not raise
+
+
+def test_context_manager_returns_the_store_itself(tmp_path):
+    db = tmp_path / "s.db"
+    with Store.open(db) as st:
+        assert isinstance(st, Store)
+        st.save_review(REC)
+        assert st.get_review("r1")["summary"] == "ok"
+
+
+def test_context_manager_closes_on_normal_exit(tmp_path):
+    db = tmp_path / "s.db"
+    with Store.open(db) as st:
+        st.save_review(REC)
+    with pytest.raises(sqlite3.ProgrammingError):
+        st.get_review("r1")
+
+
+def test_context_manager_closes_even_when_the_body_raises(tmp_path):
+    """The point of `__exit__`: a review or triage failure mid-command must
+    not leak the connection just because the code that was using it never
+    reached its own cleanup."""
+    db = tmp_path / "s.db"
+    st_ref = {}
+    with pytest.raises(RuntimeError, match="boom"):
+        with Store.open(db) as st:
+            st_ref["st"] = st
+            raise RuntimeError("boom")
+    with pytest.raises(sqlite3.ProgrammingError):
+        st_ref["st"].get_review("nope")
+
+
+def test_operating_on_a_closed_store_raises_programming_error_not_swallowed(tmp_path):
+    """The mutation-killer for a no-op `close()`: if `close()` stopped
+    actually closing the underlying connection, every assertion below would
+    fail because the store would still answer normally instead of raising.
+    `sqlite3.ProgrammingError` specifically, and uncaught -- `close()` must
+    never wrap this in something that quietly returns None or an empty
+    result instead."""
+    st = Store.open(tmp_path / "s.db")
+    st.save_review(REC)
+    st.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        st.get_review("r1")
+    with pytest.raises(sqlite3.ProgrammingError):
+        st.save_review({**REC, "id": "r2"})
+    with pytest.raises(sqlite3.ProgrammingError):
+        st.list_reviews(None, 10)
+
+
+# --- ResourceWarning-clean store suite: supplementary regression net --------
+
+#: Every test module that opens a `Store` (directly, or by driving `cli.main`
+#: /`run_gate`/`run_review`/`import_legacy`/`shadow.compare` against a real
+#: one). `test_passes.py` matches `Store` in a grep only because of two
+#: `svc/credential/Store.go` / `UserStore.scala` fixture PATH STRINGS -- it
+#: never opens one -- so it is deliberately excluded.
+_STORE_TOUCHING_MODULES = (
+    "tests/test_store.py",
+    "tests/test_cli.py",
+    "tests/test_gate.py",
+    "tests/test_fallback.py",
+    "tests/test_pipeline.py",
+    "tests/test_legacy_import.py",
+    "tests/test_shadow.py",
+    "tests/test_refuter.py",
+    "tests/test_triage.py",
+)
+
+
+#: Guards against the recursion this test would otherwise cause: `test_store.py`
+#: is itself one of `_STORE_TOUCHING_MODULES`, so the subprocess it spawns
+#: collects THIS test too, which would spawn another subprocess, forever.
+#: `--deselect` below is the primary defence; this is the belt for it, so a
+#: future rename of this test (which would silently break a `--deselect`
+#: pointed at the old nodeid) cannot reintroduce an unbounded process tree.
+_RESOURCEWARNING_SUBPROCESS_GUARD_ENV = "_SKODUN_RESOURCEWARNING_SUBPROCESS_ACTIVE"
+_THIS_TEST_NODEID = ("tests/test_store.py::"
+                     "test_store_touching_modules_run_clean_under_resourcewarning_error")
+
+
+def test_store_touching_modules_run_clean_under_resourcewarning_error(tmp_path):
+    """A supplementary regression net, NOT the mutation-killer for a no-op
+    `close()` -- `test_operating_on_a_closed_store_raises_programming_error_
+    not_swallowed` above is. `sqlite3.Connection`'s own "unclosed database"
+    warning is emitted from the connection's finalizer during garbage
+    collection, and a warning raised from a finalizer is UNRAISABLE: Python
+    cannot let it propagate as a real exception there (that is exactly what
+    `sys.unraisablehook` exists to handle instead), so `-W error::
+    ResourceWarning` cannot turn a GC-collected leaked connection into a
+    failing assertion no matter how strict the filter is. Confirmed
+    empirically on the local interpreter: pytest's own `unraisableexception`
+    plugin re-reports it as `pytest.PytestUnraisableExceptionWarning` -- a
+    `UserWarning` subclass, not a `ResourceWarning` -- specifically so it
+    does not vanish silently, but that also means this specific filter never
+    matches it. This run's job is narrower and still worth having: every
+    store-touching test module must complete with zero test FAILURES under
+    the stricter flag, so a future change that explicitly warns/raises a real
+    `ResourceWarning` (rather than relying on GC finalization timing) is still
+    caught here rather than only in a developer's interactive `-W` run.
+    """
+    if os.environ.get(_RESOURCEWARNING_SUBPROCESS_GUARD_ENV):
+        # We ARE the nested subprocess this test spawns -- see the guard's
+        # own docstring above for why this check exists at all.
+        pytest.skip("nested inside the subprocess this test itself spawns")
+
+    repo_root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    # Never the real store, even though every module above already pins
+    # `SKODUN_DB` itself (autouse fixture or explicit `tmp_path` construction):
+    # this is defence in depth for the one process-wide default the CLI falls
+    # back to before any of that runs.
+    env["SKODUN_DB"] = str(tmp_path / "unused" / "skodun.db")
+    env["PYTHONUNBUFFERED"] = "1"
+    env[_RESOURCEWARNING_SUBPROCESS_GUARD_ENV] = "1"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(repo_root / "src"), str(repo_root)]
+        + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+
+    proc = subprocess.run(
+        [sys.executable, "-W", "error::ResourceWarning", "-m", "pytest", "-q",
+         "--deselect", _THIS_TEST_NODEID, *_STORE_TOUCHING_MODULES],
+        cwd=repo_root, env=env, capture_output=True, text=True, timeout=300)
+    assert proc.returncode == 0, (
+        f"store-touching subset failed under -W error::ResourceWarning "
+        f"(exit {proc.returncode}):\n{proc.stdout}\n{proc.stderr}")

@@ -1031,12 +1031,14 @@ def test_providers_shows_a_found_executable_binary(tmp_path, monkeypatch, capsys
 
 def test_providers_shows_a_found_but_not_executable_binary(tmp_path, monkeypatch,
                                                             capsys):
-    """`_fmt_binary` is the sole justification for duplicating
-    `pipeline._binary_is_absent`'s path-vs-PATH split -- it additionally
-    checks `os.X_OK`, which the pipeline's existence-only contract
-    deliberately does not. Nothing pinned that this branch actually fires
-    until now: replacing it with an unconditional `"executable"` used to
-    pass the whole suite."""
+    """`_fmt_binary` additionally checks `os.X_OK`, which
+    `pipeline._binary_is_absent`'s existence-only contract deliberately does
+    not -- that is the one remaining difference between the two; the
+    path-vs-PATH split itself is `pipeline._is_path_shaped`, one definition
+    shared by both (see `test_fmt_binary_reuses_pipelines_path_vs_path_split`
+    below). Nothing pinned that this branch actually fires until now:
+    replacing it with an unconditional `"executable"` used to pass the whole
+    suite."""
     grok = tmp_path / "bin" / "grok"
     grok.parent.mkdir()
     grok.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -1049,6 +1051,39 @@ def test_providers_shows_a_found_but_not_executable_binary(tmp_path, monkeypatch
     lines = capsys.readouterr().out.splitlines()
     line = next(l for l in lines if l.startswith("xai |"))
     assert "found, NOT executable" in line, line
+
+
+def test_fmt_binary_reuses_pipelines_path_vs_path_split(monkeypatch):
+    """`cli._fmt_binary` must not carry its own copy of the path-vs-PATH
+    split -- it has to call through to `pipeline._is_path_shaped`, the one
+    definition `pipeline._binary_is_absent` also uses. Re-inlining a
+    divergent copy in `cli.py` would still pass every other assertion in this
+    module (the same `NOT FOUND` / `executable` / `found, NOT executable`
+    strings, for the same inputs) while silently drifting from the pipeline's
+    own split -- this test catches exactly that, by spying on the shared
+    helper directly rather than comparing rendered output."""
+    from skodun import cli, pipeline
+
+    calls = []
+    real = pipeline._is_path_shaped
+
+    def spy(binary):
+        calls.append(binary)
+        return real(binary)
+
+    monkeypatch.setattr(pipeline, "_is_path_shaped", spy)
+
+    assert cli._fmt_binary("/some/path/grok") == "NOT FOUND"
+    assert calls == ["/some/path/grok"], (
+        "cli._fmt_binary did not call pipeline._is_path_shaped for a "
+        "path-shaped input -- it may be re-inlining the split instead of "
+        "importing the shared helper")
+
+    calls.clear()
+    cli._fmt_binary("grok")
+    assert calls == ["grok"], (
+        "cli._fmt_binary did not call pipeline._is_path_shaped for a bare "
+        "name either")
 
 
 def test_providers_a_directory_is_never_reported_executable(tmp_path, monkeypatch,
@@ -1337,3 +1372,87 @@ role = "finder"
 def test_providers_appears_in_top_level_help(capsys):
     assert main(["--help"]) == 0
     assert "providers" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 Task 1: every CLI path closes the store it opens
+# ---------------------------------------------------------------------------
+#
+# Phase 3's dispatcher and MCP server (later tasks) hold one `Store` open far
+# longer than any one-shot CLI invocation ever did, which is exactly why every
+# path below now opens its store through `with Store.open(...) as store:`
+# rather than a bare assignment: whatever happens next -- success, a
+# refusal, an exception raised deep in `run_gate`/`run_review` -- the
+# connection must not outlive the command. Spying on `Store.close` (rather
+# than asserting on a specific message or exit code) verifies the MECHANISM
+# directly, for every subcommand that opens a store at all.
+
+def test_every_cli_subcommand_closes_its_store(tmp_path, monkeypatch):
+    from tests.test_gitio import _mkrepo
+
+    closes = []
+    real_close = Store.close
+
+    def spy(self):
+        closes.append(self)
+        return real_close(self)
+
+    monkeypatch.setattr(Store, "close", spy)
+    monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "absent.toml"))
+
+    # log: no rows at all, still opens (and must close) the store.
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "log.db"))
+    closes.clear()
+    assert main(["log"]) == 0
+    assert closes, "skodun log did not close its store"
+
+    # providers: read-only diagnostic listing.
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "providers.db"))
+    closes.clear()
+    main(["providers", "--repo", str(tmp_path)])
+    assert closes, "skodun providers did not close its store"
+
+    # shadow-compare: no archive on disk -- still an ordinary, store-opening
+    # exit 0.
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "shadow.db"))
+    closes.clear()
+    assert main(["shadow-compare", "--dir",
+                str(tmp_path / "no-such-archive")]) == 0
+    assert closes, "skodun shadow-compare did not close its store"
+
+    # import-legacy: a missing archive is a clean 0, and the store is opened
+    # (and must be closed) either way.
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "import.db"))
+    closes.clear()
+    assert main(["import-legacy", "--repo", str(tmp_path),
+                "--dir", str(tmp_path / "no-such-archive")]) == 0
+    assert closes, "skodun import-legacy did not close its store"
+
+    # triage --list: a real stored review.
+    triage_db = tmp_path / "triage.db"
+    monkeypatch.setenv("SKODUN_DB", str(triage_db))
+    setup_store = Store.open(triage_db)
+    setup_store.save_review(_artifact([_finding(0)]))
+    setup_store.close()
+    closes.clear()
+    assert main(["triage", "--list", "rev1"]) == 0
+    assert closes, "skodun triage --list did not close its store"
+
+    # gate: a real repo, no config -- exercises `_cmd_gate`'s own store.
+    repo = _mkrepo(tmp_path)
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "gate.db"))
+    closes.clear()
+    main(["gate", "--repo", str(repo)])
+    assert closes, "skodun gate did not close its store"
+
+    # review: no reviewer configured -> a preflight refusal (exit 2), raised
+    # deep inside `run_review` -- the store is opened before that point and
+    # must still close on the way out through the exception.
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "review.db"))
+    closes.clear()
+    main(["review", "--repo", str(repo)])
+    assert closes, "skodun review did not close its store"
+
+    # triage --adopt-refuter and a plain dismissal share `_cmd_triage`'s
+    # single store-opening path with `--list`, already covered above; no
+    # separate assertion needed for the same code path.

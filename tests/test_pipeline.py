@@ -1287,3 +1287,25 @@ def test_review_subcommand_is_registered(capsys):
     from skodun.cli import build_parser
     args = build_parser().parse_args(["review", "--repo", "x"])
     assert args.command == "review" and str(args.repo) == "x"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 Task 1: `pipeline._TS_FORMAT` is imported, not re-spelled
+# ---------------------------------------------------------------------------
+
+def test_ts_format_is_imported_from_store_not_a_second_literal():
+    """`_iso_at`, `_iso_now` and `_epoch` each used to spell out
+    `"%Y-%m-%dT%H:%M:%SZ"` directly -- three copies of one format the store
+    owns and validates against. A single `_TS_FORMAT`, imported from `store`,
+    replaces all three, so a future change to the canonical format only has
+    one place to make it (well, two counting `gate.py`'s own copy -- that one
+    is explicitly out of scope for this task; see its byte-pledge)."""
+    import inspect
+
+    from skodun import store
+
+    assert pipeline._TS_FORMAT is store._TS_FORMAT
+    src = inspect.getsource(pipeline)
+    assert "%Y-%m-%dT%H:%M:%SZ" not in src, (
+        "pipeline.py still spells out the timestamp format literal directly "
+        "somewhere instead of using the imported store._TS_FORMAT")

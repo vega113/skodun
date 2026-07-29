@@ -214,6 +214,27 @@ class Store:
             raise
         return cls(conn)
 
+    def close(self) -> None:
+        """Close the underlying connection. Idempotent.
+
+        `sqlite3.Connection.close()` is already a no-op on a connection that
+        is already closed, so this only has to forward to it -- no extra
+        "already closed" bookkeeping to get subtly out of sync with the
+        connection's own state. Anything called on this `Store` afterwards
+        raises `sqlite3.ProgrammingError` from the connection itself; nothing
+        here catches or downgrades that.
+        """
+        self._c.close()
+
+    def __enter__(self) -> "Store":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # No `except`/return-True here: whatever exception the caller's body
+        # raised (or didn't) propagates exactly as it would without this
+        # context manager. Closing is the only side effect exiting adds.
+        self.close()
+
     def save_review(self, rec: dict) -> None:
         rec = dict(rec)   # never mutate the caller's dict
         axes = {k: rec.get(k, False) for k in _TRUST_AXES}
