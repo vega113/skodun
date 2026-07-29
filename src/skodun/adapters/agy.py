@@ -65,10 +65,10 @@ global rule rather than a detail:
   with a matching `effort`. It fails closed and loudly (see above), so no
   review is ever silently weakened by it, but a config author who never reads
   this docstring can still burn every attempt on it before noticing.
-  TODO(Task 13, `examples/multi-provider.toml`): when that file's `google`
-  section is written, state this two-shapes rule there in plain config-author
-  language — next to the example, not buried in an adapter docstring — so the
-  footgun is visible where a config is actually being written.
+  This two-shapes rule is restated in plain config-author language next
+  to the `google` section of `examples/multi-provider.toml`, so the
+  footgun is visible where a config is actually being written, not only
+  here.
 
 Classification never reads the model's own words. It looks at the exit code, at
 stderr, and at the envelope's `status` and `error` — both written by the

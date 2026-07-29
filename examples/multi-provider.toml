@@ -1,0 +1,114 @@
+# Example skodun reviewer configuration: a cross-provider finder with a
+# quota-fallback chain, a refuter on a different provider from the finder, and
+# a security-pass reviewer. Stack-agnostic on purpose -- like
+# examples/scala-angular-monorepo.toml, this file is named for a SHAPE
+# (multiple providers in one config), never for a company or project.
+#
+# Copy the parts you want into <your repo>/.skodun.toml or your global
+# ~/.config/skodun/config.toml. Every entry below that is NOT commented out is
+# a working example against the shipped adapters -- `skodun providers` exits 0
+# against this exact file. The commented blocks show shapes that are either
+# not yet shippable (`anthropic`) or carry sharp edges worth reading about
+# before you turn them on (`google`/`agy`).
+#
+# Registered providers, and the CLI each one drives, as of this file:
+#   xai    -> grok
+#   openai -> codex
+#   google -> agy
+# `anthropic` is NOT registered -- see the commented `security` block below.
+# Run `skodun providers` to check what THIS machine actually has.
+
+# --- the finder, with a same-role fallback on a different provider ---------
+#
+# `fallbacks` is tried, in order, only when the head reviewer's OWN attempt
+# classifies "unavailable" (binary missing, auth failure, an unknown model
+# id, or a cached provider-wide quota outage) -- never merely because it found
+# nothing wrong, and never on a "degraded" (truncated/corrupted) run, which
+# has its own retry budget instead. A fallback member's role field is not
+# consulted while it stands in for the head: what runs is that entry's own
+# provider/model/effort, in the role the HEAD was serving.
+[[reviewers]]
+name      = "finder"
+provider  = "xai"
+model     = "grok-4.5"        # verify with `grok models` -- ids are retired without notice
+effort    = "high"
+role      = "finder"
+fallbacks = ["finder-openai"]  # up to 3 names; each must exist, be enabled, and not cycle
+
+[[reviewers]]
+name     = "finder-openai"
+provider = "openai"
+model    = "gpt-5.4-mini"     # the codex CLI has no `list models` subcommand -- see README
+effort   = "medium"
+role     = "finder"
+
+# --- the refuter: a DIFFERENT provider re-examines the finder's findings ---
+#
+# Scheduled only when the finder came back trustworthy WITH findings. This is
+# annotation-only: it never dismisses anything and the gate never reads its
+# verdicts. The only way an annotation becomes a dismissal is a human running
+# `skodun triage --adopt-refuter <review-id> <finding-index>`, one finding at
+# a time -- there is no bulk form. Putting the refuter on the SAME provider as
+# the finder is allowed (the config loads fine) but defeats the point: a
+# model re-examining its own work tends to agree with itself, and
+# `triage --adopt-refuter` prints a WARNING when it detects this.
+[[reviewers]]
+name     = "refuter"
+provider = "openai"
+model    = "gpt-5.4"
+role     = "refuter"
+
+# --- security pass: an anthropic reviewer, NOT a working example -----------
+#
+# `anthropic` has no registered adapter in this phase (verify with
+# `skodun providers`; a config naming it loads, but the listing reports it
+# FAILED and exits 1, and an actual review against it fails closed the same
+# way). Left commented so this file stays a working example end to end.
+# `max_cost_usd` DOES validate today (must be a finite, strictly positive,
+# non-boolean number) even though no shipped adapter reads it yet -- it is
+# reserved for whichever adapter consumes it first.
+#
+# [[reviewers]]
+# name         = "security"
+# provider     = "anthropic"
+# model        = "<check your anthropic CLI's own listing command>"
+# role         = "security"
+# max_cost_usd = 2.0
+
+# --- google (agy): works, but read this before you turn it on --------------
+#
+# Two properties of the `agy` CLI are worth knowing before you configure
+# `google` as a reviewer, because both fail LOUDLY and CLOSED rather than
+# silently -- but only once you have already burned an attempt on them:
+#
+# 1. Effort is entangled with the model id, and `agy models` (the command a
+#    config author actually runs) prints ONLY effort-suffixed ids such as
+#    "gemini-3.6-flash-high" -- never the bare "gemini-3.6-flash" a base id
+#    would need. Only two shapes work:
+#      (a) a SUFFIXED id (one `agy models` actually lists), with `effort`
+#          left unset or set to "none" -- the suffix already says the level;
+#      (b) a BASE id (NOT listed by `agy models` -- you have to know it),
+#          with `effort` set to the matching level ("low"/"medium"/"high").
+#    A suffixed id combined with ANY other `effort` value is a guaranteed
+#    rc-1 "invalid model selection" refusal on every single attempt.
+#
+# 2. This CLI has no prompt-file flag and does not read stdin in print mode,
+#    so skodun passes the reviewed diff as a command-line ARGUMENT. On a
+#    shared machine that diff is visible in `ps` (and on default Linux,
+#    world-readable at /proc/<pid>/cmdline) for the life of the review call.
+#    It also caps how large a diff this provider can review at all: the argv
+#    size guard here is 122,880 bytes (120 KB), well under the
+#    `max_diff_bytes` default of 400,000 -- a bigger diff is refused with a
+#    clear "too large to pass on the command line" error rather than a
+#    kernel-level failure. Lower `max_diff_bytes` if you configure this
+#    provider, or expect it to sit this one out on large changes.
+#
+# [[reviewers]]
+# name     = "finder-google"
+# provider = "google"
+# model    = "gemini-3.6-flash-high"   # shape (a): suffixed id, no `effort` line
+# role     = "finder"
+#
+# # shape (b) instead of the above:
+# # model  = "gemini-3.6-flash"        # base id -- NOT in `agy models`' own listing
+# # effort = "high"                    # required, and must match

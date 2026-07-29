@@ -12,6 +12,11 @@
 # Section names on the right-hand side must match `<name>.md` files in your
 # checklist_dir (default docs/review/checklists). skodun knows these:
 # core, cross-file, migrations, backend, tests, frontend, tooling.
+#
+# This file covers only the [defaults] repo-layout tables (checklist routing,
+# test-path patterns, security paths). It carries no [[reviewers]] of its own
+# -- pair it with a reviewer config; see examples/multi-provider.toml and the
+# README's Configuration section for the provider/model/effort/role side.
 
 [defaults]
 
