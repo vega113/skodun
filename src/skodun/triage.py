@@ -22,6 +22,8 @@ nothing anywhere adopts by itself.
 
 from __future__ import annotations
 
+import re
+
 from .store import Store
 from .textnorm import collapse_ws, finding_key, ledger_key, norm
 from .trust import one_line
@@ -254,32 +256,56 @@ def refuter_annotation(finding) -> dict | None:
     return annotation if isinstance(annotation, dict) else None
 
 
-def _shown(value) -> str:
-    """One annotation field, bounded for a one-line-per-item listing.
+#: C0 controls (0x00-0x1F) other than the two `trust.one_line` already turns
+#: into spaces, plus DEL (0x7F) and the C1 controls (0x80-0x9F). ESC (0x1B)
+#: is the one that matters most in practice — it is how a terminal is told to
+#: move the cursor and erase what is already on screen, and the reviewer
+#: demonstrated a complete, deterministic rewrite of a finding's OPEN/
+#: DISMISSED status this way, from a refuter's free-text `reasoning` alone.
+#: But every character in these ranges is a display-plane instruction, not
+#: content, for a listing meant to be read as plain text — so all of them go,
+#: not just the one used in the demonstrated exploit.
+_CONTROL_CHARS = re.compile("[\x00-\x1f\x7f-\x9f]")
 
-    `trust.one_line` — the project's single "this value may not break out of a
-    single-line record" rule, which replaces CR/LF with spaces and does
-    nothing else — and then a hard length cap. Both halves are needed: the
-    flattening stops a reasoning with a newline in it from forging an extra
-    row, and the cap stops a 10,000-character field from burying the rest of
-    the listing under itself.
+
+def shown_field(value) -> str:
+    """One display field, bounded and safe for a one-line-per-item listing.
+
+    Three rules, in order: `trust.one_line` — the project's single "this
+    value may not break out of a single-line record" rule, which replaces
+    CR/LF with spaces and does nothing else; then every remaining C0/C1
+    control character (ESC and friends — CR/LF are already gone by this
+    point) is REMOVED, not escaped into some other visible marker, because
+    escaping would just put a different attacker-controlled string on the
+    line; then a hard length cap. All three are needed: the flattening stops
+    a value with a raw newline in it from forging an extra row, the control
+    strip stops one from rewriting what the terminal already printed, and the
+    cap stops a 10,000-character field from burying the rest of the listing
+    under itself.
+
+    Used for every refuter annotation field (see `refuter_line`) AND for a
+    finding's TITLE in the CLI listing: both are untrusted model text
+    reaching the same one-line-per-item display, so both go through the same
+    rule.
     """
-    return one_line(value)[:MAX_ANNOTATION_DISPLAY_CHARS]
+    return _CONTROL_CHARS.sub("", one_line(value))[:MAX_ANNOTATION_DISPLAY_CHARS]
 
 
 def refuter_line(annotation) -> str:
     """The one extra `triage --list` line for a refuter annotation.
 
     `refuter(<provider>/<model>): <verdict> — <reasoning>`, every field
-    bounded by `_shown`. A missing field renders as the empty string rather
-    than the literal "None", the same convention `trust.one_line` already
-    uses everywhere else.
+    bounded by `shown_field`. A missing field renders as the empty string
+    rather than the literal "None", the same convention `trust.one_line`
+    already uses everywhere else.
     """
     if not isinstance(annotation, dict):
         annotation = {}
     return ("refuter(%s/%s): %s — %s"
-            % (_shown(annotation.get("provider")), _shown(annotation.get("model")),
-               _shown(annotation.get("verdict")), _shown(annotation.get("reasoning"))))
+            % (shown_field(annotation.get("provider")),
+               shown_field(annotation.get("model")),
+               shown_field(annotation.get("verdict")),
+               shown_field(annotation.get("reasoning"))))
 
 
 def refuter_pass_ran(review) -> bool:

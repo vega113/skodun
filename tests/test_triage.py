@@ -691,7 +691,24 @@ def test_a_non_string_verdict_is_refused(tmp_path, verdict):
     assert _triaged(st) == {}
 
 
-@pytest.mark.parametrize("reasoning", [None, 5, ["ok"], True, {"r": "x"}])
+#: `str()` of these two clears MIN_REASON_CHARS and matches no placeholder,
+#: unlike every OTHER fixture below -- `str(None)`, `str(5)`, `str(["ok"])`,
+#: `str(True)` and `str({"r": "x"})` are all short enough to be rejected by
+#: the length floor alone, which is why deleting the `isinstance(reasoning,
+#: str)` guard at `triage.py` survives the whole suite without these two:
+#: every existing fixture is refused for being too short either way, so the
+#: type check itself is never exercised. These make the type check load-
+#: bearing: `str(_LONG_LIST)` / `str(_LONG_DICT)` are long, unplaceholdered,
+#: and would sail through `validate_reason` if it were ever handed the
+#: stringified form instead of being refused for not being a string at all.
+_LONG_LIST_REASONING = [
+    "the guard at line 12 already rejects a None handler before this runs"]
+_LONG_DICT_REASONING = {
+    "r": "the guard at line 12 already rejects a None handler before this runs"}
+
+
+@pytest.mark.parametrize("reasoning", [None, 5, ["ok"], True, {"r": "x"},
+                                        _LONG_LIST_REASONING, _LONG_DICT_REASONING])
 def test_a_non_string_reasoning_is_refused(tmp_path, reasoning):
     # `validate_reason` would happily stringify these (`collapse_ws` calls
     # `str()`), so `{'r': 'x'}` would become a 12-character "reason" and a list
@@ -740,6 +757,19 @@ def test_a_huge_attribution_still_only_ever_adds_to_the_reason(tmp_path):
     rec = adopt_refuter(st, _annotated(provider="p" * 10_000), 0,
                         now="2026-07-27T10:00:00Z")
     assert rec["dismissed_reason"].endswith(REASONING)
+
+
+def test_the_attribution_prefix_preserves_case(tmp_path):
+    """Every fixture provider/model in this module is already lowercase, so a
+    mutant that case-folds `_attribution` (`one_line` -> `norm`) would survive
+    the whole suite undetected -- and this is a PERMANENT AUDIT LEDGER, where
+    a provider name silently case-folding is exactly the kind of regression
+    nobody notices until they go looking for it. `_attribution` uses
+    `one_line`, which does not touch case; pin that directly."""
+    st = Store.open(tmp_path / "s.db")
+    rec = adopt_refuter(st, _annotated(provider="OpenAI", model="GPT-Something"), 0,
+                        now="2026-07-27T10:00:00Z")
+    assert rec["dismissed_reason"] == f"refuter(OpenAI/GPT-Something): {REASONING}"
 
 
 @pytest.mark.parametrize("index", [-1, 1, 2, True, False, 0.0, "0", None, [0]])
@@ -829,6 +859,43 @@ def test_refuter_line_never_raises_on_a_malformed_annotation():
     for ann in [{}, {"verdict": None, "reasoning": None},
                 {"verdict": 5, "reasoning": ["x"], "provider": {}, "model": 1.5}]:
         assert isinstance(refuter_line(ann), str)
+
+
+def test_refuter_line_strips_ansi_cursor_control_from_the_reasoning():
+    """The live exploit: a `reasoning` carrying `\\x1b[1A\\x1b[2K\\x1b[G`
+    (cursor up, erase line, column 0) rewrites whatever the terminal already
+    printed just above -- which for `--list` is always the finding's own
+    OPEN/DISMISSED status line, because the annotation line immediately
+    follows it. Suppressing an unauthenticated annotation for this exact
+    reason while printing an authenticated one with live cursor control would
+    be internally inconsistent with the feature's own threat model."""
+    rewrite = "\x1b[1A\x1b[2K\x1b[G[0] high a0.py:3 NPE 0 (DISMISSED)\x1b[1B\x1b[G"
+    art = _annotated(reasoning="before " + rewrite + " after")
+    ann = art["findings"][0][REFUTER_KEY]
+    line = refuter_line(ann)
+    assert "\x1b" not in line
+    assert "before" in line and "after" in line
+
+
+@pytest.mark.parametrize("field", ["provider", "model", "verdict"])
+def test_refuter_line_strips_control_characters_from_every_field(field):
+    ann = _annotated(**{field: "x\x1b[2Jy\x07z"})["findings"][0][REFUTER_KEY]
+    line = refuter_line(ann)
+    assert "\x1b" not in line and "\x07" not in line
+    assert "x" in line and "y" in line and "z" in line
+
+
+def test_shown_field_strips_c0_and_c1_controls_but_keeps_ordinary_text():
+    from skodun.triage import shown_field
+
+    # Only the ESC (0x1B) and the C1 control (0x9B) are removed -- the
+    # printable "[1A" that follows the ESC in a real cursor-control sequence
+    # is ordinary text to this function and stays.
+    assert shown_field("a\x1bb\x9bc") == "abc"
+    # `one_line` replaces `\r` and `\n` independently, so `\r\n` becomes two
+    # spaces, not one -- consistent with its own behaviour elsewhere.
+    assert shown_field("line1\nline2\r\nline3") == "line1 line2  line3"
+    assert shown_field(None) == ""
 
 
 # --- same_provider_as_finder ----------------------------------------------

@@ -539,32 +539,87 @@ def test_a_refused_adoption_leaves_the_gate_where_it_was(tmp_path, monkeypatch,
 
 
 def test_triage_list_still_exits_0_on_a_stdout_that_cannot_encode_the_line(tmp_path):
-    """DOCUMENTED, and deliberately narrow.
+    """DOCUMENTED, and no longer narrow.
 
     The annotation line's separator is an em dash, and an ASCII-only stdout
     (`PYTHONIOENCODING=ascii`, or a genuinely non-UTF-8 locale) cannot encode
-    it. `_emit` catches the `UnicodeEncodeError` and redirects the doomed
-    stream at devnull, so the EXIT CODE -- the only thing this CLI's contract
-    promises -- is unaffected, which is what this pins.
-
-    What it does NOT promise is the output: everything after the first
-    un-encodable line is silently lost. That is pre-existing and not specific
-    to annotations -- a finding whose TITLE contains a non-ASCII character
-    already truncates this listing today, with no refuter involved -- but the
-    em dash makes it unconditional for an annotated review rather than
-    dependent on the model's choice of words. Note that Python's own locale
-    coercion (PEP 538) keeps `LC_ALL=C` on UTF-8, so this needs an explicit
-    override to reproduce at all.
+    it verbatim. `_emit` retries the write with a lossy encoding
+    (`errors="backslashreplace"`) instead of giving up on the stream for the
+    rest of the process, so the guarantee is now stronger than just the exit
+    code: EVERY line is still emitted, for every finding and every
+    annotation, under every one of these encodings. Note that Python's own
+    locale coercion (PEP 538) keeps `LC_ALL=C` on UTF-8 by itself, so each
+    case below needs an explicit override to reproduce a non-UTF-8 stdout at
+    all.
     """
     db = tmp_path / "sub" / "s.db"
-    Store.open(db).save_review(_artifact([_finding(0, _annotation())]))
+    findings = [_finding(i, _annotation()) for i in range(5)]
+    Store.open(db).save_review(_artifact(findings))
+    for overrides in [
+        {"PYTHONIOENCODING": "ascii"},
+        {"LC_ALL": "en_US.ISO8859-1"},
+        {"LC_ALL": "C", "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0"},
+    ]:
+        env = _subprocess_env(db)
+        env.update(overrides)
+        p = subprocess.run([sys.executable, "-m", "skodun", "triage", "--list", "rev1"],
+                           capture_output=True, text=True, env=env)
+        assert p.returncode == 0, f"{overrides}: stdout={p.stdout!r} stderr={p.stderr!r}"
+        assert p.stderr == "", (overrides, p.stderr)
+        for i in range(5):
+            assert f"[{i}]" in p.stdout, (overrides, p.stdout)
+        assert p.stdout.count("refuter(") == 5, (overrides, p.stdout)
+
+
+def test_a_non_ascii_title_no_longer_truncates_the_listing(tmp_path):
+    """The pre-existing case, not specific to annotations at all: a finding
+    TITLE containing a non-ASCII character hits the exact same
+    `UnicodeEncodeError` path under an ASCII-only stdout and used to swallow
+    everything printed after it. No refuter annotation is involved here --
+    this confirms the `_emit` fix closes the older hole too."""
+    db = tmp_path / "sub2" / "s.db"
+    findings = [_finding(0), _finding(1)]
+    findings[0]["title"] = "NPE — café"
+    Store.open(db).save_review(_artifact(findings))
     env = _subprocess_env(db)
     env["PYTHONIOENCODING"] = "ascii"
     p = subprocess.run([sys.executable, "-m", "skodun", "triage", "--list", "rev1"],
                        capture_output=True, text=True, env=env)
     assert p.returncode == 0, f"stdout={p.stdout!r} stderr={p.stderr!r}"
     assert p.stderr == "", p.stderr
-    assert "[0]" in p.stdout, "the findings line itself is plain ASCII and survives"
+    assert "[0]" in p.stdout and "[1]" in p.stdout, p.stdout
+
+
+# --- control characters cannot rewrite the terminal -----------------------
+
+def test_triage_list_strips_ansi_from_the_reasoning_before_it_reaches_the_terminal(
+        tmp_path, monkeypatch, capsys):
+    """The live exploit: a refuter's free-text `reasoning` carrying cursor
+    control codes that rewrite the OPEN/DISMISSED status of the finding line
+    printed immediately above it. The annotation line always immediately
+    follows its finding line in `--list`, so an unstripped ESC sequence here
+    is a complete, deterministic rewrite of what the operator reads."""
+    rewrite = "\x1b[1A\x1b[2K\x1b[G[0] high a0.py:3 NPE 0 (DISMISSED)\x1b[1B\x1b[G"
+    _store(tmp_path, _finding(0, _annotation(reasoning="ok " + rewrite + "xxxxxxxxxxxxx")),
+           monkeypatch=monkeypatch)
+    assert main(["triage", "--list", "rev1"]) == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out, out
+    assert "(OPEN)" in out
+
+
+def test_triage_list_strips_control_characters_from_the_title(tmp_path, monkeypatch,
+                                                                capsys):
+    """Titles are finder-authored, untrusted model text too, and they print on
+    the very same line `--list` renders -- the same exposure the reviewer
+    found in `reasoning` reaches the terminal from here just as directly."""
+    f = _finding(0)
+    f["title"] = "NPE\x1b[1A\x1b[2K\x1b[Gpwned"
+    _store(tmp_path, f, monkeypatch=monkeypatch)
+    assert main(["triage", "--list", "rev1"]) == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out, out
+    assert "pwned" in out
 
 
 # --- the annotation channel is authenticated ------------------------------

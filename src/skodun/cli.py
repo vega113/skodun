@@ -171,24 +171,55 @@ def _emit(message: str, code: int) -> int:
     other `OSError` (full disk, closed fd), or a `UnicodeEncodeError` from an
     ASCII-only locale meeting a non-ASCII message must not turn a 2 into the
     interpreter's exit code of 1.
+
+    A `UnicodeEncodeError` gets one more chance than the others: the STREAM is
+    still alive, only THIS line's characters do not fit its encoding -- an
+    ASCII locale meeting the `refuter(...)` line's em dash, or a non-ASCII
+    finding title. `triage --list` calls this once per line, and the old
+    behaviour (poison the stream at devnull, same as a dead pipe) silently
+    dropped every line printed after the first one that failed to encode,
+    while still returning the caller's `code` -- an operator piping the
+    listing through `grep -c` would undercount findings and see exit 0. Retry
+    once with `errors="backslashreplace"` instead: every character is still
+    accounted for, and the exit code stays exactly what it already was.
     """
     try:
         print(message)
         sys.stdout.flush()
-    except BaseException:
-        # Redirect the doomed stream at devnull before returning: CPython
-        # flushes stdout again during finalization, and a failure there is
-        # reported as exit status 120, which is not in the contract either.
-        # (This is the recipe from the stdlib docs for BrokenPipeError.)
+    except UnicodeEncodeError:
         try:
-            fd = os.open(os.devnull, os.O_WRONLY)
-            try:
-                os.dup2(fd, sys.stdout.fileno())
-            finally:
-                os.close(fd)
+            encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+            # Round-trip through the stream's own encoding with a lossy
+            # error handler, so the retry below is guaranteed to be made of
+            # characters that encoding can represent -- it cannot fail with
+            # the same error again.
+            lossy = message.encode(encoding, errors="backslashreplace").decode(encoding)
+            print(lossy)
+            sys.stdout.flush()
         except BaseException:
-            pass
+            _blackhole_stdout()
+    except BaseException:
+        # BrokenPipeError, any other OSError (full disk, closed fd): the
+        # STREAM itself is dead, not just this line's encoding, so there is
+        # nothing a retry can do. Redirect it at devnull before returning:
+        # CPython flushes stdout again during finalization, and a failure
+        # there is reported as exit status 120, which is not in the contract
+        # either. (This is the recipe from the stdlib docs for
+        # BrokenPipeError.)
+        _blackhole_stdout()
     return code
+
+
+def _blackhole_stdout() -> None:
+    """Redirect fd 1 at devnull so nothing further can raise writing to it."""
+    try:
+        fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(fd, sys.stdout.fileno())
+        finally:
+            os.close(fd)
+    except BaseException:
+        pass
 
 
 def _cmd_gate(args) -> int:
@@ -595,7 +626,7 @@ def _cmd_triage(args) -> int:
     from .triage import (ArtifactError, FindingNotFound, TriageError,
                          adopt_refuter, dismiss, load_valid_artifact,
                          refuter_annotation, refuter_line, refuter_pass_ran,
-                         refuter_same_provider_as_finder)
+                         refuter_same_provider_as_finder, shown_field)
 
     try:
         review = load_valid_artifact(review)
@@ -615,8 +646,13 @@ def _cmd_triage(args) -> int:
         for i, f in enumerate(review["findings"]):
             fkey = finding_key(f.get("file", ""), f.get("title", ""))
             status = "DISMISSED" if fkey in triaged else "OPEN"
+            # `title` is finder-authored, untrusted model text reaching this
+            # line the same way a refuter's `reasoning` does -- `shown_field`
+            # strips the same control/ANSI exposure and bounds the same way,
+            # so a title cannot forge an extra row or rewrite this line's own
+            # status the instant it is printed.
             _emit(f"[{i}] {f.get('severity')} {f.get('file')}:{f.get('line')} "
-                  f"{f.get('title')} ({status})", 0)
+                  f"{shown_field(f.get('title'))} ({status})", 0)
             # One extra line for an annotated finding, and never more than
             # one: `refuter_line` flattens and bounds every field it prints,
             # so arbitrary model text cannot forge a second `[n]` row. An
