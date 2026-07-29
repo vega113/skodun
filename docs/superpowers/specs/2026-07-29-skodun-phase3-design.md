@@ -66,8 +66,14 @@ phases). The background failure modes map to existing fail-closed machinery:
   are never touched), with the oracle's pid-reuse guard — only a pid whose command
   line still names the skodun dispatcher entrypoint is signalled; an unconfirmable pid
   is retired terminally without a signal.
-- **Worker outliving its branch** → supersede on the next push plus stale recovery;
-  a worker's record for a vanished branch simply never matches a gate query.
+- **Worker outliving its branch** → supersede on the next push plus stale recovery.
+  (Note, stated precisely: the gate looks up by `diff_hash` alone and applies the
+  matched review's own branch-scoped dismissals — so identical bytes at the same base
+  on a renamed branch legitimately reuse the review AND its dismissals. This is
+  shipped Phase 1 behavior and matches the oracle's ledger scoping. Tightening the
+  gate lookup to the current branch would require modifying byte-pinned `gate.py` —
+  a **named owner decision deliberately NOT taken in Phase 3**; the default is
+  oracle parity, unchanged.)
 - The dispatcher itself is a thin `skodun dispatch` subcommand reading the pre-push
   ref lines from stdin; workers are detached (`start_new_session`) so a closed
   terminal cannot kill a review (the oracle's `nohup` discipline).
@@ -81,9 +87,14 @@ since Phase 1). The probe is the oracle's 3-way protocol, ported:
   `trustworthy` (which by construction already excludes `parse_ok=False`, `degraded`,
   `diff_truncated`) AND its context matches: a record with a non-empty `context_hash`
   suppresses only after packing the candidate's context and matching the dual hash; a
-  legacy record with **absent** context (`NULL`) suppresses without packing; a record
-  with **explicit-empty** context (`""` — pack attempted and failed) NEVER suppresses.
-  The store has preserved the NULL-vs-`""` distinction since Phase 1 for exactly this.
+  legacy record with **absent** context (`NULL` — legacy-imported rows only)
+  suppresses without packing; a record with **empty-string** context (`""`) NEVER
+  suppresses — in the shipped pipeline `""` is written when packing was disabled or
+  the diff was empty, which is ambiguous evidence, and ambiguity must not skip a
+  review. Batched aggregates deliberately persist `context_hash=""` and are therefore
+  never dedup-suppressible: a redundant re-review of a rare oversized diff is the
+  accepted cost. The store has preserved the NULL-vs-`""` distinction since Phase 1
+  for exactly this.
 - **Any probe error, any ambiguity, any partial state ⇒ review.** The probe's only
   failure mode is a redundant review; there is no code path from probe failure to
   suppression. Suppressions are recorded (a `dedup` event with the matched review id)
@@ -103,11 +114,17 @@ oracle-parity-pinned. Batching is internal decomposition:
   status keyed to the full `diff_hash`.
 - With ≥ 2 batches, a **cross-file integration pass** reviews the seams: each batch's
   file list, its changed-region headers, one-line summary and findings — prompt asks
-  only for cross-file problems. Checklist selection runs in `batch` mode per batch
+  only for cross-file problems. It runs under the `integrator` reviewer role when one
+  is configured (else the finder's reviewer), through the chain executor, and it is a
+  **full participant in the aggregate**: its parse/degraded/unavailable outcome joins
+  the trust formulas below, and a failed or degraded integration pass makes the
+  aggregate untrustworthy — seam coverage is coverage, not annotation. Checklist selection runs in `batch` mode per batch
   (never cross-file) and `integration` mode for the seam pass — modes shipped in
   Phase 1 and consumed for the first time here.
-- Aggregation: `parse_ok = all parsed`, `degraded = any degraded`,
-  `diff_truncated = any truncated`, `stop_reason` = the **first abnormal** value —
+- Aggregation (integration included): `parse_ok = all batches parsed AND integration
+  parsed`, `degraded = any degraded (integration included)`,
+  `diff_truncated = any batch truncated`, `stop_reason` = the **first abnormal** value
+  in batch order then integration —
   a truncated batch can never hide behind healthy siblings. The gate reasons only
   about the one aggregated record; partial coverage is untrustworthy by construction.
 - Both modes share the one implementation. Foreground over-budget diffs, which today
@@ -118,8 +135,11 @@ oracle-parity-pinned. Batching is internal decomposition:
 ### 5. Delivery semantics
 
 "Undelivered" is store state, not a marker file: a `deliveries` ledger keyed by review
-id records `delivered_at` + channel. `skodun surface` prints, for the current branch,
-every background round not yet delivered — **findings AND failures**: a failed round
+id records `delivered_at` + channel. Eligible rounds are **terminal only** (`clean`,
+`degraded`, `failed`, `superseded` — a `running` round is never surfaced and never
+acknowledged; its story is not final) and **skodun-originated only** (`source="skodun"`
+— the legacy-imported archive must not flood the first post-upgrade session).
+`skodun surface` prints, for the current branch, every such round not yet delivered — **findings AND failures**: a failed round
 prints an explicit "NO REVIEW HAPPENED — this round reports nothing because it said
 nothing, not because it found nothing" line (research decision 15, verbatim spirit).
 
@@ -139,10 +159,13 @@ One config, two execution modes, explicit mode table:
 - `[dispatch]` table: `enabled` (default true once the shim is installed),
   `timeout_sec` (default 240 — oracle parity vs 420 foreground), `timeout_retries`
   (default 0 — a force-push storm must not accumulate workers), `dedup` (default
-  true), `large_prompt_escalation` (bg cap raised for large prompts, oracle parity).
+  true), `large_prompt_bytes` (over this prompt size the background cap escalates to the foreground cap, oracle parity).
   Everything absent falls back to `[defaults]`.
-- Reviewer selection, chains, and extra-pass semantics are identical in both modes
-  (the security pass's fail-closed hold applies to background reviews too).
+- Reviewer selection and fallback chains are identical in both modes. **Extra
+  passes (security/skeptic/refuter) remain `--now`-only — oracle parity** (the
+  oracle fires them only in foreground mode): background rounds are finder-only
+  plus the batching integration pass. The passes' mode predicates are pinned, not
+  extended.
 - The dispatcher does **not** take the foreground lock (oracle parity: only `--now`
   contends it); background concurrency is bounded by supersede + budgets.
 - Worktree binding carries over as shipped: `review --now` still refuses the primary
@@ -170,10 +193,12 @@ Tool results carry the same text the CLI prints plus a small structured envelope
   load-bearing): every internal consumer uses the context form; the store-touching
   test modules run `ResourceWarning`-clean, pinned by a dedicated `-W error` test
   runner covering the store suite (whole-suite `-W error` remains Phase 4).
-- **`triage --reopen`** — folded in (owner decision): append-only reversal records in
-  the ledger (same ≥ 20-char audited-reason validator); `open_findings` treats a
-  finding with a reversal newer than its dismissal as open again; full history
-  preserved; surfaced in `triage --list`. No bulk form.
+- **`triage --reopen`** — folded in (owner decision), implemented as an append-only
+  **triage event stream** (`dismiss`/`reopen` events, monotonic sequence order —
+  second-resolution timestamps cannot order same-second events; existing dismissals
+  are seeded as events at migration, and re-dismissal no longer overwrites history,
+  which the shipped single-row table did). Effective state = last event by sequence;
+  same ≥ 20-char audited-reason validator; surfaced in `triage --list`. No bulk form.
 - **`_TS_FORMAT` literals** in `pipeline.py`/`gate.py` and the
   `_fmt_binary`/`_binary_is_absent` duplication — folded in as mechanical cleanups.
 - **`chain.py` extraction** — folded in, before dispatcher work grows `pipeline.py`:
