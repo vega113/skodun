@@ -62,7 +62,7 @@ Checked live, immediately before the run:
 | `openai` | `codex` | codex-cli 0.144.5 | **works** — `gpt-5.4-mini` confirmed live |
 | `google` | `agy` | 1.1.8 | **works** — `gemini-3.6-flash-low` confirmed live |
 | `xai` | `grok` | grok 0.2.112 | **dead** — HTTP 402, usage balance exhausted |
-| `anthropic` | `claude` | 2.1.118 | **dead**, and *not registered at all* |
+| `anthropic` | `claude` | 2.1.118 | *not registered at all* — **deliberately out of scope**, see below |
 
 Evidence — the two dead ones:
 
@@ -119,11 +119,11 @@ preserve.
 ### `anthropic` is NOT a shipped adapter — this supersedes the plan and spec
 
 The Phase 2 plan and spec describe four provider CLIs (grok, codex, claude, agy)
-and a `claude.py` adapter. **That adapter was never shipped** — its task was
-blocked — and `anthropic` is not in the registry. Any statement in the plan or the
-design spec that treats `anthropic` as a shipped adapter is superseded by this
-document. The shipped registry is `{xai, openai, google}`, the product says so, and
-a config naming `anthropic` fails closed:
+and a `claude.py` adapter. **That adapter was never shipped**, and `anthropic` is
+not in the registry. Any statement in the plan or the design spec that treats
+`anthropic` as a shipped adapter is superseded by this document. The shipped
+registry is `{xai, openai, google}`, the product says so, and a config naming
+`anthropic` fails closed:
 
 ```
 $ skodun providers --repo .
@@ -133,6 +133,26 @@ xai | adapter=grok | binary=$HOME/.grok/bin/grok (executable) | state=none
 skodun providers: FAILED reviewer 'security' uses provider 'anthropic', which has no registered adapter (known: ['google', 'openai', 'xai'])
 # rc 1
 ```
+
+**Why it is out of scope, which matters more than the fact that it is.** During
+this phase the task was first reported as *blocked* — the CLI's stored OAuth token
+had expired and its own refresh attempt cleared the credential. That framing was
+incomplete, and correcting it is the point of this paragraph: the owner's decision
+is that **driving the `claude` CLI headlessly bills as API usage rather than
+drawing on a Claude subscription.** skodun's entire premise is reusing the CLI
+subscriptions you already pay for — that is why it shells out to installed binaries
+instead of linking a provider SDK. An adapter that quietly moves a user from
+flat-rate to metered billing to run the same review inverts that premise.
+
+So this is a scope decision, not an unfinished task, and a future reader should not
+spend time re-attempting authentication. Nothing is stubbed out waiting for it:
+there is no `adapters/claude.py`, no `anthropic` fixture directory, no registry
+entry, and no synthesized fixture pretending to be a capture. The conformance suite
+is the registration gate and fails CI for an adapter registered without a
+subclass, so the absence is enforced rather than assumed. `max_cost_usd` validates
+at config load and no shipped adapter reads it; it is kept because a budget cap is
+provider-neutral. If the CLI's headless billing changes, the adapter becomes an
+ordinary task against the contract `openai` and `google` already satisfy.
 
 ### Environment used by every command below
 
@@ -997,9 +1017,11 @@ subclass.
   adoption path has never been exercised on model output that a model actually
   produced. The next person to see a live refutation should re-run §1.4 without the
   seeding step and replace that section.
-* **The `anthropic` adapter.** Never shipped; its task was blocked. The plan and
-  spec still describe four providers; three are registered. `skodun providers`
-  reports the missing one and exits 1.
+* **The `anthropic` adapter.** Never shipped — and, unlike the other entries in
+  this list, not something to come back and finish: headless `claude` use bills as
+  API rather than drawing on a subscription, which inverts skodun's premise, so it
+  is deliberately out of scope. The plan and spec still describe four providers;
+  three are registered. `skodun providers` reports the missing one and exits 1.
 * **A `grok`-as-finder run producing a review.** The account is out of quota. Every
   `xai` appearance in this document is a dead binary, a fake CLI replaying a
   committed fixture, or the real 402 itself.

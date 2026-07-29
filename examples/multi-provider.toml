@@ -8,8 +8,8 @@
 # ~/.config/skodun/config.toml. Every entry below that is NOT commented out is
 # a working example against the shipped adapters -- `skodun providers` exits 0
 # against this exact file. The commented blocks show shapes that are either
-# not yet shippable (`anthropic`) or carry sharp edges worth reading about
-# before you turn them on (`google`/`agy`).
+# deliberately out of scope (`anthropic`) or carry sharp edges worth reading
+# about before you turn them on (`google`/`agy`).
 #
 # Registered providers, and the CLI each one drives, as of this file:
 #   xai    -> grok
@@ -60,13 +60,22 @@ role     = "refuter"
 
 # --- security pass: an anthropic reviewer, NOT a working example -----------
 #
-# `anthropic` has no registered adapter in this phase (verify with
-# `skodun providers`; a config naming it loads, but the listing reports it
-# FAILED and exits 1, and an actual review against it fails closed the same
-# way). Left commented so this file stays a working example end to end.
+# `anthropic` has no registered adapter, and this is a deliberate scope
+# decision rather than an unfinished one: driving the `claude` CLI HEADLESSLY
+# bills as API usage rather than drawing on a Claude subscription. skodun
+# exists to reuse the CLI subscriptions you already pay for -- that is why it
+# shells out to installed binaries instead of linking a provider SDK -- so an
+# adapter that moves you from flat-rate to metered billing to run the same
+# review works against the point of the tool. Do not expect this block to
+# start working; it is here to show the shape, not to be uncommented.
+#
+# Verify with `skodun providers`: a config naming `anthropic` loads, but the
+# listing reports it FAILED and exits 1, and an actual review against it fails
+# closed the same way any unresolvable provider does.
+#
 # `max_cost_usd` DOES validate today (must be a finite, strictly positive,
-# non-boolean number) even though no shipped adapter reads it yet -- it is
-# reserved for whichever adapter consumes it first.
+# non-boolean number) even though no shipped adapter reads it -- a budget cap
+# is provider-neutral, so it is kept for whichever metered adapter needs it.
 #
 # [[reviewers]]
 # name         = "security"

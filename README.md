@@ -33,8 +33,13 @@ the honest scope:
   implementation, and a shadow comparison used to check the two against each other.
 - What does not: an `anthropic` adapter is declared nowhere in the registry — it is
   not shipped, so do not configure a reviewer with `provider = "anthropic"` and
-  expect it to run (`skodun providers` will report it `FAILED` and exit `1`). There
-  is also still no MCP server, no scheduling, and no git hooks.
+  expect it to run (`skodun providers` will report it `FAILED` and exit `1`). This
+  is a deliberate scope decision, not an unfinished task: driving the `claude` CLI
+  headlessly bills as API usage rather than drawing on a Claude subscription, and
+  the whole premise of skodun is reusing the CLI subscriptions you already pay for.
+  An adapter that quietly moves a user onto metered API billing would work against
+  that. See "Why there is no `anthropic` adapter" below. There is also still no MCP
+  server, no scheduling, and no git hooks.
 - Shadow mode means exactly what it says: `shadow-compare` is observational, always
   exits `0`, and blocks nothing. skodun is being watched against the tool it is
   meant to replace, not yet trusted in its place.
@@ -129,6 +134,23 @@ adapter registry — but `skodun providers` reports it `FAILED ... has no
 registered adapter` and exits `1`, and an actual review or gate run against it
 fails closed the same way any unresolvable provider does.
 
+#### Why there is no `anthropic` adapter
+
+Not an oversight, and not a half-finished task. skodun exists to reuse the
+provider CLI subscriptions you already pay for — that is the reason it shells out
+to installed binaries instead of linking a provider SDK. Driving the `claude` CLI
+**headlessly** bills as API usage rather than drawing on a Claude subscription, so
+an `anthropic` adapter would quietly move a user from flat-rate to metered billing
+to run the same review. That trade is the project's premise inverted, so the
+adapter is deliberately out of scope for now.
+
+Nothing is stubbed out waiting for it: there is no `adapters/claude.py`, no
+`anthropic` fixture directory, and no registry entry. The conformance suite is the
+registration gate and would fail CI for an adapter registered without one, so the
+absence is enforced rather than assumed. If the CLI's headless billing changes, the
+adapter is a normal task — the contract it would implement is already the same one
+`openai` and `google` satisfy.
+
 Per-adapter binary overrides: `SKODUN_GROK_BIN`, `SKODUN_CODEX_BIN`,
 `SKODUN_AGY_BIN` (a path, or a bare name resolved on `PATH`; unset or empty is
 treated as "use the default"). `grok` additionally falls back to
@@ -195,8 +217,10 @@ turns a pass off).
 A reviewer may set `max_cost_usd` (a finite, strictly positive number — `true`,
 `0`, negative, `nan`, and `inf` are all rejected at load time, with a message
 naming the reviewer). This validates today, but **no currently shipped adapter
-(`xai`/`openai`/`google`) reads it** — it exists for a future `anthropic` adapter
-that is not registered yet.
+(`xai`/`openai`/`google`) reads it** — it was added for an `anthropic` adapter that
+is deliberately not shipped (see above), and is kept because a budget cap is a
+provider-neutral idea any future metered adapter would want. Setting it today is
+harmless and has no effect.
 
 ### Provider-state cache
 

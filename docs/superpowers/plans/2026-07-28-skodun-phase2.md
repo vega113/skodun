@@ -637,11 +637,24 @@ used **finder = codex (`openai`), refuter = agy (`google`)**, and the reverse fo
 second run. The criterion's substance — finder and refuter answering from different
 vendors, with the annotation attributing the verdict to one of them — is satisfied.
 
-**2. `anthropic` is not a shipped adapter.** Task 6 was blocked, so the registry is
-`{xai, openai, google}`, not the four this plan describes. Every statement in this
-plan and in the design spec that treats `anthropic` as shipped is superseded by the
-acceptance document. A config naming it fails closed (`skodun providers` reports it
-and exits 1).
+**2. `anthropic` is not a shipped adapter, and Task 6 is cancelled rather than
+deferred.** The registry is `{xai, openai, google}`, not the four this plan
+describes. Every statement in this plan and in the design spec that treats
+`anthropic` as shipped is superseded by the acceptance document. A config naming it
+fails closed (`skodun providers` reports it and exits 1).
+
+The task was first reported as *blocked* on an expired CLI credential. That was
+incomplete. The owner's decision, recorded here so no one re-attempts the auth
+path: **driving the `claude` CLI headlessly bills as API usage rather than drawing
+on a Claude subscription**, and skodun exists to reuse the CLI subscriptions you
+already pay for — the reason it shells out to installed binaries rather than
+linking a provider SDK. An adapter that moves a user from flat-rate to metered
+billing to run the same review inverts the project's premise. Task 6 should be read
+as taking the same documented-skip outcome Task 10 offered for `agy`, for a
+different and more durable reason.
+
+`max_cost_usd` validation shipped and no adapter reads it; it is kept because a
+budget cap is provider-neutral and any future metered adapter would want it.
 
 **3. Criterion 3 is PARTIAL, and stays PARTIAL.** Four live refuter passes across
 two change-sets and both provider orderings produced **six verdicts, all
