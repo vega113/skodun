@@ -180,7 +180,7 @@ One config, two execution modes, explicit mode table:
 
 ## MCP surface — full CLI mirror (owner decision)
 
-Tools mirror subcommands 1:1, through the same validators, with the same granularity:
+Tools mirror the REVIEW-LOOP subcommands 1:1 — a curated subset, through the same validators, with the same granularity (operational/installation commands — `providers`, `import-legacy`, `shadow-compare`, `install-hooks`, `dispatch`, `worker`, `mcp` itself — are deliberately excluded: they administer the installation; exclusion only REMOVES agent surface, consistent with the owner decision's principle):
 `gate`, `review` (documented long-running; one in-flight review per server — the
 foreground lock already serializes the backend), `log`, `surface`, `triage_list`,
 `triage_dismiss` (single finding, audited ≥ 20-char reason), `adopt_refuter` (single
