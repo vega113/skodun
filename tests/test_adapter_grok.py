@@ -31,11 +31,13 @@ from skodun.adapters import ParseResult, get_adapter
 from skodun.adapters.grok import (
     SCHEMA,
     GrokAdapter,
+    _QUOTA_SIGNALS,
     resolve_grok_bin,
 )
 from skodun.config import Defaults, Reviewer
 from tests.adapter_conformance import (  # noqa: F401 - see below
     AdapterConformance,
+    load_fixture,
     test_coverage_gate_fails_without_a_conformance_subclass,
     test_every_registered_adapter_has_conformance_coverage,
     test_load_fixture_rejects_a_malformed_rc,
@@ -751,6 +753,108 @@ def test_signal_precedence_stderr_first():
     """Ordering follows the oracle: stderr signals, token, stopReason, turns."""
     e = env(structuredOutput=GOOD, stopReason="Cancelled")
     assert "stderr" in GrokAdapter().parse(e, b"tool_error").degraded_reason
+
+
+# --------------------------------------------------------------------------
+# classify: the real quota exhaustion this provider actually emits
+# --------------------------------------------------------------------------
+#
+# The generic classify tests live in `test_adapter_base.py` because they are
+# contract-level. These do not: they pin ONE captured provider message, and
+# they live next to the adapter whose table has to match it, so a future reader
+# who breaks the table is told which real-world failure they just re-opened.
+
+#: The exact stderr the installed xAI grok CLI wrote on 2026-07-28 when the
+#: account ran out of balance — rc 1, empty stdout. The only edit is the removal
+#: of the paid-tier name that preceded "usage balance exhausted"; the wrapper,
+#: the doubled `Error: Internal error:` line, the JSON shape, the HTTP status
+#: and the wording are the capture's own.
+#:
+#: Task 14's live acceptance run found that NONE of the shipped quota signals
+#: matched this: not `quota`, not `rate limit`, and — the near miss that makes
+#: this worth a named test — not `usage limit`, which reads as though it would
+#: match "usage balance exhausted" and does not. `classify` therefore fell
+#: through every table to `ok`, the fallback chain never advanced to the next
+#: provider, and nothing was cached. The feature was defeated by exactly the
+#: condition it exists for.
+REAL_XAI_QUOTA_STDERR = (
+    b'Internal error: {\n'
+    b'  "message": "API error (status 402 Payment Required): usage balance '
+    b'exhausted",\n'
+    b'  "http_status": 402\n'
+    b'}\n'
+    b'Error: Internal error: {\n'
+    b'  "message": "API error (status 402 Payment Required): usage balance '
+    b'exhausted",\n'
+    b'  "http_status": 402\n'
+    b'}'
+)
+
+QUOTA_FIXTURE = (Path(__file__).parent / "fixtures" / "adapters" / "xai"
+                 / "unavailable_quota.txt")
+
+
+def test_real_xai_balance_exhaustion_is_unavailable_quota():
+    """The defect, stated where it is legible: this run is out of budget.
+
+    `unavailable` so the chain advances to the next provider instead of
+    burning the remaining attempts on one that cannot serve, and `quota` and
+    not `other` because `quota` is the only category a caller may remember
+    beyond a single attempt — which is the entire point of noticing a balance
+    that is gone rather than one request that failed.
+    """
+    r = GrokAdapter().classify(1, b"", REAL_XAI_QUOTA_STDERR)
+    assert r.kind == "unavailable" and r.category == "quota", (
+        f"real xAI balance exhaustion classified {r.kind}/{r.category} "
+        f"({r.detail!r}) — the fallback chain does not advance and the "
+        f"provider is not cached, so every later reviewer in the run retries a "
+        f"provider that is out of budget")
+
+
+def test_the_quota_fixture_carries_exactly_the_captured_bytes():
+    """The literal above and the conformance fixture may not drift apart.
+
+    Two witnesses of one capture are worth having — the fixture drives the
+    registration gate, the literal makes the intent readable at the point of
+    failure — but only while they are the same bytes. Without this, editing one
+    to make a test pass silently leaves the other asserting something else.
+    """
+    fx = load_fixture(QUOTA_FIXTURE)
+    assert fx.rc == 1 and fx.category == "quota" and fx.stdout == b""
+    assert fx.stderr == REAL_XAI_QUOTA_STDERR
+
+
+@pytest.mark.parametrize("signal", _QUOTA_SIGNALS)
+def test_every_quota_signal_is_individually_load_bearing(signal):
+    """Each `_QUOTA_SIGNALS` entry alone must classify `quota`.
+
+    `quota` is the one provider-wide-cacheable category, so an entry that
+    cannot fire on its own is dead weight in the table that matters most —
+    and an entry shadowed by another table's wording is a silent
+    reclassification. Parametrized over the table itself so a new entry is
+    covered the moment it is added.
+    """
+    r = GrokAdapter().classify(1, b"", b"error: " + signal + b" for this key")
+    assert r.kind == "unavailable" and r.category == "quota"
+
+
+@pytest.mark.parametrize("err", [
+    pytest.param(b"parse error at offset 402 in stream", id="offset-402"),
+    pytest.param(b"json decode failed at line 402", id="line-402"),
+    pytest.param(b"retried 402 times before giving up", id="counter-402"),
+])
+def test_a_bare_402_is_not_a_quota_signal(err):
+    """The status CODE is not a signal; its reason PHRASE is.
+
+    Task 1 rejected a bare `429` for this exact reason and the same argument
+    binds `402`: stderr carries line numbers, byte offsets and retry counters,
+    and a three-digit substring match would mint provider-wide quota outages
+    out of arithmetic. `payment required` and `balance exhausted` are added
+    instead — they are phrases, they are unambiguous, and neither occurs by
+    accident in a diagnostic.
+    """
+    r = GrokAdapter().classify(1, b"", err)
+    assert r.category != "quota"
 
 
 # --------------------------------------------------------------------------

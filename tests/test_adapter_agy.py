@@ -668,6 +668,41 @@ def test_quota_wording_is_unavailable_quota():
     assert res.kind == "unavailable" and res.category == "quota"
 
 
+@pytest.mark.parametrize("err", [
+    pytest.param(b"You have exhausted your quota on this model.\n",
+                 id="exhausted-your-quota"),
+    pytest.param(b"Quota exhausted\n", id="quota-exhausted"),
+    pytest.param(b"request failed: 402 Payment Required\n",
+                 id="payment-required"),
+])
+def test_budget_wording_this_cli_can_emit_is_unavailable_quota(err):
+    """The audit half of Task 14's quota defect, on this adapter's own words.
+
+    This table is deliberately narrower than the other two — it matches
+    `quota exceeded`, not a bare `quota`, because the Google protos this
+    binary embeds are dense with the word. That narrowness is what let the
+    binary's OWN sentence, "You have exhausted your quota on this model.",
+    fall through every table to `ok`: `quota exceeded` does not match it, and
+    neither does `resource_exhausted`. Both of the first two strings are
+    present verbatim in the installed agy 1.1.8 binary.
+    """
+    res = AgyAdapter().classify(1, b"", err, REVIEW_CONTRACT)
+    assert res.kind == "unavailable" and res.category == "quota"
+
+
+@pytest.mark.parametrize("err", [
+    pytest.param(b"parse error at offset 402 in stream", id="offset-402"),
+    pytest.param(b"retried 402 times before giving up", id="counter-402"),
+])
+def test_a_bare_402_is_not_a_quota_signal(err):
+    """Task 1's rejection of a bare `429` binds `402` for the same reason.
+
+    The reason PHRASE is the signal; the status CODE is arithmetic.
+    """
+    res = AgyAdapter().classify(1, b"", err, REVIEW_CONTRACT)
+    assert res.category != "quota"
+
+
 @pytest.mark.parametrize("signal", _QUOTA_SIGNALS)
 def test_every_quota_signal_is_individually_load_bearing(signal):
     """Each `_QUOTA_SIGNALS` entry alone must classify `quota`.

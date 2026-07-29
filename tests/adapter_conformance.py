@@ -63,6 +63,43 @@ witness proves nothing:
 `*refuter*healthy*`          rule 1b (>= 1)
 ===========================  ============================================
 
+Why rule 4 does NOT require a `quota` fixture specifically
+----------------------------------------------------------
+
+It is the obvious hardening and it is deliberately not done. `quota` is the
+only provider-wide-cacheable category, so it is the one whose misdetection has
+blast radius beyond a single attempt — and Task 14's live acceptance run found
+exactly that defect: every adapter satisfied rule 4 with an `auth` or `model`
+fixture, no adapter had a `quota` capture, and real xAI budget exhaustion
+(`402 Payment Required ... usage balance exhausted`) matched none of the
+shipped quota signals. `classify` returned `ok`, the fallback chain never
+advanced, and nothing was cached.
+
+Requiring one would not have caught it. A quota failure cannot be produced on
+demand: it needs a real account with a real balance to run out, at a moment
+nobody schedules. An adapter author told to supply a `*unavailable_quota*`
+fixture would therefore write one — and a hand-written quota fixture asserts
+only that the phrase its author imagined matches the signal table that same
+author wrote. That circle passes cleanly while the provider's actual wording
+goes on matching nothing, which is this defect wearing a green tick. The
+capture rule ("SYNTHESIZED where the archive cannot supply it") exists to keep
+hand-written envelopes honest about being hand-written; a rule that can only be
+satisfied by synthesizing is a rule that manufactures the thing it is meant to
+prevent.
+
+So the obligation is documentary rather than mechanical, and it is stated here
+because this is where an adapter author reads:
+
+    When a live quota failure DOES occur for your provider, capture it,
+    sanitize it, commit it as `unavailable_quota.txt`, and record it as a
+    real capture in the fixture directory's README.
+
+`tests/fixtures/adapters/xai/unavailable_quota.txt` is that fixture for xai and
+is a real capture. `openai` and `google` do not have one yet; when they do, the
+per-adapter "every quota signal is individually load-bearing" tests in their
+test modules are what keep the tables from growing entries that fire on nothing
+in the meantime.
+
 Fixture file format
 -------------------
 

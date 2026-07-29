@@ -192,6 +192,31 @@ _MODEL_SIGNALS: tuple[bytes, ...] = (
 # can never over-match), but a signal that can never fire is dead weight and
 # its stated provenance was false, so it is gone rather than relabelled
 # speculative.
+# The last three were added by the Task 14 audit, after a live capture showed
+# grok's table missing real budget exhaustion. This table's narrowness — it
+# matches `quota exceeded`, never a bare `quota`, because the Google protos
+# this binary embeds are dense with the word — is correct and is kept, but it
+# is also what let the binary's OWN sentence fall through every table to `ok`.
+# Provenance, per entry:
+#
+# * `exhausted your quota` — verbatim in the installed agy 1.1.8 binary
+#   ("You have exhausted your quota on this model."). Matched by neither
+#   `quota exceeded` nor `resource_exhausted`. OBSERVED IN THE BINARY, not in
+#   a live failure: the balance to exhaust was xAI's, not Google's.
+# * `quota exhausted` — verbatim in the installed binary, as the UI's own
+#   status label ("Quota available" / "Quota exhausted"). Same caveat.
+# * `payment required` — the IANA-registered reason phrase for HTTP 402. It is
+#   present in this binary only inside Go's `net/http` status-text table, so it
+#   is reachable wherever the CLI renders a status line, and it is the exact
+#   wording xAI's CLI was live-captured emitting. SPECULATIVE for THIS
+#   provider: no agy run has been observed emitting it.
+#
+# A bare `exhausted` was considered and rejected: this binary exhausts
+# iterators, counters, read limits and retry budgets, and reading any of those
+# as a provider outage is the false-`quota` direction that costs a healthy
+# provider every later chain in the run. `balance exhausted` — grok's other new
+# signal — is likewise absent: zero occurrences in this binary, and a signal
+# that can never fire is the dead weight this comment's older half records.
 _QUOTA_SIGNALS: tuple[bytes, ...] = (
     b"quota exceeded",
     b"resource_exhausted",
@@ -201,6 +226,9 @@ _QUOTA_SIGNALS: tuple[bytes, ...] = (
     b"ratelimit",
     b"too many requests",
     b"out of credits",
+    b"exhausted your quota",
+    b"quota exhausted",
+    b"payment required",
 )
 
 # The CLI refusing our own argv. Attempt-local and caches nothing, hence

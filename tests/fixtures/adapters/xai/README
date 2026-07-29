@@ -65,6 +65,29 @@ unavailable_auth.txt
     because the archive's real auth-failure stderr is dense with the
     developer's machine paths and plugin directories.
 
+unavailable_quota.txt
+    CAPTURED LIVE on 2026-07-28 from the installed grok CLI (0.2.112), during
+    Task 14's acceptance run, when the account's balance ran out. rc 1, EMPTY
+    stdout, the whole message on stderr. Declares `category=quota`.
+    This is the fixture the conformance suite was missing: `quota` is the only
+    provider-wide-cacheable category — the one whose misdetection has blast
+    radius beyond a single attempt, in both directions — and until this file no
+    adapter in this repository had an `*unavailable_quota*` capture at all.
+    It is also the fixture that FAILED first: none of the shipped
+    `_QUOTA_SIGNALS` matched these bytes, so `classify` fell through to `ok`,
+    the fallback chain never advanced and nothing was cached. See
+    `src/skodun/adapters/grok.py::_QUOTA_SIGNALS` for the two phrases added and
+    why a bare `402` was not one of them.
+    STRIPPED: exactly one thing — the paid product-tier name that stood
+    immediately before "usage balance exhausted", because it says which tier
+    the capturing account subscribes to. Everything else is the capture's own
+    bytes: the `Internal error: {` wrapper, the JSON keys and their order, the
+    two-space indent, the doubled `Error: Internal error:` block the CLI writes
+    after the first, the HTTP status in both the prose and the `http_status`
+    field, and the wording. No tokens, no account or request ids, no usernames,
+    no machine paths and no project names were present in the capture to begin
+    with — verified by reading the bytes rather than assumed.
+
 healthy_noisy_stderr.txt
     CAPTURED stdout (identical to `healthy.txt`) + SYNTHESIZED stderr. Rule 7,
     which generalizes grok's Phase 1 auth-noise non-signal rule: the stderr

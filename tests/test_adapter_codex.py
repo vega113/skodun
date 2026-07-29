@@ -33,7 +33,12 @@ from skodun.adapters import (
     UNAVAILABLE_RC,
     get_adapter,
 )
-from skodun.adapters.codex import CodexAdapter, resolve_codex_bin, strict_schema
+from skodun.adapters.codex import (
+    _QUOTA_SIGNALS,
+    CodexAdapter,
+    resolve_codex_bin,
+    strict_schema,
+)
 from skodun.config import Defaults, Reviewer
 from tests.adapter_conformance import (  # noqa: F401 - see below
     AdapterConformance,
@@ -532,6 +537,58 @@ def test_quota_wording_is_unavailable_quota():
     err = b"ERROR codex_api: 429 Too Many Requests: rate limit exceeded\n"
     res = CodexAdapter().classify(1, b"", err, REVIEW_CONTRACT)
     assert res.kind == "unavailable" and res.category == "quota"
+
+
+@pytest.mark.parametrize("err", [
+    pytest.param(b"You've reached your workspace credit limit\n",
+                 id="credit-limit"),
+    pytest.param(b"You hit your spend cap set in your workspace. Increase "
+                 b"your spend cap to continue.\n", id="spend-cap"),
+    pytest.param(b"request failed: 402 Payment Required\n",
+                 id="payment-required"),
+])
+def test_budget_wording_this_cli_can_emit_is_unavailable_quota(err):
+    """The audit half of Task 14's quota defect, on this adapter's own words.
+
+    grok's table missed real budget exhaustion because it enumerated the
+    phrases its author expected rather than the ones the CLI emits. The same
+    shape of gap is here: the first two strings are present verbatim in the
+    installed codex binary and matched NOTHING in `_QUOTA_SIGNALS` — a
+    workspace at its credit limit or spend cap is out of budget in exactly the
+    sense `quota` exists to cache. The third is the HTTP-level sibling of
+    grok's live capture.
+    """
+    res = CodexAdapter().classify(1, b"", err, REVIEW_CONTRACT)
+    assert res.kind == "unavailable" and res.category == "quota"
+
+
+@pytest.mark.parametrize("signal", _QUOTA_SIGNALS)
+def test_every_quota_signal_is_individually_load_bearing(signal):
+    """Each `_QUOTA_SIGNALS` entry alone must classify `quota`.
+
+    `quota` is the one provider-wide-cacheable category, so a table entry that
+    cannot fire on its own is the most expensive kind of dead signal this
+    module has: it keeps re-trying a provider that has told every caller it is
+    out of budget. Parametrized over the table itself, so an entry added later
+    is covered the moment it is added — which is precisely what was missing
+    when grok's table grew a `usage limit` that never matched anything real.
+    """
+    err = b"codex: " + signal + b"\n"
+    res = CodexAdapter().classify(1, b"", err, REVIEW_CONTRACT)
+    assert res.kind == "unavailable" and res.category == "quota"
+
+
+@pytest.mark.parametrize("err", [
+    pytest.param(b"parse error at offset 402 in stream", id="offset-402"),
+    pytest.param(b"retried 402 times before giving up", id="counter-402"),
+])
+def test_a_bare_402_is_not_a_quota_signal(err):
+    """Task 1's rejection of a bare `429` binds `402` for the same reason.
+
+    The reason PHRASE is the signal; the status CODE is arithmetic.
+    """
+    res = CodexAdapter().classify(1, b"", err, REVIEW_CONTRACT)
+    assert res.category != "quota"
 
 
 def test_auth_beats_quota_when_both_appear():

@@ -110,9 +110,43 @@ _MODEL_SIGNALS: tuple[bytes, ...] = (
     b"unsupported model",
 )
 
-# No bare `429` here, deliberately: stderr can carry line numbers and byte
-# offsets, and a numeric substring match would mint provider-wide quota
-# outages out of arithmetic.
+# No bare `429` or `402` here, deliberately: stderr can carry line numbers and
+# byte offsets, and a numeric substring match would mint provider-wide quota
+# outages out of arithmetic. That rejection is Task 1's and it still stands —
+# what the last two entries change is the OTHER half of the same argument.
+#
+# The last two were added after Task 14's live acceptance run found that real
+# xAI budget exhaustion matched nothing here. The installed CLI's actual
+# message, rc 1 with empty stdout, is:
+#
+#     API error (status 402 Payment Required): <tier> usage balance exhausted
+#
+# `quota`, `rate limit` and `too many requests` all miss it, and so — this is
+# the near miss worth naming — does `usage limit`, which reads as though it
+# would match "usage balance exhausted" and does not. `classify` fell through
+# to `ok`, the fallback chain never advanced, and nothing was cached: the
+# headline feature defeated by its own most likely real-world trigger.
+#
+# Task 1's conservatism was about a BARE NUMBER being too easily present in
+# unrelated stderr, and the safe failure direction being a missed `unavailable`
+# rather than a false provider outage. A missed quota signal is exactly the
+# failure being fixed here, so the two halves have to be weighed rather than
+# one of them applied by reflex. Both additions are PHRASES, not numbers:
+#
+# * `payment required` is the IANA-registered reason phrase for HTTP 402 and
+#   means one thing in every provider's vocabulary. It cannot arrive from
+#   arithmetic, and a diagnostic that contains it is a diagnostic about
+#   billing.
+# * `balance exhausted` is the captured wording, and is specific in the way a
+#   bare `exhausted` is not — CLIs routinely exhaust retries, iterators, token
+#   budgets and context windows, and a bare `exhausted` would read all of those
+#   as a provider outage.
+#
+# `402` itself stays out for precisely Task 1's reason, and
+# `test_a_bare_402_is_not_a_quota_signal` pins that it does.
+#
+# Captured live on 2026-07-28 from grok 0.2.112; the capture is
+# `tests/fixtures/adapters/xai/unavailable_quota.txt`.
 _QUOTA_SIGNALS: tuple[bytes, ...] = (
     b"quota",
     b"rate limit",
@@ -122,6 +156,8 @@ _QUOTA_SIGNALS: tuple[bytes, ...] = (
     b"usage limit",
     b"insufficient credit",
     b"out of credits",
+    b"payment required",
+    b"balance exhausted",
 )
 
 # Canonical effort (`config.EFFORTS`) -> grok's spelling. Pass-through today;

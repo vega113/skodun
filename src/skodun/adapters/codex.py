@@ -122,9 +122,33 @@ _MODEL_SIGNALS: tuple[bytes, ...] = (
     b"unsupported model",
 )
 
-# No bare `429` here, deliberately: diagnostics carry byte offsets and request
-# counters, and a numeric substring match would mint provider-wide quota
-# outages out of arithmetic.
+# No bare `429` or `402` here, deliberately: diagnostics carry byte offsets and
+# request counters, and a numeric substring match would mint provider-wide
+# quota outages out of arithmetic. Pinned by
+# `test_a_bare_402_is_not_a_quota_signal`.
+#
+# The last three were added by the Task 14 audit, after a live capture showed
+# grok's table missing real budget exhaustion. This table had the same shape of
+# gap: it enumerated the phrases its author expected rather than the ones this
+# CLI emits. Provenance, stated per entry rather than for the table, because
+# the earlier agy draft's blanket claim was wrong for two of its entries:
+#
+# * `credit limit` — verbatim in the installed codex binary
+#   ("You've reached your workspace credit limit"). OBSERVED IN THE BINARY,
+#   not in a live failure: the balance to exhaust was xAI's, not OpenAI's.
+# * `spend cap` — verbatim in the installed codex binary ("You hit your spend
+#   cap set in your workspace. Increase your spend cap to continue."). Same
+#   provenance and same caveat.
+# * `payment required` — the IANA-registered reason phrase for HTTP 402. It is
+#   present in this binary only inside the HTTP crate's canonical reason-phrase
+#   table, so it is reachable wherever the CLI renders a status line, and it is
+#   the exact wording xAI's CLI was live-captured emitting. SPECULATIVE for
+#   THIS provider: no codex run has been observed emitting it.
+#
+# `balance exhausted` — grok's other new signal — is deliberately NOT here:
+# `strings` finds zero occurrences of it in this binary, and adding a signal
+# that can never fire while describing it as this CLI's vocabulary is exactly
+# the mistake the agy table's comment records and undoes.
 _QUOTA_SIGNALS: tuple[bytes, ...] = (
     b"quota",
     b"rate limit",
@@ -134,6 +158,9 @@ _QUOTA_SIGNALS: tuple[bytes, ...] = (
     b"usage limit",
     b"insufficient credit",
     b"out of credits",
+    b"credit limit",
+    b"spend cap",
+    b"payment required",
 )
 
 # Canonical effort (`config.EFFORTS`) -> the CLI's `model_reasoning_effort`.
