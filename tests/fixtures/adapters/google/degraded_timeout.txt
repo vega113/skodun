@@ -1,0 +1,6 @@
+rc=1
+--- stdout ---
+{"conversation_id":"00000000-0000-0000-0000-000000000000","status":"ERROR","response":"","error":"timeout waiting for response","duration_seconds":0,"num_turns":0,"json_schema":{"type":"object","properties":{"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"object","properties":{"file":{"type":"string"},"line":{"type":"integer"},"severity":{"type":"string","enum":["high","medium","low"]},"category":{"type":"string"},"title":{"type":"string"},"detail":{"type":"string"}},"required":["file","severity","title","detail"]}}},"required":["summary","findings"]},"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0}}
+
+--- stderr ---
+

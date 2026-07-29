@@ -1,0 +1,143 @@
+google / agy conformance fixtures
+=================================
+
+Witnesses for the rules in `tests/adapter_conformance.py`, which is where the
+file format is documented. In short: `rc=<int>` first, an optional
+`category=<expected>` (required on every `*unavailable*` file), then
+`--- stdout ---` and `--- stderr ---` sections holding raw UTF-8 bytes.
+
+stdout here is ONE JSON envelope, written at the end of the run — not a stream
+and not a bare payload. Its keys are `conversation_id`, `status`, `response`,
+`duration_seconds`, `num_turns`, `usage`, and, when `--json-schema` was given
+and the run got far enough, `structured_output` and `json_schema`. A failed run
+adds `error`. The review payload rides in `structured_output` (the copy the CLI
+validated against the schema) and usually a second time, as text, in
+`response`.
+
+The loader consumes exactly one trailing newline per section, as the separator
+before the next marker. Every capture below genuinely ended with a newline on
+the wire, so their stdout sections end with a blank line — that blank line is
+the run's own final newline, not formatting.
+
+Provenance
+----------
+
+Every file marked CAPTURED came from a live `agy` run against agy 1.1.8 during
+this task's Step 0 probe, and was then sanitized. RECOMBINED means two real
+captures joined (a real stdout with a real stderr from a different run) —
+stated per file, because the pair never occurred together on one run.
+SYNTHESIZED would mean written by hand; **nothing here is synthesized**. The
+distinction matters: a hand-written envelope proves the adapter can parse what
+its author imagined, which is exactly the thing an adapter is most likely to
+get wrong.
+
+Every capture was taken from a scratch directory outside the repository, with
+`--sandbox` and WITHOUT `--dangerously-skip-permissions`, using the same argv
+shape `AgyAdapter.build_cmd` produces. The reviewed material is synthetic code
+written for the probe, so the finding text names nothing real.
+
+healthy.txt
+    CAPTURED, whole. A completed review of a small synthetic diff
+    (`svc/cache.py`): three findings, `status: SUCCESS`, rc 0, empty stderr.
+    Every finding `title` is plain ASCII with no quotes or backslashes, which
+    is what conformance rule 6 needs — rule 6 splices the adapter's own stderr
+    signal words into a title *in the raw bytes*, and only a title that
+    survives `json.dumps` unchanged appears there verbatim. The title appears
+    twice in these bytes (once in `structured_output`, once inside the
+    `response` text) at the same escaping depth, so a single byte replacement
+    keeps both copies valid and consistent.
+    STRIPPED: `conversation_id` (replaced by an all-zero UUID).
+
+healthy_noisy_stderr.txt
+    RECOMBINED: CAPTURED stdout from a second, different live review
+    (`svc/token.py`, two findings) + CAPTURED stderr from the no-credentials
+    run below. Rule 7's witness. The run must still classify `ok`, because the
+    provider demonstrably served; the suite proves the fixture is not vacuous
+    by classifying the SAME stderr with empty stdout and requiring
+    `unavailable` there.
+    This stdout is also the one whose `response` carries the payload TWICE at
+    two different indentations — real output, and the reason extraction
+    prefers `structured_output` rather than scanning the text first.
+    STRIPPED: `conversation_id`; the OAuth URL (see `unavailable_auth`).
+
+refuter_healthy.txt
+    CAPTURED, whole. A live run asked for `REFUTER_CONTRACT` — the same
+    invocation with the refuter schema in `--json-schema` — answering three
+    findings with `confirmed`, `refuted`, `refuted`. It must parse under
+    `REFUTER_CONTRACT` and must NOT parse under `REVIEW_CONTRACT`; a refuter
+    response a Phase 1 caller could read as a review would read as a review
+    with no findings, which is a clean bill of health.
+    STRIPPED: `conversation_id`.
+
+degraded_stderr.txt
+    RECOMBINED: CAPTURED stdout (identical to `healthy.txt`) + CAPTURED stderr
+    from a live auto-denied-tool run. Both halves are real; no run produced
+    both, because the denied run's own stdout is the empty-response envelope
+    described next.
+    That denied run is the sharpest failure shape this CLI has: a prompt that
+    needed a tool, in a headless run that cannot prompt for permission, so the
+    call was auto-denied — and the CLI still exits **0** with **`status:
+    SUCCESS`** and an **empty `response`**. The only evidence anywhere is the
+    stderr line `no output produced`. It is a silent-false-all-clear generator,
+    and that phrase is what stops it.
+    Pairing that stderr with a valid stdout is what rule 3 needs: the run must
+    classify `degraded`, NOT `unavailable`, because usable output wins on the
+    availability axis only. It is also the source of the signal words rule 6
+    splices into a finding title.
+    The stderr is byte-faithful, including the CLI's own `jetski:` prefix and
+    the em dash it writes. Both are provider constants, like the endpoint names
+    in the other adapters' fixtures; rewriting them would make the fixture a
+    lie about what the binary emits, and the adapter's signal matching is
+    exactly what these bytes exist to pin.
+
+degraded_timeout.txt
+    CAPTURED, whole. A real `--print-timeout` expiry: rc 1, `status: ERROR`,
+    `error: timeout waiting for response`, empty stderr, no payload. It carries
+    no auth, model or quota wording, so it must land on `degraded` rather than
+    `unavailable` — the provider was reachable and the answer was cut short,
+    which buys a same-reviewer retry instead of advancing the fallback chain.
+    STRIPPED: `conversation_id`.
+
+unavailable_auth.txt
+    CAPTURED, whole, from a run with `HOME` pointed at an empty scratch
+    directory, so the CLI found no credentials: rc 1, `status: ERROR`,
+    `error: authentication failed or timed out`, and the CLI's own
+    `Authentication required` prompt on stderr. Declares `category=auth`.
+    No credential of the developer's was read, written or refreshed to produce
+    this: the run simply looked in a directory that had none. The category is
+    asserted EXACTLY: `auth` is attempt-local, `quota` is cached provider-wide,
+    and confusing the two takes a healthy provider out of every later fallback
+    chain.
+    STRIPPED: `conversation_id`, and the whole OAuth authorization URL —
+    replaced by `https://accounts.example/oauth2/auth?REDACTED`. That URL
+    carried a client id, a PKCE code challenge and a CSRF state token; none is
+    a credential of the developer's, and none belongs in a public repository.
+    No token was ever in these bytes — the point of the run is that there was
+    none.
+
+unavailable_model.txt
+    CAPTURED, whole, from a run asking for a model id that does not exist.
+    Declares `category=model`. stderr is EMPTY here, which is the interesting
+    part: the only evidence is inside the envelope, in the harness-authored
+    `error` field. The adapter reads that and never reads `response` or
+    `structured_output`, which is what keeps review CONTENT from ever driving a
+    classification.
+    The `error` opens with `invalid model selection`, which is this CLI's
+    umbrella prefix for EVERY model/effort rejection — unknown id, missing
+    `--effort`, an `--effort` the model has no level for, an `--effort` that
+    conflicts with an effort-suffixed id. One signal covers all four.
+    The model id in this file (`gemini-9.9-nonexistent`) is deliberately not a
+    real one — it is the id the CLI rejected, and rejecting it is what the
+    fixture witnesses. The list of REAL model names the CLI prints in reply is
+    its own public catalogue, kept verbatim. Every model id that appears in a
+    passing invocation (in the tests) is one this CLI accepted live.
+
+Sanitization
+------------
+
+These files are committed to a public repository. Every capture was checked to
+contain no tokens, usernames, machine paths, home directories, repo or project
+names, session ids or request ids; `conversation_id` values were replaced with
+an all-zero UUID and the OAuth URL was redacted. What the captures still carry
+is provider constants (the CLI's own field names, status words, error wording
+and model catalogue) and usage numbers, which identify nothing.

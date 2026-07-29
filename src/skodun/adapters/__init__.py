@@ -24,11 +24,13 @@ from .base import (
     OutputContract,
     ParseResult,
 )
+from .agy import AgyAdapter
 from .codex import CodexAdapter
 from .grok import GrokAdapter
 
 __all__ = [
     "Adapter",
+    "AgyAdapter",
     "ClassifyResult",
     "CodexAdapter",
     "GrokAdapter",
@@ -49,6 +51,7 @@ __all__ = [
 _REGISTRY: dict[str, type[Adapter]] = {
     "xai": GrokAdapter,
     "openai": CodexAdapter,
+    "google": AgyAdapter,
 }
 
 

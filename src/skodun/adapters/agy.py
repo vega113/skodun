@@ -1,0 +1,499 @@
+"""The agy adapter: build the invocation, read the envelope, judge the run.
+
+Written against agy 1.1.8 and probed flag by flag before a line of it existed;
+where this file and the plan disagreed, the installed binary won. Four things
+about that CLI shape the whole module, and the first is a deviation from a
+global rule rather than a detail:
+
+* **There is no way to hand this CLI a prompt FILE.** It has no `--prompt-file`
+  flag, and it does not read stdin in print mode — probed twice: piping text in
+  alongside `--print "<question>"` left the model answering `NONE` (it never
+  saw the piped bytes), and `--print -` sent the literal one-character string
+  `-`. The only channel the binary offers is the `--print` argv value. So
+  `build_cmd` reads the prompt file and puts its TEXT in the argv. No shell is
+  involved — the argv is a list handed to `subprocess` — so nothing is
+  shell-interpolated and no quoting rule can be got wrong; what changes is that
+  the bytes are in the process's argument vector, which is (a) size-limited and
+  (b) visible in the process table. (a) is handled by `MAX_PROMPT_ARG_BYTES`
+  below, which fails closed and loudly. (b) is a real, stated cost of this
+  provider: a reviewer's prompt contains the diff under review, and on a shared
+  machine `ps` will show it for the life of the attempt. Providers whose CLI
+  accepts a file (grok) or stdin (codex) do not pay it.
+
+* **stdout is ONE JSON envelope**, written at the end of the run:
+  `{"conversation_id", "status", "response", "structured_output"?, "error"?,
+  "json_schema"?, "duration_seconds", "num_turns", "usage"}`. `structured_output`
+  is the copy the CLI itself validated against `--json-schema` and is
+  authoritative; `response` is the model's raw text, which the probe saw carry
+  a ```json fence and, once, the payload twice at two indentations. Extraction
+  is therefore the same three-level fallback the grok adapter uses.
+
+* **`--json-schema` takes the contract's schema VERBATIM.** Unlike codex's
+  OpenAI structured-outputs mode, nothing has to be projected: the probe handed
+  `contract.json_schema` over byte-for-byte and got a `structured_output` back
+  that validated. The flag accepts "a JSON schema string or path to a schema
+  file"; this adapter passes the STRING. A sidecar file would buy nothing here
+  (there is no projection to write) and would cost `build_cmd` its freedom from
+  side effects and add a stale-file hazard when two attempts share a prompt
+  directory — the exact hazard codex has to defend against by always
+  overwriting.
+
+* **`--effort` has exactly three levels**, `low|medium|high`, and it is
+  entangled with the model id. `agy models` lists both base ids
+  (`gemini-3.6-flash`) and effort-suffixed ones (`gemini-3.6-flash-low`); a
+  base id REQUIRES `--effort`, and a suffixed id REFUSES any `--effort` that
+  disagrees with its suffix. All of those refusals are rc 1 with an `error`
+  opening `invalid model selection`, which is why one signal classifies the
+  unknown id, the missing effort and the conflicting effort alike. Canonical
+  `max` has no level and is refused loudly by `build_cmd`; canonical `none` is
+  the opt-out and passes no flag, exactly as it does for grok.
+
+Classification never reads the model's own words. It looks at the exit code, at
+stderr, and at the envelope's `status` and `error` — both written by the
+harness. `response` and `structured_output` are never consulted for a verdict,
+so a review that quotes an auth error or discusses a dropped stream cannot take
+the provider down (conformance rule 6).
+
+One captured failure shape drove the degradation table more than any other: a
+run whose tool call was auto-denied (headless mode cannot prompt for
+permission) exits **0** with **`status: SUCCESS`** and an **empty `response`**,
+and says so only on stderr. That is a silent-false-all-clear generator, and
+`no output produced` — the CLI's own words — is what stops it.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable
+
+from ..config import Defaults, Reviewer
+from .base import (
+    REVIEW_CONTRACT,
+    UNAVAILABLE_RC,
+    ClassifyResult,
+    OutputContract,
+    ParseResult,
+    _ask,
+    _DECODE_FAILURES,
+    _first_eligible_object,
+)
+
+#: The largest prompt this adapter will place in an argv element.
+#:
+#: Linux caps a SINGLE argument at `MAX_ARG_STRLEN` = 32 pages = 131072 bytes,
+#: regardless of how much room `ARG_MAX` leaves overall; macOS caps the whole
+#: argv (`kern.argmax`, 1 MiB on the probe machine). The Linux per-argument cap
+#: is the smaller and the less obvious of the two, so it is the one this guard
+#: uses everywhere: a reviewer that works on one developer's machine and dies
+#: on CI is worse than one that refuses the same prompt on both. The slack
+#: leaves room for the flags and the inline schema that share the vector.
+#:
+#: `config.Defaults.max_diff_bytes` is 400_000, so a large diff CAN exceed this.
+#: That is a real limitation of this provider and it fails closed: `build_cmd`
+#: raises, `pipeline._run_chain` records "could not build the invocation" and
+#: stops the chain. The alternative is an `OSError` out of `subprocess`, which
+#: reaches the gate as an unexpected exception instead of as a reviewer that
+#: could not be invoked.
+MAX_PROMPT_ARG_BYTES = 128 * 1024 - 8 * 1024
+
+# The `status` value that means "the run reached its end normally". An
+# ALLOWLIST, deliberately: a false positive costs one re-review, a false
+# negative is the silent false all-clear this module exists to prevent. The
+# binary carries `SUCCESS`, `ERROR`, `TIMEOUT` and `CANCELLED`; only the first
+# two were observed in print mode, and the table does not depend on having seen
+# them all.
+_STATUS_OK = "SUCCESS"
+
+# --- degradation tells (stderr only) ---------------------------------------
+#
+# Matched case-insensitively on stderr BYTES and on nothing else. Every string
+# here is present verbatim in the installed agy binary, so these are the CLI's
+# own words rather than guesses about what it might say. stdout is never
+# searched for them: a review of retry code would otherwise flag itself.
+_DEGRADED_STDERR_SIGNALS: tuple[bytes, ...] = (
+    b"no output produced",
+    b"stream error",
+    b"was interrupted",
+    b"context deadline exceeded",
+)
+
+# --- unavailability tells (classify only; never inputs to `degraded`) ------
+#
+# Consulted only when the run carried no usable payload — the Phase 1
+# non-signal rule: noisy diagnostics alongside a healthy answer are noise, not
+# a verdict.
+#
+# Checked in the order below, and the order is a safety decision rather than
+# alphabetical: `quota` is the ONLY provider-wide-cacheable category, so a
+# false `quota` takes a working provider out of every later chain in the run,
+# while a false `auth`/`model`/`other` costs one attempt. Anything that also
+# looks like a more specific, attempt-local failure is therefore reported as
+# that instead.
+_AUTH_SIGNALS: tuple[bytes, ...] = (
+    b"authentication required",
+    b"authentication failed",
+    b"authentication timed out",
+    b"please visit the url to log in",
+    b"not logged in",
+    b"unauthorized",
+    b"invalid api key",
+    b"sign in again",
+)
+
+# `invalid model selection` is the CLI's umbrella prefix for EVERY model or
+# effort rejection — unknown id, missing `--effort`, an `--effort` the model
+# has no level for, an `--effort` that conflicts with an effort-suffixed id.
+# All of them are attempt-local statements about this reviewer's configuration.
+_MODEL_SIGNALS: tuple[bytes, ...] = (
+    b"invalid model selection",
+    b"is not recognized as a known model",
+    b"unknown model",
+    b"no such model",
+    b"model not found",
+    b"unsupported model",
+)
+
+# No bare `429` here, deliberately: diagnostics carry byte offsets and request
+# counters, and a numeric substring match would mint provider-wide quota
+# outages out of arithmetic.
+_QUOTA_SIGNALS: tuple[bytes, ...] = (
+    b"quota exceeded",
+    b"resource_exhausted",
+    b"resourceexhausted",
+    b"rate limit",
+    b"rate_limit",
+    b"ratelimit",
+    b"too many requests",
+    b"usage limit",
+    b"insufficient credit",
+    b"out of credits",
+)
+
+# The CLI refusing our own argv. Attempt-local and caches nothing, hence
+# `other` — but it must be classified as SOMETHING: a rejected `--json-schema`
+# exits 1 with empty stdout, which the tables above would otherwise read as a
+# provider that simply said nothing.
+_INVOCATION_SIGNALS: tuple[bytes, ...] = (
+    b"invalid --json-schema",
+    b"empty prompt",
+    b"flag provided but not defined",
+)
+
+# Canonical effort (`config.EFFORTS`) -> the CLI's `--effort`. Pass-through for
+# the three levels it has. `"max"` is ABSENT on purpose and is not an oversight
+# the next reader should fix: `agy --effort max` is refused live with `invalid
+# --effort "max" (valid: low, medium, high)`, so `build_cmd` raises rather than
+# quietly sending `high` and reporting the result as `max`. `"none"` is absent
+# for the different reason grok's is: it is the user's explicit opt-out,
+# handled before any lookup happens, not a CLI value — the CLI rejects the
+# literal string `none` too.
+_EFFORT_MAP: dict[str, str] = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+}
+
+# `effort` values that mean "do not pass the flag at all". `None` is unset;
+# `"none"` is the user's explicit opt-out. Those are the only two: `config`
+# rejects every other spelling before a `Reviewer` can reach this module.
+_EFFORT_OFF = (None, "none")
+
+
+def resolve_agy_bin() -> str:
+    """`SKODUN_AGY_BIN` -> `agy` on PATH.
+
+    No `~`-relative default, unlike grok: agy is installed on PATH by its own
+    installer and `~/.gemini` holds credentials, settings and conversation
+    state rather than the executable. An exported-but-EMPTY variable is treated
+    as unset — `""` as argv[0] is not a path anyone meant.
+    """
+    return os.environ.get("SKODUN_AGY_BIN") or "agy"
+
+
+class AgyAdapter:
+    """Invocation + output interpretation for the Google agy CLI."""
+
+    name = "agy"
+    provider = "google"
+    # agy ignores stdin in print mode (probed twice; see the module docstring),
+    # so the runner must NOT open the prompt file as the child's stdin. The
+    # prompt reaches the CLI as the `--print` value instead.
+    stdin_from_prompt_file = False
+
+    def resolve_binary(self) -> str:
+        """The protocol's spelling of `resolve_agy_bin`."""
+        return resolve_agy_bin()
+
+    def effort_map(self) -> dict[str, str]:
+        """Canonical effort -> `--effort`. A copy, so that a caller inspecting
+        the table cannot mutate this adapter's behaviour."""
+        return dict(_EFFORT_MAP)
+
+    def build_cmd(self, prompt_file: Path, r: Reviewer, d: Defaults,
+                  cwd: Path,
+                  contract: OutputContract = REVIEW_CONTRACT) -> list[str]:
+        """The full argv for one attempt. Writes nothing.
+
+        Every flag here was accepted by agy 1.1.8 during the probe. The
+        load-bearing ones:
+
+        * `--print <text>` — the only prompt channel this CLI has. See the
+          module docstring; the size guard below is the price.
+        * `--output-format json` — one envelope on stdout instead of prose.
+        * `--json-schema <string>` — the contract's schema, verbatim.
+        * `--model` — always explicit, never inherited from the CLI's own
+          settings file.
+        * `--sandbox` — "run in a sandbox with terminal restrictions enabled".
+          Paired with the ABSENCE of `--dangerously-skip-permissions`: a tool
+          call that needs permission is then auto-denied, because a reviewer
+          must not be able to execute anything.
+        * `--print-timeout` — the CLI's own deadline, set to the runner's, so
+          that a stalled run has a chance to return a diagnosable envelope
+          (`status: ERROR`, `timeout waiting for response`) before the
+          watchdog kills it and leaves nothing at all.
+
+        `cwd` takes no flag: agy has no `--cwd`/`-C`, and the runner already
+        spawns the child in that directory. `d.max_turns` and `d.deny_tools`
+        have no counterpart either — the sandbox plus auto-denied permissions
+        is what stands in for the latter.
+        """
+        effort = None if r.effort in _EFFORT_OFF else r.effort
+        cli_effort = None
+        if effort is not None:
+            mapping = self.effort_map()
+            if effort not in mapping:
+                # LOUD, never a dropped flag: silently reviewing at the CLI's
+                # own default effort is an unnoticed downgrade, and an
+                # unnoticed downgrade is how a weak review passes for a strong
+                # one. `max` lands here by design — this CLI has no fourth
+                # level, and mapping it down to `high` would report a weaker
+                # review as the configured one.
+                raise ValueError(
+                    f"adapter {self.name!r} has no CLI value for effort "
+                    f"{effort!r} (known: {sorted(mapping)})")
+            cli_effort = mapping[effort]
+
+        prompt = prompt_file.read_text(encoding="utf-8")
+        size = len(prompt.encode("utf-8"))
+        if size > MAX_PROMPT_ARG_BYTES:
+            # BYTES, not characters: the kernel's per-argument cap counts
+            # bytes, so a multibyte prompt that looks short in characters can
+            # still be refused by `execve`.
+            raise ValueError(
+                f"adapter {self.name!r}: prompt is too large to pass on the "
+                f"command line ({size} bytes > {MAX_PROMPT_ARG_BYTES}); this "
+                f"CLI has no prompt-file flag and ignores stdin, so lower "
+                f"`max_diff_bytes` or review this change with another "
+                f"provider")
+
+        cmd = [
+            resolve_agy_bin(),
+            "--print", prompt,
+            "--output-format", "json",
+            "--json-schema", contract.json_schema,
+            "--model", r.model,
+            "--print-timeout", f"{d.timeout_sec}s",
+            "--sandbox",
+        ]
+        if cli_effort is not None:
+            cmd += ["--effort", cli_effort]
+        return cmd
+
+    def parse(self, stdout: bytes, stderr: bytes,
+              contract: OutputContract = REVIEW_CONTRACT) -> ParseResult:
+        payload, status, _ = _extract(stdout, contract.eligible)
+        parse_ok = _ask(contract.validate, payload)
+        degraded, reason = _detect_degraded(status, stderr)
+        # The `findings`/`summary` projection is REVIEW_CONTRACT's alone. Under
+        # any other contract those two stay empty rather than being filled from
+        # a foreign payload, so a Phase 1 caller that only knows them can never
+        # read a refuter response as a review; such callers get `payload`.
+        review = parse_ok and contract is REVIEW_CONTRACT
+        return ParseResult(
+            parse_ok=parse_ok,
+            findings=list(payload["findings"]) if review else [],
+            summary=payload["summary"] if review else "",
+            stop_reason=status,
+            degraded=degraded,
+            degraded_reason=reason,
+            payload=payload if parse_ok else None,
+        )
+
+    def classify(self, rc: int, stdout: bytes, stderr: bytes,
+                 contract: OutputContract = REVIEW_CONTRACT) -> ClassifyResult:
+        """Run health, on its own axis from parsing. Never raises.
+
+        Precedence, and every step of it is a fail-safe choice:
+
+        1. `rc 127` — the binary is not there, so nothing else means anything.
+        2. Usable output wins over noisy diagnostics, on the AVAILABILITY axis
+           only. A run that produced a valid payload is not "unavailable"
+           because the harness grumbled on the way. Usability is judged by
+           `contract.validate`, so a valid refuter response counts as usable.
+        3. Unavailability tells, attempt-local ones first (see the tables),
+           read from stderr and from the envelope's harness-authored `error` —
+           never from `response` or `structured_output`.
+        4. Degradation evidence, byte-for-byte the same signals `parse`
+           reports. This is checked AFTER step 2 on purpose: "the provider
+           served" is proved by the payload, "the answer is complete" is not,
+           and conflating them is the Phase 1 silent false all-clear.
+        5. Otherwise `ok` — including a run with empty stdout and clean stderr,
+           which is a failed attempt (`parse_ok=False`) but carries no positive
+           evidence of anything. Inventing a category for it would be the
+           inference-from-absence this module refuses to make.
+        """
+        if rc == UNAVAILABLE_RC:
+            return ClassifyResult(
+                "unavailable", "binary",
+                f"binary not found (rc {UNAVAILABLE_RC})")
+        payload, status, error = _extract(stdout, contract.eligible)
+        if not _ask(contract.validate, payload):
+            diagnostics = stderr.lower() + b"\n" + error
+            for category, signals in (("auth", _AUTH_SIGNALS),
+                                      ("model", _MODEL_SIGNALS),
+                                      ("other", _INVOCATION_SIGNALS),
+                                      ("quota", _QUOTA_SIGNALS)):
+                for sig in signals:
+                    if sig in diagnostics:
+                        return ClassifyResult(
+                            "unavailable", category,
+                            f"{category} failure in the run's diagnostics "
+                            f"({sig.decode()}) with no usable "
+                            f"{contract.name} payload")
+        degraded, reason = _detect_degraded(status, stderr)
+        if degraded:
+            return ClassifyResult("degraded", "", reason)
+        return ClassifyResult("ok", "", "")
+
+
+# --------------------------------------------------------------------------
+# the envelope
+# --------------------------------------------------------------------------
+
+
+def _root_envelope(text: str) -> object | None:
+    """The envelope ROOT value, or None if `text` does not open with one.
+
+    `raw_decode` rather than `json.loads`, for the reason the grok adapter
+    spells out at length: `loads` raises "Extra data" on ANY trailing byte,
+    and losing the root that way would silently skip the `status` check on
+    exactly the malformed runs it exists to catch.
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return None
+    try:
+        root, _ = json.JSONDecoder().raw_decode(stripped, 0)
+    except _DECODE_FAILURES:
+        return None
+    return root
+
+
+def _extract(
+    stdout: bytes,
+    eligible: Callable[[object], bool],
+) -> tuple[dict | None, str | None, bytes]:
+    """`(payload, status, diagnostics)` from one run's stdout. Never raises.
+
+    Three levels for the payload — `structured_output` -> `response` -> a raw
+    scan — and `eligible` is the requested contract's candidate predicate,
+    applied identically at every level so extraction needs no
+    contract-conditionals.
+
+    `structured_output` first because it is the copy the CLI validated against
+    `--json-schema`; `response` behind it because a run without a schema (or
+    one the CLI could not validate) still carries the model's answer there,
+    sometimes inside a ```json fence. The raw scan is the last resort for
+    output that is not this CLI's envelope at all.
+
+    `diagnostics` is the harness's own words about why the run went wrong —
+    the root `error` string, lowercased — and NOTHING else. Not `response`, not
+    `structured_output`: those are the model's words, and a review that quotes
+    a 401 must not be able to take the provider down.
+
+    `errors="replace"` rather than a strict decode: in exactly the truncated
+    runs that matter the output is cut mid-codepoint, and a
+    `UnicodeDecodeError` here would blind the status check on the very runs it
+    exists to catch.
+    """
+    text = stdout.decode("utf-8", "replace")
+    root = _root_envelope(text)
+
+    status: str | None = None
+    diagnostics = b""
+    payload: dict | None = None
+
+    if isinstance(root, dict):
+        value = root.get("status")
+        if isinstance(value, str) and value:
+            status = value
+        err = root.get("error")
+        if isinstance(err, str):
+            diagnostics = err.lower().encode("utf-8", "replace")
+
+        so = root.get("structured_output")
+        if _ask(eligible, so):
+            payload = so
+        else:
+            inner = root.get("response")
+            if isinstance(inner, str) and inner.strip():
+                payload = _first_eligible_object(inner, eligible)
+
+    if payload is None:
+        payload = _first_eligible_object(text, eligible)
+    return payload, status, diagnostics
+
+
+# --------------------------------------------------------------------------
+# degraded detection
+# --------------------------------------------------------------------------
+
+
+def _detect_degraded(status: str | None,
+                     stderr: bytes) -> tuple[bool, str]:
+    """Positive evidence that the run was cut short. Never inferred from absence.
+
+    Returns `(degraded, reason)`; `reason` is empty exactly when not degraded.
+
+    The two signals, each on its own:
+
+    1. stderr carrying the CLI's own failure wording. The sharp member is
+       `no output produced`, which is the ONLY evidence in the captured
+       auto-denied-tool run: rc 0, `status: SUCCESS`, empty `response`. Every
+       other axis reports that run as healthy-but-empty.
+    2. a terminal `status` that is present and is not `SUCCESS` — the harness
+       saying the run ended, and not well. A print-mode timeout lands here
+       (`status: ERROR`, `error: timeout waiting for response`), and so does
+       any future `TIMEOUT`/`CANCELLED` spelling without a table edit, because
+       the check is an allowlist of the one good value rather than a denylist
+       of bad ones.
+
+    An ABSENT status is not degraded. A run with no output and clean stderr is
+    a failed attempt (`parse_ok=False`), but nothing about it is evidence of
+    truncation, and manufacturing a signal from silence is the inference from
+    absence this module refuses to make.
+    """
+    err_lower = stderr.lower()
+    for sig in _DEGRADED_STDERR_SIGNALS:
+        if sig in err_lower:
+            return True, (
+                f"harness failure in stderr ({sig.decode()}); the review may "
+                f"be truncated and an empty result cannot be trusted")
+    if status is not None and status != _STATUS_OK:
+        return True, (
+            f"the agy run did not complete normally (status: {status}); the "
+            f"review was cut off mid-investigation and an empty result cannot "
+            f"be trusted")
+    return False, ""
+
+
+if TYPE_CHECKING:  # pragma: no cover - static conformance, no runtime cost
+    # `AgyAdapter` explicitly declares that it satisfies the package's
+    # `Adapter` protocol. A type checker fails HERE, at the definition site, if
+    # any member ever drifts from the protocol — which matters more once four
+    # adapters exist and only one of them is exercised by a given config.
+    from .base import Adapter
+
+    _CONFORMS: type[Adapter] = AgyAdapter
