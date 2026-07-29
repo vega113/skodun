@@ -97,7 +97,7 @@ from . import checklist, contextpack, gitio, passes, promptbuild, runner
 from .adapters import (REFUTER_CONTRACT, REVIEW_CONTRACT, UNAVAILABLE_RC,
                        OutputContract, ParseResult, get_adapter)
 from .config import Config, Defaults, Reviewer
-from .store import Store
+from .store import Store, _TS_FORMAT
 from .trust import banner, is_trustworthy
 
 #: The legacy lock directory name. Interop-critical: see the module docstring.
@@ -173,13 +173,15 @@ def _iso_at(epoch: float) -> str:
 
     The store validates this format at its door and orders `provider_state`
     TTLs by plain string comparison, which is only correct because every field
-    is zero-padded to a constant width.
+    is zero-padded to a constant width. `_TS_FORMAT` is `store`'s own
+    definition, imported rather than re-spelled here, so the two can never
+    quietly drift apart.
     """
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+    return time.strftime(_TS_FORMAT, time.gmtime(epoch))
 
 
 def _iso_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return time.strftime(_TS_FORMAT, time.gmtime())
 
 
 def _new_id(prefix: str = "sk_") -> str:
@@ -215,7 +217,7 @@ def _epoch(stamp: object) -> float | None:
     if not isinstance(stamp, str):
         return None
     try:
-        return float(calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")))
+        return float(calendar.timegm(time.strptime(stamp, _TS_FORMAT)))
     except (TypeError, ValueError):
         return None
 
@@ -608,20 +610,36 @@ def _chain_for(cfg: Config, head: Reviewer) -> list[Reviewer]:
     return chain
 
 
+def _is_path_shaped(binary: str) -> bool:
+    """Whether `binary` should be resolved as a path rather than walked
+    through `PATH`: it contains `/`, or the platform's own separator on a
+    platform where that differs from `/`.
+
+    The ONE definition of the path-vs-PATH split, shared by `_binary_is_absent`
+    below and `cli._fmt_binary`'s diagnostic -- both decide whether a
+    per-adapter `SKODUN_<X>_BIN` override or grok's own `~/.grok/bin/grok`
+    default gets checked directly, exactly how the adapter's own `Popen` call
+    would resolve it. Before this was factored out, `cli._fmt_binary` carried
+    its own copy of this exact condition, free to drift from this one.
+    """
+    return "/" in binary or (os.sep != "/" and os.sep in binary)
+
+
 def _binary_is_absent(binary: str) -> bool:
     """Whether `binary` names nothing this machine can execute.
 
     Checked BEFORE spawning, so a missing CLI costs no process and its
     `attempts[]` row is honestly free of execution fields. A path-shaped value
-    is tested as a path (the per-adapter `SKODUN_<X>_BIN` overrides and grok's
-    `~/.grok/bin/grok` default are both paths); a bare name goes through
-    `PATH`. Existence only, not executability: a file that is there but not
-    runnable is a permissions problem the spawn should report in its own words
-    rather than something to route around as "the provider is unavailable".
+    (see `_is_path_shaped`) is tested as a path (the per-adapter
+    `SKODUN_<X>_BIN` overrides and grok's `~/.grok/bin/grok` default are both
+    paths); a bare name goes through `PATH`. Existence only, not
+    executability: a file that is there but not runnable is a permissions
+    problem the spawn should report in its own words rather than something to
+    route around as "the provider is unavailable".
     """
     if not binary:
         return True
-    if "/" in binary or (os.sep != "/" and os.sep in binary):
+    if _is_path_shaped(binary):
         return not Path(binary).exists()
     return shutil.which(binary) is None
 
