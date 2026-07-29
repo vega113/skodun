@@ -624,3 +624,64 @@ world-readable; and (b) an argv length ceiling, which caps a reviewable diff at 
 - An embedded NUL is refused before `Popen` can raise `ValueError: embedded null byte`.
 
 Only `google` is affected; grok and codex build the same prompt file unchanged.
+
+### Task 14 — what the live acceptance run could and could not demonstrate
+
+Full evidence log: `docs/phase2-acceptance.md`. Four departures from this task's
+procedure as written, each recorded there in place rather than smoothed over.
+
+**1. Provider substitution in the cross-provider run.** The procedure names
+*finder = grok, refuter = codex (or claude)*. Both were unusable at run time — the
+`grok` account was out of balance (HTTP 402) and `claude` was not logged in. The run
+used **finder = codex (`openai`), refuter = agy (`google`)**, and the reverse for a
+second run. The criterion's substance — finder and refuter answering from different
+vendors, with the annotation attributing the verdict to one of them — is satisfied.
+
+**2. `anthropic` is not a shipped adapter.** Task 6 was blocked, so the registry is
+`{xai, openai, google}`, not the four this plan describes. Every statement in this
+plan and in the design spec that treats `anthropic` as shipped is superseded by the
+acceptance document. A config naming it fails closed (`skodun providers` reports it
+and exits 1).
+
+**3. Criterion 3 is PARTIAL, and stays PARTIAL.** Four live refuter passes across
+two change-sets and both provider orderings produced **six verdicts, all
+`confirmed`** — including on findings deliberately seeded to be arguable. No live
+refutation therefore existed to adopt, so the `--adopt-refuter` 1 → 0 gate flip was
+demonstrated on a **copy** of the store with the verdict string and reasoning text
+rewritten, explicitly labelled as seeded. The review, the finding, the refuter pass
+and its attribution in that demonstration are all live; only the verdict is not.
+The *refusal* to adopt a `confirmed` verdict was demonstrated live. This is an
+honest outcome — the annotation channel declining to rubber-stamp is the reassuring
+direction — and it is not to be upgraded until someone sees a live `refuted`.
+
+**4. Criterion 4's quota drill found a real defect, which was fixed on this branch,
+after which the drill was re-run and the criterion reached ✅.** This is the part
+worth reading. Step 2(b) prescribes a fake CLI replaying *a captured quota-failure
+envelope*; the run used the real one the installed `grok` CLI had just emitted, and
+it classified `ok`: `_QUOTA_SIGNALS` in `grok.py` matched nothing in
+`402 Payment Required … usage balance exhausted` (the near miss, `usage limit`,
+reads as though it would). The chain did not advance and nothing was cached — the
+headline feature defeated by its own most likely real-world trigger. It failed
+closed, so nothing unsafe passed.
+
+The conformance gate had missed it structurally: rule 4 requires ≥ 1 `*unavailable*`
+fixture of *any* category, every adapter satisfied it with `auth` or `model`, and no
+adapter in the repository had an `unavailable_quota` fixture at all — leaving the
+one provider-wide-cacheable category as the one with no witness, while rule 7's
+`rate limit` line in `healthy_noisy_stderr.txt` made the path look exercised.
+
+Fixed by `688464f`: `payment required` and `balance exhausted` added to grok (a bare
+`402` deliberately not, for Task 1's reason, now pinned by a test); audited
+additions with per-entry provenance for codex and agy; the real capture committed as
+`tests/fixtures/adapters/xai/unavailable_quota.txt` (the repository's first); and a
+per-adapter sweep asserting every quota signal is individually load-bearing. Rule 4
+was **not** given a mechanical "must supply a quota fixture" clause — a quota failure
+cannot be produced on demand, so the rule could only be satisfied by synthesizing,
+and a hand-written quota fixture proves only that its author's imagined phrase
+matches its author's own table. The reasoning lives in `tests/adapter_conformance.py`'s
+module docstring, and the obligation to capture a real one lives in the mixin.
+
+The 2(b) drill was then re-run at head driven entirely by committed real captures —
+the xai quota envelope at the head of the chain, the openai healthy envelope as the
+fallback — and the chain advances, `providers` shows the cached `unavailable_until`,
+and `SKODUN_IGNORE_PROVIDER_STATE=1` bypasses it. Criterion 4 is ✅.

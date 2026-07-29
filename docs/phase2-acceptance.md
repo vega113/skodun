@@ -11,14 +11,26 @@ marked as such with the reason. A documented gap is honest; a glossed one is not
 **Nothing below is marked ✅ on the strength of a partial demonstration** — see the
 scorecard at the end.
 
+**This document has been executed twice.** The first run (at commit `8faf7fa`)
+found a real defect — the installed `grok` CLI's actual out-of-balance message
+matched no shipped quota signal, so the fallback chain never advanced. That defect
+was fixed on this branch by `688464f`, and §2(b) was then re-run against the fix.
+Both are recorded: §2(b)-i is the finding as it stood, §2(b)-ii is the resolution
+and the re-run. The finding is not deleted, because a live acceptance run catching
+what 1700 fixture-driven tests missed is the most useful thing in here.
+
 ## About the pasted transcripts
 
 **All pasted output is sanitized.** Absolute paths, the porting oracle's location,
 and the operator's home directory are replaced by the shell variables the runbook
-itself defines (`$WORK`, `$SKODUN_ORACLE_DIR`, `$ARCHIVE`, `$HOME`). Nothing else
-is edited: counts, exit codes, timings, review ids, diff hashes, model text and
-error strings are verbatim. Where a line was dropped from a transcript for length,
-the omission is marked inline.
+itself defines (`$WORK`, `$SKODUN_ORACLE_DIR`, `$ARCHIVE`, `$HOME`, `$REPO`). One
+further redaction, marked at each site: the paid product-tier name inside the
+captured xAI 402 message is written `<tier>`, because it says which commercial tier
+the capturing account subscribes to — the same single edit the committed fixture
+`tests/fixtures/adapters/xai/unavailable_quota.txt` carries, for the same reason.
+Nothing else is edited: counts, exit codes, timings, review ids, diff hashes, model
+text and error strings are verbatim. Where a line was dropped from a transcript for
+length, the omission is marked inline.
 
 ---
 
@@ -57,11 +69,11 @@ Evidence — the two dead ones:
 ```
 $ grok --model grok-4.5 -p "reply with the single word OK"
 Internal error: {
-  "message": "API error (status 402 Payment Required): Grok Build usage balance exhausted",
+  "message": "API error (status 402 Payment Required): <tier> usage balance exhausted",
   "http_status": 402
 }
 Error: Internal error: {
-  "message": "API error (status 402 Payment Required): Grok Build usage balance exhausted",
+  "message": "API error (status 402 Payment Required): <tier> usage balance exhausted",
   "http_status": 402
 }
 # rc 1, and the whole message is on stderr; stdout is empty.
@@ -479,10 +491,18 @@ SKODUN GATE: FAIL(2) no trustworthy review covers diff_hash=f9fae18f3dc9 -- run 
 The drill points a reviewer at a shell script standing in for the CLI, so the
 failure is reproducible without burning real quota.
 
-#### 2(b)-i — the REAL captured envelope, and the defect it exposes
+This drill is told in three parts, because running it is what found a defect, the
+defect was fixed on this same branch, and the drill was then re-run against the
+fix. **§2(b)-i is a historical record of the first execution**, kept because it is
+the whole reason the fix exists; **§2(b)-ii is the current evidence.**
+
+#### 2(b)-i — the REAL captured envelope, and the defect it exposed
 
 The `grok` CLI on this machine is genuinely out of quota, so the envelope below is
-a **real capture**, byte for byte:
+a **real capture**, byte for byte — with one redaction, the paid product-tier name
+that stood immediately before `usage balance exhausted`, elided here for exactly
+the reason it is stripped from the committed fixture: it says which commercial tier
+the capturing account subscribes to, and this is a public repository.
 
 ```sh
 cat > "$WORK/fake/grok-402.sh" <<'EOF'
@@ -492,15 +512,16 @@ exit 1
 EOF
 # grok-402-captured.txt holds, verbatim:
 #   Internal error: {
-#     "message": "API error (status 402 Payment Required): Grok Build usage balance exhausted",
+#     "message": "API error (status 402 Payment Required): <tier> usage balance exhausted",
 #     "http_status": 402
 #   }
 #   Error: Internal error: { ...the same object again... }
 export SKODUN_GROK_BIN="$WORK/fake/grok-402.sh"
 ```
 
-**Evidence — the real quota envelope classifies as `ok`, the chain does NOT
-advance, and nothing is cached:**
+**Evidence — AS THE ACCEPTANCE RUN FOUND IT, at commit `8faf7fa`, before the fix
+in §2(b)-ii.** The real quota envelope classified as `ok`, the chain did NOT
+advance, and nothing was cached:
 
 ```
 $ skodun review --repo .
@@ -529,36 +550,199 @@ Reproduced against `classify` directly, with the captured stderr bytes:
 ClassifyResult(kind='ok', category='', detail='')
 ```
 
-> ### DEFECT FOUND DURING ACCEPTANCE — real xAI quota exhaustion is not recognised
+> ### DEFECT FOUND DURING ACCEPTANCE — real xAI quota exhaustion was not recognised
 >
-> The shipped `_QUOTA_SIGNALS` table in `src/skodun/adapters/grok.py` matches
+> *This box describes the code as it stood at commit `8faf7fa`. It is preserved
+> rather than rewritten because it is the record of a live acceptance run finding
+> a defect that every fixture-driven test had missed — see the resolution in
+> §2(b)-ii, which does not erase the finding.*
+>
+> The `_QUOTA_SIGNALS` table then shipping in `src/skodun/adapters/grok.py` matched
 > `quota`, `rate limit`, `rate_limit`, `ratelimit`, `too many requests`,
 > `usage limit`, `insufficient credit`, `out of credits`. The message the installed
 > `grok` CLI actually emits when the account is out of balance —
-> `API error (status 402 Payment Required): Grok Build usage balance exhausted` —
-> matches **none** of them, so:
+> `API error (status 402 Payment Required): <tier> usage balance exhausted` —
+> matched **none** of them, so:
 >
-> * the attempt classifies `ok` rather than `unavailable/quota`;
-> * a configured fallback chain **does not advance** (only one attempt appears in
->   `attempts[]`, the codex fallback is never tried);
-> * `provider_state` is **not** populated, so every later reviewer in the run keeps
+> * the attempt classified `ok` rather than `unavailable/quota`;
+> * a configured fallback chain **did not advance** (only one attempt appears in
+>   `attempts[]`, the codex fallback was never tried);
+> * `provider_state` was **not** populated, so every later reviewer in the run kept
 >   paying the same failure.
 >
-> This is a **coverage gap in a signal table, not a break in the trust model**: the
-> review still fails closed (`status=failed`, `trustworthy=false`), and the gate
-> still returns 2. Nothing passes that should not. But the fallback feature is
-> defeated by the exact real-world condition it exists for, and the closest real
-> capture of that condition was never in the fixture set — no provider's fixture
-> directory contains a `unavailable_quota` fixture at all. Fixing it is a table
-> edit plus a fixture; it is out of scope for this task and is reported rather
-> than patched here.
+> This was a **coverage gap in a signal table, not a break in the trust model**: the
+> review still failed closed (`status=failed`, `trustworthy=false`), and the gate
+> still returned 2. Nothing passed that should not. But the fallback feature was
+> defeated by the exact real-world condition it exists for.
+>
+> **Why the conformance gate missed it, which is the part worth keeping.** The
+> closest real capture of that condition was never in the fixture set: at that
+> commit **no provider's fixture directory contained an `unavailable_quota` fixture
+> at all**. Conformance rule 4 requires only ≥ 1 `*unavailable*` fixture of *any*
+> category, and every adapter satisfied it with an `auth` or `model` one — so
+> `quota`, the single provider-wide-cacheable category, the one whose misdetection
+> has blast radius beyond one attempt in both directions, was the category with no
+> witness. Worse, xai's `healthy_noisy_stderr.txt` already carried a `rate limit`
+> line and rule 7 already asserted that that stderr *alone* classifies
+> `unavailable` — so the quota path *looked* exercised, by a phrase the table's own
+> author had chosen. A table can only be tested against real wording by real
+> wording.
 
-#### 2(b)-ii — an envelope whose text the shipped table does recognise
+#### 2(b)-ii — RESOLVED on this branch, and the drill re-run against the real envelope
 
-Because of the gap above, the caching half of the drill needs an envelope the
-shipped signal table matches. This one is **synthesized** — shaped exactly like the
-captured 402 above, but carrying a `429 / rate limit exceeded` message. It is
-labelled as synthesized precisely because the real capture does not work:
+The defect above was fixed by commit `688464f` on this branch, after this
+document's first version was written:
+
+* `_QUOTA_SIGNALS` in `grok.py` gained **`payment required`** (the IANA reason
+  phrase for HTTP 402) and **`balance exhausted`** (the captured wording). Both are
+  phrases; a bare `402` was deliberately **not** added, for Task 1's reason — a
+  three-digit substring mints provider-wide outages out of arithmetic — and that
+  rejection is now pinned by a test rather than left as a comment. The near miss is
+  called out by name in the table: `usage limit` reads as though it would match
+  "usage balance exhausted", and does not.
+* `codex` and `agy` were audited for the same class of gap and gained entries whose
+  provenance is recorded per entry (verbatim-in-the-binary vs HTTP-standard, the
+  latter marked speculative).
+* **`tests/fixtures/adapters/xai/unavailable_quota.txt` now ships** — this very
+  capture, sanitized, recorded as a real capture in the directory README. It is the
+  repository's first `unavailable_quota` fixture, and it is the fixture that failed
+  first.
+* Each adapter gained a `test_every_quota_signal_is_individually_load_bearing`
+  sweep, so an entry that fires on nothing cannot ship unnoticed again.
+
+The conformance gate was **not** given a mechanical "every adapter must supply a
+quota fixture" rule; the reasoning is committed in `tests/adapter_conformance.py`'s
+module docstring. In short: a quota failure cannot be produced on demand, so such a
+rule could only be satisfied by synthesizing — and a hand-written quota fixture
+asserts only that the phrase its author imagined matches the signal table that same
+author wrote. That is this exact defect wearing a green tick, which is worse than a
+documented gap, because a gap invites a look. The obligation is documented in the
+mixin instead: capture a real one when your provider's quota does run out.
+
+**The drill below is §2(b) re-run at head, against the REAL captured envelope.**
+The fake `grok` replays `tests/fixtures/adapters/xai/unavailable_quota.txt`'s own
+bytes and exit code; the fallback replays
+`tests/fixtures/adapters/openai/healthy.txt`'s captured codex event stream, so the
+whole re-run is driven by committed real captures and makes **no billable
+inference call**. (The fallback leg was separately exercised against a *live*
+codex in §2(a) and in §2(b)-iii; what this re-run adds is the real quota envelope
+at the head of the chain.)
+
+```sh
+# both scripts replay committed fixture bytes; neither calls a provider
+cat > "$WORK/fake/grok-402.sh" <<'EOF'
+#!/bin/sh
+cat "$(dirname "$0")/grok-402-captured.txt" >&2      # xai/unavailable_quota.txt stderr
+exit 1                                               # ...and its rc
+EOF
+cat > "$WORK/fake/codex-healthy.sh" <<'EOF'
+#!/bin/sh
+cat "$(dirname "$0")/codex-healthy-captured.txt"     # openai/healthy.txt stdout
+exit 0
+EOF
+chmod +x "$WORK/fake/grok-402.sh" "$WORK/fake/codex-healthy.sh"
+export SKODUN_GROK_BIN="$WORK/fake/grok-402.sh"
+export SKODUN_CODEX_BIN="$WORK/fake/codex-healthy.sh"
+```
+
+**Evidence — `classify` on the captured bytes, at head:**
+
+```
+>>> get_adapter("xai").classify(1, b"", open("grok-402-captured.txt","rb").read(),
+...                             REVIEW_CONTRACT)
+ClassifyResult(kind='unavailable', category='quota', detail='quota failure in stderr (payment required) with no usable review payload')
+```
+
+**Evidence — the chain advances past the quota-failed entry to the fallback, the
+review is trustworthy, and `providers` shows the cached state:**
+
+```
+$ skodun review --repo .
+skodun: reviewing 1 file(s) vs main as sk_20260729T044227Z_6199_4109627c ...
+skodun: marking provider xai unavailable until 2026-07-29T05:12:28Z (quota failure in stderr (payment required) with no usable review payload)
+skodun: finder (xai) is unavailable (quota): quota failure in stderr (payment required) with no usable review payload
+SKODUN VERDICT: trustworthy=true findings=3 degraded=false stop_reason=turn.completed head=8d8921052 id=sk_20260729T044227Z_6199_4109627c severity=1/2/0
+# rc 1 -- findings open
+
+$ skodun providers --repo .
+google | adapter=agy | binary=agy (executable) | state=none
+openai | adapter=codex | binary=$WORK/fake/... (executable) | state=none
+xai | adapter=grok | binary=$WORK/fake/... (executable) | state=active=True until=2026-07-29T05:12:28Z reason=quota failure in stderr (payment required) with no usable review payload category=quota
+# rc 0.  `providers` truncates a long binary path itself; that is its own output.
+```
+
+```json
+status= clean   trustworthy= True   adapter= codex   model= gpt-5.4-mini
+"attempts": [
+  { "n": 1, "provider": "xai", "model": "grok-4.5", "effort": null,
+    "rc": 1, "timed_out": false, "duration_sec": 0.262, "first_output_sec": null,
+    "classification": { "kind": "unavailable", "category": "quota",
+                        "detail": "quota failure in stderr (payment required) with no usable review payload" } },
+  { "n": 2, "provider": "openai", "model": "gpt-5.4-mini", "effort": "medium",
+    "rc": 0, "timed_out": false, "duration_sec": 0.259, "first_output_sec": 0.259,
+    "classification": { "kind": "ok", "category": "", "detail": "" } }
+]
+provider_state: [('xai', '2026-07-29T05:12:28Z',
+                  'quota failure in stderr (payment required) with no usable review payload',
+                  'quota', '2026-07-29T04:42:28Z')]
+```
+
+Compare that `attempts[]` with §2(b)-i's, which had **one** entry and an empty
+`provider_state`. That is the fix, end to end.
+
+**Evidence — the cached state is honoured on the next run, on fresh content (the
+fake binary is not even spawned: `rc` is `null` and `skipped` says why):**
+
+```
+$ skodun review --repo .
+skodun: reviewing 2 file(s) vs main as sk_20260729T044228Z_6252_c2dff1f1 ...
+skodun: skipping finder (xai): quota failure in stderr (payment required) with no usable review payload
+SKODUN VERDICT: trustworthy=true findings=3 degraded=false stop_reason=turn.completed head=4dd5fff7f id=sk_20260729T044228Z_6252_c2dff1f1 severity=1/2/0
+# rc 1
+```
+
+```json
+{ "n": 1, "provider": "xai", "model": "grok-4.5", "rc": null, "timed_out": null,
+  "duration_sec": null, "first_output_sec": null,
+  "classification": { "kind": "unavailable", "category": "quota",
+                      "detail": "quota failure in stderr (payment required) with no usable review payload" },
+  "skipped": "provider marked unavailable: quota failure in stderr (payment required) with no usable review payload" }
+```
+
+**Evidence — `SKODUN_IGNORE_PROVIDER_STATE=1` bypasses the cache** (the attempt is
+made for real again: `rc` is `1`, `duration_sec` is non-null, and the state is
+re-marked with a later expiry):
+
+```
+$ SKODUN_IGNORE_PROVIDER_STATE=1 skodun review --repo .
+skodun: reviewing 3 file(s) vs main as sk_20260729T044229Z_6332_2b836428 ...
+skodun: marking provider xai unavailable until 2026-07-29T05:12:29Z (quota failure in stderr (payment required) with no usable review payload)
+skodun: finder (xai) is unavailable (quota): quota failure in stderr (payment required) with no usable review payload
+SKODUN VERDICT: trustworthy=true findings=3 degraded=false stop_reason=turn.completed head=1a9a96b2e id=sk_20260729T044229Z_6332_2b836428 severity=1/2/0
+# rc 1
+```
+
+```json
+{ "n": 1, "provider": "xai", "model": "grok-4.5", "rc": 1, "timed_out": false,
+  "duration_sec": 0.254,
+  "classification": { "kind": "unavailable", "category": "quota",
+                      "detail": "quota failure in stderr (payment required) with no usable review payload" } }
+provider_state: [('xai', '2026-07-29T05:12:29Z', ..., 'quota', '2026-07-29T04:42:29Z')]
+```
+
+The three runs above were driven by `skodun` invoked as `python3 -m skodun` from
+this worktree (`PYTHONPATH=$REPO/src`), which the CLI contract requires to behave
+identically to the console script.
+
+#### 2(b)-iii — the earlier run, with a synthesized 429 envelope
+
+Retained, and **no longer load-bearing**: when §2(b) was first executed the real
+capture classified `ok`, so the caching half needed an envelope the table then
+matched. This one is **synthesized** — shaped exactly like the captured 402 above,
+but carrying a `429 / rate limit exceeded` message. It is kept for one reason that
+§2(b)-ii cannot supply: its fallback leg was a **live** codex call (11.6 s of real
+inference), so between the two runs both legs of the quota drill have a live
+witness.
 
 ```
 Internal error: {
@@ -737,16 +921,18 @@ documented.
 ## 4. Full suite, both modes, one final time
 
 Run in the foreground, with the environment cleaned of every override this runbook
-sets, so the suite pins its own paths and cannot reach a real store.
+sets, so the suite pins its own paths and cannot reach a real store. **These are
+head's numbers, re-measured after the §2(b)-ii fix landed** (`688464f` added 39
+tests: grok +15, codex +16, agy +8, against the 1708 this document first recorded).
 
 **Evidence — with `SKODUN_ORACLE_DIR` set (parity tests RUN):**
 
 ```
 $ SKODUN_ORACLE_DIR=<legacy checkout> python3 -m pytest -q -rs
-........................................................................ [  4%]
-...  (24 lines of dots elided)  ...
-....................................................                     [100%]
-1708 passed in 164.44s (0:02:44)
+........................................................................ [ 90%]
+...  (dots elided)  ...
+...................                                                      [100%]
+1747 passed in 161.55s (0:02:41)
 ```
 
 **Evidence — with `SKODUN_ORACLE_DIR` unset (parity tests SKIP, cleanly):**
@@ -758,24 +944,31 @@ SKIPPED [1] tests/test_legacy_import.py:1226: no legacy archive at $SKODUN_ORACL
 SKIPPED [14] tests/test_passes.py:761: SKODUN_ORACLE_DIR unset
 SKIPPED [6] tests/test_passes.py:831: SKODUN_ORACLE_DIR unset
 SKIPPED [3] tests/test_promptbuild.py:490: SKODUN_ORACLE_DIR unset or oracle script absent
-1620 passed, 88 skipped in 139.17s (0:02:19)
+SKIPPED [1] tests/test_textnorm.py:102: oracle checkout not present (set SKODUN_ORACLE_DIR)
+1659 passed, 88 skipped in 141.07s (0:02:21)
 ```
 
 | mode | ran | skipped | failed |
 |---|---|---|---|
-| `SKODUN_ORACLE_DIR` set | **1708** | 0 | 0 |
-| `SKODUN_ORACLE_DIR` unset | **1620** | **88** | 0 |
+| `SKODUN_ORACLE_DIR` set | **1747** | 0 | 0 |
+| `SKODUN_ORACLE_DIR` unset | **1659** | **88** | 0 |
 
-1620 + 88 = 1708: the two modes account for exactly the same tests, and every skip
-names `SKODUN_ORACLE_DIR` as its reason. **No parity test silently vanished.**
+1659 + 88 = 1747: the two modes account for exactly the same tests, the skip count
+is unchanged by the fix (all 39 new tests are fixture-driven and oracle-independent),
+and every skip names `SKODUN_ORACLE_DIR` as its reason. **No parity test silently
+vanished.**
 
 **Evidence — the conformance suite, which is the adapter registration gate:**
 
 ```
 $ python3 -m pytest -q -k conformance
 ................................................                         [100%]
-48 passed, 1660 deselected in 0.28s
+48 passed, 1699 deselected in 1.52s
 ```
+
+The same 48 test ids as before the fix: the new `unavailable_quota` fixture adds
+assertions *inside* existing rules (rule 4's sweep now includes it) rather than new
+test ids.
 
 Coverage is enforced structurally rather than by convention:
 `tests/adapter_conformance.py::test_every_registered_adapter_has_conformance_coverage`
@@ -791,10 +984,10 @@ subclass.
 
 | # | criterion | verdict | evidence |
 |---|---|---|---|
-| 1 | Full suite green with and without `SKODUN_ORACLE_DIR`; Phase 1 parity tests untouched and passing | **✅** | §4 — 1708 passed / 1620 passed + 88 skipped, 1620 + 88 = 1708 |
+| 1 | Full suite green with and without `SKODUN_ORACLE_DIR`; Phase 1 parity tests untouched and passing | **✅** | §4 — 1747 passed / 1659 passed + 88 skipped, 1659 + 88 = 1747 |
 | 2 | Every adapter in the registry passes the shared conformance suite | **✅** | §4 — 48 passed, plus the two-way registry-coverage gate |
 | 3 | Live cross-provider run: finder and refuter on different providers, annotations visible with attribution, one `--adopt-refuter` flips the gate 1 → 0, artifact shows per-pass provenance | **PARTIAL** | §1.3 fully live (both orderings); §1.4 — **the 1 → 0 flip was demonstrated on a SEEDED store copy**, because all six live refuter verdicts were `confirmed`. The refusal to adopt a `confirmed` verdict *was* demonstrated live. |
-| 4 | Fallback drill: `[dead → real]` yields a trustworthy review whose `attempts[]` shows `unavailable` then the fallback; `[dead → dead]` on fresh content yields `failed`, `trustworthy=false`, gate 2; provider-state cache exercised with a quota-category failure | **PARTIAL** | §2(a) and §2(a′) fully live and complete. §2(b) — caching, honouring and bypass all demonstrated, **but with a synthesized envelope**, because the *real* captured xAI quota message matches no shipped signal and classifies as `ok`. See the DEFECT box in §2(b)-i. |
+| 4 | Fallback drill: `[dead → real]` yields a trustworthy review whose `attempts[]` shows `unavailable` then the fallback; `[dead → dead]` on fresh content yields `failed`, `trustworthy=false`, gate 2; provider-state cache exercised with a quota-category failure | **✅** | §2(a) and §2(a′) fully live and complete. §2(b)-ii — the cache drill **re-run at head against the REAL captured 402 envelope**, not a synthesized one: the chain advances past the quota-failed entry, the review is trustworthy, `providers` shows the cached `unavailable_until`, and `SKODUN_IGNORE_PROVIDER_STATE=1` bypasses it. The defect that made this row PARTIAL was fixed by `688464f` on this branch; the finding and its root cause are preserved in §2(b)-i. |
 | 5 | No regression: whole-archive shadow comparison reproduces Phase 1 counts modulo documented classes and the `--since` window | **✅** | §3 — 5076 compared / 5071 matched, five structurally-explained mismatches, two `--since` windows, every delta from Phase 1 mapped to a documented class |
 
 ### Not demonstrated, and why
@@ -807,8 +1000,17 @@ subclass.
 * **The `anthropic` adapter.** Never shipped; its task was blocked. The plan and
   spec still describe four providers; three are registered. `skodun providers`
   reports the missing one and exits 1.
-* **A `grok`-as-finder run.** The account is out of quota. Every `xai` appearance in
-  this document is a dead binary, a fake CLI, or a real 402.
-* **A real captured quota fixture.** No provider's fixture directory contains one,
-  and the one real quota envelope available on this machine does not classify as
-  quota (§2(b)-i).
+* **A `grok`-as-finder run producing a review.** The account is out of quota. Every
+  `xai` appearance in this document is a dead binary, a fake CLI replaying a
+  committed fixture, or the real 402 itself.
+* **A live quota failure driving a live fallback inside one process.** The two legs
+  have separate live witnesses — §2(a) and §2(b)-iii ran a live codex fallback,
+  §2(b)-ii ran the real captured quota envelope — but no single run had both,
+  because a real quota failure cannot be scheduled and re-running the fallback leg
+  live would have bought nothing §2(a) had not already shown.
+* **A quota capture for `openai` or `google`.** `xai` now ships one
+  (`tests/fixtures/adapters/xai/unavailable_quota.txt`, a real capture, §2(b)-ii);
+  the other two adapters' quota entries still rest on strings verbatim in the
+  installed binary and on the HTTP reason phrase, not on a live failure. The
+  obligation to capture one when it happens is documented in the conformance mixin,
+  deliberately as an obligation rather than a mechanical rule — see §2(b)-ii.
