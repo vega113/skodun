@@ -13,7 +13,8 @@ Phase 3 is the surfaces phase: skodun stops being only a foreground CLI.
    *to* it: the dedup probe, `contextpack source="oid"`, batching of oversized diffs,
    the pushed-ref diff scope, same-branch supersede, worktree binding.
 2. **MCP server** — hand-rolled stdio JSON-RPC, stdlib-only (owner decision), exposing
-   a full CLI mirror (owner decision) to agent harnesses.
+   a curated review-loop mirror of the CLI (owner decision, refined: operational
+   commands excluded — exclusion only removes agent surface) to agent harnesses.
 3. **Delivery** — a store-backed undelivered-findings ledger, a `skodun surface`
    command, and a SessionStart hook template. Research decision 15 binds: "no review
    happened" is stated explicitly, never read as silence.
@@ -178,7 +179,7 @@ One config, two execution modes, explicit mode table:
   bind (the problem that rule existed to paper over is the one skodun was built to
   delete).
 
-## MCP surface — full CLI mirror (owner decision)
+## MCP surface — curated review-loop mirror (owner decision, refined)
 
 Tools mirror the REVIEW-LOOP subcommands 1:1 — a curated subset, through the same validators, with the same granularity (operational/installation commands — `providers`, `import-legacy`, `shadow-compare`, `install-hooks`, `dispatch`, `worker`, `mcp` itself — are deliberately excluded: they administer the installation; exclusion only REMOVES agent surface, consistent with the owner decision's principle):
 `gate`, `review` (documented long-running; one in-flight review per server — the
@@ -228,8 +229,11 @@ mechanical gates, not conventions.
    reported and reconciled; Phase 1/2 parity and conformance tests untouched.
 2. **Live push drill**: a real `git push` in a linked worktree triggers the shim; the
    background review lands as a store record; a fresh `skodun surface` delivers it
-   once (marked, not re-delivered); a second identical push is dedup-suppressed with
-   a recorded dedup event; a third push after an edit reviews again.
+   once (marked, not re-delivered); an identical ref update replayed against a rewound or
+   second disposable remote at the same base is dedup-suppressed with a recorded
+   dedup event (an up-to-date push invokes the hook with empty stdin, so identity
+   replay needs a remote that lacks the ref); a further push after an edit reviews
+   again.
 3. **Failure surfacing drill**: a background round forced to fail (a NO-FALLBACK
    reviewer with a dead binary — a chain head with a live fallback would recover,
    not fail) surfaces via `skodun surface` with the explicit "NO REVIEW HAPPENED"
