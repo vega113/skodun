@@ -13,12 +13,20 @@ global rule rather than a detail:
   `build_cmd` reads the prompt file and puts its TEXT in the argv. No shell is
   involved — the argv is a list handed to `subprocess` — so nothing is
   shell-interpolated and no quoting rule can be got wrong; what changes is that
-  the bytes are in the process's argument vector, which is (a) size-limited and
-  (b) visible in the process table. (a) is handled by `MAX_PROMPT_ARG_BYTES`
-  below, which fails closed and loudly. (b) is a real, stated cost of this
-  provider: a reviewer's prompt contains the diff under review, and on a shared
-  machine `ps` will show it for the life of the attempt. Providers whose CLI
-  accepts a file (grok) or stdin (codex) do not pay it.
+  the bytes are in the process's argument vector, which has THREE
+  preconditions the file (grok) and stdin (codex) routes never had: the text
+  must decode as UTF-8 (a `str` is what argv needs), it must carry no embedded
+  NUL (`subprocess.Popen` rejects one anywhere in argv), and it must fit under
+  the kernel's per-argument cap. All three are guarded in `build_cmd`, in that
+  order, and all three fail the SAME way: a loud `ValueError`, which
+  `pipeline._run_chain` already turns into "could not build the invocation"
+  and a stopped chain — never a `UnicodeDecodeError` or an unguarded `Popen`
+  `ValueError` escaping as an unexpected exception. The size guard is
+  `MAX_PROMPT_ARG_BYTES` below. (b) is a real, stated cost of this provider
+  regardless of the guards: a reviewer's prompt contains the diff under
+  review, and on a shared machine `ps` will show it for the life of the
+  attempt. Providers whose CLI accepts a file (grok) or stdin (codex) do not
+  pay any of this.
 
 * **stdout is ONE JSON envelope**, written at the end of the run:
   `{"conversation_id", "status", "response", "structured_output"?, "error"?,
@@ -47,6 +55,20 @@ global rule rather than a detail:
   unknown id, the missing effort and the conflicting effort alike. Canonical
   `max` has no level and is refused loudly by `build_cmd`; canonical `none` is
   the opt-out and passes no flag, exactly as it does for grok.
+
+  This is a configuration footgun, not just an implementation detail: `agy
+  models` (the command a config author actually runs) prints ONLY the
+  effort-suffixed ids, and picking one of THOSE alongside any non-matching
+  `effort =` in a `[[reviewer]]` entry is a guaranteed rc-1 on every attempt,
+  every time, for this provider. Only two shapes work — a suffixed id with
+  `effort` unset or `"none"`, or a base id (not in `agy models`' own listing)
+  with a matching `effort`. It fails closed and loudly (see above), so no
+  review is ever silently weakened by it, but a config author who never reads
+  this docstring can still burn every attempt on it before noticing.
+  TODO(Task 13, `examples/multi-provider.toml`): when that file's `google`
+  section is written, state this two-shapes rule there in plain config-author
+  language — next to the example, not buried in an adapter docstring — so the
+  footgun is visible where a config is actually being written.
 
 Classification never reads the model's own words. It looks at the exit code, at
 stderr, and at the envelope's `status` and `error` — both written by the
@@ -158,6 +180,18 @@ _MODEL_SIGNALS: tuple[bytes, ...] = (
 # No bare `429` here, deliberately: diagnostics carry byte offsets and request
 # counters, and a numeric substring match would mint provider-wide quota
 # outages out of arithmetic.
+#
+# Every entry below is present verbatim in the installed agy 1.1.8 binary
+# (`strings -a "$(which agy)" | grep -ic -- '<phrase>'`), same standard as
+# every other signal table in this module. `"usage limit"` and `"insufficient
+# credit"` were dropped from an earlier draft that listed them as if they were
+# observed: a direct grep against the binary found zero hits for either, so
+# the earlier report's claim that this table was "built from phrases present
+# in it" was wrong for those two specifically. The direction was harmless
+# (over-broad quota matching is the dangerous direction, and absent strings
+# can never over-match), but a signal that can never fire is dead weight and
+# its stated provenance was false, so it is gone rather than relabelled
+# speculative.
 _QUOTA_SIGNALS: tuple[bytes, ...] = (
     b"quota exceeded",
     b"resource_exhausted",
@@ -166,8 +200,6 @@ _QUOTA_SIGNALS: tuple[bytes, ...] = (
     b"rate_limit",
     b"ratelimit",
     b"too many requests",
-    b"usage limit",
-    b"insufficient credit",
     b"out of credits",
 )
 
@@ -178,7 +210,19 @@ _QUOTA_SIGNALS: tuple[bytes, ...] = (
 _INVOCATION_SIGNALS: tuple[bytes, ...] = (
     b"invalid --json-schema",
     b"empty prompt",
-    b"flag provided but not defined",
+    # PLURAL, verified against the installed binary rather than assumed:
+    # `agy --nonexistent-flag` -> rc 2, stderr `flags provided but not
+    # defined: -nonexistent-flag`. The installed CLI's wrapper always emits
+    # the plural, even for exactly one undefined flag. Go stdlib's `flag`
+    # package spells this singular ("flag provided but not defined:"), and
+    # that spelling IS present in the binary too, but it is unreachable
+    # through agy's own argument parser -- only the wrapper's plural ever
+    # reaches stderr. A singular entry here would never match a real run,
+    # so a rejected invocation (rc 2, no auth/model/quota wording) would fall
+    # through every table unclassified and land on plain `ok` with no
+    # explanation -- precisely the silent all-clear this table exists to
+    # prevent.
+    b"flags provided but not defined",
 )
 
 # Canonical effort (`config.EFFORTS`) -> the CLI's `--effort`. Pass-through for
@@ -249,10 +293,20 @@ class AgyAdapter:
           Paired with the ABSENCE of `--dangerously-skip-permissions`: a tool
           call that needs permission is then auto-denied, because a reviewer
           must not be able to execute anything.
-        * `--print-timeout` — the CLI's own deadline, set to the runner's, so
-          that a stalled run has a chance to return a diagnosable envelope
-          (`status: ERROR`, `timeout waiting for response`) before the
-          watchdog kills it and leaves nothing at all.
+        * `--print-timeout` — set to `d.timeout_sec`, the SAME deadline the
+          watchdog (`runner.py`) enforces, and the watchdog starts counting
+          first and always wins the race in practice: it is armed before
+          `Popen` even returns, while the CLI's own `--print-timeout` clock
+          starts later, after its own startup work. So this flag is NOT what
+          gives a stalled run a chance to self-report before the watchdog
+          kills it — at equal deadlines with a later start, it essentially
+          never fires first. What it actually buys is real and different:
+          agy's default `--print-timeout` is `5m0s` (300s, `agy --help`), well
+          under `Defaults.timeout_sec` (420s), so WITHOUT this flag the CLI
+          would self-terminate at five minutes while skodun still had two
+          minutes of budget left. Passing the runner's own deadline raises
+          agy's internal timeout to match skodun's, so the CLI does not give
+          up on its own before the watchdog would.
 
         `cwd` takes no flag: agy has no `--cwd`/`-C`, and the runner already
         spawns the child in that directory. `d.max_turns` and `d.deny_tools`
@@ -275,7 +329,50 @@ class AgyAdapter:
                     f"{effort!r} (known: {sorted(mapping)})")
             cli_effort = mapping[effort]
 
-        prompt = prompt_file.read_text(encoding="utf-8")
+        try:
+            prompt = prompt_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError as e:
+            # STRICT, not `errors="replace"`. This is the SOURCE side of the
+            # pipeline (the diff under review, read back from the file
+            # `promptbuild.py` wrote), not the CLI's stdout: a lossy decode
+            # here would let the model review bytes that differ from what is
+            # actually in the repo -- for a REVIEW tool that is its own
+            # hazard, since a finding could point at text that does not
+            # exist. Refusing loudly costs a latin-1 repo this one provider;
+            # decoding lossily would cost every repo the correctness of what
+            # gets reviewed. Reachable on a normal path: a latin-1 source file
+            # produces a `git diff` that is not UTF-8 decodable, and grok/codex
+            # build fine on the same file because neither of them decodes the
+            # prompt text at all (grok passes the path, codex streams the raw
+            # bytes on stdin) -- this decode exists only because the argv
+            # channel needs a `str`.
+            raise ValueError(
+                f"adapter {self.name!r}: prompt is not valid UTF-8 ({e}); "
+                f"this CLI takes the prompt as an argv string, which must be "
+                f"decodable text, and reviewing a lossy re-decode would risk "
+                f"the model commenting on bytes that are not actually in the "
+                f"diff. Review this change with another provider, or make the "
+                f"source file UTF-8") from e
+
+        if "\x00" in prompt:
+            # `subprocess.Popen` raises `ValueError: embedded null byte` for a
+            # NUL anywhere in argv -- and that raise happens in `runner.py`,
+            # OUTSIDE this function, where `pipeline._run_chain` catches only
+            # `FileNotFoundError` around the call. Left unguarded here the
+            # same `ValueError` still fires, but as an unexpected exception
+            # escaping `_run_chain` rather than as a reviewer that could not
+            # be invoked. A NUL survives into the diff when it is past git's
+            # first-8000-byte binary-file heuristic, so this is reachable on
+            # a normal path, not just a synthetic input. Caught in the SAME
+            # guard as the size check below, and failing the same way, so
+            # every argv precondition this adapter has surfaces as one loud,
+            # diagnosable `ValueError` from `build_cmd` instead of three
+            # different failure shapes at three different layers.
+            raise ValueError(
+                f"adapter {self.name!r}: prompt contains an embedded NUL "
+                f"byte, which a subprocess argv cannot carry; review this "
+                f"change with another provider")
+
         size = len(prompt.encode("utf-8"))
         if size > MAX_PROMPT_ARG_BYTES:
             # BYTES, not characters: the kernel's per-argument cap counts

@@ -38,6 +38,11 @@ from skodun.adapters.agy import (
     MAX_PROMPT_ARG_BYTES,
     AgyAdapter,
     resolve_agy_bin,
+    _AUTH_SIGNALS,
+    _DEGRADED_STDERR_SIGNALS,
+    _INVOCATION_SIGNALS,
+    _MODEL_SIGNALS,
+    _QUOTA_SIGNALS,
 )
 from skodun.config import Defaults, Reviewer
 from tests.adapter_conformance import (  # noqa: F401 - see below
@@ -234,6 +239,82 @@ def test_the_guard_measures_bytes_not_characters(tmp_path):
     prompt.write_bytes("あ".encode("utf-8") * (MAX_PROMPT_ARG_BYTES // 3 + 1))
     with pytest.raises(ValueError, match="prompt is too large"):
         AgyAdapter().build_cmd(prompt, R, D, tmp_path)
+
+
+def test_non_utf8_prompt_is_refused_loudly(tmp_path):
+    """A latin-1 source file's diff is not UTF-8 decodable; refuse, don't abort.
+
+    Reachable on a normal path: `git --no-pager diff --no-ext-diff --no-textconv`
+    over a latin-1 source file emits raw bytes (`gitio.py`), and
+    `promptbuild.py` concatenates them into the prompt untouched. Unguarded,
+    `prompt_file.read_text(encoding="utf-8")` raises a bare
+    `UnicodeDecodeError` out of `build_cmd`, which `pipeline._run_chain`
+    (only `except Exception` around the *build*, not the decode specifically)
+    still turns into "could not build the invocation" — but the guard makes
+    that outcome explicit and tested rather than an accident of exception
+    inheritance, and gives a message that says WHY in adapter terms instead of
+    a raw codec error.
+
+    A realistic prompt file: a diff-shaped hunk carrying one latin-1-encoded
+    accented byte sequence that latin-1 -> UTF-8 confusion actually produces
+    (`é` as a single 0xE9 byte, not the two-byte UTF-8 encoding).
+    """
+    prompt = tmp_path / "prompt.txt"
+    diff_hunk = (
+        "diff --git a/config.py b/config.py\n"
+        "--- a/config.py\n"
+        "+++ b/config.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-DEFAULT_NAME = \"cafe\"\n"
+        "+DEFAULT_NAME = \"caf\xe9\"\n"  # a real, standalone invalid-UTF-8 byte
+    ).encode("latin-1")
+    prompt.write_bytes(diff_hunk)
+    with pytest.raises(ValueError, match="not valid UTF-8"):
+        AgyAdapter().build_cmd(prompt, R, D, tmp_path)
+
+
+def test_embedded_nul_in_prompt_is_refused_loudly(tmp_path):
+    """A NUL in the prompt must not reach `subprocess.Popen` unguarded.
+
+    `subprocess.Popen` raises `ValueError: embedded null byte` for a NUL
+    anywhere in argv, and that raise happens in `runner.py` -- outside
+    `build_cmd` -- where `pipeline._run_chain` catches only
+    `FileNotFoundError` around the run call, so an unguarded NUL propagates
+    all the way out of `_run_chain` as an unexpected exception. NUL is valid
+    UTF-8 (the single byte 0x00), so the UTF-8 decode above does not catch it
+    -- this is a genuinely separate precondition needing its own check.
+
+    Realistic: a NUL survives into a diff when it is past git's first-8000-
+    byte binary-file detection heuristic, so a mixed text/binary-looking file
+    can carry one through to the prompt.
+    """
+    prompt = tmp_path / "prompt.txt"
+    diff_hunk = (
+        "diff --git a/data.bin b/data.bin\n"
+        "--- a/data.bin\n"
+        "+++ b/data.bin\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-header\n"
+        "+header\x00trailer\n"
+    )
+    prompt.write_text(diff_hunk, encoding="utf-8")
+    with pytest.raises(ValueError, match="embedded NUL byte"):
+        AgyAdapter().build_cmd(prompt, R, D, tmp_path)
+
+
+def test_non_utf8_check_runs_before_the_size_check(tmp_path):
+    """Decode-and-NUL guards fire even on a prompt well under the size cap.
+
+    Pins the ORDER a future edit could quietly break: if the size check ran
+    first and short-circuited, a small non-UTF-8 or NUL-carrying prompt would
+    sail through to `subprocess` unguarded while only an oversize one was
+    protected.
+    """
+    small_bad = tmp_path / "prompt.txt"
+    small_bad.write_bytes(b"tiny diff with one bad byte: \xe9\n")
+    assert len(small_bad.read_bytes()) < MAX_PROMPT_ARG_BYTES
+    with pytest.raises(ValueError, match="not valid UTF-8"):
+        AgyAdapter().build_cmd(small_bad, R, D, tmp_path)
 
 
 @pytest.mark.parametrize("canonical", ["low", "medium", "high"])
@@ -456,6 +537,24 @@ def test_a_terminal_status_other_than_success_is_degraded():
     assert a.classify(f.rc, f.stdout, f.stderr, REVIEW_CONTRACT).kind == "degraded"
 
 
+@pytest.mark.parametrize("signal", _DEGRADED_STDERR_SIGNALS)
+def test_every_degraded_stderr_signal_is_individually_load_bearing(signal):
+    """Each entry alone must trip `degraded`, not just `no output produced`.
+
+    The fixture-based tests above exercise exactly one of the four entries in
+    `_DEGRADED_STDERR_SIGNALS` (`no output produced`, via `degraded_stderr`)
+    plus the terminal-status path, which is a SEPARATE signal entirely. That
+    leaves `stream error`, `was interrupted` and `context deadline exceeded`
+    unpinned: deleting any of the three currently leaves all existing tests
+    green. This closes that gap by exercising every tuple entry on its own.
+    """
+    stderr = b"agy: " + signal + b"\n"
+    a = AgyAdapter()
+    res = a.parse(b"", stderr, REVIEW_CONTRACT)
+    assert res.degraded is True and res.degraded_reason
+    assert a.classify(0, b"", stderr, REVIEW_CONTRACT).kind == "degraded"
+
+
 def test_empty_stdout_is_not_degraded():
     """Absence of a signal is never taken as proof of anything."""
     a = AgyAdapter()
@@ -504,6 +603,19 @@ def test_auth_capture_is_unavailable_auth():
     assert res.kind == "unavailable" and res.category == "auth"
 
 
+@pytest.mark.parametrize("signal", _AUTH_SIGNALS)
+def test_every_auth_signal_is_individually_load_bearing(signal):
+    """Each of the eight `_AUTH_SIGNALS` entries alone must classify `auth`.
+
+    The fixture-based test above exercises exactly one entry
+    (`authentication required`, via `unavailable_auth`); deleting any of the
+    other seven currently leaves every existing test green.
+    """
+    err = b"agy: " + signal + b"\n"
+    res = AgyAdapter().classify(1, b"", err, REVIEW_CONTRACT)
+    assert res.kind == "unavailable" and res.category == "auth"
+
+
 def test_model_capture_is_unavailable_model_from_the_envelope_alone():
     """stderr is empty in this capture; the only evidence is `error`.
 
@@ -537,8 +649,35 @@ def test_effort_conflict_capture_is_model(tmp_path):
     assert res.kind == "unavailable" and res.category == "model"
 
 
+@pytest.mark.parametrize("signal", _MODEL_SIGNALS)
+def test_every_model_signal_is_individually_load_bearing(signal):
+    """Each of the six `_MODEL_SIGNALS` entries alone must classify `model`.
+
+    The fixture/synthetic tests above exercise exactly one entry
+    (`invalid model selection`); deleting any of the other five currently
+    leaves every existing test green.
+    """
+    err = b"agy: " + signal + b"\n"
+    res = AgyAdapter().classify(1, b"", err, REVIEW_CONTRACT)
+    assert res.kind == "unavailable" and res.category == "model"
+
+
 def test_quota_wording_is_unavailable_quota():
     err = b"rpc error: code = ResourceExhausted desc = quota exceeded\n"
+    res = AgyAdapter().classify(1, b"", err, REVIEW_CONTRACT)
+    assert res.kind == "unavailable" and res.category == "quota"
+
+
+@pytest.mark.parametrize("signal", _QUOTA_SIGNALS)
+def test_every_quota_signal_is_individually_load_bearing(signal):
+    """Each `_QUOTA_SIGNALS` entry alone must classify `quota`.
+
+    `quota` is the one provider-wide-cacheable category, so a table entry
+    that silently stops matching is the most expensive kind of dead signal
+    this module has: it would keep re-trying a provider that has told every
+    caller it is out of budget.
+    """
+    err = b"agy: " + signal + b"\n"
     res = AgyAdapter().classify(1, b"", err, REVIEW_CONTRACT)
     assert res.kind == "unavailable" and res.category == "quota"
 
@@ -565,6 +704,50 @@ def test_a_rejected_invocation_is_unavailable_other():
           b"unexpected end of JSON input\n"
     res = AgyAdapter().classify(1, b"", err, REVIEW_CONTRACT)
     assert res.kind == "unavailable" and res.category == "other"
+
+
+@pytest.mark.parametrize("signal", _INVOCATION_SIGNALS)
+def test_every_invocation_signal_is_individually_load_bearing(signal):
+    """Each `_INVOCATION_SIGNALS` entry alone must classify `other`.
+
+    The other test in this section exercises `invalid --json-schema` only;
+    deleting `empty prompt` or the undefined-flag signal currently leaves
+    every existing test green.
+    """
+    err = b"agy: " + signal + b"\n"
+    res = AgyAdapter().classify(1, b"", err, REVIEW_CONTRACT)
+    assert res.kind == "unavailable" and res.category == "other"
+
+
+def test_undefined_flag_signal_matches_the_real_binarys_plural_wording():
+    """The installed agy 1.1.8 wrapper's own words, verified live, not assumed.
+
+    `agy --nonexistent-flag-xyz` (a cheap, read-only, no-inference call) gave:
+
+        flags provided but not defined: -nonexistent-flag-xyz
+        Usage of agy:
+          ...
+        rc=2
+
+    PLURAL, every time, even for exactly one bad flag. Go stdlib's `flag`
+    package itself spells this singular ("flag provided but not defined:"),
+    and that string IS present somewhere in the binary too, but it is
+    unreachable through agy's own argument parser -- only the wrapper's
+    plural form ever reaches stderr on a real run. A table entry spelled
+    singular would never match this real output and a rejected invocation
+    would fall through to plain `ok` with no explanation.
+    """
+    stderr = (
+        b"flags provided but not defined: -nonexistent-flag-xyz\n"
+        b"Usage of agy:\n"
+        b"  --add-dir  Add a directory to the workspace (repeatable)\n"
+    )
+    res = AgyAdapter().classify(2, b"", stderr, REVIEW_CONTRACT)
+    assert res.kind == "unavailable" and res.category == "other"
+    # The premise this test protects: the singular Go-stdlib spelling is a
+    # DIFFERENT string that must not be relied on -- it is not what a real
+    # rejected invocation contains.
+    assert b"flag provided but not defined" not in stderr
 
 
 def test_usable_output_wins_over_auth_noise():
