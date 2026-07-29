@@ -807,6 +807,25 @@ def test_gate_still_maps_keyboard_interrupt_to_2(monkeypatch, tmp_path):
     assert main(["gate", "--repo", str(tmp_path)]) == 2
 
 
+def test_gate_import_keyboard_interrupt_maps_to_2_via_mains_general_handler(
+        monkeypatch, tmp_path):
+    """`main()`'s scoped 130 carve-out names only the `review` dispatch (see
+    its own docstring). This test pins that `gate`'s dispatch is NOT also
+    wrapped in one -- a seam that is reachable, not theoretical: `_cmd_gate`'s
+    own module imports (`from .gate import run_gate`, `cli.py`) sit outside
+    any guard, so a `KeyboardInterrupt` raised there propagates straight past
+    `main`'s undecorated `if args.command == "gate": return _cmd_gate(args)`
+    line to `main`'s general `except BaseException`, which reports 2.
+    `test_gate_still_maps_keyboard_interrupt_to_2` only exercises
+    `_cmd_gate`'s OWN internal handler (a `KeyboardInterrupt` raised after
+    entry, at `Store.open`); this test is the `main()`-layer counterpart --
+    without it, wrapping `_cmd_gate(args)` in `try/except KeyboardInterrupt:
+    return 130` (the same carve-out `review` gets) would pass the whole
+    suite, silently opening a hole in the gate's fail-closed contract."""
+    monkeypatch.setitem(sys.modules, "skodun.gate", _KaboomModule())
+    assert main(["gate", "--repo", str(tmp_path)]) == 2
+
+
 def test_keyboard_interrupt_during_arg_parsing_still_maps_to_2(monkeypatch):
     """`main()`'s 130 carve-out is scoped to the parsed `review` dispatch
     only. A `KeyboardInterrupt` anywhere upstream of that -- here, simulated
@@ -1010,6 +1029,66 @@ def test_providers_shows_a_found_executable_binary(tmp_path, monkeypatch, capsys
     assert str(grok)[:60] in line, line
 
 
+def test_providers_shows_a_found_but_not_executable_binary(tmp_path, monkeypatch,
+                                                            capsys):
+    """`_fmt_binary` is the sole justification for duplicating
+    `pipeline._binary_is_absent`'s path-vs-PATH split -- it additionally
+    checks `os.X_OK`, which the pipeline's existence-only contract
+    deliberately does not. Nothing pinned that this branch actually fires
+    until now: replacing it with an unconditional `"executable"` used to
+    pass the whole suite."""
+    grok = tmp_path / "bin" / "grok"
+    grok.parent.mkdir()
+    grok.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    grok.chmod(0o644)   # readable, NOT executable
+    monkeypatch.setenv("SKODUN_GROK_BIN", str(grok))
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(tmp_path / "nope" / "codex"))
+    monkeypatch.setenv("SKODUN_AGY_BIN", str(tmp_path / "nope" / "agy"))
+
+    assert main(["providers", "--repo", str(tmp_path)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    line = next(l for l in lines if l.startswith("xai |"))
+    assert "found, NOT executable" in line, line
+
+
+def test_providers_a_directory_is_never_reported_executable(tmp_path, monkeypatch,
+                                                              capsys):
+    """`os.access(<dir>, os.X_OK)` is true for any traversable directory, so
+    without an `is_file()` check `SKODUN_CODEX_BIN` pointed at a directory
+    would print `(executable)` while `Popen` on that path would fail
+    immediately. A diagnostic whose whole purpose is answering "can a review
+    actually run" must not claim a directory is runnable."""
+    a_directory = tmp_path / "bin"
+    a_directory.mkdir()
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(a_directory))
+    monkeypatch.setenv("SKODUN_GROK_BIN", str(tmp_path / "nope" / "grok"))
+    monkeypatch.setenv("SKODUN_AGY_BIN", str(tmp_path / "nope" / "agy"))
+
+    assert main(["providers", "--repo", str(tmp_path)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    line = next(l for l in lines if l.startswith("openai |"))
+    assert "(executable)" not in line, line
+    assert "found, NOT executable" in line, line
+
+
+def test_providers_marks_a_truncated_binary_path(tmp_path, monkeypatch, capsys):
+    """The 120-char cap on `binary=...` is correct sanitization (visible in
+    every run against a pytest tmp path), but an unmarked truncation reads as
+    a COMPLETE path that merely does not exist -- precisely the wrong
+    conclusion for an operator debugging a missing CLI. A cap that actually
+    bit must say so."""
+    long_missing = tmp_path / ("x" * 200) / "grok"
+    monkeypatch.setenv("SKODUN_GROK_BIN", str(long_missing))
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(tmp_path / "nope" / "codex"))
+    monkeypatch.setenv("SKODUN_AGY_BIN", str(tmp_path / "nope" / "agy"))
+
+    assert main(["providers", "--repo", str(tmp_path)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    line = next(l for l in lines if l.startswith("xai |"))
+    assert "NOT FOUND" in line, line
+    assert "(truncated)" in line, line
+
+
 def test_providers_shows_an_empty_state_table_as_none(tmp_path, monkeypatch, capsys):
     _no_such_binaries(monkeypatch, tmp_path)
     assert main(["providers", "--repo", str(tmp_path)]) == 0
@@ -1104,6 +1183,48 @@ role = "finder"
 """, encoding="utf-8")
 
     assert main(["providers", "--repo", str(tmp_path)]) == 1
+
+
+def test_providers_caps_config_derived_text_on_the_exit_1_line(tmp_path, monkeypatch,
+                                                                capsys):
+    """Every other untrusted field this command prints goes through
+    `shown_field`; the reviewer name and provider on the exit-1 line used to
+    go through bare `{name!r}` / `{provider!r}` instead. `repr` covers the
+    dangerous half (no raw ESC, no forged row) but has no length cap of its
+    own -- a 10,000-char `provider` used to produce a line over ten thousand
+    characters long."""
+    long_name = "n" * 10_000
+    long_provider = "p" * 10_000
+    (tmp_path / ".skodun.toml").write_text(f"""
+[[reviewers]]
+name = "{long_name}"
+provider = "{long_provider}"
+model = "claude-x"
+role = "finder"
+""", encoding="utf-8")
+
+    assert main(["providers", "--repo", str(tmp_path)]) == 1
+    out = capsys.readouterr().out
+    assert "n" * 200 not in out, "the reviewer name was not capped"
+    assert "p" * 200 not in out, "the provider name was not capped"
+
+
+def test_providers_refuses_a_nonexistent_repo_path_with_exit_2(tmp_path, capsys):
+    """A typo in `--repo` must not silently disable the exit-1 CI contract.
+    `_repo_root` raises for a path that is not a git worktree; the old
+    fallback used the literal path directly REGARDLESS of whether it existed,
+    so `load_config` found no `.skodun.toml` there and the command reported a
+    clean 0 -- the exact contract this command exists to fail loudly. `gate
+    --repo` on the same input exits 2; `providers` must match, not be
+    uniquely lenient. The fallback stays for a real directory that is merely
+    not a git worktree (see the other `--repo str(tmp_path)` tests in this
+    module, which must keep exiting 0) -- only a path that does not resolve
+    to an existing directory at all is refused."""
+    missing = tmp_path / "definitely-not-here"
+    assert not missing.exists()
+    assert main(["providers", "--repo", str(missing)]) == 2
+    out = capsys.readouterr().out
+    assert out.strip(), "a refusal must still say something"
 
 
 @pytest.mark.parametrize("value, expect_note", [

@@ -17,8 +17,14 @@ are guarded below:
   * A refusal that leaves stdout silent. The last line of stdout is always a
     verdict, so the two paths that used to exit without one -- an argparse
     usage error, and an import failure inside `_cmd_review` -- now carry a
-    `banner_failure` line too. The two invocations that legitimately exit 0
-    without gating anything, `--version` and `--help`, deliberately do not.
+    `banner_failure` line too. Several invocations legitimately carry no
+    verdict banner, and deliberately do not gain one: `--version` and
+    `--help`, which gate nothing and exit 0; `review` cut short by Ctrl-C,
+    which exits 130 with stdout entirely empty -- an operator's own
+    interruption, not a refusal this contract owes a banner for (see
+    `main`'s scoped carve-out); and `providers`, a read-only diagnostic
+    listing that is never a gate and prints no verdict line on any of its
+    exit codes.
 """
 
 import argparse
@@ -387,6 +393,13 @@ def _fmt_binary(binary: str) -> str:
     EXECUTABILITY, not just existence: `providers` is read by a human deciding
     whether a review can actually run, and "there but not runnable" is a
     different, more specific fact than "not found" for them to act on.
+
+    A path-shaped value also gets an `is_file()` check, not just `X_OK`:
+    `os.access(<dir>, os.X_OK)` is true for any traversable directory, so
+    without it a `SKODUN_<X>_BIN` pointed at a directory would report
+    "executable" while the adapter's `Popen` on that same path would fail
+    immediately -- exactly the wrong answer for a diagnostic whose whole
+    point is "can a review actually run".
     """
     if not binary:
         return "NOT FOUND"
@@ -394,7 +407,9 @@ def _fmt_binary(binary: str) -> str:
         p = Path(binary)
         if not p.exists():
             return "NOT FOUND"
-        return "executable" if os.access(p, os.X_OK) else "found, NOT executable"
+        if p.is_file() and os.access(p, os.X_OK):
+            return "executable"
+        return "found, NOT executable"
     return "executable" if shutil.which(binary) else "NOT FOUND"
 
 
@@ -403,6 +418,19 @@ def _fmt_provider_state(row: dict | None, shown_field) -> str:
         return "none"
     return (f"active={row['active']} until={shown_field(row['unavailable_until'])} "
             f"reason={shown_field(row['reason'])} category={shown_field(row['category'])}")
+
+
+def _shown_binary(binary: str, shown_field, cap: int) -> str:
+    """`shown_field(binary)`, marked when the cap actually cut it.
+
+    Visible in every run against a pytest tmp path (and any sufficiently
+    deep real one): `binary=/private/.../s (NOT FOUND)` reads as a COMPLETE
+    path that merely does not exist -- exactly the wrong conclusion for an
+    operator debugging a missing CLI. `shown_field`'s cap is the right
+    sanitization; it just needs to say, when it fires, that it fired.
+    """
+    shown = shown_field(binary)
+    return shown + "...(truncated)" if len(binary) > cap else shown
 
 
 def _cmd_providers(args) -> int:
@@ -416,34 +444,64 @@ def _cmd_providers(args) -> int:
 
     Exit 1 is reserved for one thing: the loaded CONFIG names a reviewer
     whose `provider` has no registered adapter at all. That is a typo or a
-    provider skodun has not shipped support for, and -- unlike a merely
-    missing binary -- `run_review`'s own preflight (`_repo_root`'s
-    `_adapter_for` loop) would refuse EVERY review with this config until it
-    is fixed, so it is worth failing this listing loudly in CI rather than
-    only being discovered when a review runs and refuses. A reviewer entry
-    always carries a non-empty `provider` by the time `load_config` returns
-    one (`config._validate` requires it), so every entry is considered
-    "configured" here -- `enabled = false` included, because a config that
-    silently disables the one reviewer with the typo instead of fixing it is
-    not a config this check should wave through as clean.
+    provider skodun has not shipped support for, worth failing this listing
+    loudly in CI rather than only being discovered later. It is NOT the case
+    that `run_review`'s own preflight would always catch it first: its
+    adapter-resolution loop (`pipeline._adapter_for`, walked from
+    `run_review` around `pipeline.py:1007-1011`, not from `_repo_root`, which
+    is a `cli.py` function with nothing to do with adapters) only resolves
+    adapters for the selected finder, the role-specific reviewer for each
+    configured extra pass, and their fallback chains. A reviewer with
+    `enabled = false` and a bad provider that is not reachable through any of
+    those roles is never resolved there, so it refuses NO review at all, no
+    matter how many times one runs -- for that config, this check is not
+    merely "fail earlier than a review would," it is the ONLY place the typo
+    is ever caught. A reviewer entry always carries a non-empty `provider` by
+    the time `load_config` returns one (`config._validate` requires it), so
+    every entry is considered "configured" here -- `enabled = false`
+    included, because a config that silently disables the one reviewer with
+    the typo instead of fixing it is not a config this check should wave
+    through as clean.
 
-    `--repo` is read directly when it is not inside a git worktree at all:
-    unlike `gate`/`review`, this command certifies nothing about a diff, so
-    it has no need of `_repo_root`'s "config and diff identity from the same
-    directory" invariant, and refusing to run outside a git checkout would
-    make this diagnostic tool less useful exactly where an operator reaches
-    for it first -- before `git init`, or against a bare checkout.
+    `--repo` falls back to the literal path directly when it names a real
+    directory that is merely not inside a git worktree: unlike `gate`/
+    `review`, this command certifies nothing about a diff, so it has no need
+    of `_repo_root`'s "config and diff identity from the same directory"
+    invariant, and refusing to run outside a git checkout would make this
+    diagnostic tool less useful exactly where an operator reaches for it
+    first -- before `git init`, or against a bare checkout. A `--repo` that
+    is not even a directory gets no such fallback: `load_config` would find
+    no `.skodun.toml` at a nonexistent path and report a clean 0 for the
+    input most likely to be a typo, silently disabling this command's exit-1
+    contract, so that case is refused with exit 2 instead, matching `gate`.
     """
     from . import store as store_mod
     from .adapters import _REGISTRY
     from .config import load_config
     from .store import Store
-    from .triage import shown_field
+    from .triage import MAX_ANNOTATION_DISPLAY_CHARS, shown_field
 
+    repo = Path(args.repo)
     try:
-        root = _repo_root(Path(args.repo))
-    except BaseException:
-        root = Path(args.repo)
+        root = _repo_root(repo)
+    except BaseException as e:
+        # `_repo_root` raises for anything that is not inside a git worktree
+        # -- including a path that does not exist at all. Falling back to the
+        # literal path is only safe for the first case: a real directory that
+        # is simply not (in) a git checkout still has somewhere for
+        # `load_config` to look for a `.skodun.toml` and honestly report "no
+        # config error" if none is found. A path that is not even a
+        # directory -- almost always a typo in `--repo` -- has nowhere to
+        # look, so falling back the same way would make `load_config` find
+        # nothing and report a clean exit 0 for exactly the input most likely
+        # to be a mistake, silently disabling this command's exit-1 CI
+        # contract. Refuse instead, matching `gate --repo` on the same input.
+        if repo.is_dir():
+            root = repo
+        else:
+            return _emit(
+                f"skodun providers: could not resolve --repo {str(repo)!r}: "
+                f"{e!r}", 2)
     try:
         cfg = load_config(root)
     except BaseException as e:
@@ -472,8 +530,9 @@ def _cmd_providers(args) -> int:
         binary = adapter.resolve_binary()
         status = _fmt_binary(binary)
         state = _fmt_provider_state(state_rows.get(provider), shown_field)
+        shown_binary = _shown_binary(binary, shown_field, MAX_ANNOTATION_DISPLAY_CHARS)
         _emit(f"{provider} | adapter={adapter.name} | "
-              f"binary={shown_field(binary)} ({status}) | state={state}", 0)
+              f"binary={shown_binary} ({status}) | state={state}", 0)
 
     for provider, row in sorted(state_rows.items()):
         if provider not in _REGISTRY:
@@ -486,9 +545,15 @@ def _cmd_providers(args) -> int:
     if not unregistered:
         return 0
     for name, provider in unregistered:
-        _emit(f"skodun providers: FAILED reviewer {name!r} uses provider "
-              f"{provider!r}, which has no registered adapter "
-              f"(known: {sorted(_REGISTRY)})", 0)
+        # `name`/`provider` are config-authored text of unbounded length,
+        # same class of risk as every other untrusted field this command
+        # prints -- `repr` alone stops a raw ESC or a forged row but has no
+        # length cap, so a 10,000-char `provider` would still bury the rest
+        # of the listing under itself. `shown_field` first, same as
+        # everywhere else, `!r` after for the quoting.
+        _emit(f"skodun providers: FAILED reviewer {shown_field(name)!r} uses "
+              f"provider {shown_field(provider)!r}, which has no registered "
+              f"adapter (known: {sorted(_REGISTRY)})", 0)
     return 1
 
 
