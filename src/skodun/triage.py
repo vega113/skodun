@@ -1,6 +1,13 @@
-"""Human dismissal of review findings, with an audited reason, plus the
-fail-closed artifact validation that keeps a corrupt or hand-edited review
-from ever satisfying the gate.
+"""Human dismissal of review findings, with an audited reason -- and the
+audited un-dismissal that overturns one -- plus the fail-closed artifact
+validation that keeps a corrupt or hand-edited review from ever satisfying the
+gate.
+
+Both decisions are APPENDED to the store's triage event stream: `dismiss` and
+`reopen` (see `reopen` below and `store.Store.triage_state`). Nothing is edited
+or deleted, so an overturned dismissal keeps its reason and the whole history of
+a finding reads back in order. `reopen` clears the same audit floor a dismissal
+does, from the same `validate_reason`.
 
 PARITY-CRITICAL: ported from the oracle's `grok_review_triage.py`. Where this
 module's *review semantics* and the oracle's disagree, the oracle wins — the
@@ -205,16 +212,19 @@ def _finding_at(findings: list, index) -> dict:
 
 
 def dismiss(store: Store, review: dict, index: int, reason: str, now: str) -> dict:
-    """Record an audited dismissal of one finding and return the ledger row."""
+    """Record an audited dismissal of one finding and return the ledger row.
+
+    Appends a `dismiss` event (v3). A finding that was dismissed, reopened and
+    then dismissed again goes through this same function every time -- there is
+    no separate "re-dismiss" verb, and no previous decision is overwritten.
+    """
     review = load_valid_artifact(review)
     validate_reason(reason)
     # load_valid_artifact guarantees `findings` is present and a list of dicts.
-    findings = review["findings"]
-    f = _finding_at(findings, index)
-    fkey = finding_key(f.get("file", ""), f.get("title", ""))
-    rec = dict(ledger_key=ledger_key(review["branch"], review["base_sha"], fkey),
-               finding_key=fkey, id=review["id"], branch=review["branch"],
-               base_sha=review["base_sha"], file=f.get("file"), line=f.get("line"),
+    f, fkey, lkey = _keys_for(review, index)
+    rec = dict(ledger_key=lkey, finding_key=fkey, id=review["id"],
+               branch=review["branch"], base_sha=review["base_sha"],
+               file=f.get("file"), line=f.get("line"),
                severity=f.get("severity"), title=f.get("title"),
                dismissed_reason=reason, dismissed_at=now)
     store.add_triage(rec)
@@ -227,6 +237,106 @@ def open_findings(review: dict, triaged: dict[str, dict]) -> list[dict]:
     for f in load_valid_artifact(review)["findings"]:
         if finding_key(f.get("file", ""), f.get("title", "")) not in triaged:
             out.append(f)
+    return out
+
+
+def _keys_for(review: dict, index) -> tuple[dict, str, str]:
+    """`(finding, finding_key, ledger_key)` for one named finding of `review`.
+
+    ONE derivation, shared by `dismiss` and `reopen`, so the two cannot end up
+    writing events under different keys for the same finding -- which would
+    make a reopen silently fail to overturn anything.
+    """
+    f = _finding_at(review["findings"], index)
+    fkey = finding_key(f.get("file", ""), f.get("title", ""))
+    return f, fkey, ledger_key(review["branch"], review["base_sha"], fkey)
+
+
+def _effective_event(store: Store, review: dict, fkey: str) -> str | None:
+    """The last event recorded for one finding of `review`, or None.
+
+    Read through the store's own effective-state definition rather than by
+    re-deriving "the latest row" here: the gate and this module must never
+    disagree about whether a finding is dismissed.
+    """
+    state = store.triage_state(review["branch"], review["base_sha"]).get(fkey)
+    return None if state is None else state.get("event")
+
+
+def reopen(store: Store, review: dict, index: int, reason: str, now: str) -> dict:
+    """Overturn one finding's dismissal with an audited reason. Append-only.
+
+    A dismissal is not a verdict for all time: a fix regresses, a base moves, a
+    reason turns out to have been wrong. Reopening is therefore a first-class
+    decision recorded in the same stream, and it is subject to the SAME audit
+    floor a dismissal clears -- `validate_reason`, the identical function, so
+    the two floors cannot drift. A reopen moves the gate from 0 to 1, which is
+    exactly the kind of change nobody should be able to make without saying
+    why.
+
+    Nothing is edited or deleted: the dismissal and its reason stay in the
+    stream, readable by `store.triage_history`, and the reopen is appended
+    after them.
+
+    THE ORDER OF THE CHECKS IS THE EXIT CONTRACT. `FindingNotFound` (which the
+    CLI reports as 2, "the thing you named does not exist") is raised before
+    the reason is judged and before the ledger is consulted, because a reason
+    cannot be refused on behalf of no finding. Only then does a `TriageError`
+    (reported as 1, "it exists and the reopen was declined") become possible:
+    an unauditable reason, or a finding that is not dismissed in the first
+    place -- for which there is nothing to overturn, and an event claiming
+    otherwise would be a reopen with no dismissal behind it.
+    """
+    review = load_valid_artifact(review)
+    f, fkey, lkey = _keys_for(review, index)
+    validate_reason(reason)
+    state = _effective_event(store, review, fkey)
+    if state != Store.EVENT_DISMISS:
+        raise TriageError(
+            f"finding {index} is not dismissed"
+            + (" (it was already reopened)" if state == Store.EVENT_REOPEN else "")
+            + "; there is nothing to reopen")
+    rec = dict(ledger_key=lkey, finding_key=fkey, id=review["id"],
+               branch=review["branch"], base_sha=review["base_sha"],
+               file=f.get("file"), line=f.get("line"), severity=f.get("severity"),
+               title=f.get("title"), reason=reason, at=now)
+    store.triage_reopen(rec)
+    return rec
+
+
+def status_token(state) -> str:
+    """The `(...)` status `triage --list` prints for one finding.
+
+    `OPEN`, `DISMISSED <when>`, or `REOPENED <when>, dismissed <when>` -- both
+    timestamps whenever both decisions exist, because "reopened today" is only
+    meaningful next to the dismissal it overturned.
+
+    `state` is one value from `store.triage_state`, or None for a finding with
+    no events. Every timestamp goes through `shown_field`: a seeded legacy
+    `dismissed_at` is whatever the archive happened to contain, and it prints on
+    the same terminal line as the finding's own status -- the exact exposure
+    that rule exists for. An unknown event verb renders `OPEN`, the safe
+    direction: a finding shown as open is one a human still has to look at.
+
+    Rendering may never be the thing that crashes a listing, so nothing here
+    raises for any input.
+    """
+    event = state.get("event") if isinstance(state, dict) else None
+    if event == Store.EVENT_DISMISS:
+        label, own, other, other_word = ("DISMISSED", "dismissed_at",
+                                         "reopened_at", "reopened")
+    elif event == Store.EVENT_REOPEN:
+        label, own, other, other_word = ("REOPENED", "reopened_at",
+                                         "dismissed_at", "dismissed")
+    else:
+        return "OPEN"
+    out = label
+    when = shown_field(state.get(own))
+    if when:
+        out += f" {when}"
+    before = shown_field(state.get(other))
+    if before:
+        out += f", {other_word} {before}"
     return out
 
 

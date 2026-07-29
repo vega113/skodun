@@ -108,12 +108,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     tri = sub.add_parser(
         "triage",
-        help="dismiss a finding with an audited reason, or list a review's findings")
+        help="dismiss or reopen a finding with an audited reason, or list a "
+             "review's findings")
     tri.add_argument("review_id")
     tri.add_argument("finding_index", nargs="?", type=int, default=None)
     tri.add_argument("reason", nargs="?", default=None)
     tri.add_argument("--list", action="store_true", dest="list_only",
                      help="list a review's findings instead of dismissing one")
+    # The audited un-dismissal. It takes a reason of its own -- and the same
+    # reason floor a dismissal clears -- because it moves the gate from 0 back
+    # to 1, and nothing may do that silently. Append-only: the dismissal it
+    # overturns stays in the ledger with its own reason.
+    tri.add_argument("--reopen", action="store_true", dest="reopen",
+                     help="reopen ONE previously dismissed finding, with an "
+                          "audited reason for overturning the dismissal")
     # Explicit, per-finding, and deliberately WITHOUT a bulk form: a refuter
     # verdict is an annotation, and the only way one may ever dismiss a
     # finding is a human naming that finding. `--adopt-all` would be exactly
@@ -821,7 +829,7 @@ def _cmd_log(args) -> int:
 
 
 def _cmd_triage(args) -> int:
-    """Dismiss one finding with an audited reason, or list a review's findings.
+    """Dismiss or reopen one finding with an audited reason, or list a review's.
 
     A rejected reason or a missing/invalid review is reported as a clear
     message and a nonzero exit -- never a traceback -- because both are the
@@ -832,35 +840,53 @@ def _cmd_triage(args) -> int:
     interpreter's own exit code of 1 -- indistinguishable from a real error
     about a decision that in fact was never even reached.
 
-    `--adopt-refuter` has its own exit contract, and the split is the point:
+    `--adopt-refuter` and `--reopen` share one exit contract, and the split is
+    the point:
 
-      0  the dismissal was recorded
-      1  REFUSED -- the finding is right there and the adoption was declined
-         (wrong verdict, thin reasoning, a reasoning that fails the audit
-         floor, an annotation that cannot say who answered)
+      0  the decision was recorded
+      1  REFUSED -- the finding is right there and the decision was declined
+         (for `--adopt-refuter`: a wrong verdict, thin reasoning, a reasoning
+         that fails the audit floor, an annotation that cannot say who
+         answered; for `--reopen`: a reason that fails the audit floor, or a
+         finding that is not dismissed and so has nothing to overturn)
       2  NOT FOUND -- no such review, no such finding, an artifact that does
          not validate, a store that will not open, or plain misuse
 
-    A refusal is a fact about the annotation and is worth acting on; a 2 means
-    the command never got as far as having an opinion. Collapsing them would
-    make "your refuter said `confirmed`" indistinguishable from "you typed the
-    wrong review id".
+    A refusal is a fact about the ledger and is worth acting on; a 2 means the
+    command never got as far as having an opinion. Collapsing them would make
+    "your refuter said `confirmed`" indistinguishable from "you typed the wrong
+    review id".
+
+    The PLAIN dismissal path keeps its own shipped behaviour, in which a
+    rejected reason is a 2. That is deliberately left alone here: it is a
+    shipped contract that pre-push hooks and humans already read, and this task
+    is not the place to change what `skodun triage <id> <n> "<reason>"` returns.
     """
     from .store import Store, _TS_FORMAT
 
-    # `--list` and a dismissal are two different commands sharing one parser,
-    # so `triage --list <id> <index> "<reason>"` parses cleanly and then throws
-    # the index and the reason away. Someone who typed a reason believes a
-    # finding was dismissed; they get a listing and a 0. Reject the mixture
-    # instead of picking one of the two meanings.
-    if args.list_only and args.adopt_refuter:
+    # `--list`, `--adopt-refuter` and `--reopen` are different commands sharing
+    # one parser, so `triage --list <id> <index> "<reason>"` parses cleanly and
+    # then throws the index and the reason away. Someone who typed a reason
+    # believes a finding was dismissed; they get a listing and a 0. Reject every
+    # mixture instead of picking one of the meanings.
+    modes = [name for name, on in (("--list", args.list_only),
+                                   ("--adopt-refuter", args.adopt_refuter),
+                                   ("--reopen", args.reopen)) if on]
+    if len(modes) > 1:
         return _emit(
-            "skodun triage: --list and --adopt-refuter are two different "
+            f"skodun triage: {modes[0]} and {modes[1]} are two different "
             "commands; pick one", 2)
     if args.list_only and not (args.finding_index is None and args.reason is None):
         return _emit(
             "skodun triage: --list takes only a review id; drop the finding "
             "index and the reason to list, or drop --list to dismiss", 2)
+    if args.reopen and (args.finding_index is None or args.reason is None):
+        # Both are mandatory: one finding at a time, and never without a stated
+        # reason for overturning a dismissal somebody else may have recorded.
+        return _emit(
+            "skodun triage: usage: skodun triage --reopen <review-id> "
+            "<finding-index> \"<reason>\"  (one finding at a time, and the "
+            "reason is required)", 2)
     if args.adopt_refuter:
         # Same class of mixture, and the same refusal to guess. The reason is
         # SYNTHESIZED from the annotation, so a reason typed alongside the flag
@@ -891,7 +917,8 @@ def _cmd_triage(args) -> int:
         from .triage import (ArtifactError, FindingNotFound, TriageError,
                              adopt_refuter, dismiss, load_valid_artifact,
                              refuter_annotation, refuter_line, refuter_pass_ran,
-                             refuter_same_provider_as_finder, shown_field)
+                             refuter_same_provider_as_finder, reopen, shown_field,
+                             status_token)
 
         try:
             review = load_valid_artifact(review)
@@ -899,7 +926,12 @@ def _cmd_triage(args) -> int:
             return _emit(f"skodun triage: invalid review artifact: {e}", 2)
 
         if args.list_only:
-            triaged = store.triage_for(review["branch"], review["base_sha"])
+            # The EFFECTIVE state of every finding in this review's scope, from
+            # the store's one definition of it -- the same answer the gate gets
+            # from `triage_for`, which is a filter over exactly this map. A
+            # second, independent "latest decision" query here could print
+            # DISMISSED for a finding the gate still counts as open.
+            states = store.triage_state(review["branch"], review["base_sha"])
             # An annotation is shown only on a record where a refuter pass
             # actually ran. On a record where none did, a `refuter` key is
             # something the FINDER wrote about its own finding (see
@@ -910,7 +942,11 @@ def _cmd_triage(args) -> int:
             annotated = refuter_pass_ran(review)
             for i, f in enumerate(review["findings"]):
                 fkey = finding_key(f.get("file", ""), f.get("title", ""))
-                status = "DISMISSED" if fkey in triaged else "OPEN"
+                # `OPEN`, `DISMISSED <when>`, or `REOPENED <when>, dismissed
+                # <when>` -- one definition, in `triage.status_token`, which
+                # bounds and strips the stored timestamps the same way every
+                # other untrusted field on this line is bounded and stripped.
+                status = status_token(states.get(fkey))
                 # EVERY field on this line is finder-authored, untrusted model
                 # text reaching the terminal the same way a refuter's `reasoning`
                 # does -- `severity`, `file` and `line` are read straight off the
@@ -931,6 +967,26 @@ def _cmd_triage(args) -> int:
                 if annotation is not None:
                     _emit(refuter_line(annotation), 0)
             return 0
+
+        if args.reopen:
+            try:
+                reopen(store, review, args.finding_index, args.reason,
+                       now=time.strftime(_TS_FORMAT, time.gmtime()))
+            except (FindingNotFound, ArtifactError) as e:
+                # The finding or the review does not exist: nothing was decided.
+                return _emit(f"skodun triage: {e}", 2)
+            except TriageError as e:
+                # The finding exists and the reopen was declined -- an
+                # unauditable reason, or a finding that is not dismissed.
+                return _emit(f"skodun triage: refused: {e}", 1)
+            except BaseException as e:
+                # A store that stopped accepting writes is not a refusal about
+                # the reason: nothing was decided and nothing was recorded.
+                return _emit(
+                    f"skodun triage: could not record the reopen: {e!r}", 2)
+            return _emit(
+                f"skodun triage: reopened finding {args.finding_index} on review "
+                f"{args.review_id}; it counts as open again", 0)
 
         if args.adopt_refuter:
             try:

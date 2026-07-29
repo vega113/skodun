@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shlex
 import signal
 import stat
 import subprocess
@@ -540,6 +541,328 @@ def test_a_refused_adoption_leaves_the_gate_where_it_was(tmp_path, monkeypatch,
     assert main(["triage", "--adopt-refuter", "rev1", "0"]) == 1
     capsys.readouterr()
     assert _gate_code(repo, st) == 1
+
+
+# ---------------------------------------------------------------------------
+# triage --reopen: the audited un-dismissal, and its seam matrix
+# ---------------------------------------------------------------------------
+#
+# A dismissal is not permanent -- a fix regresses, a reason turns out to be
+# wrong -- so reopening is a first-class decision with the SAME audit floor a
+# dismissal clears. Its exit contract is `--adopt-refuter`'s, and for the same
+# reason: 1 means "the finding is right there and the reopen was declined"
+# (an unauditable reason, a finding that is not dismissed), 2 means "the
+# command never got as far as having an opinion" (no such review, no such
+# finding, an invalid artifact, plain misuse). Collapsing them would make
+# "your reason says nothing" indistinguishable from "you typed the wrong id".
+
+DISMISS_REASON = "the guard at line 12 already rejects a None handler before this"
+REOPEN_REASON = "the guard was deleted in the refactor and this crashes on main"
+REDISMISS_REASON = "the guard is back in the follow-up commit, with a test"
+
+#: `(argv-tail, expected exit)` for the three outcomes, driven through every
+#: invocation form below. The store each row runs against already carries a
+#: dismissal of finding 0 (`_dismissed_store`).
+_REOPEN_CASES = [
+    ("recorded", ["triage", "--reopen", "rev1", "0", REOPEN_REASON], 0),
+    ("refused", ["triage", "--reopen", "rev1", "0", "fp"], 1),
+    ("not-found", ["triage", "--reopen", "nope", "0", REOPEN_REASON], 2),
+]
+
+
+def _dismissed_store(db: Path) -> Path:
+    """A store holding one review whose only finding is already DISMISSED."""
+    from skodun.triage import dismiss
+
+    st = Store.open(db)
+    st.save_review(_artifact([_finding(0)]))
+    dismiss(st, st.get_review("rev1"), 0, DISMISS_REASON, now="2026-07-27T10:00:00Z")
+    st.close()
+    return db
+
+
+def _still_dismissed(db: Path) -> bool:
+    st = Store.open(db)
+    try:
+        return finding_key("a0.py", "NPE 0") in st.triage_for("feat", "s" * 40)
+    finally:
+        st.close()
+
+
+def _lkey(st, review_id="rev1", file="a0.py", title="NPE 0") -> str:
+    from skodun.textnorm import ledger_key
+
+    art = st.get_review(review_id)
+    return ledger_key(art["branch"], art["base_sha"], finding_key(file, title))
+
+
+def test_reopen_records_the_event_and_reports_it(tmp_path, monkeypatch, capsys):
+    st = _store(tmp_path, _finding(0), monkeypatch=monkeypatch)
+    from skodun.triage import dismiss
+
+    dismiss(st, st.get_review("rev1"), 0, DISMISS_REASON, now="2026-07-27T10:00:00Z")
+
+    assert main(["triage", "--reopen", "rev1", "0", REOPEN_REASON]) == 0
+    out = capsys.readouterr().out
+    assert "rev1" in out and "0" in out
+    assert st.triage_for("feat", "s" * 40) == {}
+    assert [h["event"] for h in st.triage_history(_lkey(st))] == ["dismiss", "reopen"]
+    assert st.triage_history(_lkey(st))[-1]["reason"] == REOPEN_REASON
+
+
+def test_reopen_flips_the_gate_from_0_back_to_1_and_a_re_dismissal_back_to_0(
+        tmp_path, monkeypatch, capsys):
+    """The whole point, end to end and through the LEDGER, not the CLI's own
+    say-so: the gate moves because the event stream moved."""
+    repo, st = _gated_repo(tmp_path, monkeypatch, None)
+    assert _gate_code(repo, st) == 1
+
+    assert main(["triage", "rev1", "0", DISMISS_REASON]) == 0
+    assert _gate_code(repo, st) == 0
+
+    assert main(["triage", "--reopen", "rev1", "0", REOPEN_REASON]) == 0
+    assert _gate_code(repo, st) == 1
+
+    assert main(["triage", "rev1", "0", REDISMISS_REASON]) == 0
+    assert _gate_code(repo, st) == 0
+    capsys.readouterr()
+
+    history = st.triage_history(_lkey(st))
+    assert [h["event"] for h in history] == ["dismiss", "reopen", "dismiss"]
+    assert [h["reason"] for h in history] == [DISMISS_REASON, REOPEN_REASON,
+                                              REDISMISS_REASON]
+
+
+def test_a_refused_reopen_leaves_the_gate_where_it_was(tmp_path, monkeypatch, capsys):
+    repo, st = _gated_repo(tmp_path, monkeypatch, None)
+    assert main(["triage", "rev1", "0", DISMISS_REASON]) == 0
+    assert _gate_code(repo, st) == 0
+
+    assert main(["triage", "--reopen", "rev1", "0", "false positive"]) == 1
+    capsys.readouterr()
+
+    assert _gate_code(repo, st) == 0, "a refused reopen must not move the gate"
+    assert [h["event"] for h in st.triage_history(_lkey(st))] == ["dismiss"]
+
+
+@pytest.mark.parametrize("reason", ["fp", "false positive", "wontfix", "too short"])
+def test_reopen_refuses_an_unauditable_reason_as_a_1(tmp_path, monkeypatch, capsys,
+                                                     reason):
+    db = _dismissed_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["triage", "--reopen", "rev1", "0", reason]) == 1
+    cap = capsys.readouterr()
+    assert "refused" in cap.out
+    assert "Traceback" not in cap.out and "Traceback" not in cap.err
+    assert _still_dismissed(db)
+
+
+def test_reopening_a_finding_that_is_not_dismissed_is_a_1(tmp_path, monkeypatch,
+                                                           capsys):
+    """A fact about the ledger, not a typo: there is nothing to overturn."""
+    _store(tmp_path, _finding(0), monkeypatch=monkeypatch)
+    assert main(["triage", "--reopen", "rev1", "0", REOPEN_REASON]) == 1
+    assert "not dismissed" in capsys.readouterr().out.lower()
+
+
+def test_reopening_on_an_unknown_review_is_a_2(tmp_path, monkeypatch, capsys):
+    _dismissed_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "cli.db"))
+    assert main(["triage", "--reopen", "nope", "0", REOPEN_REASON]) == 2
+    assert "no such review" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("index", ["1", "-1", "99"])
+def test_reopening_an_out_of_range_index_is_a_2(tmp_path, monkeypatch, capsys, index):
+    db = _dismissed_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["triage", "--reopen", "rev1", index, REOPEN_REASON]) == 2
+    cap = capsys.readouterr()
+    assert "usage:" not in cap.err                  # a real answer, not argparse
+    assert "out of range" in cap.out
+    assert _still_dismissed(db)
+
+
+def test_reopening_on_a_corrupt_artifact_is_a_2(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    st = Store.open(db)
+    art = _artifact([_finding(0)])
+    art["findings_total"] = 5                       # index/artifact disagreement
+    st.save_review(art)
+    assert main(["triage", "--reopen", "rev1", "0", REOPEN_REASON]) == 2
+    assert "invalid review artifact" in capsys.readouterr().out
+
+
+# --- misuse: a message, never a traceback ---------------------------------
+
+@pytest.mark.parametrize("argv, expected_in_out", [
+    (["triage", "--reopen", "--list", "rev1"], "--list"),
+    (["triage", "--reopen", "--adopt-refuter", "rev1", "0"], "--adopt-refuter"),
+    (["triage", "--reopen", "rev1"], "--reopen"),
+    (["triage", "--reopen", "rev1", "0"], "--reopen"),
+])
+def test_reopen_misuse_is_a_clear_message_and_a_2(tmp_path, monkeypatch, capsys,
+                                                   argv, expected_in_out):
+    db = _dismissed_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(argv) == 2
+    cap = capsys.readouterr()
+    assert expected_in_out in cap.out, cap.out
+    assert "Traceback" not in cap.out and "Traceback" not in cap.err
+    assert "[0]" not in cap.out, "a listing must not be printed as if it were the ask"
+    assert _still_dismissed(db), "nothing may be recorded on a misuse"
+
+
+def test_reopen_with_a_non_numeric_index_is_a_usage_error_not_a_traceback(
+        tmp_path, monkeypatch, capsys):
+    db = _dismissed_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["triage", "--reopen", "rev1", "zero", REOPEN_REASON]) == 2
+    cap = capsys.readouterr()
+    assert "Traceback" not in cap.err and "Traceback" not in cap.out
+    assert "usage:" in cap.err
+    assert _still_dismissed(db)
+
+
+def test_reopen_appears_in_the_triage_help(capsys):
+    assert main(["triage", "--help"]) == 0
+    assert "--reopen" in capsys.readouterr().out
+
+
+# --- --list renders the event stream --------------------------------------
+
+def test_list_renders_dismissed_then_reopened_with_both_timestamps(
+        tmp_path, monkeypatch, capsys):
+    from skodun.triage import dismiss, reopen
+
+    st = _store(tmp_path, _finding(0), monkeypatch=monkeypatch)
+    art = st.get_review("rev1")
+
+    assert main(["triage", "--list", "rev1"]) == 0
+    assert "(OPEN)" in capsys.readouterr().out
+
+    dismiss(st, art, 0, DISMISS_REASON, now="2026-07-27T10:00:00Z")
+    assert main(["triage", "--list", "rev1"]) == 0
+    assert "(DISMISSED 2026-07-27T10:00:00Z)" in capsys.readouterr().out
+
+    reopen(st, art, 0, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+    assert main(["triage", "--list", "rev1"]) == 0
+    out = capsys.readouterr().out
+    assert "(REOPENED 2026-07-27T12:00:00Z, dismissed 2026-07-27T10:00:00Z)" in out
+
+    dismiss(st, art, 0, REDISMISS_REASON, now="2026-07-27T14:00:00Z")
+    assert main(["triage", "--list", "rev1"]) == 0
+    out = capsys.readouterr().out
+    assert "(DISMISSED 2026-07-27T14:00:00Z, reopened 2026-07-27T12:00:00Z)" in out
+
+
+def test_the_listing_and_the_gate_never_disagree_about_a_dismissal(
+        tmp_path, monkeypatch, capsys):
+    """Both read the same effective state (last event by seq). A listing that
+    said DISMISSED while the gate still counted the finding as open would send
+    a human away from the one thing blocking their push."""
+    repo, st = _gated_repo(tmp_path, monkeypatch, None)
+    for argv, gate_code, token in [
+            (["triage", "rev1", "0", DISMISS_REASON], 0, "DISMISSED"),
+            (["triage", "--reopen", "rev1", "0", REOPEN_REASON], 1, "REOPENED")]:
+        assert main(argv) == 0
+        capsys.readouterr()
+        assert main(["triage", "--list", "rev1"]) == 0
+        assert f"({token} " in capsys.readouterr().out
+        assert _gate_code(repo, st) == gate_code
+
+
+# --- the seam matrix for the new flag -------------------------------------
+#
+# Exit code correctness across {normal run, closed stdout, `| head` under
+# pipefail, `python -m skodun`, the console script}, for all three outcomes.
+# The dangerous coincidence this exists for: a `BrokenPipeError` escaping
+# `_emit` would hand the shell the interpreter's own exit code of 1 -- exactly
+# the value that means "the reopen was refused" -- so every row asserts the
+# code AND an empty stderr, which is what tells a real refusal from a crash.
+
+
+@pytest.mark.parametrize("name, argv, expected", _REOPEN_CASES,
+                         ids=[c[0] for c in _REOPEN_CASES])
+def test_reopen_seam_normal_run(tmp_path, monkeypatch, capsys, name, argv, expected):
+    db = _dismissed_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(argv) == expected
+    cap = capsys.readouterr()
+    assert cap.out.strip(), "every outcome says something on stdout"
+    assert "Traceback" not in cap.out and "Traceback" not in cap.err
+    assert _still_dismissed(db) is (expected != 0)
+
+
+@pytest.mark.parametrize("name, argv, expected", _REOPEN_CASES,
+                         ids=[c[0] for c in _REOPEN_CASES])
+def test_reopen_seam_closed_stdout(tmp_path, name, argv, expected):
+    """`skodun triage --reopen ... > <dead pipe>`: every write raises, and the
+    verdict must still be the process's exit code -- and the write must still
+    land for the recorded case."""
+    db = _dismissed_store(tmp_path / "sub" / "s.db")
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run([sys.executable, "-m", "skodun", *argv],
+                           stdout=w_fd, stderr=subprocess.PIPE, text=True,
+                           env=_subprocess_env(db))
+    finally:
+        os.close(w_fd)
+    assert p.returncode == expected, f"stderr={p.stderr!r}"
+    assert p.stderr == "", p.stderr
+    assert _still_dismissed(db) is (expected != 0)
+
+
+@pytest.mark.parametrize("name, argv, expected", _REOPEN_CASES,
+                         ids=[c[0] for c in _REOPEN_CASES])
+def test_reopen_seam_through_head_under_pipefail(tmp_path, name, argv, expected):
+    """A live pipe, not a closed-fd simulation. `head -1` closes its end while
+    skodun may still be writing; `${PIPESTATUS[0]}` is bash's record of
+    skodun's OWN status, which `set -o pipefail` alone would flatten into the
+    pipeline's."""
+    db = _dismissed_store(tmp_path / "sub" / "s.db")
+    quoted = " ".join(shlex.quote(a) for a in argv)
+    script = (f'set -o pipefail; {shlex.quote(sys.executable)} -m skodun {quoted} '
+              f'| head -1; echo "SKODUN_EXIT=${{PIPESTATUS[0]}}"')
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                       env=_subprocess_env(db))
+    m = re.search(r"SKODUN_EXIT=(\d+)", p.stdout)
+    assert m, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert int(m.group(1)) == expected, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert "Traceback" not in p.stderr, p.stderr
+    assert _still_dismissed(db) is (expected != 0)
+
+
+@pytest.mark.parametrize("module", ["skodun", "skodun.cli"])
+@pytest.mark.parametrize("name, argv, expected", _REOPEN_CASES,
+                         ids=[c[0] for c in _REOPEN_CASES])
+def test_reopen_seam_module_invocation(tmp_path, module, name, argv, expected):
+    db = _dismissed_store(tmp_path / module / "s.db")
+    p = subprocess.run([sys.executable, "-m", module, *argv],
+                       capture_output=True, text=True, env=_subprocess_env(db))
+    assert p.returncode == expected, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert p.stderr == "", p.stderr
+    assert _still_dismissed(db) is (expected != 0)
+
+
+@pytest.mark.parametrize("name, argv, expected", _REOPEN_CASES,
+                         ids=[c[0] for c in _REOPEN_CASES])
+def test_reopen_seam_console_script_entry_point(tmp_path, name, argv, expected):
+    """The console script `skodun` is `skodun.cli:entry` (pyproject
+    `[project.scripts]`), and the generated wrapper does exactly what the `-c`
+    below does. Driving `entry()` rather than an installed `skodun` binary
+    keeps the row honest in a checkout that was never `pip install`ed -- the
+    contract being tested is `entry`'s `SystemExit(main())`, which is what
+    turns a returned 1 into the shell's 1."""
+    db = _dismissed_store(tmp_path / "sub" / "s.db")
+    p = subprocess.run(
+        [sys.executable, "-c", "from skodun.cli import entry; entry()", *argv],
+        capture_output=True, text=True, env=_subprocess_env(db))
+    assert p.returncode == expected, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert p.stderr == "", p.stderr
+    assert _still_dismissed(db) is (expected != 0)
 
 
 def test_triage_list_still_exits_0_on_a_stdout_that_cannot_encode_the_line(tmp_path):

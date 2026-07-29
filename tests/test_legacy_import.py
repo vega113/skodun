@@ -890,7 +890,13 @@ def test_triage_counts_ledger_lines_not_distinct_ledger_keys(tmp_path):
         triage_rows=[TRIAGE_ROW,
                      {**TRIAGE_ROW, "dismissed_at": "2026-07-02T00:00:00Z"}]))
     assert stats.triage == 2
-    assert st._c.execute("SELECT COUNT(*) c FROM triage").fetchone()["c"] == 1
+    # Two ledger LINES, one ledger KEY -- which is the distinction the stat
+    # deliberately does not make. Since v3 each line is an appended event
+    # (`triage_events`) rather than an upsert into the legacy single-row
+    # `triage` table, so the count is read where the rows now live.
+    assert st._c.execute(
+        "SELECT COUNT(DISTINCT ledger_key) c FROM triage_events").fetchone()["c"] == 1
+    assert st._c.execute("SELECT COUNT(*) c FROM triage_events").fetchone()["c"] == 2
 
 
 # --------------------------------------------------------------------------
@@ -950,13 +956,28 @@ def test_an_unbindable_record_is_a_skipped_line_not_a_store_failure(tmp_path):
 def test_importing_twice_changes_nothing(tmp_path):
     d = _archive(tmp_path, artifacts={"loop_1": _artifact()})
     st = _store(tmp_path)
+    def dismissals():
+        # The ledger as the GATE reads it: one entry per finding key, with the
+        # reason and timestamp that entry carries. `seq` is deliberately not
+        # compared -- see below.
+        return {k: (v["dismissed_reason"], v["dismissed_at"])
+                for k, v in st.triage_for("b", "s" * 40).items()}
+
     first = import_legacy(st, d)
+    before = dismissals()
     second = import_legacy(st, d)
     assert first == second
     assert st._c.execute("SELECT COUNT(*) c FROM reviews").fetchone()["c"] == 1
-    assert st._c.execute("SELECT COUNT(*) c FROM triage").fetchone()["c"] == 1
     assert st.latest_trustworthy_for("d" * 40)["findings"] == []
-    assert set(st.triage_for("b", "s" * 40)) == {"ab" * 8}
+    # The EFFECTIVE ledger is unchanged by the second import, which is what
+    # "changes nothing" means for a store the gate reads. The event stream is
+    # append-only by design, so a re-import appends a second, identical
+    # `dismiss` event rather than upserting one row: the finding stays
+    # dismissed, with the same reason, and no decision is ever overwritten.
+    assert set(before) == {"ab" * 8}
+    assert dismissals() == before
+    assert st._c.execute(
+        "SELECT COUNT(DISTINCT ledger_key) c FROM triage_events").fetchone()["c"] == 1
 
 
 def test_re_import_after_the_artifact_appears_upgrades_the_row(tmp_path):
@@ -1246,10 +1267,16 @@ def test_real_archive_smoke(tmp_path):
     assert stats.store_failures == 0
 
     # The audit floor costs a real archive nothing: every dismissal a human
-    # actually wrote clears it, so `triage` is not being propped up by rows
-    # that would be rubber stamps.
-    for row in st._c.execute("SELECT dismissed_reason FROM triage").fetchall():
-        validate_reason(row["dismissed_reason"])
+    # actually wrote clears it, so the ledger is not being propped up by rows
+    # that would be rubber stamps. (Read from `triage_events`, where v3 records
+    # every decision; the legacy single-row `triage` table is read-only now and
+    # this import never writes it, so reading it here would loop over nothing
+    # and assert nothing.)
+    reasons = st._c.execute(
+        "SELECT reason FROM triage_events WHERE event='dismiss'").fetchall()
+    assert reasons, "a real ledger imported no dismissal events"
+    for row in reasons:
+        validate_reason(row["reason"])
 
     # Every row the import called trustworthy must be a real, valid artifact --
     # this is the property whose violation jams the gate at 2.

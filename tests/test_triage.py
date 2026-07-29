@@ -976,3 +976,216 @@ def test_refuter_pass_ran_never_raises_on_junk():
     for review in [None, "x", 5, [], {}, {"extra_passes": "x"},
                    {"extra_passes": ["refuter"]}]:
         assert refuter_pass_ran(review) is False, review
+
+
+# ---------------------------------------------------------------------------
+# reopen: an audited un-dismissal, appended to the same event stream
+# ---------------------------------------------------------------------------
+#
+# A dismissal is not a verdict for all time -- a fix regresses, a base moves,
+# a reason turns out to have been wrong. Reopening is therefore a first-class,
+# AUDITED decision recorded with the same floor `validate_reason` puts on a
+# dismissal, and it is APPENDED: nothing in the ledger is ever edited or
+# deleted, so the history of a finding reads dismiss -> reopen -> dismiss and
+# every reason survives.
+
+GOOD_REASON = "line numbers drift; verified the handler checks None on entry"
+REOPEN_REASON = "the null check was removed again in the refactor; it crashes"
+
+
+def _lkey(review=None) -> str:
+    from skodun.textnorm import ledger_key
+
+    review = review or GOOD
+    f = review["findings"][0]
+    return ledger_key(review["branch"], review["base_sha"],
+                      finding_key(f["file"], f["title"]))
+
+
+def _dismissed(st, review=None):
+    review = review or GOOD
+    return dismiss(st, review, 0, GOOD_REASON, now="2026-07-27T10:00:00Z")
+
+
+def test_reopen_records_an_audited_reopen_and_reopens_the_finding(tmp_path):
+    from skodun.triage import reopen
+
+    st = Store.open(tmp_path / "s.db")
+    _dismissed(st)
+    assert open_findings(GOOD, _triaged(st)) == []
+
+    rec = reopen(st, GOOD, 0, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+
+    assert rec["finding_key"] == finding_key("a.py", "NPE")
+    assert rec["ledger_key"] == _lkey()
+    assert rec["reason"] == REOPEN_REASON
+    assert rec["at"] == "2026-07-27T12:00:00Z"
+    # The gate's view: the finding is open again.
+    assert _triaged(st) == {}
+    assert len(open_findings(GOOD, _triaged(st))) == 1
+    assert [h["event"] for h in st.triage_history(_lkey())] == ["dismiss", "reopen"]
+
+
+def test_reopen_preserves_the_dismissal_reason_it_overturns(tmp_path):
+    """Append-only is the point: the reason the finding was dismissed with must
+    still be readable after it is reopened, or the ledger cannot be audited."""
+    from skodun.triage import reopen
+
+    st = Store.open(tmp_path / "s.db")
+    _dismissed(st)
+    reopen(st, GOOD, 0, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+    history = st.triage_history(_lkey())
+    assert [h["reason"] for h in history] == [GOOD_REASON, REOPEN_REASON]
+
+
+@pytest.mark.parametrize("reason", ["fp", "false positive", "wontfix", "",
+                                    "   ", "too short"])
+def test_reopen_refuses_an_unauditable_reason_and_writes_nothing(tmp_path, reason):
+    """The SAME floor a dismissal clears -- `validate_reason`, unchanged. A
+    reopen nobody can audit later is indistinguishable from re-opening a
+    finding out of spite, and it moves the gate from 0 to 1."""
+    from skodun.triage import reopen
+
+    st = Store.open(tmp_path / "s.db")
+    _dismissed(st)
+    with pytest.raises(TriageError):
+        reopen(st, GOOD, 0, reason, now="2026-07-27T12:00:00Z")
+    assert set(_triaged(st)) == {finding_key("a.py", "NPE")}, "still dismissed"
+    assert [h["event"] for h in st.triage_history(_lkey())] == ["dismiss"]
+
+
+def test_reopen_refuses_a_finding_that_is_not_dismissed(tmp_path):
+    """There is nothing to overturn, and an event saying otherwise would be a
+    reopen with no dismissal behind it in the audit stream."""
+    from skodun.triage import reopen
+
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(TriageError) as e:
+        reopen(st, GOOD, 0, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+    assert "not dismissed" in str(e.value).lower()
+    assert st.triage_history(_lkey()) == []
+
+
+def test_reopen_refuses_a_finding_that_is_already_reopened(tmp_path):
+    from skodun.triage import reopen
+
+    st = Store.open(tmp_path / "s.db")
+    _dismissed(st)
+    reopen(st, GOOD, 0, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+    with pytest.raises(TriageError):
+        reopen(st, GOOD, 0, "and again, for a second unrelated reason entirely",
+               now="2026-07-27T13:00:00Z")
+    assert [h["event"] for h in st.triage_history(_lkey())] == ["dismiss", "reopen"]
+
+
+def test_a_dismissal_after_a_reopen_is_an_ordinary_dismissal(tmp_path):
+    """No special "re-dismiss" verb: the stream is dismiss/reopen and `dismiss`
+    is the same function it always was."""
+    from skodun.triage import reopen
+
+    st = Store.open(tmp_path / "s.db")
+    _dismissed(st)
+    reopen(st, GOOD, 0, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+    dismiss(st, GOOD, 0, "fixed in the follow-up commit; the guard is back",
+            now="2026-07-27T14:00:00Z")
+    assert open_findings(GOOD, _triaged(st)) == []
+    assert [h["event"] for h in st.triage_history(_lkey())] == \
+        ["dismiss", "reopen", "dismiss"]
+
+
+@pytest.mark.parametrize("index", [1, -1, 99, True, "0", None, 1.0])
+def test_reopen_raises_finding_not_found_for_an_unresolvable_index(tmp_path, index):
+    """`FindingNotFound`, not `TriageError`, because the CLI maps the two to
+    DIFFERENT exit codes: 2 for "the thing you named does not exist", 1 for "it
+    exists and the reopen was refused"."""
+    from skodun.triage import reopen
+
+    st = Store.open(tmp_path / "s.db")
+    _dismissed(st)
+    with pytest.raises(FindingNotFound):
+        reopen(st, GOOD, index, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+    assert [h["event"] for h in st.triage_history(_lkey())] == ["dismiss"]
+
+
+def test_reopen_reports_a_bad_index_before_it_judges_the_reason(tmp_path):
+    """Both are wrong; the honest answer is the one about the thing that does
+    not exist, because a reason cannot be refused on behalf of no finding."""
+    from skodun.triage import reopen
+
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(FindingNotFound):
+        reopen(st, GOOD, 99, "fp", now="2026-07-27T12:00:00Z")
+
+
+def test_reopen_rejects_a_corrupt_artifact_before_writing(tmp_path):
+    from skodun.triage import reopen
+
+    st = Store.open(tmp_path / "s.db")
+    bad = dict(GOOD, findings_total=2)
+    with pytest.raises(ArtifactError):
+        reopen(st, bad, 0, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+    assert st.triage_history(_lkey()) == []
+
+
+def test_reopen_rejects_a_non_canonical_timestamp(tmp_path):
+    from skodun.triage import reopen
+
+    st = Store.open(tmp_path / "s.db")
+    _dismissed(st)
+    with pytest.raises(ValueError):
+        reopen(st, GOOD, 0, REOPEN_REASON, now="2026-07-27 12:00:00")
+    assert [h["event"] for h in st.triage_history(_lkey())] == ["dismiss"]
+
+
+def test_reopen_is_scoped_to_the_reviews_own_branch_and_base(tmp_path):
+    """A dismissal recorded against another base must not be reopenable from
+    here, and vice versa: the ledger key carries branch and base_sha."""
+    from skodun.triage import reopen
+
+    st = Store.open(tmp_path / "s.db")
+    other = dict(GOOD, base_sha="0" * 40)
+    _dismissed(st, other)                       # dismissed under a DIFFERENT base
+    with pytest.raises(TriageError):
+        reopen(st, GOOD, 0, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+    assert st.triage_history(_lkey(other))[-1]["event"] == "dismiss"
+
+
+# --- the status token the listing prints ----------------------------------
+
+def test_status_token_renders_open_dismissed_and_reopened(tmp_path):
+    from skodun.triage import reopen, status_token
+
+    st = Store.open(tmp_path / "s.db")
+    fkey = finding_key("a.py", "NPE")
+
+    def token():
+        return status_token(st.triage_state(GOOD["branch"], GOOD["base_sha"]).get(fkey))
+
+    assert token() == "OPEN"
+    _dismissed(st)
+    assert token() == "DISMISSED 2026-07-27T10:00:00Z"
+    reopen(st, GOOD, 0, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+    # BOTH timestamps: the reopen is the state, the dismissal is its history.
+    assert token() == "REOPENED 2026-07-27T12:00:00Z, dismissed 2026-07-27T10:00:00Z"
+    dismiss(st, GOOD, 0, "fixed in the follow-up commit; the guard is back",
+            now="2026-07-27T14:00:00Z")
+    assert token() == "DISMISSED 2026-07-27T14:00:00Z, reopened 2026-07-27T12:00:00Z"
+
+
+def test_status_token_never_raises_and_never_trusts_a_stored_timestamp():
+    """A seeded legacy `dismissed_at` is whatever the archive contained, so the
+    listing treats it as untrusted display text like every other field on the
+    line: no raw ESC, no forged second row, bounded length."""
+    from skodun.triage import status_token
+
+    assert status_token(None) == "OPEN"
+    assert status_token({}) == "OPEN"
+    assert status_token({"event": "deleted"}) == "OPEN"
+    assert status_token({"event": "dismiss", "dismissed_at": None}) == "DISMISSED"
+    hostile = status_token({"event": "dismiss",
+                            "dismissed_at": "2026\x1b[2K\n(OPEN) " + "z" * 5000})
+    assert "\x1b" not in hostile and "\n" not in hostile
+    assert len(hostile) < 200, len(hostile)
+    for junk in [{"event": 5}, {"event": None}, [], "x", 7,
+                 {"event": "reopen", "reopened_at": ["x"], "dismissed_at": {}}]:
+        assert isinstance(status_token(junk), str), junk

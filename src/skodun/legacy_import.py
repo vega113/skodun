@@ -529,10 +529,15 @@ def _import_ledger(store: Store, archive: Path, stats: dict) -> None:
 def import_legacy(store: Store, grok_reviews_dir: Path) -> ImportStats:
     """Import `grok_reviews_dir` into `store`. Idempotent, and never raises.
 
-    Both underlying writes upsert on their primary key (`reviews.id`,
-    `triage.ledger_key`), so importing the same archive twice produces the same
-    store and the same stats. A demotion is therefore not a tombstone: if the
-    missing artifact is later restored, a re-import upgrades the row.
+    Idempotent in the sense that matters: re-importing the same archive
+    produces the same stats and the same store as the GATE reads it. The index
+    write upserts on `reviews.id`. Dismissals are appended to the store's
+    triage event stream (v3), which is append-only by design, so a second
+    import appends a second, identical `dismiss` event rather than upserting a
+    row -- the finding stays dismissed for the same reason, and no decision a
+    human made in between is ever overwritten. A demotion is therefore not a
+    tombstone either: if the missing artifact is later restored, a re-import
+    upgrades the row.
 
     A missing archive directory returns zeros. Migration tooling runs on
     machines that never used the legacy tool, and "nothing to import" is an
