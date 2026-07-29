@@ -646,12 +646,15 @@ def _cmd_triage(args) -> int:
         for i, f in enumerate(review["findings"]):
             fkey = finding_key(f.get("file", ""), f.get("title", ""))
             status = "DISMISSED" if fkey in triaged else "OPEN"
-            # `title` is finder-authored, untrusted model text reaching this
-            # line the same way a refuter's `reasoning` does -- `shown_field`
-            # strips the same control/ANSI exposure and bounds the same way,
-            # so a title cannot forge an extra row or rewrite this line's own
-            # status the instant it is printed.
-            _emit(f"[{i}] {f.get('severity')} {f.get('file')}:{f.get('line')} "
+            # EVERY field on this line is finder-authored, untrusted model
+            # text reaching the terminal the same way a refuter's `reasoning`
+            # does -- `severity`, `file` and `line` are read straight off the
+            # parsed payload, exactly like `title`. `shown_field` strips the
+            # same control/ANSI exposure and bounds the same way, so no field
+            # can forge an extra row or rewrite this line's own status the
+            # instant it is printed. Only `[{i}]` and `({status})` are ours.
+            _emit(f"[{i}] {shown_field(f.get('severity'))} "
+                  f"{shown_field(f.get('file'))}:{shown_field(f.get('line'))} "
                   f"{shown_field(f.get('title'))} ({status})", 0)
             # One extra line for an annotated finding, and never more than
             # one: `refuter_line` flattens and bounds every field it prints,

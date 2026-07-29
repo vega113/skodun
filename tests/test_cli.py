@@ -622,6 +622,23 @@ def test_triage_list_strips_control_characters_from_the_title(tmp_path, monkeypa
     assert "pwned" in out
 
 
+@pytest.mark.parametrize("field", ["severity", "file", "line"])
+def test_triage_list_strips_control_characters_from_every_finding_field(
+        field, tmp_path, monkeypatch, capsys):
+    """`title` is not special: `severity`, `file` and `line` are read off the
+    same parsed payload, print on the same line, and carry the same exposure.
+    Sanitizing only the field named in a review finding would leave the class
+    open at three other spellings."""
+    f = _finding(0)
+    f[field] = "a\x1b[1A\x1b[2K\x1b[Gpwned"
+    _store(tmp_path, f, monkeypatch=monkeypatch)
+    assert main(["triage", "--list", "rev1"]) == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out, out
+    assert "pwned" in out
+    assert "(OPEN)" in out
+
+
 # --- the annotation channel is authenticated ------------------------------
 
 def test_list_hides_and_adopt_refuses_an_annotation_no_pass_stands_behind(
