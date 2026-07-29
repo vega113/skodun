@@ -85,6 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
     shadow.add_argument("--diff-hash", default=None, dest="diff_hash",
                         help="restrict the comparison to one diff_hash "
                              "(default: every hash on either side)")
+    shadow.add_argument("--since", default=None, dest="since",
+                        help="only compare rows reviewed at or after this "
+                             "canonical UTC timestamp, exactly "
+                             "%%Y-%%m-%%dT%%H:%%M:%%SZ (e.g. "
+                             "2026-07-28T12:00:00Z); default: the whole "
+                             "archive")
 
     providers = sub.add_parser(
         "providers",
@@ -161,6 +167,7 @@ def _record_setup_failure(store, repo: Path, note: str) -> None:
     lenient verdict trustworthy.)
     """
     try:
+        from .store import _TS_FORMAT
         from .trust import flatten_lines
         branch = None
         try:
@@ -169,7 +176,7 @@ def _record_setup_failure(store, repo: Path, note: str) -> None:
         except BaseException:
             pass   # a label for the auditor, never a precondition for the row
         store.log_gate_event(dict(
-            at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            at=time.strftime(_TS_FORMAT, time.gmtime()),
             repo=str(repo), branch=branch, diff_hash=None,
             # The same `gate_events.note` convention `run_gate._record` uses,
             # from the same definition -- two spellings of it could drift.
@@ -512,7 +519,7 @@ def _cmd_providers(args) -> int:
     except BaseException as e:
         return _emit(f"skodun providers: could not open the store: {e!r}", 2)
 
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now = time.strftime(store_mod._TS_FORMAT, time.gmtime())
     try:
         state_rows = {row["provider"]: row for row in store.provider_state_rows(now)}
     except BaseException as e:
@@ -623,7 +630,8 @@ def _fmt_side(row: dict | None) -> str:
 
 
 def _cmd_shadow_compare(args) -> int:
-    """Print the shadow-mode comparison table and summary. Always exits 0.
+    """Print the shadow-mode comparison table and summary. Exits 0, except a
+    malformed `--since` (checked first, below): that is a usage error, 2.
 
     Shadow mode is purely observational: it exists to show a human whether
     skodun agrees with the legacy tool, and a workflow that happens to run it
@@ -636,6 +644,13 @@ def _cmd_shadow_compare(args) -> int:
     silently becoming "findings remain open". Every line below goes through
     `_emit`, the same broken-pipe guard `gate` and `review` use, for exactly
     that reason.
+
+    `--since`, once validated, is the ONE exception to "never fails": it is
+    misuse, not a data problem, so it is rejected before anything else runs
+    (no archive notice, no comparison) with exit 2 -- the same contract every
+    other usage error in this CLI carries, and the one Task 11's
+    `providers --repo <nonexistent>` review found missing for a look-alike
+    flag.
 
     Each row is `<hash> | <skodun> | <legacy> | <label>`, where a side reads
     `t/H-M-L`. A row the two sides disagree about carries a second, indented
@@ -650,10 +665,21 @@ def _cmd_shadow_compare(args) -> int:
     try:
         from .legacy_import import INDEX_NAME
         from .shadow import compare
-        from .store import Store
+        from .store import Store, _require_ts
     except BaseException as e:
         return _emit(
             f"skodun shadow-compare: could not load the shadow module: {e!r}", 0)
+
+    # Validated FIRST and via the store's own helper -- one spelling of "what
+    # counts as canonical", reused rather than restated -- so a malformed
+    # `--since` is refused before any archive I/O, any store I/O, or any
+    # output that a genuine data problem would otherwise have earned.
+    since = args.since
+    if since is not None:
+        try:
+            since = _require_ts("--since", since)
+        except ValueError as e:
+            return _emit(f"skodun shadow-compare: {e}", 2)
 
     archive = Path(args.dir) if args.dir else Path(_LEGACY_DIR)
 
@@ -679,13 +705,16 @@ def _cmd_shadow_compare(args) -> int:
     # `--diff-hash` reaches `compare`'s own filter rather than filtering the
     # result here: it also decides what "nothing to report" means (a hash on
     # neither side yields an empty list, and the summary below then says
-    # `0 compared` instead of inventing an empty row for it).
+    # `0 compared` instead of inventing an empty row for it). `since` is
+    # already validated above, so this call can only raise on a genuine data
+    # or I/O problem -- caught below and reported at exit 0, same as ever.
     try:
         store = Store.open(_store_path())
-        comparisons = compare(store, archive, args.diff_hash)
+        result = compare(store, archive, args.diff_hash, since=since)
     except BaseException as e:
         return _emit(f"skodun shadow-compare: FAILED on {archive}: {e!r}", 0)
 
+    comparisons = result.comparisons
     matched = skodun_only = legacy_only = 0
     for c in sorted(comparisons, key=lambda c: c.diff_hash):
         if c.legacy is None:
@@ -706,8 +735,15 @@ def _cmd_shadow_compare(args) -> int:
                   + ", ".join(f"{k}={v[0]}/{v[1]}"
                               for k, v in _deltas(c).items()), 0)
 
-    return _emit(f"shadow: {len(comparisons)} compared, {matched} matched, "
-                 f"{skodun_only} skodun-only, {legacy_only} legacy-only", 0)
+    # `since=` and the excluded count are printed on EVERY run, windowed or
+    # not -- a fixed schema, rather than a field that appears only sometimes,
+    # is what lets Task 14's runbook (and any other script) read this line
+    # the same way for both the whole-archive and the windowed comparison.
+    return _emit(
+        f"shadow: {len(comparisons)} compared, {matched} matched, "
+        f"{skodun_only} skodun-only, {legacy_only} legacy-only, "
+        f"since={since if since is not None else 'none'}, "
+        f"{result.excluded_unparseable} unparseable-timestamp rows excluded", 0)
 
 
 def _deltas(c) -> dict:
@@ -796,7 +832,7 @@ def _cmd_triage(args) -> int:
     make "your refuter said `confirmed`" indistinguishable from "you typed the
     wrong review id".
     """
-    from .store import Store
+    from .store import Store, _TS_FORMAT
 
     # `--list` and a dismissal are two different commands sharing one parser,
     # so `triage --list <id> <index> "<reason>"` parses cleanly and then throws
@@ -884,7 +920,7 @@ def _cmd_triage(args) -> int:
     if args.adopt_refuter:
         try:
             adopt_refuter(store, review, args.finding_index,
-                          now=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                          now=time.strftime(_TS_FORMAT, time.gmtime()))
         except (FindingNotFound, ArtifactError) as e:
             return _emit(f"skodun triage: {e}", 2)
         except TriageError as e:
@@ -921,7 +957,7 @@ def _cmd_triage(args) -> int:
 
     try:
         dismiss(store, review, args.finding_index, args.reason,
-                now=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                now=time.strftime(_TS_FORMAT, time.gmtime()))
     except (TriageError, ArtifactError) as e:
         return _emit(f"skodun triage: rejected: {e}", 2)
 

@@ -187,10 +187,27 @@ skodun found one more finding than the archive — and is still a MATCH, because
 shadow: 4792 compared, 4783 matched, 0 skodun-only, 3 legacy-only
 ```
 
-That is a **point-in-time** snapshot. The legacy system keeps running, so the
-legacy-only count grows on its own between comparisons — a legacy-only row means
-only "skodun has never reviewed that content", which is the normal state for
-anything reviewed before or outside a shadow run. It is not a disagreement.
+**Bound the drift with `--since`.** A whole-archive comparison like the one
+above is a point-in-time snapshot: the legacy system keeps running between
+comparisons, so its side keeps growing and the legacy-only count drifts
+upward on its own — a legacy-only row means only "skodun has never reviewed
+that content", which is the normal state for anything reviewed before or
+outside a shadow run, not a disagreement — and left unbounded that drift
+eventually drowns any real signal in noise. `skodun shadow-compare --since
+<timestamp>` bounds both sides to the same window instead: only rows whose
+`reviewed_at` is at or after `<timestamp>`, on either side, enter the
+comparison, so legacy-only now measures "the legacy tool reviewed something
+in this window that skodun did not" rather than the whole archive's history.
+`<timestamp>` must be in the store's own canonical form, `%Y-%m-%dT%H:%M:%SZ`
+(UTC), exactly — e.g. `2026-07-28T00:00:00Z` — and anything else (an offset,
+a date-only value, prose) is a usage error rather than a silently-ignored
+window. Rows whose stored `reviewed_at` is missing or not in that exact form
+are excluded from a windowed comparison rather than guessed at, and the
+summary line always reports how many, alongside the window itself:
+
+```
+shadow: 4792 compared, 4783 matched, 0 skodun-only, 3 legacy-only, since=2026-07-21T00:00:00Z, 0 unparseable-timestamp rows excluded
+```
 
 The nine non-matching rows in that snapshot were three legacy-only plus **six
 mismatches**, and every one falls into a documented class:

@@ -11,6 +11,17 @@ surface a hash the legacy archive reviewed but skodun never touched --
 `legacy-only` would be a bucket that can never be nonzero, and the summary
 line would quietly lie about coverage.
 
+**`since` bounds both sides to the same window**, because the legacy system
+keeps running after a shadow run starts: its archive keeps growing on its
+own, so an unwindowed `legacy-only` count drifts upward forever and eventually
+drowns the signal a real disagreement would otherwise stand out against.
+`since` filters each side to rows at or after that timestamp independently
+before the union above is computed, so `legacy-only` in a windowed compare
+means "the legacy tool reviewed something skodun did not, IN THIS WINDOW" --
+not "ever". See `compare` and `_apply_since` for the exact rule, including
+how a row whose stored `reviewed_at` cannot be read in the canonical form is
+handled (excluded and counted, never guessed at).
+
 **`match` has exactly one definition**, and it is intentionally coarse: both
 sides present, both agree on `trustworthy`, and both agree on cleanliness
 (`findings_total == 0` vs `> 0`). Two independent LLM runs over the same diff
@@ -42,7 +53,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .legacy_import import INDEX_NAME, _axis, _iter_records, _recorded_denies_trust
-from .store import Store
+from .store import Store, _is_canonical_ts, _require_ts
 from .trust import coerce_count, is_trustworthy
 
 _AXES = ("parse_ok", "degraded", "diff_truncated")
@@ -66,6 +77,49 @@ class Comparison:
     legacy: dict | None
     match: bool
     deltas: dict
+
+
+@dataclass(frozen=True)
+class CompareResult:
+    """`compare`'s full answer: the per-hash rows, and the `since` bookkeeping.
+
+    A plain `list[Comparison]` cannot also carry `excluded_unparseable`, and
+    the CLI summary has to print that count -- so `cli.py` would otherwise
+    need to re-derive it by re-filtering the rows itself, a second
+    implementation of the window `compare` already applied. This object is
+    the one place both are computed and reported from.
+    """
+
+    comparisons: list[Comparison]
+    excluded_unparseable: int
+
+
+def _apply_since(rows: dict[str, dict], since: str) -> tuple[dict[str, dict], int]:
+    """Filter `diff_hash -> newest row` to rows at or after `since`.
+
+    A row whose `reviewed_at` is not exactly the canonical form (missing,
+    `None`, a non-string, or a canonical-*looking* value of the wrong width)
+    cannot be ordered against `since` at all -- it is dropped and counted,
+    never guessed at and never silently kept in the window. A row WITH a
+    canonical timestamp that simply falls before `since` is dropped too, but
+    that is ordinary windowing, not an exclusion worth counting: every real
+    archive accumulates rows outside any given window, and counting those
+    would make the count measure the window's width instead of data quality.
+
+    Plain string `>=` is a correct time comparison here only because both
+    operands are already known-canonical, fixed-width ISO-8601 UTC -- see
+    `store._is_canonical_ts` for why that precondition matters.
+    """
+    kept: dict[str, dict] = {}
+    excluded = 0
+    for dh, row in rows.items():
+        ts = row.get("reviewed_at")
+        if not _is_canonical_ts(ts):
+            excluded += 1
+            continue
+        if ts >= since:
+            kept[dh] = row
+    return kept, excluded
 
 
 def effective_trustworthy(row: dict | None) -> bool:
@@ -169,8 +223,8 @@ def _skodun_rows(store: Store) -> dict[str, dict]:
     return {dh: _newest(rows) for dh, rows in by_hash.items()}
 
 
-def compare(store: Store, grok_reviews_dir: Path,
-            diff_hash: str | None) -> list[Comparison]:
+def compare(store: Store, grok_reviews_dir: Path, diff_hash: str | None,
+            since: str | None = None) -> CompareResult:
     """Compare skodun's verdicts to the legacy archive's, hash by hash.
 
     Iterates the union of `diff_hash`es seen on either side, or just
@@ -178,9 +232,34 @@ def compare(store: Store, grok_reviews_dir: Path,
     otherwise there is nothing to report and the result is empty). See the
     module docstring for why the union, and for the exact, single definition
     of `match`.
+
+    `since`, when given, must be exactly the store's canonical timestamp
+    form (`store._TS_FORMAT`, e.g. `2026-07-28T12:00:00Z`) -- anything else
+    raises `ValueError` naming the required format, via the same
+    `store._require_ts` the store itself uses to guard writes, rather than a
+    second spelling of the check. With `since` validated to that fixed
+    width, comparing it against a row's `reviewed_at` with plain `>=` is a
+    correct time comparison (see `_apply_since`), and both sides are
+    filtered by it independently and identically before the union/single-hash
+    selection above ever runs -- a hash whose only legacy row falls outside
+    the window is exactly as absent-on-that-side as one legacy never saw at
+    all. Rows that cannot be windowed at all (`_apply_since`'s unparseable
+    case) are dropped from both sides and tallied in the returned
+    `excluded_unparseable`, which is `0` whenever `since` is `None`: with no
+    window requested, no row's timestamp needs to be understood to be
+    included.
     """
+    if since is not None:
+        since = _require_ts("since", since)
+
     legacy = _legacy_rows(Path(grok_reviews_dir))
     skodun = _skodun_rows(store)
+
+    excluded_unparseable = 0
+    if since is not None:
+        legacy, excluded_legacy = _apply_since(legacy, since)
+        skodun, excluded_skodun = _apply_since(skodun, since)
+        excluded_unparseable = excluded_legacy + excluded_skodun
 
     if diff_hash is not None:
         hashes = [diff_hash] if (diff_hash in legacy or diff_hash in skodun) else []
@@ -203,4 +282,4 @@ def compare(store: Store, grok_reviews_dir: Path,
         else:
             match = False
         out.append(Comparison(dh, s, g, match, deltas))
-    return out
+    return CompareResult(out, excluded_unparseable)

@@ -55,7 +55,7 @@ def test_compare_matches_on_trust_and_cleanliness(tmp_path):
                   severity={"high": 0, "medium": 0, "low": 0}, branch="b",
                   reviewed_at="2026-07-01T00:00:00Z")
     (d / "index.jsonl").write_text(json.dumps(legacy) + "\n", encoding="utf-8")
-    out = compare(st, d, None)
+    out = compare(st, d, None).comparisons
     assert len(out) == 1 and out[0].match is True
 
 
@@ -67,7 +67,7 @@ def test_mismatch_when_legacy_found_findings(tmp_path):
                   findings_total=2, severity={"high": 1, "medium": 1, "low": 0},
                   branch="b", reviewed_at="2026-07-01T00:00:00Z")
     (d / "index.jsonl").write_text(json.dumps(legacy) + "\n", encoding="utf-8")
-    out = compare(st, d, None)
+    out = compare(st, d, None).comparisons
     assert out[0].match is False and out[0].deltas["findings_total"] == (0, 2)
 
 
@@ -82,7 +82,7 @@ def test_union_surfaces_one_sided_hashes_and_newest_row_wins(tmp_path):
                  reviewed_at="2026-07-02T00:00:00Z")
     (d / "index.jsonl").write_text(
         json.dumps(older) + "\n" + json.dumps(newer) + "\n", encoding="utf-8")
-    out = {c.diff_hash: c for c in compare(st, d, None)}
+    out = {c.diff_hash: c for c in compare(st, d, None).comparisons}
     assert out["d"*40].legacy is None and out["d"*40].match is False  # skodun-only
     assert out["e"*40].skodun is None                                  # legacy-only
     assert out["e"*40].legacy["id"] == "loop_2"                        # newest wins
@@ -103,7 +103,7 @@ def test_corrupt_line_in_index_is_tolerated_not_fatal(tmp_path):
         json.dumps(good).encode() + b"\n"
         + b'{"id": "truncated", "diff_hash": "f"'    # truncated final line
     )
-    out = {c.diff_hash: c for c in compare(st, d, None)}
+    out = {c.diff_hash: c for c in compare(st, d, None).comparisons}
     # the corrupt line contributed no comparison at all -- only the two real
     # hashes (skodun's "d"*40 and legacy's "e"*40) appear
     assert set(out) == {"d"*40, "e"*40}
@@ -113,7 +113,7 @@ def test_corrupt_line_in_index_is_tolerated_not_fatal(tmp_path):
 def test_missing_grok_reviews_directory_does_not_crash(tmp_path):
     st = Store.open(tmp_path / "s.db")
     st.save_review(REC)
-    out = compare(st, tmp_path / "nope-no-such-dir", None)
+    out = compare(st, tmp_path / "nope-no-such-dir", None).comparisons
     assert len(out) == 1
     assert out[0].diff_hash == "d"*40
     assert out[0].legacy is None and out[0].skodun is not None
@@ -133,7 +133,7 @@ def test_both_sides_untrustworthy_is_a_match(tmp_path):
                   findings_total=0, severity={"high": 0, "medium": 0, "low": 0},
                   branch="b", reviewed_at="2026-07-01T00:00:00Z")
     _write_index(d, legacy)
-    out = compare(st, d, None)
+    out = compare(st, d, None).comparisons
     assert len(out) == 1
     assert out[0].match is True, "both sides agree: neither is trustworthy"
 
@@ -146,7 +146,7 @@ def test_one_trustworthy_one_not_is_a_mismatch(tmp_path):
                   findings_total=0, severity={"high": 0, "medium": 0, "low": 0},
                   branch="b", reviewed_at="2026-07-01T00:00:00Z")
     _write_index(d, legacy)
-    out = compare(st, d, None)
+    out = compare(st, d, None).comparisons
     assert out[0].match is False
 
 
@@ -170,7 +170,7 @@ def test_equal_cleanliness_different_severity_tallies_is_still_a_match(tmp_path)
                   findings_total=7, severity={"high": 0, "medium": 1, "low": 6},
                   branch="b", reviewed_at="2026-07-01T00:00:00Z")
     _write_index(d, legacy)
-    out = compare(st, d, None)
+    out = compare(st, d, None).comparisons
     assert len(out) == 1
     assert out[0].match is True
     assert out[0].deltas["findings_total"] == (3, 7)
@@ -323,7 +323,7 @@ def test_recorded_true_against_a_denying_axis_is_a_mismatch_not_a_match(tmp_path
     st.save_review(REC)                                   # trustworthy, clean
     d = tmp_path / ".grok-reviews"
     _write_index(d, _legacy_row(trustworthy=True, degraded=True))
-    out = compare(st, d, None)
+    out = compare(st, d, None).comparisons
     assert len(out) == 1
     assert out[0].match is False
 
@@ -347,7 +347,7 @@ def test_bool_counts_are_rejected_rather_than_counted_as_one(tmp_path):
     d = tmp_path / ".grok-reviews"
     _write_index(d, _legacy_row(trustworthy=True, findings_total=True,
                                 severity={"high": True, "medium": 0, "low": 0}))
-    out = compare(st, d, None)
+    out = compare(st, d, None).comparisons
     assert out[0].deltas["findings_total"] == (0, 0)
     assert out[0].deltas["sev_high"] == (0, 0)
     assert out[0].match is True
@@ -367,7 +367,7 @@ def test_single_hash_filter_returns_only_that_hash(tmp_path):
                     branch="b", reviewed_at="2026-07-01T00:00:00Z")
     _write_index(d, legacy_c)
 
-    out = compare(st, d, "d"*40)
+    out = compare(st, d, "d"*40).comparisons
     assert len(out) == 1
     assert out[0].diff_hash == "d"*40
     assert out[0].legacy is None            # legacy never reviewed this one
@@ -376,8 +376,125 @@ def test_single_hash_filter_returns_only_that_hash(tmp_path):
 def test_single_hash_filter_absent_on_both_sides_is_empty(tmp_path):
     st = Store.open(tmp_path / "s.db")
     st.save_review(REC)
-    out = compare(st, tmp_path / ".grok-reviews", "z"*40)
+    out = compare(st, tmp_path / ".grok-reviews", "z"*40).comparisons
     assert out == []
+
+
+# ---------------------------------------------------------------------------
+# `since`: bounds both sides to the same window. Rows whose stored
+# `reviewed_at` cannot be read in the canonical form are excluded from a
+# windowed compare and counted -- never crashed on, never silently included.
+# ---------------------------------------------------------------------------
+
+def test_compare_returns_a_result_object_with_comparisons_and_excluded_count(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.save_review(REC)
+    result = compare(st, tmp_path / ".grok-reviews", None)
+    assert isinstance(result.comparisons, list)
+    assert result.comparisons[0].diff_hash == "d"*40
+    assert result.excluded_unparseable == 0
+
+
+def test_since_excludes_a_legacy_only_row_older_than_since(tmp_path):
+    """The brief's case 1: a legacy-only row strictly before `since` vanishes."""
+    st = Store.open(tmp_path / "s.db")
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, _legacy_row(reviewed_at="2026-07-01T00:00:00Z"))
+    result = compare(st, d, None, since="2026-07-15T00:00:00Z")
+    assert result.comparisons == []
+    assert result.excluded_unparseable == 0
+
+
+def test_since_malformed_offset_is_a_usage_error(tmp_path):
+    """The brief's case 2, at the `compare` boundary: an offset is not the
+    canonical form, so `since` is rejected rather than silently misread.
+    The message reuses `store._require_ts`'s own wording, naming the format.
+    """
+    st = Store.open(tmp_path / "s.db")
+    d = tmp_path / ".grok-reviews"
+    with pytest.raises(ValueError, match="2026-07-28T12:00:00Z"):
+        compare(st, d, None, since="2026-07-28T00:00:00+02:00")
+
+
+@pytest.mark.parametrize("bad_since", [
+    "", "   ", "2026-07-28", "not-a-timestamp", "2026-7-8T1:2:3Z",
+    "2026-07-28T00:00:00", "2026-07-28 00:00:00Z"])
+def test_since_any_non_canonical_value_is_a_usage_error(tmp_path, bad_since):
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(ValueError):
+        compare(st, tmp_path / ".grok-reviews", None, since=bad_since)
+
+
+def test_since_excludes_and_counts_a_malformed_stored_timestamp(tmp_path):
+    """The brief's case 3: a row that cannot be windowed is excluded, not
+    crashed on and not silently included -- and the exclusion is counted."""
+    st = Store.open(tmp_path / "s.db")
+    st.save_review({**REC, "reviewed_at": ""})               # skodun: blank ts
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, _legacy_row(diff_hash="e"*40, reviewed_at="not-a-timestamp"))
+    result = compare(st, d, None, since="2000-01-01T00:00:00Z")
+    assert result.comparisons == []
+    assert result.excluded_unparseable == 2
+
+
+@pytest.mark.parametrize("bad_ts", ["", None, 42, "2026-7-8T1:2:3Z"])
+def test_since_excludes_rows_with_unparseable_reviewed_at_on_skodun_side(
+        tmp_path, bad_ts):
+    """Empty string, missing entirely, a non-string, and a canonical-looking
+    value of the wrong width all count as unparseable -- none of them may be
+    guessed at or silently kept in the window."""
+    st = Store.open(tmp_path / "s.db")
+    rec = {k: v for k, v in REC.items() if k != "reviewed_at"}
+    if bad_ts is not None:
+        rec["reviewed_at"] = bad_ts
+    st.save_review(rec)
+    result = compare(st, tmp_path / "nope-no-such-dir", None,
+                      since="2000-01-01T00:00:00Z")
+    assert result.comparisons == []
+    assert result.excluded_unparseable == 1
+
+
+def test_since_in_the_future_excludes_everything_and_counts_nothing(tmp_path):
+    """Every stored timestamp is canonical here, just outside the window --
+    that is ordinary windowing, not an unparseable-timestamp exclusion."""
+    st = Store.open(tmp_path / "s.db")
+    st.save_review(REC)
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, _legacy_row(diff_hash="e"*40))
+    result = compare(st, d, None, since="2099-01-01T00:00:00Z")
+    assert result.comparisons == []
+    assert result.excluded_unparseable == 0
+
+
+def test_since_older_than_every_row_matches_the_unwindowed_result(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.save_review(REC)
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, _legacy_row(diff_hash="e"*40))
+    unwindowed = compare(st, d, None)
+    windowed = compare(st, d, None, since="2000-01-01T00:00:00Z")
+    assert ([c.diff_hash for c in windowed.comparisons]
+            == [c.diff_hash for c in unwindowed.comparisons])
+    assert windowed.excluded_unparseable == 0
+
+
+def test_since_windows_both_sides_independently(tmp_path):
+    """A hash present on both sides but with one side's newest row outside
+    the window must not silently keep the excluded side's verdict."""
+    st = Store.open(tmp_path / "s.db")
+    st.save_review({**REC, "diff_hash": "a"*40, "reviewed_at": "2026-08-01T00:00:00Z"})
+    d = tmp_path / ".grok-reviews"
+    _write_index(
+        d,
+        _legacy_row(diff_hash="a"*40, reviewed_at="2026-01-01T00:00:00Z"),  # too old
+        _legacy_row(diff_hash="b"*40, reviewed_at="2026-08-01T00:00:00Z"),  # in window
+    )
+    result = compare(st, d, None, since="2026-07-01T00:00:00Z")
+    out = {c.diff_hash: c for c in result.comparisons}
+    assert set(out) == {"a"*40, "b"*40}
+    assert out["a"*40].legacy is None and out["a"*40].skodun is not None
+    assert out["b"*40].skodun is None and out["b"*40].legacy is not None
+    assert result.excluded_unparseable == 0
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +575,99 @@ def test_cli_shadow_compare_diff_hash_restricts_the_table(tmp_path, monkeypatch,
     assert main(["shadow-compare", "--dir", str(d), "--diff-hash", "z"*40]) == 0
     assert ("shadow: 0 compared, 0 matched, 0 skodun-only, 0 legacy-only"
             in capsys.readouterr().out)
+
+
+def test_cli_shadow_compare_summary_always_carries_since_and_excluded_count(
+        tmp_path, monkeypatch, capsys):
+    """`since=` and the excluded count are part of the summary schema, present
+    on every run -- including the ordinary, unwindowed one -- so a reader (or
+    a script, per Task 14's runbook) never has to special-case their absence.
+    """
+    from skodun.cli import main
+    dbpath = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(dbpath))
+    Store.open(dbpath).save_review(REC)
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, _legacy_row(trustworthy=True))
+
+    assert main(["shadow-compare", "--dir", str(d)]) == 0
+    out = capsys.readouterr().out
+    assert "since=none, 0 unparseable-timestamp rows excluded" in out
+
+    assert main(["shadow-compare", "--dir", str(d),
+                 "--since", "2026-01-01T00:00:00Z"]) == 0
+    out = capsys.readouterr().out
+    assert "since=2026-01-01T00:00:00Z, 0 unparseable-timestamp rows excluded" in out
+
+
+def test_cli_shadow_compare_since_windows_the_table_and_the_summary(
+        tmp_path, monkeypatch, capsys):
+    from skodun.cli import main
+    dbpath = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(dbpath))
+    st = Store.open(dbpath)
+    st.save_review({**REC, "reviewed_at": "2026-08-01T00:00:00Z"})           # "d"*40
+    st.save_review({**REC, "id": "old", "diff_hash": "e"*40,
+                    "reviewed_at": "2026-01-01T00:00:00Z"})                  # too old
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, _legacy_row(trustworthy=True, reviewed_at="2026-08-01T00:00:00Z"))
+
+    rc = main(["shadow-compare", "--dir", str(d), "--diff-hash", "d"*40,
+               "--since", "2026-07-01T00:00:00Z"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert ("e"*40)[:12] not in out
+    assert "shadow: 1 compared" in out
+    assert "since=2026-07-01T00:00:00Z" in out
+
+
+def test_cli_shadow_compare_since_in_the_future_excludes_everything_cleanly(
+        tmp_path, monkeypatch, capsys):
+    from skodun.cli import main
+    dbpath = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(dbpath))
+    Store.open(dbpath).save_review(REC)
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, _legacy_row(diff_hash="e"*40))
+
+    assert main(["shadow-compare", "--dir", str(d),
+                 "--since", "2099-01-01T00:00:00Z"]) == 0
+    out = capsys.readouterr().out
+    assert ("shadow: 0 compared, 0 matched, 0 skodun-only, 0 legacy-only, "
+            "since=2099-01-01T00:00:00Z, 0 unparseable-timestamp rows excluded"
+            in out)
+
+
+@pytest.mark.parametrize("bad_since", [
+    "", "   ", "2026-07-28", "2026-07-28T00:00:00+02:00", "not-a-timestamp",
+    "2026-7-8T1:2:3Z"])
+def test_cli_shadow_compare_since_usage_error_exits_2_names_the_format(
+        tmp_path, monkeypatch, capsys, bad_since):
+    """Task 11's `providers --repo <nonexistent>` lesson, applied here: a
+    malformed `--since` must never exit 0 and silently disable the window,
+    and the refusal must be readable, not a traceback."""
+    from skodun.cli import main
+    dbpath = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(dbpath))
+    Store.open(dbpath).save_review(REC)
+
+    rc = main(["shadow-compare", "--since", bad_since])
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "--since" in out
+    assert "2026-07-28T12:00:00Z" in out          # names the required format
+    assert "shadow:" not in out                    # never got to a comparison
+
+
+def test_python_dash_m_shadow_compare_since_usage_error_matches_console_script(
+        tmp_path):
+    db = tmp_path / "sub" / "s.db"
+    Store.open(db).save_review(REC)
+    p = subprocess.run(
+        [sys.executable, "-m", "skodun", "shadow-compare", "--since", "bad"],
+        capture_output=True, text=True, env=_subprocess_env(db))
+    assert p.returncode == 2
+    assert "--since" in p.stdout
 
 
 def test_cli_shadow_compare_prints_no_deltas_for_an_agreeing_row(
@@ -759,6 +969,24 @@ def test_cli_shadow_compare_exit_code_survives_a_closed_stdout(tmp_path):
     try:
         p = subprocess.run(
             [sys.executable, "-m", "skodun", "shadow-compare"],
+            stdout=w_fd, stderr=subprocess.PIPE, text=True, env=_subprocess_env(db))
+    finally:
+        os.close(w_fd)
+    assert p.returncode == 0, f"stderr={p.stderr!r}"
+
+
+def test_cli_shadow_compare_since_exit_code_survives_a_closed_stdout(tmp_path):
+    """The new summary fields (`since=`, the excluded count) are printed on
+    the same `_emit` path as everything else -- a closed stdout must not turn
+    THIS line's failure into the interpreter's exit code of 1 either."""
+    db = tmp_path / "sub" / "s.db"
+    Store.open(db).save_review(REC)
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run(
+            [sys.executable, "-m", "skodun", "shadow-compare",
+             "--since", "2026-01-01T00:00:00Z"],
             stdout=w_fd, stderr=subprocess.PIPE, text=True, env=_subprocess_env(db))
     finally:
         os.close(w_fd)
