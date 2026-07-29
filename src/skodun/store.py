@@ -39,7 +39,15 @@ IGNORE_PROVIDER_STATE_ENV = "SKODUN_IGNORE_PROVIDER_STATE"
 #: Every field is zero-padded to a constant width, which is what makes a plain
 #: string comparison a correct time comparison. Nothing else may be stored.
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+#: `[0-9]`, deliberately NOT `\d`. Python's `\d` is Unicode-aware and matches
+#: every Unicode decimal digit -- and `time.strptime` accepts them too, so a
+#: timestamp written with fullwidth or Arabic-Indic digits passed as canonical
+#: while breaking the one property canonicality exists to guarantee. Those
+#: codepoints sort ABOVE every ASCII digit (U+FF12 vs "2"), so the failure is
+#: maximally quiet: `shadow-compare --since "２０２６-01-01T00:00:00Z"` put every
+#: real row outside the window and reported "0 compared, 0 unparseable rows
+#: excluded" -- a clean-looking answer from a filter that matched nothing.
+_TS_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (

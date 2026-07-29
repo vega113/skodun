@@ -661,6 +661,13 @@ def test_provider_state_survives_reopen(tmp_path):
     "2026-07-28T12:00:00+00:00",
     "2026-13-01T00:00:00Z",   # not a real date
     20260728,
+    # Unicode decimal digits. `re.\d` matches them and `strptime` accepts them,
+    # so both halves of the canonical check waved these through -- while they
+    # sort ABOVE every ASCII digit, which is what makes the resulting window or
+    # TTL comparison quietly wrong instead of loudly broken.
+    "２０２６-01-01T00:00:00Z",       # fullwidth 2026
+    "٢٠٢٦-01-01T00:00:00Z",       # Arabic-Indic 2026
+    "2026-01-01T00:00:0０Z",                       # one fullwidth digit
 ])
 def test_mark_provider_unavailable_rejects_non_canonical_until(tmp_path, until):
     """Lexicographic TTL comparison is only sound for the fixed-width

@@ -418,11 +418,34 @@ def test_since_malformed_offset_is_a_usage_error(tmp_path):
 
 @pytest.mark.parametrize("bad_since", [
     "", "   ", "2026-07-28", "not-a-timestamp", "2026-7-8T1:2:3Z",
-    "2026-07-28T00:00:00", "2026-07-28 00:00:00Z"])
+    "2026-07-28T00:00:00", "2026-07-28 00:00:00Z",
+    "２０２６-01-01T00:00:00Z", "٢٠٢٦-01-01T00:00:00Z"])
 def test_since_any_non_canonical_value_is_a_usage_error(tmp_path, bad_since):
     st = Store.open(tmp_path / "s.db")
     with pytest.raises(ValueError):
         compare(st, tmp_path / ".grok-reviews", None, since=bad_since)
+
+
+def test_a_unicode_digit_since_cannot_silently_empty_the_window(tmp_path):
+    """The failure this guards is quiet, not loud, which is why it needs its
+    own test rather than one more parametrize case.
+
+    Python's `\\d` is Unicode-aware and `time.strptime` accepts Unicode decimal
+    digits, so `２０２６-01-01T00:00:00Z` used to pass the canonical check. Those
+    codepoints sort ABOVE every ASCII digit, so the window then matched nothing
+    and the run reported a clean `0 compared, 0 unparseable rows excluded` --
+    an answer indistinguishable from "the archive really is empty in that
+    window". A usage error is the only safe outcome.
+    """
+    st = Store.open(tmp_path / "s.db")
+    d = tmp_path / ".grok-reviews"
+    _write_index(d, _legacy_row(reviewed_at="2026-07-20T00:00:00Z"))
+
+    ascii_since = compare(st, d, None, since="2026-01-01T00:00:00Z")
+    assert len(ascii_since.comparisons) == 1        # the row is genuinely in window
+
+    with pytest.raises(ValueError):
+        compare(st, d, None, since="２０２６-01-01T00:00:00Z")
 
 
 def test_since_excludes_and_counts_a_malformed_stored_timestamp(tmp_path):
