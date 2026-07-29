@@ -143,9 +143,13 @@ id records `delivered_at` + channel. Eligible rounds are **terminal only** (`cle
 `degraded`, `failed`, `superseded` — a `running` round is never surfaced and never
 acknowledged; its story is not final) and **skodun-originated only** (`source="skodun"`
 — the legacy-imported archive must not flood the first post-upgrade session).
-`skodun surface` prints, for the current branch, every such round not yet delivered — **findings AND failures**: a failed round
-prints an explicit "NO REVIEW HAPPENED — this round reports nothing because it said
-nothing, not because it found nothing" line (research decision 15, verbatim spirit).
+`skodun surface` prints, for the current branch, every such round not yet delivered — **findings AND failures**: a round with NO
+usable output (an explicit persisted signal — no pass anywhere produced a parse-ok
+answer) prints the exact "NO REVIEW HAPPENED — this round reports nothing because it
+said nothing, not because it found nothing" line (research decision 15, verbatim
+spirit); an untrustworthy round that DOES carry answered passes or findings renders
+them under an incomplete-cannot-certify warning instead — partial evidence is
+surfaced, never hidden behind a no-review banner.
 
 The acknowledgement discipline is the oracle's, inverted to fail toward repetition:
 quiet rounds are marked delivered immediately; rounds with content are marked **only
