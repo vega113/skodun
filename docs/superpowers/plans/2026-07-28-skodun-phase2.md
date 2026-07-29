@@ -587,3 +587,40 @@ Procedure (run on a real repository with real outgoing changes; store copies for
 - Deliberate decisions restated: classification runs on every completed, non-timeout attempt (a truncated stream gets the same retry a truncated envelope does; timeouts persist `classification: null` since their output was discarded); only `unavailable` advances the chain, and only `category == "quota"` is cached provider-wide; indexed `adapter` column carries the adapter *name* of the accepted attempt (providers live in provenance); an exhausted chain's failed record never erases coverage — the gate reads the NEWEST trustworthy row for the bytes and that row must still pass every artifact check (base_sha included), gating 2 otherwise or when no coverage exists; refuter eligibility/indexes come from the finder snapshot; refuter failure never demotes; adoption validates the raw reasoning before the attributed string; no `--adopt-all`.
 - Open risk named plainly: Tasks 5/6/10 depend on the *installed* CLI versions' flags and envelope shapes — that is why each starts with a probe step and captured fixtures instead of trusting this plan's command sketches, and why agy carries an explicit skip path.
 - Adversarially loop-reviewed by codex (gpt-5.6-sol, high reasoning effort) against the shipped Phase 1 source over 11 rounds (18 → 14 → 8 → 7 → 3 → 4 → 1 → 1 → 1 → 1 → 0 findings), all incorporated — incl. per-attempt classification with a complete persisted schema, the OutputContract refuter plumbing, chain-scaled lock budgets, newest-wins gate-vs-exhaustion semantics, quota-only cacheability, preflight over the full chain graph, Ctrl-C handler layering, and true-v0 migration testing.
+
+---
+
+## Deviations recorded at implementation time
+
+Each was forced by an installed binary, verified independently by the between-task
+reviewer, and is recorded here rather than taken silently.
+
+### Task 10 — the agy prompt travels in argv, not in a file
+
+**This departs from a Global Constraint** ("all prompts/diffs travel via files, never
+shell-interpolated strings") and from Task 5's two-channel enumeration (input-file flag,
+else stdin). It is flagged for the owner.
+
+**Premise, independently verified:** `agy` has no `--prompt-file`, `--input-file`,
+`--flagfile` or `@file` convention, no prompt-input env var, and it *ignores stdin* —
+`printf 'X' | agy --print "" …` and the same call with empty stdin produce byte-identical
+`Error: empty prompt` output under all three `--output-format` values. There is no third
+channel. The adapter therefore passes the prompt as the `--print` argv value.
+
+**What is and is not lost.** Command injection is *not* the exposure: `subprocess` is
+called with a list and never invokes a shell. What is genuinely lost is (a) process-table
+and audit-log visibility — `ps` shows the full argv, so the reviewed diff is readable by
+any local process for the life of the call, and on default Linux `/proc/<pid>/cmdline` is
+world-readable; and (b) an argv length ceiling, which caps a reviewable diff at roughly
+120 KB against a `max_diff_bytes` default of 400,000.
+
+**Guards, all fail-closed and all loud `ValueError`s from `build_cmd`** — never an
+`OSError` at exec, never an unexpected exception, never a silent chain-stop:
+- `MAX_PROMPT_ARG_BYTES = 122880`, measured in bytes: 8 KiB under Linux `MAX_ARG_STRLEN`
+  (131072), and far under the measured macOS single-element ceiling of 1,043,396 bytes.
+- Non-UTF-8 prompt bytes are refused **strictly**, not decoded lossily. A lossy decode
+  would have the model review bytes that differ from the source, so a finding could point
+  at text that does not exist — an unacceptable hazard for a review tool specifically.
+- An embedded NUL is refused before `Popen` can raise `ValueError: embedded null byte`.
+
+Only `google` is affected; grok and codex build the same prompt file unchanged.
