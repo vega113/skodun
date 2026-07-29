@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -209,6 +210,131 @@ def test_gate_triage_scoped_to_other_base_does_not_pass(tmp_path):
     art = dict(_artifact(st), base_sha="0" * 40)
     triage.dismiss(st, art, 0, _REASON, "2026-07-27T11:00:00Z")
     assert run_gate(st, repo, _cfg(repo), env={}).code == 1
+
+
+# --------------------------------------------------------------------------
+# The triage EVENT STREAM (v3) as the gate sees it
+# --------------------------------------------------------------------------
+#
+# `gate.py` is byte-identical across Phase 3 -- it still asks
+# `store.triage_for(branch, base_sha)` and still calls `open_findings`. What
+# changed underneath is where that answer comes from: an append-only event
+# stream whose last event by `seq` decides. These tests assert the gate's
+# answer, which is the only thing that decision is for.
+
+_REOPEN_REASON = "the guard was deleted in the refactor; it crashes again on main"
+
+
+def _v2_store_with_a_dismissal(db: Path, repo: Path) -> None:
+    """A Phase-2-shaped store: v2 schema, one trustworthy review of `repo`'s
+    outgoing change, and its only finding dismissed in the SINGLE-ROW `triage`
+    ledger -- no event stream, because v2 had none.
+
+    This is the database on a user's disk the moment Phase 3 lands, so the v3
+    migration is only correct if the gate's answer about it does not change.
+    The DDL comes from the frozen copies in `tests/test_store.py` rather than
+    from `store._SCHEMA`, for the reason recorded there: a fixture that tracks
+    the code cannot be evidence about upgrading from the old shape.
+    """
+    from skodun.textnorm import finding_key, ledger_key
+    from tests.test_store import (PHASE1_SCHEMA, PHASE2_PROVIDER_STATE,
+                                  _insert_legacy_triage)
+
+    base = gitio.resolve_base(repo)
+    diff = gitio.capture_diff(repo, base.sha, 100)
+    branch = gitio.current_branch(repo)
+    art = dict(id="r1", reviewed_at="2026-07-27T10:00:00Z", branch=branch,
+               head=gitio.head_sha(repo), base_ref=base.ref, base_sha=base.sha,
+               diff_hash=gitio.diff_identity(diff.data), context_hash="", mode="now",
+               model="m", adapter="grok", status="findings", parse_ok=True,
+               degraded=False, diff_truncated=False, trustworthy=True,
+               stop_reason="EndTurn", summary="s", findings_total=1,
+               severity={"high": 1, "medium": 0, "low": 0}, findings=[_FINDING],
+               source="skodun")
+    fkey = finding_key(_FINDING["file"], _FINDING["title"])
+
+    raw = sqlite3.connect(db)
+    raw.executescript(PHASE1_SCHEMA)
+    raw.executescript(PHASE2_PROVIDER_STATE)
+    raw.execute(
+        """INSERT INTO reviews (id, reviewed_at, branch, head, base_ref, base_sha,
+             diff_hash, context_hash, mode, model, adapter, status, parse_ok,
+             degraded, diff_truncated, trustworthy, stop_reason, findings_total,
+             sev_high, sev_medium, sev_low, summary, source, artifact_json)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,0,0,1,?,1,1,0,0,?,'skodun',?)""",
+        (art["id"], art["reviewed_at"], branch, art["head"], base.ref, base.sha,
+         art["diff_hash"], "", "now", "m", "grok", "findings", "EndTurn", "s",
+         json.dumps(art)))
+    _insert_legacy_triage(raw, dict(
+        ledger_key=ledger_key(branch, base.sha, fkey), finding_key=fkey,
+        review_id="r1", branch=branch, base_sha=base.sha, file=_FINDING["file"],
+        line=_FINDING["line"], severity=_FINDING["severity"], title=_FINDING["title"],
+        dismissed_reason=_REASON, dismissed_at="2026-07-27T11:00:00Z"))
+    raw.execute("PRAGMA user_version = 2")
+    raw.commit()
+    raw.close()
+
+
+def test_the_v3_migration_preserves_an_existing_dismissals_effect_on_the_gate(tmp_path):
+    """A dismissal a human recorded before Phase 3 still passes the gate after
+    the store migrates. Without the migration's seeding, every dismissal on the
+    real store silently evaporates and every previously-triaged finding comes
+    back open -- the exact failure the ledger exists to prevent, delivered by an
+    upgrade."""
+    repo = _outgoing(_mkrepo(tmp_path))
+    db = tmp_path / "s.db"
+    _v2_store_with_a_dismissal(db, repo)
+
+    st = Store.open(db)                       # v2 -> v3, seeding the event stream
+    assert st._c.execute("PRAGMA user_version").fetchone()[0] == 3
+
+    r = run_gate(st, repo, _cfg(repo), env={})
+    assert r.code == 0, r.message
+    assert "all triaged" in r.message
+
+
+def test_that_gate_continuity_test_is_sensitive(tmp_path):
+    """The control for the test above: the SAME v2 store with its `triage` row
+    deleted gates 1. Without this, a seeding that silently dropped the reason,
+    the key, or the row could still leave the test above green for the wrong
+    reason -- e.g. if the gate had stopped consulting the ledger at all."""
+    repo = _outgoing(_mkrepo(tmp_path))
+    db = tmp_path / "s.db"
+    _v2_store_with_a_dismissal(db, repo)
+    raw = sqlite3.connect(db)
+    raw.execute("DELETE FROM triage")
+    raw.commit()
+    raw.close()
+
+    st = Store.open(db)
+    assert run_gate(st, repo, _cfg(repo), env={}).code == 1
+
+
+def test_reopening_a_dismissed_finding_takes_the_gate_from_0_back_to_1(tmp_path):
+    repo = _outgoing(_mkrepo(tmp_path))
+    st = Store.open(tmp_path / "s.db")
+    _reviewed(st, repo, findings=[_FINDING])
+    assert run_gate(st, repo, _cfg(repo), env={}).code == 1
+
+    triage.dismiss(st, _artifact(st), 0, _REASON, "2026-07-27T11:00:00Z")
+    assert run_gate(st, repo, _cfg(repo), env={}).code == 0
+
+    triage.reopen(st, _artifact(st), 0, _REOPEN_REASON, "2026-07-27T12:00:00Z")
+    r = run_gate(st, repo, _cfg(repo), env={})
+    assert r.code == 1
+    assert "1 finding(s) open" in r.message
+
+    # ... and a fresh dismissal closes it again, on top of the same stream.
+    triage.dismiss(st, _artifact(st), 0, "the guard is back, with a test this time",
+                   "2026-07-27T13:00:00Z")
+    assert run_gate(st, repo, _cfg(repo), env={}).code == 0
+
+    from skodun.textnorm import finding_key, ledger_key
+    art = _artifact(st)
+    lkey = ledger_key(art["branch"], art["base_sha"],
+                      finding_key(_FINDING["file"], _FINDING["title"]))
+    assert [h["event"] for h in st.triage_history(lkey)] == \
+        ["dismiss", "reopen", "dismiss"]
 
 
 # --------------------------------------------------------------------------

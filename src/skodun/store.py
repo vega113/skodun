@@ -11,6 +11,14 @@ Schema changes go through the migration ladder in :func:`_migrate`, keyed on
 migrations are additive only: no Phase 1 table, index or row is ever dropped or
 rewritten, and a store stamped with a version this build does not understand is
 refused without being written to at all.
+
+Triage decisions are an APPEND-ONLY EVENT STREAM (v3). ``triage_events`` holds
+one row per decision -- ``dismiss`` or ``reopen`` -- and the effective state of
+a finding is its LAST EVENT BY ``seq``. Nothing is ever overwritten or deleted,
+so a finding's whole history reads back in order and every reason survives the
+decision that overturned it. The pre-v3 single-row ``triage`` table is still
+here and is now READ-ONLY: it is the audit source the migration seeded the
+stream from.
 """
 
 from __future__ import annotations
@@ -29,7 +37,7 @@ _TRUST_AXES = ("parse_ok", "degraded", "diff_truncated")
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: Set to anything other than "0", unset, or blank to ignore `provider_state`
 #: entirely.
@@ -91,9 +99,80 @@ CREATE TABLE IF NOT EXISTS provider_state (
 );
 """
 
-# `(target_version, ddl)`, applied in order. Keep it sorted ascending and keep
+# --- v3: the Phase 3 store, installed as ONE transaction --------------------
+#
+# THE WHOLE PHASE'S DDL LIVES HERE, deliberately. The ladder runs a delta only
+# while `user_version < target`, so a store already stamped v3 would never
+# receive a table or column a later task tried to add -- the change would land
+# on fresh databases and silently miss every existing one. Later tasks may
+# CONSUME this state; they may not extend it.
+#
+#   * `triage_events` -- the append-only triage stream (see the module
+#     docstring). `finding_key` is a COLUMN because that is the key the gate's
+#     `open_findings` tests membership by and the key `triage_for` returns its
+#     map under; `ledger_key` is what groups one finding's history. The
+#     migration SEEDS one `dismiss` event per existing `triage` row so that
+#     every dismissal a human already recorded keeps its effect on the gate.
+#   * `dedup_events` -- the dispatcher's suppression audit.
+#   * `deliveries` -- which review rounds have been surfaced, and on which
+#     channel.
+#   * three `reviews` columns for background reviews: the persisted runtime
+#     budget stale recovery reads, the worker pid, and the superseding record.
+#
+# UNLIKE the ladder above, this delta runs inside ONE explicit transaction with
+# its own version stamp (see `_apply_atomic`), because `ALTER TABLE ADD COLUMN`
+# is NOT replay-idempotent: a crash between the column-add and the stamp would
+# leave a store that raises `duplicate column name` on every subsequent open --
+# bricked, with thousands of reviews inside it. The statements are a tuple
+# rather than one script for the same reason: `executescript` commits any
+# pending transaction before it runs, which would defeat the transaction.
+_MIGRATION_V3: tuple[str, ...] = (
+    """CREATE TABLE IF NOT EXISTS triage_events (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, ledger_key TEXT, finding_key TEXT,
+      event TEXT CHECK(event IN ('dismiss','reopen')), review_id TEXT, branch TEXT,
+      base_sha TEXT, file TEXT, line INTEGER, severity TEXT, title TEXT,
+      reason TEXT, at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS dedup_events (
+      at TEXT, branch TEXT, diff_hash TEXT, matched_review_id TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS deliveries (
+      review_id TEXT PRIMARY KEY, delivered_at TEXT, channel TEXT
+    )""",
+    "ALTER TABLE reviews ADD COLUMN worst_runtime_sec INTEGER",
+    "ALTER TABLE reviews ADD COLUMN pid INTEGER",
+    "ALTER TABLE reviews ADD COLUMN superseded_by TEXT",
+    # LAST, and inside the same transaction: seeding the stream from the legacy
+    # ledger. `ORDER BY rowid` so the seeded events land in the order the
+    # dismissals were recorded -- `seq` is the total order everything
+    # downstream reads, and it must not be arbitrary.
+    """INSERT INTO triage_events (ledger_key, finding_key, event, review_id, branch,
+         base_sha, file, line, severity, title, reason, at)
+       SELECT ledger_key, finding_key, 'dismiss', review_id, branch, base_sha, file,
+         line, severity, title, dismissed_reason, dismissed_at
+       FROM triage ORDER BY rowid""",
+)
+
+# `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
-_MIGRATIONS: tuple[tuple[int, str], ...] = ((2, _MIGRATION_V2),)
+#
+# A delta comes in one of two shapes, and the shape IS the contract:
+#
+#   * a `str` is `executescript`ed OUTSIDE any transaction. Every statement in
+#     it must be replay-idempotent (`IF NOT EXISTS`), so a crash before the
+#     version stamp simply replays it harmlessly. This is the shipped v2
+#     contract, kept exactly.
+#   * a `tuple[str, ...]` is applied inside one `BEGIN IMMEDIATE` together with
+#     its own version stamp: all of it commits, or none of it does. This is
+#     mandatory for any delta containing a statement that cannot be replayed --
+#     `ALTER TABLE ADD COLUMN` above being the reason it exists.
+#
+# `test_no_non_transactional_delta_carries_a_non_idempotent_statement` pins the
+# rule, because putting a delta in the wrong lane is invisible until a crash.
+_MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
+    (2, _MIGRATION_V2),
+    (3, _MIGRATION_V3),
+)
 
 
 def _is_canonical_ts(value: object) -> bool:
@@ -168,6 +247,43 @@ def _still_unavailable(until: object, now_iso: str) -> bool:
     return _is_canonical_ts(until) and now_iso < until   # type: ignore[operator]
 
 
+def _apply_atomic(conn: sqlite3.Connection, target: int,
+                  statements: tuple[str, ...]) -> None:
+    """Apply one delta and stamp `target`, all inside a single transaction.
+
+    Either the whole delta is in the database and the version says so, or
+    nothing happened at all. That is not a nicety: a delta containing `ALTER
+    TABLE ADD COLUMN` cannot be replayed (the second attempt raises `duplicate
+    column name`), so a crash between the column-add and the version stamp
+    would make EVERY later open of that store fail -- and the store holds
+    thousands of reviews that are not recoverable from anywhere else. SQLite
+    rolls back DDL, the seeded rows, and `PRAGMA user_version` alike, so the
+    interrupted store simply comes back at its old version and migrates on the
+    next open.
+
+    `BEGIN IMMEDIATE` rather than a deferred `BEGIN`: the write lock is taken
+    up front, so two processes opening the same store at once cannot both get
+    part-way through the delta and have one of them fail at COMMIT time.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for sql in statements:
+            conn.execute(sql)
+        # PRAGMA takes no bound parameters; the value is an int constant.
+        conn.execute(f"PRAGMA user_version = {target:d}")
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except BaseException:
+            # A rollback that itself fails changes nothing about what the
+            # caller has to be told, and closing the connection (which
+            # `Store.open` does on any failure) rolls back anyway. The
+            # original exception is the one that matters.
+            pass
+        raise
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Bring an open connection's database up to `SCHEMA_VERSION`.
 
@@ -179,8 +295,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
        Not merely before the DDL: `PRAGMA journal_mode=WAL` rewrites the file
        header too, and a store we do not understand (holding reviews we cannot
        interpret) must come back byte-identical;
-    3. apply the ordered deltas above the current version;
-    4. stamp the new version.
+    3. apply the ordered deltas above the current version, each in the lane its
+       shape declares (see `_MIGRATIONS`);
+    4. stamp the new version -- if a transactional delta has not already
+       stamped it. The final read is deliberately of the DATABASE rather than
+       of the `version` local: a delta that stamped its own target inside its
+       transaction must not be followed by a redundant write to a store that
+       is already correct.
     """
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version > SCHEMA_VERSION:
@@ -189,11 +310,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)         # v1 baseline, idempotent
-    for target, ddl in _MIGRATIONS:
+    for target, delta in _MIGRATIONS:
         if version < target:
-            conn.executescript(ddl)
-    if version != SCHEMA_VERSION:
-        # PRAGMA takes no bound parameters; the value is an int constant.
+            if isinstance(delta, str):
+                conn.executescript(delta)       # replay-idempotent, no transaction
+            else:
+                _apply_atomic(conn, target, delta)
+    if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
 
 
@@ -300,26 +423,129 @@ class Store:
             (rec.get("at"), rec.get("repo"), rec.get("branch"), rec.get("diff_hash"),
              rec.get("outcome"), rec.get("code"), rec.get("note")))
 
-    def add_triage(self, rec: dict) -> None:
+    # --- the append-only triage event stream --------------------------------
+    #
+    # The two verbs, and the ONE writer behind them. Effective state is the last
+    # event by `seq` (see `triage_state`), so a re-dismissal after a reopen is
+    # just another `dismiss` event -- there is no third verb and nothing here
+    # updates or deletes a row.
+
+    #: The closed event vocabulary. Also spelled as a CHECK constraint in the
+    #: v3 DDL, so a hand-written INSERT cannot widen it either.
+    EVENT_DISMISS = "dismiss"
+    EVENT_REOPEN = "reopen"
+
+    def _append_triage_event(self, event: str, rec: dict, reason, at) -> None:
         # Fail closed on the review_id/id spelling: `rec.get("review_id") or
         # rec.get("id")` would silently write NULL (no review linkage) when
         # neither key is present. Require one of the two spellings explicitly
         # so a malformed record raises KeyError instead of persisting an
-        # orphaned triage row.
+        # orphaned event.
         review_id = rec["review_id"] if "review_id" in rec else rec["id"]
         self._c.execute(
-            """INSERT OR REPLACE INTO triage (ledger_key, finding_key, review_id, branch,
-                 base_sha, file, line, severity, title, dismissed_reason, dismissed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (rec["ledger_key"], rec["finding_key"],
-             review_id, rec["branch"],
+            """INSERT INTO triage_events (ledger_key, finding_key, event, review_id,
+                 branch, base_sha, file, line, severity, title, reason, at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (rec["ledger_key"], rec["finding_key"], event, review_id, rec["branch"],
              rec["base_sha"], rec.get("file"), rec.get("line"), rec.get("severity"),
-             rec.get("title"), rec["dismissed_reason"], rec.get("dismissed_at")))
+             rec.get("title"), reason, at))
+
+    def add_triage(self, rec: dict) -> None:
+        """Append a `dismiss` event. Takes the record shape it always took.
+
+        The pre-v3 `INSERT OR REPLACE INTO triage` is retired: it kept one row
+        per ledger key, so a second dismissal DISCARDED the first one's reason
+        and a reopen had nowhere to live at all. The legacy table is left
+        exactly as it is -- the migration seeded the stream from it, and
+        rewriting it now would create a second, disagreeing record of the same
+        decisions.
+
+        Validation is deliberately no stricter than it was: `dismissed_at` is
+        accepted as-is (the legacy importer replays whatever timestamp the
+        archive recorded, canonical or not), and the audit floor on the REASON
+        is `triage.validate_reason`'s job at the call sites that record a human
+        decision -- including the importer, which applies it before calling
+        here. Tightening either would silently start dropping imported history.
+        """
+        self._append_triage_event(self.EVENT_DISMISS, rec, rec["dismissed_reason"],
+                                  rec.get("dismissed_at"))
+
+    def triage_reopen(self, rec: dict) -> None:
+        """Append a `reopen` event: the dismissal of this finding is overturned.
+
+        Stricter than `add_triage` on purpose. This path has no legacy data to
+        accommodate -- every reopen is written by this build -- so a reason and
+        a canonical, orderable timestamp are required at the door. An audit
+        stream entry that says a finding was reopened, but not why or when, is
+        the one thing this ledger exists to make impossible.
+
+        The audit FLOOR (length, placeholders) stays where it already is:
+        `triage.validate_reason`, applied by `triage.reopen` before it gets
+        here. This is the door, not the floor.
+        """
+        reason = _require_text("reason", rec.get("reason"))
+        at = _require_ts("at", rec.get("at"))
+        self._append_triage_event(self.EVENT_REOPEN, rec, reason, at)
+
+    def triage_state(self, branch: str, base_sha: str) -> dict[str, dict]:
+        """Effective triage state per `finding_key` for one review scope.
+
+        THE ONE DEFINITION of "effective state", which `triage_for` filters and
+        the CLI listing renders. Two independent queries here would be two
+        answers, and the listing could then print DISMISSED for a finding the
+        gate still counts as open -- sending a human away from the very thing
+        blocking their push.
+
+        The state of a finding is its LAST EVENT BY `seq`, never by `at`: the
+        store's timestamps have one-second resolution, so a dismiss and a
+        reopen recorded in the same second cannot be ordered by them, and a
+        seeded legacy `dismissed_at` or an operator-supplied `now` can order
+        BACKWARDS. `seq` is a monotonic total order; timestamps are display.
+
+        Each value carries the last event's own fields plus, independently, the
+        last `dismiss` and the last `reopen` -- so `dismissed_reason` and
+        `dismissed_at` keep the meaning they had before v3 (the dismissal's
+        own, not "the latest event's"), and a listing can show both sides of an
+        overturned decision.
+        """
+        rows = self._c.execute(
+            "SELECT * FROM triage_events WHERE branch=? AND base_sha=? ORDER BY seq",
+            (branch, base_sha)).fetchall()
+        state: dict[str, dict] = {}
+        for r in rows:
+            cur = state.setdefault(r["finding_key"], dict(
+                dismissed_reason=None, dismissed_at=None,
+                reopen_reason=None, reopened_at=None))
+            cur.update(dict(r))          # last event by seq wins
+            if r["event"] == self.EVENT_DISMISS:
+                cur["dismissed_reason"], cur["dismissed_at"] = r["reason"], r["at"]
+            elif r["event"] == self.EVENT_REOPEN:
+                cur["reopen_reason"], cur["reopened_at"] = r["reason"], r["at"]
+        return state
 
     def triage_for(self, branch: str, base_sha: str) -> dict[str, dict]:
-        rows = self._c.execute("SELECT * FROM triage WHERE branch=? AND base_sha=?",
-                               (branch, base_sha)).fetchall()
-        return {r["finding_key"]: dict(r) for r in rows}
+        """The findings in this scope whose last event is a `dismiss`.
+
+        SHIPPED SHAPE, unchanged: a `finding_key`-keyed map whose rows carry
+        `dismissed_reason` and `dismissed_at`. `gate.open_findings` tests
+        membership by `finding_key` and reads nothing else, so the gate needed
+        no change for the event stream -- and must not need one.
+        """
+        return {k: v for k, v in self.triage_state(branch, base_sha).items()
+                if v["event"] == self.EVENT_DISMISS}
+
+    def triage_history(self, ledger_key: str) -> list[dict]:
+        """Every decision ever recorded for one finding, oldest first.
+
+        `ledger_key` (branch + base_sha + finding_key) is what groups a
+        finding's history; `seq` orders it. This is the audit read: it returns
+        the overturned reasons too, because a ledger that only shows the
+        current answer cannot be audited.
+        """
+        rows = self._c.execute(
+            "SELECT * FROM triage_events WHERE ledger_key=? ORDER BY seq",
+            (ledger_key,)).fetchall()
+        return [dict(r) for r in rows]
 
     # --- provider availability cache ---------------------------------------
 
