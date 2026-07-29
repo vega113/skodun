@@ -1,7 +1,11 @@
 import json
 import os
+import re
+import signal
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -732,3 +736,483 @@ role = "finder"
     assert main(["triage", "--adopt-refuter", rec["id"], "0"]) == 1
     assert "no refuter pass ran" in capsys.readouterr().out
     assert st.triage_for(stored["branch"], stored["base_sha"]) == {}
+
+
+# ---------------------------------------------------------------------------
+# Ctrl-C honesty: `skodun review` exits 130, `skodun gate` still fails closed
+# ---------------------------------------------------------------------------
+#
+# `_cmd_review` catches `BaseException` at five points (the import guard, the
+# store-open guard, the `_repo_root` guard, the config-load guard, and the
+# `run_review` guard). A `KeyboardInterrupt` at any one of those must escape
+# ALL FIVE and reach `main()`, which maps it to exit 130 -- the shell's own
+# convention for "killed by SIGINT" -- only for the `review` dispatch.
+# `_cmd_gate` is a different, pinned contract: every exception, Ctrl-C
+# included, still maps to 2 there, because the gate is fail-closed by design.
+
+
+class _KaboomModule:
+    """A `sys.modules` stand-in whose every attribute access raises
+    `KeyboardInterrupt`, so `from .pipeline import (...)` inside `_cmd_review`
+    fails exactly the way a real Ctrl-C landing mid-import would: the
+    exception comes out of the `from X import Y` statement itself, not out of
+    a function call `_cmd_review` goes on to make."""
+
+    def __getattr__(self, name):
+        raise KeyboardInterrupt
+
+
+def _boom(*_a, **_k):
+    raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize("seam", [
+    "import", "store_open", "repo_root", "config_load", "run_review"])
+def test_keyboard_interrupt_at_every_cmd_review_seam_exits_130(
+        seam, monkeypatch, tmp_path):
+    # A real git worktree, not bare `tmp_path`: `store_open` and `import`
+    # never get far enough to need one, but `config_load` and `run_review`
+    # only run AFTER `_repo_root` succeeds, and a `GitError` from a bare
+    # tmp dir would be caught by that seam's own (unpatched) `except
+    # BaseException` and report 2 -- proving nothing about the seam actually
+    # under test.
+    from tests.test_gitio import _mkrepo
+    repo = _mkrepo(tmp_path)
+
+    if seam == "import":
+        monkeypatch.setitem(sys.modules, "skodun.pipeline", _KaboomModule())
+    elif seam == "store_open":
+        from skodun.store import Store as StoreCls
+        monkeypatch.setattr(StoreCls, "open", staticmethod(_boom))
+    elif seam == "repo_root":
+        from skodun import gitio
+        monkeypatch.setattr(gitio, "_worktree_root", _boom)
+    elif seam == "config_load":
+        from skodun import config
+        monkeypatch.setattr(config, "load_config", _boom)
+    elif seam == "run_review":
+        from skodun import pipeline
+        monkeypatch.setattr(pipeline, "run_review", _boom)
+
+    assert main(["review", "--repo", str(repo)]) == 130
+
+
+def test_gate_still_maps_keyboard_interrupt_to_2(monkeypatch, tmp_path):
+    """The gate's fail-closed contract is pinned: Ctrl-C is just another
+    exception there, and every exception is 2. Do not "make it consistent"
+    with `review` -- a gate that a Ctrl-C could dodge past would be a hole in
+    exactly the seam that has to fail closed."""
+    from skodun.store import Store as StoreCls
+    monkeypatch.setattr(StoreCls, "open", staticmethod(_boom))
+    assert main(["gate", "--repo", str(tmp_path)]) == 2
+
+
+def test_keyboard_interrupt_during_arg_parsing_still_maps_to_2(monkeypatch):
+    """`main()`'s 130 carve-out is scoped to the parsed `review` dispatch
+    only. A `KeyboardInterrupt` anywhere upstream of that -- here, simulated
+    inside argparse's own `parse_args` -- must still fall through to `main`'s
+    general `except BaseException` and come out as 2, never 130 and never the
+    interpreter's bare 1."""
+    import argparse
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", _boom)
+    assert main(["gate"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# the real SIGINT, end to end: skodun as its own subprocess
+# ---------------------------------------------------------------------------
+
+
+def _fake_slow_grok(bin_dir: Path, ready_file: Path) -> Path:
+    """A fake `grok` CLI that announces its own pid, then blocks.
+
+    No shebang-wrapping shell survives between `Popen` and this script: the
+    kernel execs `/bin/sh` directly on the shebang line, so `$$` inside it IS
+    the pid `run_with_watchdog`'s `Popen` reports, which — because
+    `start_new_session=True` — is also that process's own process-group id.
+    Writing it is what lets the test confirm the GROUP (not just the leader)
+    is dead after the signal, not merely that something somewhere exited.
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    g = bin_dir / "grok"
+    g.write_text(
+        "#!/bin/sh\n"
+        f'echo $$ > "{ready_file}"\n'
+        "sleep 30\n",
+        encoding="utf-8")
+    g.chmod(g.stat().st_mode | stat.S_IEXEC)
+    return g
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def test_sigint_to_the_skodun_process_exits_130_and_cleans_up_after_itself(
+        tmp_path):
+    """The end-to-end pin the brief asks for: skodun launched as ITS OWN
+    subprocess (`python -m skodun review ...`), signalled only once three
+    independent, race-free preconditions are all observed -- the fake CLI's
+    readiness marker, the persisted `running` record, and the held foreground
+    lock -- so no assertion below depends on timing.
+
+    SIGINT goes to the skodun PROCESS, never to the fake CLI's group: the fake
+    CLI is `start_new_session=True`, so it sits outside the terminal's
+    foreground group and would never see a signal aimed at its own group from
+    an interactive Ctrl-C. Signalling it directly would prove nothing about
+    skodun's own handling.
+    """
+    from tests.test_fallback import FAKE_XAI_MODEL
+    from tests.test_gitio import _git, _mkrepo
+
+    repo = _mkrepo(tmp_path)
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    (repo / ".skodun.toml").write_text(f"""
+[[reviewers]]
+name = "primary"
+provider = "xai"
+model = "{FAKE_XAI_MODEL}"
+role = "finder"
+effort = "medium"
+""", encoding="utf-8")
+
+    ready = tmp_path / "ready.pid"
+    _fake_slow_grok(tmp_path / "bin", ready)
+
+    db = tmp_path / "sigint.db"
+    env = dict(os.environ)
+    env["SKODUN_DB"] = str(db)
+    env["SKODUN_CONFIG"] = str(tmp_path / "absent-config.toml")
+    env["SKODUN_GROK_BIN"] = str(tmp_path / "bin" / "grok")
+    env["SKODUN_ALLOW_MAIN"] = "1"
+    env["SKODUN_SECURITY_PASS"] = "0"
+    env["SKODUN_SKEPTIC_PASS"] = "0"
+    env["SKODUN_REFUTER_PASS"] = "0"
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [_SRC] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+
+    from skodun.gitio import git_common_dir
+    from skodun.pipeline import LOCK_NAME
+    lock_path = git_common_dir(repo) / LOCK_NAME
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "skodun", "review", "--repo", str(repo)],
+        cwd=str(repo), env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        # Race-free precondition: all three, not merely the marker. Signalling
+        # on the marker alone could land before the record — or the lock —
+        # existed, which would make every assertion below a timing gamble.
+        deadline = time.monotonic() + 20.0
+        running_seen = False
+        while time.monotonic() < deadline:
+            if ready.exists() and lock_path.is_dir():
+                try:
+                    st = Store.open(db)
+                    rows = st.list_reviews(None, 5)
+                except Exception:
+                    rows = []
+                if any(r.get("status") == "running" for r in rows):
+                    running_seen = True
+                    break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+
+        assert running_seen, (
+            f"preconditions never all held: ready={ready.exists()} "
+            f"lock={lock_path.is_dir()} proc_alive={proc.poll() is None}")
+
+        proc.send_signal(signal.SIGINT)
+        out, err = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+    assert proc.returncode == 130, f"stdout={out!r} stderr={err!r}"
+
+    st = Store.open(db)
+    rows = st.list_reviews(None, 5)
+    assert rows, "no record was ever persisted"
+    assert rows[0]["status"] == "failed", rows[0]
+
+    assert not lock_path.exists(), "the foreground lock survived the signal"
+
+    pgid = int(ready.read_text(encoding="utf-8").strip())
+    death_deadline = time.monotonic() + 10.0
+    while _group_alive(pgid) and time.monotonic() < death_deadline:
+        time.sleep(0.05)
+    assert not _group_alive(pgid), (
+        f"the fake CLI's process group {pgid} outlived the skodun parent")
+
+
+# ---------------------------------------------------------------------------
+# `skodun providers`: a read-only diagnostic listing, never a gate
+# ---------------------------------------------------------------------------
+#
+# Contract: exit 0 even when every binary is missing (this is a listing, not
+# a gate) -- exit 1 only when the loaded CONFIG names a reviewer whose
+# provider has no registered adapter at all, because that is a typo or an
+# unshipped provider and worth failing loudly in CI. `_never_the_real_store`
+# (autouse, above) already pins `SKODUN_DB` and `SKODUN_CONFIG` to tmp paths
+# for every test in this module.
+
+_KNOWN_PROVIDERS = ("google", "openai", "xai")   # the registry, Task 6's
+                                                  # "anthropic" deliberately
+                                                  # absent -- see adapters/__init__.py
+
+
+def _no_such_binaries(monkeypatch, tmp_path):
+    missing = tmp_path / "does-not-exist"
+    monkeypatch.setenv("SKODUN_GROK_BIN", str(missing / "grok"))
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(missing / "codex"))
+    monkeypatch.setenv("SKODUN_AGY_BIN", str(missing / "agy"))
+
+
+def test_providers_lists_every_registered_adapter_even_with_missing_binaries(
+        tmp_path, monkeypatch, capsys):
+    _no_such_binaries(monkeypatch, tmp_path)
+    assert main(["providers", "--repo", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    for provider in _KNOWN_PROVIDERS:
+        assert provider in out, out
+    assert "anthropic" not in out, "Task 6's unregistered provider must not appear"
+    assert out.count("NOT FOUND") == 3
+
+
+def test_providers_shows_a_found_executable_binary(tmp_path, monkeypatch, capsys):
+    grok = tmp_path / "bin" / "grok"
+    grok.parent.mkdir()
+    grok.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    grok.chmod(grok.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("SKODUN_GROK_BIN", str(grok))
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(tmp_path / "nope" / "codex"))
+    monkeypatch.setenv("SKODUN_AGY_BIN", str(tmp_path / "nope" / "agy"))
+
+    assert main(["providers", "--repo", str(tmp_path)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    line = next(l for l in lines if l.startswith("xai |"))
+    assert "NOT FOUND" not in line, line
+    # A prefix, not the whole path: the binary field goes through
+    # `triage.shown_field` same as everything else that is a resolved path
+    # rather than program-authored text (see `_fmt_binary`), and its 120-char
+    # cap can legitimately truncate a long pytest tmp_path -- that cap is
+    # exercised on its own terms elsewhere, not the point of this test.
+    assert str(grok)[:60] in line, line
+
+
+def test_providers_shows_an_empty_state_table_as_none(tmp_path, monkeypatch, capsys):
+    _no_such_binaries(monkeypatch, tmp_path)
+    assert main(["providers", "--repo", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    for provider in _KNOWN_PROVIDERS:
+        line = next(l for l in out.splitlines() if l.startswith(f"{provider} |"))
+        assert "state=none" in line, line
+
+
+def test_providers_shows_a_stored_active_provider_state_row(tmp_path, monkeypatch,
+                                                             capsys):
+    db = tmp_path / "db" / "skodun.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    _no_such_binaries(monkeypatch, tmp_path)
+    Store.open(db).mark_provider_unavailable(
+        "xai", "quota exceeded", "quota", "2099-01-01T00:00:00Z")
+
+    assert main(["providers", "--repo", str(tmp_path)]) == 0
+    line = next(l for l in capsys.readouterr().out.splitlines()
+                if l.startswith("xai |"))
+    assert "active=True" in line, line
+    assert "quota exceeded" in line, line
+    assert "2099-01-01T00:00:00Z" in line, line
+    assert "category=quota" in line, line
+
+
+def test_providers_shows_an_expired_provider_state_row_as_inactive(tmp_path,
+                                                                    monkeypatch,
+                                                                    capsys):
+    """`provider_state_rows` is a LISTING, not a filter: an expired row must
+    still appear, flagged `active=False`, not vanish as though it never
+    existed."""
+    db = tmp_path / "db" / "skodun.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    _no_such_binaries(monkeypatch, tmp_path)
+    Store.open(db).mark_provider_unavailable(
+        "xai", "old outage", "quota", "2000-01-01T00:00:00Z")
+
+    assert main(["providers", "--repo", str(tmp_path)]) == 0
+    line = next(l for l in capsys.readouterr().out.splitlines()
+                if l.startswith("xai |"))
+    assert "active=False" in line, line
+    assert "old outage" in line, line
+
+
+def test_providers_flags_a_state_row_for_a_provider_with_no_registered_adapter(
+        tmp_path, monkeypatch, capsys):
+    """A `provider_state` row surviving from before `anthropic` was
+    unregistered (Task 6) is exactly the situation the brief calls out: it
+    must not be silently dropped, but it is also not a config error -- no
+    reviewer references it -- so the exit code stays 0."""
+    db = tmp_path / "db" / "skodun.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    _no_such_binaries(monkeypatch, tmp_path)
+    Store.open(db).mark_provider_unavailable(
+        "anthropic", "credential expired", "auth", "2099-01-01T00:00:00Z")
+
+    assert main(["providers", "--repo", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "anthropic" in out
+    assert "NOTE" in out
+
+
+def test_providers_exits_1_when_a_configured_reviewer_names_an_unregistered_provider(
+        tmp_path, monkeypatch, capsys):
+    _no_such_binaries(monkeypatch, tmp_path)
+    (tmp_path / ".skodun.toml").write_text("""
+[[reviewers]]
+name = "primary"
+provider = "anthropic"
+model = "claude-x"
+role = "finder"
+""", encoding="utf-8")
+
+    assert main(["providers", "--repo", str(tmp_path)]) == 1
+    out = capsys.readouterr().out
+    assert "primary" in out and "anthropic" in out, out
+
+
+def test_providers_config_error_wins_over_missing_binaries(tmp_path, monkeypatch,
+                                                            capsys):
+    """Both problems are present at once -- an unregistered provider AND
+    every registered adapter's binary missing -- and the config error, the
+    one that is worth failing CI over, is the exit code that survives."""
+    _no_such_binaries(monkeypatch, tmp_path)
+    (tmp_path / ".skodun.toml").write_text("""
+[[reviewers]]
+name = "primary"
+provider = "anthropic"
+model = "claude-x"
+role = "finder"
+""", encoding="utf-8")
+
+    assert main(["providers", "--repo", str(tmp_path)]) == 1
+
+
+@pytest.mark.parametrize("value, expect_note", [
+    ("1", True), ("false", True), ("yes", True), ("no", True),
+    (None, False), ("", False), ("   ", False), ("0", False),
+])
+def test_providers_notes_the_ignore_provider_state_bypass_precisely(
+        value, expect_note, tmp_path, monkeypatch, capsys):
+    """Same polarity as `store._provider_state_bypassed`: unset, blank, or
+    exactly `"0"` -> no note; anything else -> the note fires. The listing
+    still shows the STORED rows either way -- the note is about whether a
+    review run right now would honour them, not about hiding what is there."""
+    _no_such_binaries(monkeypatch, tmp_path)
+    if value is None:
+        monkeypatch.delenv("SKODUN_IGNORE_PROVIDER_STATE", raising=False)
+    else:
+        monkeypatch.setenv("SKODUN_IGNORE_PROVIDER_STATE", value)
+
+    assert main(["providers", "--repo", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    fired = "NOTE" in out and "SKODUN_IGNORE_PROVIDER_STATE" in out
+    assert fired == expect_note, out
+
+
+def test_providers_strips_control_characters_and_newlines_from_a_stored_reason(
+        tmp_path, monkeypatch, capsys):
+    """`reason` is operator- or config-typo-influenced text landing on a
+    terminal line, same class of risk `triage.shown_field` exists to close
+    for finding fields -- a raw newline must not forge an extra row, and a
+    raw ESC must not rewrite what the terminal already printed."""
+    db = tmp_path / "db" / "skodun.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    _no_such_binaries(monkeypatch, tmp_path)
+    hostile = "line one\nline two\x1b[31mRED\x1b[0m"
+    Store.open(db).mark_provider_unavailable(
+        "xai", hostile, "quota", "2099-01-01T00:00:00Z")
+
+    assert main(["providers", "--repo", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out, repr(out)
+    assert "line one line two" in out, out
+    assert not any(line.strip() == "line two" for line in out.splitlines()), (
+        "a raw newline in `reason` forged an extra line")
+
+
+def test_providers_survives_a_closed_stdout(tmp_path):
+    db = tmp_path / "sub" / "s.db"
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run(
+            [sys.executable, "-m", "skodun", "providers", "--repo", str(tmp_path)],
+            stdout=w_fd, stderr=subprocess.PIPE, text=True, env=_subprocess_env(db))
+    finally:
+        os.close(w_fd)
+    assert p.returncode == 0, f"stderr={p.stderr!r}"
+    assert p.stderr == "", p.stderr
+
+
+def test_providers_through_head_1_reports_skoduns_own_exit_code(tmp_path):
+    """The real pipeline, not just a closed-fd simulation: `head -1` reads one
+    line and closes its end while skodun is still mid-listing, so every write
+    after that raises `BrokenPipeError` in the child. `${PIPESTATUS[0]}` is
+    bash's own record of the FIRST command's exit status, unaffected by
+    `head`'s (always 0) -- the only way to see skodun's real code through a
+    live pipe rather than `sh -c`'s usual last-command-wins reporting."""
+    db = tmp_path / "sub" / "s.db"
+    env = _subprocess_env(db)
+    script = (
+        f'{sys.executable} -m skodun providers --repo {tmp_path} | head -1; '
+        'echo "SKODUN_EXIT=${PIPESTATUS[0]}"'
+    )
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+    m = re.search(r"SKODUN_EXIT=(\d+)", p.stdout)
+    assert m, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert int(m.group(1)) == 0, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+
+
+@pytest.mark.parametrize("module", ["skodun", "skodun.cli"])
+def test_providers_module_invocation_matches_the_console_script(tmp_path, module):
+    db = tmp_path / module / "s.db"
+    env = _subprocess_env(db)
+    p = subprocess.run(
+        [sys.executable, "-m", module, "providers", "--repo", str(tmp_path)],
+        capture_output=True, text=True, env=env)
+    assert p.returncode == 0, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert p.stderr == "", p.stderr
+    for provider in _KNOWN_PROVIDERS:
+        assert provider in p.stdout
+
+
+@pytest.mark.parametrize("module", ["skodun", "skodun.cli"])
+def test_providers_module_invocation_reports_the_config_error_as_exit_1(tmp_path,
+                                                                         module):
+    db = tmp_path / module / "modcfg" / "s.db"
+    env = _subprocess_env(db)
+    (tmp_path / ".skodun.toml").write_text("""
+[[reviewers]]
+name = "primary"
+provider = "anthropic"
+model = "claude-x"
+role = "finder"
+""", encoding="utf-8")
+    p = subprocess.run(
+        [sys.executable, "-m", module, "providers", "--repo", str(tmp_path)],
+        capture_output=True, text=True, env=env)
+    assert p.returncode == 1, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+
+
+def test_providers_appears_in_top_level_help(capsys):
+    assert main(["--help"]) == 0
+    assert "providers" in capsys.readouterr().out

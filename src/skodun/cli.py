@@ -23,6 +23,7 @@ are guarded below:
 
 import argparse
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -78,6 +79,14 @@ def build_parser() -> argparse.ArgumentParser:
     shadow.add_argument("--diff-hash", default=None, dest="diff_hash",
                         help="restrict the comparison to one diff_hash "
                              "(default: every hash on either side)")
+
+    providers = sub.add_parser(
+        "providers",
+        help="list registered provider adapters and their cached availability")
+    providers.add_argument(
+        "--repo", type=Path, default=Path("."),
+        help="repository whose .skodun.toml to read (default: the current "
+             "directory)")
 
     log = sub.add_parser("log", help="show recent reviews, newest first")
     log.add_argument("--branch", default=None,
@@ -288,6 +297,13 @@ def _cmd_review(args) -> int:
         from .pipeline import (LockTimeout, PersistenceFailed, PreflightRefused,
                                run_review)
         from .store import Store
+    except KeyboardInterrupt:
+        # Ctrl-C during the import itself: nothing ran, but that is not what
+        # this is -- `main()` maps this to 130, not to the 2 the `except
+        # BaseException` immediately below would otherwise give it. See the
+        # module-level note on why every one of `_cmd_review`'s five
+        # `BaseException` guards needs this immediately above it.
+        raise
     except BaseException as e:
         return _emit(banner_failure(
             f"could not load the review pipeline: {e!r}; no review ran"), 2)
@@ -295,6 +311,8 @@ def _cmd_review(args) -> int:
     repo = Path(args.repo)
     try:
         store = Store.open(_store_path())
+    except KeyboardInterrupt:
+        raise
     except BaseException as e:
         # No store means no record, which is exactly what 4 says.
         return _emit(banner_failure(f"could not open the review store: {e!r}"), 4)
@@ -305,10 +323,14 @@ def _cmd_review(args) -> int:
         # worktree at all raises here, which is a preflight refusal -- nothing
         # ran -- and lands on the same 2 the `GitError` handler below gives.
         root = _repo_root(repo)
+    except KeyboardInterrupt:
+        raise
     except BaseException as e:
         return _emit(banner_failure(f"{e}; no review ran"), 2)
     try:
         cfg = load_config(root)
+    except KeyboardInterrupt:
+        raise
     except BaseException as e:
         # A config that will not load is a refusal before anything ran, not a
         # review that came back badly: 2, the preflight code.
@@ -328,6 +350,14 @@ def _cmd_review(args) -> int:
         # before the reviewer is launched, so this is a preflight failure --
         # nothing ran -- and preflight refusals are 2, not "the review failed".
         return _emit(banner_failure(f"{e}; no review ran"), 2)
+    except KeyboardInterrupt:
+        # `run_review`'s own `finally` has already downgraded the `running`
+        # record to `failed` and released the foreground lock (pipeline.py,
+        # "never leave a `running` record or a held lock behind") by the time
+        # this exception reaches here -- this guard only has to let it keep
+        # going rather than let the `except BaseException` below turn it into
+        # a lying "the review failed" 4.
+        raise
     except BaseException as e:
         # Anything else: the review did not complete, so it certifies nothing.
         return _emit(banner_failure(f"the review failed: {e!r}"), 4)
@@ -341,6 +371,125 @@ def _cmd_review(args) -> int:
     except (TypeError, ValueError):
         total = 1     # an uncountable findings list is not a clean review
     return 1 if total > 0 else 0
+
+
+def _fmt_binary(binary: str) -> str:
+    """A short word for whether `resolve_binary()`'s answer names something
+    this machine can run right now: `"executable"`, `"found, NOT executable"`,
+    or `"NOT FOUND"`.
+
+    A path-shaped value (the per-adapter `SKODUN_<X>_BIN` overrides, and
+    grok's own `~/.grok/bin/grok` default) is checked directly; a bare name
+    goes through `PATH`, exactly how the adapter's own `Popen` call would
+    resolve it -- `shutil.which` already requires `os.X_OK` along the way, so
+    a match there is never merely "a file exists". This mirrors
+    `pipeline._binary_is_absent`'s path-vs-PATH split but additionally checks
+    EXECUTABILITY, not just existence: `providers` is read by a human deciding
+    whether a review can actually run, and "there but not runnable" is a
+    different, more specific fact than "not found" for them to act on.
+    """
+    if not binary:
+        return "NOT FOUND"
+    if "/" in binary or (os.sep != "/" and os.sep in binary):
+        p = Path(binary)
+        if not p.exists():
+            return "NOT FOUND"
+        return "executable" if os.access(p, os.X_OK) else "found, NOT executable"
+    return "executable" if shutil.which(binary) else "NOT FOUND"
+
+
+def _fmt_provider_state(row: dict | None, shown_field) -> str:
+    if row is None:
+        return "none"
+    return (f"active={row['active']} until={shown_field(row['unavailable_until'])} "
+            f"reason={shown_field(row['reason'])} category={shown_field(row['category'])}")
+
+
+def _cmd_providers(args) -> int:
+    """List every registered provider adapter: its id, its adapter name,
+    where `resolve_binary()` says its CLI lives and whether that is really
+    runnable, and the cached `provider_state` row for it, if any.
+
+    Read-only and diagnostic, not a gate, so a missing binary or an expired
+    cache row is exactly the kind of thing an operator runs this to discover
+    -- it is reported, not refused. Exit 0 covers all of that.
+
+    Exit 1 is reserved for one thing: the loaded CONFIG names a reviewer
+    whose `provider` has no registered adapter at all. That is a typo or a
+    provider skodun has not shipped support for, and -- unlike a merely
+    missing binary -- `run_review`'s own preflight (`_repo_root`'s
+    `_adapter_for` loop) would refuse EVERY review with this config until it
+    is fixed, so it is worth failing this listing loudly in CI rather than
+    only being discovered when a review runs and refuses. A reviewer entry
+    always carries a non-empty `provider` by the time `load_config` returns
+    one (`config._validate` requires it), so every entry is considered
+    "configured" here -- `enabled = false` included, because a config that
+    silently disables the one reviewer with the typo instead of fixing it is
+    not a config this check should wave through as clean.
+
+    `--repo` is read directly when it is not inside a git worktree at all:
+    unlike `gate`/`review`, this command certifies nothing about a diff, so
+    it has no need of `_repo_root`'s "config and diff identity from the same
+    directory" invariant, and refusing to run outside a git checkout would
+    make this diagnostic tool less useful exactly where an operator reaches
+    for it first -- before `git init`, or against a bare checkout.
+    """
+    from . import store as store_mod
+    from .adapters import _REGISTRY
+    from .config import load_config
+    from .store import Store
+    from .triage import shown_field
+
+    try:
+        root = _repo_root(Path(args.repo))
+    except BaseException:
+        root = Path(args.repo)
+    try:
+        cfg = load_config(root)
+    except BaseException as e:
+        return _emit(f"skodun providers: could not load the config: {e!r}", 2)
+
+    try:
+        store = Store.open(_store_path())
+    except BaseException as e:
+        return _emit(f"skodun providers: could not open the store: {e!r}", 2)
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        state_rows = {row["provider"]: row for row in store.provider_state_rows(now)}
+    except BaseException as e:
+        return _emit(f"skodun providers: could not read provider state: {e!r}", 2)
+
+    if store_mod._provider_state_bypassed(os.environ):
+        raw = os.environ.get(store_mod.IGNORE_PROVIDER_STATE_ENV, "")
+        _emit(f"skodun providers: NOTE {store_mod.IGNORE_PROVIDER_STATE_ENV}="
+              f"{shown_field(raw)!r} is set -- the provider_state rows below "
+              f"are informational only; a review run right now would ignore "
+              f"every one of them", 0)
+
+    for provider in sorted(_REGISTRY):
+        adapter = _REGISTRY[provider]()
+        binary = adapter.resolve_binary()
+        status = _fmt_binary(binary)
+        state = _fmt_provider_state(state_rows.get(provider), shown_field)
+        _emit(f"{provider} | adapter={adapter.name} | "
+              f"binary={shown_field(binary)} ({status}) | state={state}", 0)
+
+    for provider, row in sorted(state_rows.items()):
+        if provider not in _REGISTRY:
+            _emit(f"skodun providers: NOTE cached provider_state for "
+                  f"{shown_field(provider)!r} has no registered adapter -- "
+                  f"{_fmt_provider_state(row, shown_field)}", 0)
+
+    unregistered = [(r.name, r.provider) for r in cfg.reviewers
+                    if r.provider and r.provider not in _REGISTRY]
+    if not unregistered:
+        return 0
+    for name, provider in unregistered:
+        _emit(f"skodun providers: FAILED reviewer {name!r} uses provider "
+              f"{provider!r}, which has no registered adapter "
+              f"(known: {sorted(_REGISTRY)})", 0)
+    return 1
 
 
 def _cmd_import_legacy(args) -> int:
@@ -751,7 +900,24 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "gate":
             return _cmd_gate(args)
         if args.command == "review":
-            return _cmd_review(args)
+            try:
+                return _cmd_review(args)
+            except KeyboardInterrupt:
+                # Scoped to exactly this dispatch, on purpose. `_cmd_review`
+                # re-raises `KeyboardInterrupt` past every one of its own
+                # `BaseException` guards (see its docstring), and 130 -- 128 +
+                # SIGINT, the shell's own convention -- is the honest answer
+                # for "the operator hit Ctrl-C", never the 2/3/4 those guards
+                # would otherwise report. Every OTHER path through `main` --
+                # `gate` included -- still falls through to the general
+                # `except BaseException` below and reports 2: `_cmd_gate`'s
+                # fail-closed contract maps every exception, Ctrl-C included,
+                # to 2, and a Ctrl-C during argument parsing or a subcommand
+                # this carve-out does not name is "nothing ran", which 2
+                # already says correctly.
+                return 130
+        if args.command == "providers":
+            return _cmd_providers(args)
         if args.command == "import-legacy":
             return _cmd_import_legacy(args)
         if args.command == "shadow-compare":
