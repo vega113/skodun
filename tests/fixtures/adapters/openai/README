@@ -133,6 +133,33 @@ unavailable_auth.txt
     log timestamps. No token was ever in these bytes — the point of the run
     is that there was none.
 
+unavailable_quota.txt
+    SYNTHESIZED envelope / BINARY-SOURCED wording. Rule 4 requires every
+    adapter to witness its own provider's budget-exhaustion wording against
+    its own signal table, and no live OpenAI quota failure has been observed:
+    the balance that ran out during Task 14's acceptance run was xAI's. This
+    fixture is therefore NOT a capture and must not be read as one.
+    The load-bearing sentence, `You've reached your workspace credit limit`,
+    is VERBATIM in the installed codex binary (`strings` on
+    `@openai/codex-darwin-arm64`'s vendored `codex`, alongside its siblings
+    `Your workspace is out of credits...` and `You hit your spend cap set in
+    your workspace...`). It is a sentence this CLI can really emit, which is
+    the whole point: it matches `credit limit`, an entry added by the Task 14
+    audit from that same binary, so the fixture pins the table against the
+    provider's vocabulary rather than against its author's imagination.
+    What is ASSEMBLED, and is the fixture's honest weakness: the event stream
+    around that sentence (`thread.started` / `turn.started` / `error` /
+    `turn.failed`) is modelled on `unavailable_auth.txt`'s real failure shape,
+    not observed on a quota failure, and the stderr line is this CLI's tracing
+    format carrying the binary's own `usage_limit_reached` error-type token.
+    Whether a real 402 arrives in exactly this shape is UNVERIFIED.
+    Declares `category=quota` — the only provider-wide-cacheable category, so
+    the one whose misdetection costs a healthy provider every later chain.
+    Deliberately does NOT contain `payment required`: that entry is marked
+    speculative for this provider in `codex.py`, and a fixture witnessing a
+    speculative entry would launder a guess into evidence. Replace this file
+    with a real sanitized capture when a live OpenAI quota failure occurs.
+
 unavailable_model.txt
     CAPTURED, whole, from a run asking for a model id that does not exist.
     Declares `category=model`. stderr is EMPTY here, which is the interesting

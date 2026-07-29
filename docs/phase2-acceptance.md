@@ -598,8 +598,10 @@ ClassifyResult(kind='ok', category='', detail='')
 > **Why the conformance gate missed it, which is the part worth keeping.** The
 > closest real capture of that condition was never in the fixture set: at that
 > commit **no provider's fixture directory contained an `unavailable_quota` fixture
-> at all**. Conformance rule 4 requires only ≥ 1 `*unavailable*` fixture of *any*
-> category, and every adapter satisfied it with an `auth` or `model` one — so
+> at all**. Conformance rule 4 required, at that commit, only ≥ 1 `*unavailable*`
+> fixture of *any* category (it requires an `*unavailable_quota*` one at head — see
+> the SUPERSEDED note in §2(b)-ii), and every adapter satisfied it with an `auth`
+> or `model` one — so
 > `quota`, the single provider-wide-cacheable category, the one whose misdetection
 > has blast radius beyond one attempt in both directions, was the category with no
 > witness. Worse, xai's `healthy_noisy_stderr.txt` already carried a `rate limit`
@@ -631,13 +633,37 @@ document's first version was written:
   sweep, so an entry that fires on nothing cannot ship unnoticed again.
 
 The conformance gate was **not** given a mechanical "every adapter must supply a
-quota fixture" rule; the reasoning is committed in `tests/adapter_conformance.py`'s
-module docstring. In short: a quota failure cannot be produced on demand, so such a
-rule could only be satisfied by synthesizing — and a hand-written quota fixture
-asserts only that the phrase its author imagined matches the signal table that same
-author wrote. That is this exact defect wearing a green tick, which is worse than a
-documented gap, because a gap invites a look. The obligation is documented in the
-mixin instead: capture a real one when your provider's quota does run out.
+quota fixture" rule when `688464f` landed. The reasoning — a quota failure cannot
+be produced on demand, so such a rule could only be satisfied by synthesizing, and
+a hand-written quota fixture asserts only that the phrase its author imagined
+matches the signal table that same author wrote — is preserved here because it
+names the real failure mode, not because the decision stood.
+
+> **SUPERSEDED — rule 4 now requires an `*unavailable_quota*` fixture from every
+> adapter.** The objection above was answered rather than accepted: what makes a
+> synthesized quota fixture circular is not that it is hand-written, it is where
+> its *wording* comes from. Rule 4 therefore requires the witness AND constrains
+> its provenance — a synthesized fixture must be built from wording verifiably the
+> provider's own (a string in the installed binary, or documented provider error
+> text), never from wording invented to match the table, with capture-vs-synthesis
+> stated per fixture in the directory README.
+>
+> The two new fixtures are built that way. `openai`'s carries `You've reached your
+> workspace credit limit` and `google`'s carries `You have exhausted your quota on
+> this model.` — both verbatim in their installed binaries, both matching an entry
+> the Task 14 audit added from that same binary (`credit limit`,
+> `exhausted your quota`), and neither containing `payment required`, which is
+> marked speculative for those two providers and would launder a guess into
+> evidence. `xai`'s remains the real live capture.
+>
+> This is **weaker than a live capture and is not claimed as equal**: it proves the
+> table matches a sentence the CLI can really emit, not that the CLI emits that
+> sentence on budget exhaustion. The envelope around the wording is assembled from
+> each adapter's real failure shape and is unverified for a quota run. The standing
+> obligation survives the rule: when a live quota failure occurs, capture it and
+> **replace** the synthesis. What the rule buys outright is that `google`'s missed
+> sentence — the one its own narrow table let fall through to `ok` — can never
+> regress unnoticed again, for any adapter.
 
 **The drill below is §2(b) re-run at head, against the REAL captured envelope.**
 The fake `grok` replays `tests/fixtures/adapters/xai/unavailable_quota.txt`'s own

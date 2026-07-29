@@ -1,0 +1,9 @@
+rc=1
+category=quota
+--- stdout ---
+{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000000"}
+{"type":"turn.started"}
+{"type":"error","message":"You've reached your workspace credit limit"}
+{"type":"turn.failed","error":{"message":"You've reached your workspace credit limit"}}
+--- stderr ---
+2026-01-01T00:00:00.000000Z ERROR codex_core::codex: turn error: usage_limit_reached

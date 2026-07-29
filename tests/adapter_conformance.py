@@ -59,46 +59,61 @@ witness proves nothing:
                              least one whose STDERR carries the wording, so
                              a set in which every unavailable capture hides
                              its evidence inside the stream is not enough)
+`*unavailable_quota*`        rule 4 (>= 1, and see below)
 `*healthy_noisy_stderr*`     rule 7 (>= 1)
 `*refuter*healthy*`          rule 1b (>= 1)
 ===========================  ============================================
 
-Why rule 4 does NOT require a `quota` fixture specifically
-----------------------------------------------------------
+Why rule 4 requires a `quota` fixture specifically
+--------------------------------------------------
 
-It is the obvious hardening and it is deliberately not done. `quota` is the
-only provider-wide-cacheable category, so it is the one whose misdetection has
-blast radius beyond a single attempt — and Task 14's live acceptance run found
-exactly that defect: every adapter satisfied rule 4 with an `auth` or `model`
-fixture, no adapter had a `quota` capture, and real xAI budget exhaustion
-(`402 Payment Required ... usage balance exhausted`) matched none of the
-shipped quota signals. `classify` returned `ok`, the fallback chain never
-advanced, and nothing was cached.
+`quota` is the only provider-wide-cacheable category, so it is the one whose
+misdetection has blast radius beyond a single attempt — and Task 14's live
+acceptance run found exactly that defect: every adapter satisfied rule 4 with
+an `auth` or `model` fixture, no adapter had a `quota` capture, and real xAI
+budget exhaustion (`402 Payment Required ... usage balance exhausted`) matched
+none of the shipped quota signals. `classify` returned `ok`, the fallback chain
+never advanced, and nothing was cached.
 
-Requiring one would not have caught it. A quota failure cannot be produced on
-demand: it needs a real account with a real balance to run out, at a moment
-nobody schedules. An adapter author told to supply a `*unavailable_quota*`
-fixture would therefore write one — and a hand-written quota fixture asserts
-only that the phrase its author imagined matches the signal table that same
-author wrote. That circle passes cleanly while the provider's actual wording
-goes on matching nothing, which is this defect wearing a green tick. The
-capture rule ("SYNTHESIZED where the archive cannot supply it") exists to keep
-hand-written envelopes honest about being hand-written; a rule that can only be
-satisfied by synthesizing is a rule that manufactures the thing it is meant to
-prevent.
+The rule is therefore mechanical: every adapter must ship a
+`*unavailable_quota*` fixture, the same way every adapter must ship a
+`*refuter*healthy*` one.
 
-So the obligation is documentary rather than mechanical, and it is stated here
-because this is where an adapter author reads:
+There is a real objection to this, and it is recorded rather than dropped,
+because it says what the rule can and cannot buy. A quota failure cannot be
+produced on demand: it needs a real account with a real balance to run out, at
+a moment nobody schedules. So most adapters will satisfy this rule by
+synthesizing — and a synthesized quota fixture whose wording its author
+*imagined* asserts only that the author's guess matches the signal table that
+same author wrote. That circle passes cleanly while the provider's actual
+wording goes on matching nothing, which is the Task 14 defect wearing a green
+tick.
+
+What closes the circle is WHERE the wording comes from, so that is the part
+the rule constrains:
+
+    A synthesized `unavailable_quota` fixture must be built from wording that
+    is verifiably the provider's own — a string in the installed binary, or
+    the provider's documented error text — never from wording invented to
+    match the table. Record which it is, per fixture, in the fixture
+    directory's README, and say plainly whether the envelope AROUND that
+    wording was captured or assembled.
+
+That is a weaker guarantee than a live capture and is not presented as an
+equal one: it proves the table matches a sentence the CLI can really emit,
+not that the CLI emits that sentence on budget exhaustion specifically. It is
+strictly stronger than no witness at all, which is what the previous version
+of this rule left in place. The standing obligation survives the rule rather
+than being replaced by it:
 
     When a live quota failure DOES occur for your provider, capture it,
-    sanitize it, commit it as `unavailable_quota.txt`, and record it as a
-    real capture in the fixture directory's README.
+    sanitize it, and REPLACE the synthesized fixture with the real envelope.
 
-`tests/fixtures/adapters/xai/unavailable_quota.txt` is that fixture for xai and
-is a real capture. `openai` and `google` do not have one yet; when they do, the
-per-adapter "every quota signal is individually load-bearing" tests in their
-test modules are what keep the tables from growing entries that fire on nothing
-in the meantime.
+`tests/fixtures/adapters/xai/unavailable_quota.txt` is a real live capture and
+is the model for what the other two should eventually become. `openai` and
+`google` currently hold binary-sourced syntheses; their READMEs say so, and
+the per-adapter "every quota signal is individually load-bearing" tests are
+what keep the tables from growing entries that fire on nothing.
 
 Fixture file format
 -------------------
@@ -390,6 +405,16 @@ def _is_degraded(name: str) -> bool:
 
 def _is_unavailable(name: str) -> bool:
     return "unavailable" in name
+
+
+def _is_unavailable_quota(name: str) -> bool:
+    """Rule 4's mandatory `quota` witness.
+
+    Substring rather than an exact filename, for the same reason
+    `_is_refuter` is: a future `unavailable_quota_402` or
+    `unavailable_quota_rate_limited` is the same witness and must count.
+    """
+    return _is_unavailable(name) and "quota" in name
 
 
 def _is_noisy_healthy(name: str) -> bool:
@@ -793,6 +818,15 @@ class AdapterConformance:
         a = self.adapter()
         unavailable = self.select(_is_unavailable)
         assert unavailable, "no *unavailable* fixture"
+        assert self.select(_is_unavailable_quota), (
+            "no *unavailable_quota* fixture: `quota` is the only "
+            "provider-wide-cacheable category, so every adapter must witness "
+            "its own provider's budget-exhaustion wording against its own "
+            "signal table. Capture one if a live quota failure is available; "
+            "otherwise synthesize it from wording that is VERIFIABLY this "
+            "CLI's own — the installed binary's strings, or the provider's "
+            "documented error — and record which it is in the fixture "
+            "directory's README. See the module docstring")
         for fx in unavailable:
             assert fx.category, (
                 f"{fx.name}: every *unavailable* fixture must declare the "

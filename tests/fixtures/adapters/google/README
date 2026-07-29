@@ -115,6 +115,32 @@ unavailable_auth.txt
     No token was ever in these bytes — the point of the run is that there was
     none.
 
+unavailable_quota.txt
+    SYNTHESIZED envelope / BINARY-SOURCED wording. Rule 4 requires every
+    adapter to witness its own provider's budget-exhaustion wording against
+    its own signal table, and no live Google quota failure has been observed:
+    the balance that ran out during Task 14's acceptance run was xAI's. This
+    fixture is therefore NOT a capture and must not be read as one.
+    The load-bearing sentence, `You have exhausted your quota on this model.`,
+    is VERBATIM in the installed agy 1.1.8 binary (`strings`, alongside the
+    UI's own `Quota available` / `Quota exhausted` status labels). It matches
+    `exhausted your quota`, an entry added by the Task 14 audit from that same
+    binary — and it is precisely the sentence this adapter's older, narrower
+    table missed: that table matched `quota exceeded` and never a bare
+    `quota`, deliberately, because the Google protos this binary embeds are
+    dense with the word, and the binary's own sentence fell straight through
+    it to `ok`. This fixture is what stops that regressing.
+    What is ASSEMBLED, and is the fixture's honest weakness: the envelope
+    around the sentence (`status: ERROR`, zeroed `usage`, the `Error:` stderr
+    echo) follows `unavailable_auth.txt`'s real failure shape, and no quota
+    run has been observed to confirm the CLI reports exhaustion in it.
+    Declares `category=quota` — the only provider-wide-cacheable category, so
+    the one whose misdetection costs a healthy provider every later chain.
+    Deliberately does NOT contain `payment required`: that entry is marked
+    speculative for this provider in `agy.py`, and a fixture witnessing a
+    speculative entry would launder a guess into evidence. Replace this file
+    with a real sanitized capture when a live Google quota failure occurs.
+
 unavailable_model.txt
     CAPTURED, whole, from a run asking for a model id that does not exist.
     Declares `category=model`. stderr is EMPTY here, which is the interesting
