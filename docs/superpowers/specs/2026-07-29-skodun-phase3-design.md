@@ -19,7 +19,8 @@ Phase 3 is the surfaces phase: skodun stops being only a foreground CLI.
    happened" is stated explicitly, never read as silence.
 4. **Debt folded in** (owner decisions + triage): `Store.close()`/context manager
    (a long-lived dispatcher and server make connection lifetime real), append-only
-   `triage --reopen`, the `_TS_FORMAT` literal stragglers, the
+   `triage --reopen`, the `_TS_FORMAT` literal in `pipeline.py` (the `gate.py`
+   literal is explicitly DEFERRED — the byte-identity pledge wins), the
    `_fmt_binary`/`_binary_is_absent` duplication, and the pre-growth extraction of the
    chain executor into `chain.py` before the dispatcher adds to `pipeline.py` (1557
    lines already).
@@ -62,10 +63,11 @@ phases). The background failure modes map to existing fail-closed machinery:
 - **Machine sleep** → wall-clock ceilings mean an overdue `running` record is treated
   as dead and marked `failed`: the cost is a redundant re-review, never a stale trust.
 - **Two pushes racing** → same-branch supersede: before launching, the dispatcher
-  retires still-`running` *prepush-mode* workers of the same branch (foreground runs
-  are never touched), with the oracle's pid-reuse guard — only a pid whose command
-  line still names the skodun dispatcher entrypoint is signalled; an unconfirmable pid
-  is retired terminally without a signal.
+  retires still-`running` *prepush-mode* rows of the same branch (foreground runs are
+  never touched) inside one atomic reservation transaction, then signals only a pid
+  whose command line still names the skodun **worker** entrypoint (pid-reuse guard);
+  an unconfirmable pid gets no signal, and conditional finalization keeps its
+  already-terminal record immutable.
 - **Worker outliving its branch** → supersede on the next push plus stale recovery.
   (Note, stated precisely: the gate looks up by `diff_hash` alone and applies the
   matched review's own branch-scoped dismissals — so identical bytes at the same base
@@ -159,8 +161,8 @@ One config, two execution modes, explicit mode table:
 - `[dispatch]` table: `enabled` (default true once the shim is installed),
   `timeout_sec` (default 240 — oracle parity vs 420 foreground), `timeout_retries`
   (default 0 — a force-push storm must not accumulate workers), `dedup` (default
-  true), `large_prompt_bytes` (over this prompt size the background cap escalates to the foreground cap, oracle parity).
-  Everything absent falls back to `[defaults]`.
+  true), `large_prompt_bytes` (over this per-prompt size the background cap escalates to the foreground cap, oracle parity).
+  The `[dispatch]` table OWNS these five defaults (240 s / 0 retries deliberately differ from the foreground 420 s / 1); every `Defaults` field the table does not override is inherited unchanged.
 - Reviewer selection and fallback chains are identical in both modes. **Extra
   passes (security/skeptic/refuter) remain `--now`-only — oracle parity** (the
   oracle fires them only in foreground mode): background rounds are finder-only
