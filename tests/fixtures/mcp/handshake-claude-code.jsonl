@@ -1,0 +1,12 @@
+# CAPTURED handshake from the claude-code CLI 2.1.118 (see README for the probe).
+# The three `>` payloads are the client's own bytes, verbatim; the `<`
+# expectations are synthesized from the pinned protocol decisions.
+#
+# The client asks for 2025-11-25, which this server recognizes, so the reply
+# ECHOES it rather than answering with our own pinned constant.
+> {"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{},"elicitation":{}},"clientInfo":{"name":"claude-code","title":"Claude Code","version":"2.1.118","description":"Anthropic's agentic coding tool","websiteUrl":"https://claude.com/claude-code"}},"jsonrpc":"2.0","id":0}
+< {"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-11-25", "capabilities": {"$keys": ["tools", "prompts"], "tools": {"$type": "object"}, "prompts": {"$type": "object"}}, "serverInfo": {"name": "skodun", "version": {"$type": "string"}}}, "error": {"$absent": true}}
+# A notification: no reply, ever.
+> {"method":"notifications/initialized","jsonrpc":"2.0"}
+> {"method":"tools/list","jsonrpc":"2.0","id":1}
+< {"jsonrpc": "2.0", "id": 1, "result": {"tools": {"$type": "array"}}}

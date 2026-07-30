@@ -1,0 +1,13 @@
+!requires-fakes
+# SYNTHESIZED. The one tool registered `long_running=True` answers from its own
+# worker thread, and its response is an ordinary tool result -- the transport
+# does not leak which thread produced it. The fake `review` here returns
+# immediately; the busy path, the read loop's liveness while it runs, and the
+# EOF join are pinned in `tests/test_mcpserver.py`, where a test can hold the
+# handler still. A transcript cannot: two responses in flight have no
+# deterministic order on stdout.
+> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}
+< {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-11-25"}}
+> {"jsonrpc":"2.0","method":"notifications/initialized"}
+> {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"review","arguments":{}}}
+< {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": {"$contains": "reviewed"}}], "isError": false, "structuredContent": {"status": 0}}}

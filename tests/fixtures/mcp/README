@@ -1,0 +1,128 @@
+MCP protocol transcripts
+========================
+
+Witnesses for the JSON-RPC contract in `src/skodun/mcpserver.py`, driven by the
+harness in `tests/test_mcpserver.py` (which is where the format is normative).
+Each `.jsonl` file is a session: the lines a client sends, and the responses the
+server owes for them, in order.
+
+File format
+-----------
+
+One directive per line. Anything else is a broken fixture, not input.
+
+    # ...            a comment. Not sent, not counted.
+    (blank line)     ignored, same as a comment.
+    !<directive>     a harness flag for the whole file (see below).
+    > <payload>      send `<payload>` + "\n" to the server's stdin, UTF-8.
+                     `>` alone sends a bare newline; the payload keeps its own
+                     leading and trailing whitespace verbatim.
+    >b64 <base64>    send exactly these bytes + "\n". For lines that are not
+                     valid UTF-8, carry NUL bytes, or are pure whitespace that
+                     an editor would trim.
+    < <json object>   the next response line must match this PREDICATE.
+
+The harness reads the whole session, then matches the `<` predicates against the
+response lines IN ORDER and asserts there are exactly as many responses as
+predicates: an extra line on stdout is a failure even when every predicate
+passed, because stdout carries nothing but JSON-RPC. A file with no `<` lines
+asserts stdout is empty.
+
+A predicate is matched as a SUBSET, recursively: every key it names must be
+present and match, keys it does not name are free, and lists must have the same
+length and match element-wise. Scalars compare equal. Four escapes exist for the
+places where an exact value would be either brittle or unpinnable:
+
+    {"$type": "object"|"array"|"string"|"number"|"boolean"|"null"}
+    {"$contains": "substring"}      the value is a string containing it
+    {"$absent": true}               the key must NOT be present
+    {"$keys": ["a", "b"]}           the object has EXACTLY these keys
+    {"$version": "ours"}            equals `mcpserver.MCP_PROTOCOL_VERSION`
+
+File-level directives:
+
+    !requires-fakes        the session calls the test tool/prompt registry
+                           (`echo`, `refuse`, `boom`, `review`, `demo-prompt`),
+                           so it runs in-process only. Files without it run
+                           BOTH in-process and against a real `skodun mcp`
+                           subprocess, which is what proves the shipped entry
+                           point emits no stray stdout byte of its own.
+    !assert no-handler-calls   at the end of the session, no tool handler was
+                           invoked at all. This is how "ignored WITHOUT
+                           execution" is pinned as an absence of side effects
+                           rather than as an absence of output.
+
+Provenance
+----------
+
+The fixture-provenance rule says captures beat hand-writing. Here it applies to
+exactly one thing -- the handshake -- and cannot apply to the rest: no MCP
+client emits a batch array, a NUL byte, or an id-less `tools/call`, so an attack
+transcript has no capture to be taken from. Those files are marked SYNTHESIZED
+and say, in the file, which pinned decision each line comes from. The wording
+source for every synthesized file is the Task 13 protocol decision list (the
+Phase 3 plan, "Task 13: MCP stdio server core"), which fixed the codes and the
+shapes before any of this was written; the exception messages are this
+implementation's own and are matched by `$contains`, not by equality, so a
+reworded diagnostic is not a protocol change.
+
+handshake-claude-code.jsonl
+    CAPTURED (the three `>` payloads, byte-for-byte). Recorded 2026-07-30 from
+    the claude-code CLI 2.1.118 acting as an MCP client (`claude -p
+    --mcp-config` pointed at a stub server that logged every line it received
+    and answered a minimal handshake). It asks for protocol revision
+    2025-11-25. The `<` predicates are synthesized: the stub was a capture
+    device, not an oracle, so its replies pin nothing.
+handshake-codex-cli.jsonl
+    CAPTURED the same way and on the same day, from the codex CLI 0.144.5
+    (`codex exec -c mcp_servers...` against the same stub). It asks for
+    2025-06-18 and puts `_meta.progressToken` in `tools/list` params. The two
+    captures disagreeing about the revision is exactly why negotiation is a
+    rule (echo a recognized revision, else answer with ours) and not a constant.
+    The remaining lines of both captures (`notifications/initialized`,
+    `tools/list`) are included as the documented context they were recorded in.
+version-unrecognized.jsonl
+    SYNTHESIZED. The other half of the negotiation rule, plus the missing-field
+    and wrong-type cases. No client sends an unknown revision on purpose.
+pre-init.jsonl
+    SYNTHESIZED. `ping`/`initialize` allowed pre-handshake, everything else
+    -32002 "server not initialized", and the refusal is not a latch.
+garbage-bytes.jsonl
+    SYNTHESIZED. Invalid UTF-8, non-JSON text, a truncated object, NUL bytes,
+    and a bare number -- each answered once, id null, loop still serving.
+batch-and-non-objects.jsonl
+    SYNTHESIZED. Arrays rejected -32600 (MCP removed batching), non-object
+    JSON, a missing/wrong `jsonrpc`, a missing/wrong `method`, and ids of types
+    JSON-RPC does not allow.
+unknown-method.jsonl
+    SYNTHESIZED. -32601 for methods outside the served subset, silence for the
+    same names sent as notifications.
+malformed-params.jsonl
+    SYNTHESIZED. Every -32602 shape inside a known method, and the three
+    tolerated absences (`arguments` missing, `arguments: null`, `params: null`).
+notifications-interleaved.jsonl
+    SYNTHESIZED. Notifications between requests; string, zero, negative, empty
+    and above-2^53 ids echoed exactly.
+idless-request-only-methods.jsonl
+    SYNTHESIZED. The id-less `initialize` / `tools/call` / `prompts/get` rule,
+    with `!assert no-handler-calls` for the side-effect half.
+immediate-eof.jsonl
+    SYNTHESIZED, and deliberately empty: stdin closed with nothing said.
+blank-lines.jsonl
+    SYNTHESIZED. Bare newlines and whitespace-only lines are framing, not
+    messages; indentation around a real message is tolerated.
+tool-results.jsonl
+    SYNTHESIZED. The `{content, isError, structuredContent}` envelope, a
+    non-zero status, a raising handler, and the `tools/list` entry shape.
+long-running-tool.jsonl
+    SYNTHESIZED. The long-running tool's result is an ordinary tool result. Its
+    concurrency (busy, read-loop liveness, EOF join) is pinned in the test
+    module instead: two responses in flight have no deterministic order here.
+prompts.jsonl
+    SYNTHESIZED. `prompts/list` / `prompts/get` over a fake prompt; the real
+    `review-now` and `gate-check` prompts arrive in Task 14.
+
+The 8 MiB line cap has no file here on purpose: an 8-mebibyte fixture would be
+committed weight for a boundary that a loop generates in a millisecond. It is
+GENERATED at test runtime (`test_an_oversized_line_...`), both sides of the
+boundary.

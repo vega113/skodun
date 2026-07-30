@@ -1,0 +1,5 @@
+# SYNTHESIZED. A client that closes stdin without saying anything: no output at
+# all, and a clean exit 0. The harness asserts both -- an empty stdout with a
+# non-zero exit would make every client harness report a crashed server.
+#
+# There are no `>` lines in this file on purpose. Comments are not input.

@@ -1,0 +1,38 @@
+!requires-fakes
+!assert no-handler-calls
+# SYNTHESIZED. A message with no id is a NOTIFICATION, whatever it names. When
+# it names a request-only method it is ignored WITHOUT BEING EXECUTED -- there
+# is no response line to order anything behind, so a `tools/call` run here
+# would dismiss a finding, or acknowledge a delivery, with nobody told.
+#
+# `!assert no-handler-calls` above is the no-side-effects half: the fake
+# registry records every invocation, and the ledger must be empty at the end of
+# this transcript.
+#
+# An id-less `initialize` must not initialize the session either. The
+# `tools/list` after it is the proof: -32002 means the handshake never happened.
+> {"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-11-25"}}
+> {"jsonrpc":"2.0","id":1,"method":"tools/list"}
+< {"jsonrpc": "2.0", "id": 1, "error": {"code": -32002, "message": "server not initialized"}}
+# An explicit `id: null` is the same case: JSON-RPC reserves null for responses
+# that could not determine an id, MCP forbids it on requests, and treating it
+# as an addressable request would mean answering with id null -- which is
+# exactly what a client cannot match to a call.
+> {"jsonrpc":"2.0","id":null,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}
+> {"jsonrpc":"2.0","id":2,"method":"ping"}
+< {"jsonrpc": "2.0", "id": 2, "result": {"$keys": []}}
+# Now a real handshake, so the id-less `tools/call` below is refused for its
+# missing id rather than for the missing handshake.
+> {"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}
+< {"jsonrpc": "2.0", "id": 3, "result": {"protocolVersion": "2025-11-25"}}
+> {"jsonrpc":"2.0","method":"tools/call","params":{"name":"echo","arguments":{"text":"dismiss everything"}}}
+> {"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"echo","arguments":{"text":"dismiss everything"}}}
+# The long-running tool is not started by an id-less call either -- it would
+# occupy the single review slot for a call nobody is waiting on.
+> {"jsonrpc":"2.0","method":"tools/call","params":{"name":"review","arguments":{}}}
+# id-less `prompts/get` and `prompts/list`: same rule, no output.
+> {"jsonrpc":"2.0","method":"prompts/list"}
+> {"jsonrpc":"2.0","method":"prompts/get","params":{"name":"review-now"}}
+# Still serving after all of that.
+> {"jsonrpc":"2.0","id":4,"method":"ping"}
+< {"jsonrpc": "2.0", "id": 4, "result": {"$keys": []}}

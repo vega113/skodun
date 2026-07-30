@@ -1,0 +1,19 @@
+# SYNTHESIZED. Empty and whitespace-only lines are framing, not messages: a
+# writer that flushes a bare newline has not asked for anything, and answering
+# -32700 would fill the client's log with errors about nothing. Ignored in
+# silence, and never mistaken for EOF (the loop keeps reading).
+>
+>
+>
+# Three spaces, spelled in base64 so no editor can silently trim them away.
+>b64 ICAg
+> {"jsonrpc":"2.0","id":1,"method":"ping"}
+< {"jsonrpc": "2.0", "id": 1, "result": {"$keys": []}}
+>
+> {"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+< {"jsonrpc": "2.0", "id": 2, "result": {"protocolVersion": "2025-06-18"}}
+# Leading and trailing whitespace around a real message is tolerated too -- the
+# line is stripped before parsing, so a pretty-printer's indentation does not
+# become a protocol error.
+>   {"jsonrpc":"2.0","id":3,"method":"ping"}
+< {"jsonrpc": "2.0", "id": 3, "result": {"$keys": []}}

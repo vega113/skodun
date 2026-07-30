@@ -1,0 +1,43 @@
+!requires-fakes
+# SYNTHESIZED. Everything a client can get wrong INSIDE a known method is
+# -32602. The tool registry behind this transcript is the test fake (`echo`,
+# `refuse`, `boom`, `review`), so "unknown tool" here means unknown, not absent.
+> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+< {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18"}}
+# `params` of the wrong type.
+> {"jsonrpc":"2.0","id":2,"method":"tools/call","params":[]}
+< {"jsonrpc": "2.0", "id": 2, "error": {"code": -32602, "message": {"$contains": "params"}}, "result": {"$absent": true}}
+> {"jsonrpc":"2.0","id":3,"method":"tools/call","params":"echo"}
+< {"jsonrpc": "2.0", "id": 3, "error": {"code": -32602}}
+# No tool named.
+> {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{}}
+< {"jsonrpc": "2.0", "id": 4, "error": {"code": -32602, "message": {"$contains": "name"}}}
+> {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":7,"arguments":{}}}
+< {"jsonrpc": "2.0", "id": 5, "error": {"code": -32602, "message": {"$contains": "name"}}}
+> {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"","arguments":{}}}
+< {"jsonrpc": "2.0", "id": 6, "error": {"code": -32602, "message": {"$contains": "name"}}}
+# A tool that does not exist. A PROTOCOL error, not a tool-level `isError`
+# result: no tool ran, so there is no tool output to report.
+> {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"rm-rf","arguments":{}}}
+< {"jsonrpc": "2.0", "id": 7, "error": {"code": -32602, "message": {"$contains": "rm-rf"}}, "result": {"$absent": true}}
+# `arguments` of the wrong type. A handler reads `params` as a mapping; a list
+# would be an AttributeError inside somebody's validator instead of an answer.
+> {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"echo","arguments":[1,2]}}
+< {"jsonrpc": "2.0", "id": 8, "error": {"code": -32602, "message": {"$contains": "arguments"}}}
+> {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"echo","arguments":"text"}}
+< {"jsonrpc": "2.0", "id": 9, "error": {"code": -32602, "message": {"$contains": "arguments"}}}
+# Absent `arguments` is NOT malformed: a no-argument tool is called without it,
+# and both observed clients omit it in that case.
+> {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"echo"}}
+< {"jsonrpc": "2.0", "id": 10, "result": {"isError": false, "structuredContent": {"status": 0}}}
+# `arguments: null` reads as "no arguments" for the same reason.
+> {"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"echo","arguments":null}}
+< {"jsonrpc": "2.0", "id": 11, "result": {"isError": false}}
+# `params: null` on a method that needs none is likewise not malformed.
+> {"jsonrpc":"2.0","id":12,"method":"tools/list","params":null}
+< {"jsonrpc": "2.0", "id": 12, "result": {"tools": {"$type": "array"}}}
+# prompts/get: the same shape of refusal, for the same reasons.
+> {"jsonrpc":"2.0","id":13,"method":"prompts/get","params":{}}
+< {"jsonrpc": "2.0", "id": 13, "error": {"code": -32602, "message": {"$contains": "name"}}}
+> {"jsonrpc":"2.0","id":14,"method":"prompts/get","params":{"name":"no-such-prompt"}}
+< {"jsonrpc": "2.0", "id": 14, "error": {"code": -32602, "message": {"$contains": "no-such-prompt"}}}

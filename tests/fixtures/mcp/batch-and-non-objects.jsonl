@@ -1,0 +1,47 @@
+# SYNTHESIZED. MCP removed JSON-RPC batching, so an ARRAY is not a batch this
+# server has to unpack -- it is an invalid request, answered -32600 once with
+# id null. Executing the members would run requests whose responses no client
+# is waiting for, in an order nobody agreed on.
+> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+< {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18"}}
+> [{"jsonrpc":"2.0","id":2,"method":"ping"},{"jsonrpc":"2.0","id":3,"method":"ping"}]
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": {"$contains": "batch"}}, "result": {"$absent": true}}
+# An array of one is still an array.
+> [{"jsonrpc":"2.0","id":4,"method":"ping"}]
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": {"$contains": "batch"}}}
+# An empty array too.
+> []
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": {"$contains": "batch"}}}
+# Other valid-JSON non-objects: a string, a number, a bare null, a bool.
+> "ping"
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32600}}
+> 42
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32600}}
+> null
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32600}}
+> true
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32600}}
+# A JSON-RPC 1.0 request (no `jsonrpc` member) names a version this server does
+# not speak. It carries an id, so it gets an answer.
+> {"id":5,"method":"ping"}
+< {"jsonrpc": "2.0", "id": 5, "error": {"code": -32600, "message": {"$contains": "jsonrpc"}}}
+> {"jsonrpc":"1.0","id":6,"method":"ping"}
+< {"jsonrpc": "2.0", "id": 6, "error": {"code": -32600, "message": {"$contains": "jsonrpc"}}}
+# An object with an id and no method at all.
+> {"jsonrpc":"2.0","id":7}
+< {"jsonrpc": "2.0", "id": 7, "error": {"code": -32600, "message": {"$contains": "method"}}}
+> {"jsonrpc":"2.0","id":8,"method":42}
+< {"jsonrpc": "2.0", "id": 8, "error": {"code": -32600, "message": {"$contains": "method"}}}
+> {"jsonrpc":"2.0","id":9,"method":""}
+< {"jsonrpc": "2.0", "id": 9, "error": {"code": -32600, "message": {"$contains": "method"}}}
+# An id of a type JSON-RPC does not allow cannot be echoed, so the answer
+# carries id null rather than inventing one.
+> {"jsonrpc":"2.0","id":{"seq":1},"method":"ping"}
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": {"$contains": "id"}}}
+> {"jsonrpc":"2.0","id":[1],"method":"ping"}
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": {"$contains": "id"}}}
+> {"jsonrpc":"2.0","id":true,"method":"ping"}
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": {"$contains": "id"}}}
+# Still serving.
+> {"jsonrpc":"2.0","id":10,"method":"ping"}
+< {"jsonrpc": "2.0", "id": 10, "result": {"$keys": []}}

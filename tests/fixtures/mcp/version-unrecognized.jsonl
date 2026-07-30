@@ -1,0 +1,11 @@
+# SYNTHESIZED. The other half of the negotiation rule: a revision this server
+# does not know is answered with OUR pinned constant, never echoed back.
+> {"jsonrpc":"2.0","id":7,"method":"initialize","params":{"protocolVersion":"1999-01-01","capabilities":{},"clientInfo":{"name":"nobody","version":"0"}}}
+< {"jsonrpc": "2.0", "id": 7, "result": {"protocolVersion": {"$version": "ours"}, "serverInfo": {"name": "skodun"}}}
+# A client that sends no protocolVersion at all gets the same answer, and is
+# still initialized -- the handshake is not refused over a missing field.
+> {"jsonrpc":"2.0","id":8,"method":"initialize","params":{}}
+< {"jsonrpc": "2.0", "id": 8, "result": {"protocolVersion": {"$version": "ours"}}}
+# A protocolVersion of the wrong TYPE is malformed params, not a negotiation.
+> {"jsonrpc":"2.0","id":9,"method":"initialize","params":{"protocolVersion":20251125}}
+< {"jsonrpc": "2.0", "id": 9, "error": {"code": -32602, "message": {"$contains": "protocolVersion"}}, "result": {"$absent": true}}

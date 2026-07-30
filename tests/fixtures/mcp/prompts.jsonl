@@ -1,0 +1,15 @@
+!requires-fakes
+# SYNTHESIZED. `prompts/list` and `prompts/get` are the slash-command surface
+# (`/mcp__skodun__<name>` in every observed client). Task 13 serves the two
+# methods; the prompt registry behind this transcript is a fake, because the
+# real `review-now` / `gate-check` prompts are Task 14's.
+> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}
+< {"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {"prompts": {"$type": "object"}}}}
+> {"jsonrpc":"2.0","id":2,"method":"prompts/list"}
+< {"jsonrpc": "2.0", "id": 2, "result": {"prompts": [{"$keys": ["name", "description"], "name": "demo-prompt", "description": {"$type": "string"}}]}}
+> {"jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"demo-prompt"}}
+< {"jsonrpc": "2.0", "id": 3, "result": {"$keys": ["description", "messages"], "messages": [{"$keys": ["role", "content"], "role": "user", "content": {"$keys": ["type", "text"], "type": "text", "text": {"$contains": "demo"}}}]}}
+# `arguments` on a static prompt is accepted and ignored -- a client that sends
+# an empty argument object must not get a refusal for it.
+> {"jsonrpc":"2.0","id":4,"method":"prompts/get","params":{"name":"demo-prompt","arguments":{}}}
+< {"jsonrpc": "2.0", "id": 4, "result": {"messages": [{"role": "user"}]}}
