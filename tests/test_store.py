@@ -1543,6 +1543,7 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_dispatch.py",
     "tests/test_refuter.py",
     "tests/test_triage.py",
+    "tests/test_delivery.py",
 )
 
 

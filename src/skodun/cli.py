@@ -26,8 +26,13 @@ are guarded below:
     listing that is never a gate and prints no verdict line on any of its
     exit codes; `dispatch`, which reserves records and starts workers but
     decides nothing about a push (and whose exit code is 0 on EVERY path
-    for that reason -- a hook must not block on review machinery); and
-    `install-hooks`, which writes a file and reports on it.
+    for that reason -- a hook must not block on review machinery);
+    `install-hooks`, which writes a file and reports on it; and `surface`,
+    whose STDOUT IS A PAYLOAD -- a SessionStart hook feeds it to an agent
+    verbatim, and under `--hook-format claude` it is a single JSON object,
+    so a banner appended to it would corrupt exactly the output that is
+    meant to be consumed. Everything `surface` has to say ABOUT itself goes
+    to stderr for the same reason.
 """
 
 import argparse
@@ -162,6 +167,25 @@ def build_parser() -> argparse.ArgumentParser:
             ("--base-ref", "the base's ref name, as recorded")):
         worker.add_argument(flag, required=flag != "--base-ref", default="",
                             help=helptext)
+
+    # The delivery surface. `--hook-format`'s choices are spelled LITERALLY here
+    # rather than imported from `delivery.FORMATS`: `build_parser` runs for every
+    # invocation of every subcommand, and this module's whole import discipline is
+    # that no command pays for another command's module graph (nor inherits its
+    # import failures). `test_the_hook_format_choices_are_the_delivery_modules_own`
+    # pins the two spellings against each other so they cannot drift.
+    surf = sub.add_parser(
+        "surface",
+        help="report background review rounds nobody has been shown yet")
+    surf.add_argument("--branch", default=None,
+                      help="branch to report on (default: the checked-out one)")
+    surf.add_argument("--hook-format", default="text", dest="hook_format",
+                      choices=("text", "claude"),
+                      help="`text` for plain lines, `claude` for the SessionStart "
+                           "JSON envelope (default: text)")
+    surf.add_argument("--include-delivered", action="store_true",
+                      dest="include_delivered",
+                      help="replay rounds that were already delivered too")
 
     hooks = sub.add_parser(
         "install-hooks",
@@ -300,6 +324,71 @@ def _blackhole_stdout() -> None:
             os.close(fd)
     except BaseException:
         pass
+
+
+def _warn(message: str, code: int) -> int:
+    """Say something on STDERR and return `code`. Never raises, never touches
+    stdout.
+
+    `_emit`'s sibling for the one command whose stdout is a PAYLOAD rather than a
+    verdict: a note about the surface itself, written onto the stream a hook
+    consumes, would corrupt the report -- and under `--hook-format claude` it
+    would corrupt a JSON document. stderr is also the only stream left when the
+    reason for the message is that stdout is dead.
+    """
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except BaseException:
+        pass        # a diagnostic may never become the failure itself
+    return code
+
+
+def _emit_delivery(text: str) -> bool:
+    """Write a delivery payload to stdout and REPORT whether it landed.
+
+    The shipped `_emit` SWALLOWS a write failure, because there the exit code is
+    the product and the printed line is a courtesy. Here it is the other way
+    round: the payload IS the product, and the acknowledgement that follows is
+    only allowed to happen if this returned True. So every failure is reported
+    rather than absorbed.
+
+    Buffering is never success: the flush is inside the guard, because bytes
+    sitting in a buffer have not reached a reader and a flush at interpreter exit
+    would fail where nobody can act on it.
+
+    A `UnicodeEncodeError` gets the same lossy retry `_emit` gives it, and
+    counts as DELIVERED when the retry succeeds. That is deliberate: the stream is
+    alive and only this text's characters do not fit its encoding -- the reserved
+    no-review line carries an em dash, and an ASCII-only locale is exactly where
+    it will meet a stream that cannot encode it. `backslashreplace` keeps every
+    character accounted for, so the reader gets the whole report; treating that as
+    a failed delivery would instead repeat the same report at every session start
+    forever on such a machine.
+    """
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        return True
+    except UnicodeEncodeError:
+        try:
+            encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+            # Round-tripped through the stream's own encoding with a lossy error
+            # handler, so the retry is made only of characters that encoding can
+            # represent and cannot fail the same way twice.
+            lossy = text.encode(encoding, errors="backslashreplace").decode(encoding)
+            sys.stdout.write(lossy)
+            sys.stdout.flush()
+            return True
+        except BaseException:
+            _blackhole_stdout()
+            return False
+    except BaseException:
+        # A dead stream (broken pipe, closed fd, full disk). Redirect it at
+        # devnull before returning: CPython flushes stdout again during
+        # finalization and a failure there is reported as exit status 120, which
+        # is not in this command's contract either.
+        _blackhole_stdout()
+        return False
 
 
 def _cmd_gate(args) -> int:
@@ -518,6 +607,98 @@ def _cmd_worker(args) -> int:
         from .trust import banner_failure
         return _emit(banner_failure(f"the review worker crashed: {e!r}"), 2)
     return _emit(outcome.message, outcome.code)
+
+
+def _cmd_surface(args) -> int:
+    """Deliver the background review rounds nobody has been shown. Exit codes:
+
+      0  the report reached stdout and the ledger recorded it (or there was
+         nothing to report)
+      2  it did not: no store, no branch, an unwritable report, or an
+         unrecordable delivery
+
+    There is no code for "there were findings", deliberately: this command
+    delivers history and certifies nothing about the working tree, so a hook
+    calling it must not be able to read a verdict out of its status. `skodun
+    gate` is the only thing that answers that question.
+
+    THE ORDER BELOW IS THE PRODUCT. `delivery.surface` renders and acknowledges
+    only the QUIET rounds (nothing deliverable can be lost by marking a
+    trustworthy zero-finding round now); everything with content is acknowledged
+    HERE, after `_emit_delivery` has confirmed the write AND the flush. Marking
+    first is the mutation that passes every other test in this file: a report
+    dropped on the way out would be recorded as delivered and never shown again,
+    which is precisely the undelivered-findings failure this command exists to
+    fix, reintroduced by the fix.
+
+    A failed emit therefore leaves the rounds undelivered and says so on stderr.
+    So does a failed ACK -- but that one has already reached the reader, so the
+    cost is a repeat rather than a loss. Delivered-twice is the designed failure
+    mode in both directions.
+    """
+    try:
+        from . import delivery
+        from .store import Store
+    except BaseException as e:
+        return _warn(f"skodun surface: could not load the delivery surface: {e!r}",
+                     2)
+
+    fmt = args.hook_format
+    branch = args.branch
+    if not branch:
+        # A detached HEAD answers `HEAD` here, which matches no round and reports
+        # nothing -- correct: rounds are keyed to a branch, and a detached
+        # checkout is not on one. `--branch` is how a human asks anyway.
+        try:
+            from . import gitio
+            branch = gitio.current_branch(Path("."))
+        except BaseException as e:
+            return _warn(
+                f"skodun surface: could not work out which branch to report on "
+                f"({e!r}); pass --branch", 2)
+    if not branch:
+        return _warn("skodun surface: could not work out which branch to report "
+                     "on; pass --branch", 2)
+
+    try:
+        store = Store.open(_store_path())
+    except BaseException as e:
+        return _warn(f"skodun surface: could not open the store: {e!r}", 2)
+
+    with store:
+        try:
+            _status, text, pending = delivery.surface(
+                store, branch, fmt, bool(args.include_delivered))
+        except BaseException as e:
+            return _warn(
+                f"skodun surface: could not read the delivery ledger: {e!r}", 2)
+
+        if not text:
+            # Silence on stdout, on purpose: a hook that injects an empty report
+            # at every session start is noise. The human at the terminal still
+            # gets an answer, on the stream a hook does not read.
+            return _warn(
+                f"skodun surface: no undelivered background review rounds on "
+                f"branch {branch}", 0)
+
+        if not _emit_delivery(text):
+            return _warn(
+                f"skodun surface: the report could not be written to stdout; "
+                f"{len(pending)} round(s) stay UNDELIVERED and will be reported "
+                f"again", 2)
+
+        if not pending:
+            # Reachable only through `--include-delivered`, whose replay may
+            # render rounds that are all already in the ledger.
+            return 0
+        try:
+            delivery.acknowledge(store, pending, delivery.channel_for_format(fmt))
+        except BaseException as e:
+            return _warn(
+                f"skodun surface: the report above was delivered but could not be "
+                f"recorded ({e!r}); {len(pending)} round(s) will be reported "
+                f"again", 2)
+        return 0
 
 
 def _cmd_install_hooks(args) -> int:
@@ -1246,6 +1427,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_log(args)
         if args.command == "triage":
             return _cmd_triage(args)
+        if args.command == "surface":
+            return _cmd_surface(args)
         if args.command == "dispatch":
             return _cmd_dispatch(args)
         if args.command == "worker":
