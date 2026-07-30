@@ -1,4 +1,4 @@
-"""Three extra review passes, and how their results fold back into the primary.
+"""Extra review passes, and how their results fold back into the primary.
 
 * **security** — a dedicated, security-only pass, scheduled only in `now` mode
   and only when the change touches a risky path.
@@ -12,21 +12,36 @@
   and only when a reviewer with role `refuter` is configured. Unlike the other
   two it is **annotation only**: see "The refuter is annotation only" below.
 
-All three are opt-out via env kill switches (`SKODUN_SECURITY_PASS=0`,
+A fourth pass lives here and is NOT one of those three:
+
+* **integration** — one cross-file pass over the seams a BATCHED review cuts.
+  Batching guarantees every hunk is reviewed somewhere and guarantees no
+  reviewer ever sees two batches at once, so it creates exactly one blind spot:
+  a caller in file A broken by a change in file B, where A and B landed in
+  different batches. This pass is that blind spot's only cover. It is
+  scheduled by BATCH COUNT rather than by mode (`should_run_integration`) — a
+  background prepush review gets it too — and it is COVERAGE, not annotation:
+  its outcome joins the aggregate's trust axes, so a failed or degraded
+  integration pass makes the whole batched aggregate untrustworthy. See "The
+  integration pass" below.
+
+The first three are opt-out via env kill switches (`SKODUN_SECURITY_PASS=0`,
 `SKODUN_SKEPTIC_PASS=0`, `SKODUN_REFUTER_PASS=0`), so a wedged pass can be
 turned off without a config edit or a code change. All three read the switch
 through `_killed`, which compares against the exact string `"0"` — `bool("0")`
 and `bool("false")` are both True in Python, and treating the env value as a
-truthy string is how a kill switch silently stops killing.
+truthy string is how a kill switch silently stops killing. The integration pass
+has NO such switch, deliberately: see "The integration pass".
 
 PARITY-CRITICAL: vendored from the oracle's `scripts/grok-extra-passes.py`
 (`path_is_risky`, `should_run_security`, `should_run_skeptic`,
-`merge_extra_pass`, `write-security-prompt`, `write-skeptic-prompt`). The two
-prompt bodies were transferred from the oracle's own source — the line lists
-were extracted from its AST, never retyped — and `tests/test_passes.py` pins
-them byte-for-byte against the live oracle, along with the trigger decision and
-the merge result. Deliberate divergences are marked `DIVERGENCE` below and each
-one has its own test.
+`merge_extra_pass`, `write-security-prompt`, `write-skeptic-prompt`), and, for
+the integration pass, from `scripts/grok-prepush-review.sh`'s `--run-batched`
+region. The two prompt bodies were transferred from the oracle's own source —
+the line lists were extracted from its AST, never retyped — and
+`tests/test_passes.py` pins them byte-for-byte against the live oracle, along
+with the trigger decision and the merge result. Deliberate divergences are
+marked `DIVERGENCE` below and each one has its own test.
 
 Risky surfaces are CONFIGURATION, not code
 ------------------------------------------
@@ -160,6 +175,53 @@ forgery with. Same defensive class as `_finding_lines`'s title-collapsing:
 untrusted, model-authored text must not be able to forge structure a reader
 (here, a later `triage --adopt-refuter`) would trust.
 
+The integration pass
+--------------------
+Everything above is about one review of one diff. The integration pass is about
+a review that had to be split, and its rules follow from that:
+
+**Two batches or more, or not at all.** `should_run_integration` is the whole
+schedule: one batch has no cross-batch relationship to find, and asking a model
+to compare one file list with itself would bill a call for a foregone answer.
+The floor is the oracle's (`BATCH_COUNT -ge 2`), and `integration_prompt`
+REFUSES fewer than two batch summaries rather than rendering a degenerate
+prompt — the same choice `merge_extra_pass(primary, None)` makes for the same
+reason: a caller error that costs a model call should not be expressible.
+
+**No kill switch.** The three `--now` passes have one because each is an extra
+opinion, and an extra opinion can be given up. This pass is the only cover for
+the blind spot batching cut, so switching it off would leave a batched
+aggregate reading as a full review of a change no reviewer ever saw whole —
+which is the false clear the fail-closed rule exists to forbid. A run that does
+not want it can stay under one batch.
+
+**Headers, never bodies.** The prompt carries each batch's file list, its
+`diff --git`/`@@` header lines (`batching.changed_regions`, capped per batch),
+its one-line summary and its findings. Bodies are what did not fit one prompt;
+carrying them would rebuild the prompt batching exists to avoid. The extraction
+happens INSIDE the builder, from the batch's own bytes, so no call site can
+leak a body by handing over the wrong thing.
+
+**Checklist modes, first consumers.** `checklist.select` has had `batch` and
+`integration` modes since Phase 1 with nothing to use them. Now: a per-batch
+prompt selects `batch`, which never injects a cross-file rule (a rule about
+relationships between files, asked of a reviewer holding one slice of the
+change, is a false-positive engine), and the integration prompt selects
+`integration`, which is `core` + `cross-file` only. `batch_checklist_mode`
+carries the one exception, which is the oracle's: the SOLE batch selects `full`,
+because with one batch there is no integration pass and that batch IS the whole
+diff — anything else would make a one-batch run review less than the same diff
+reviewed unbatched.
+
+**Its own record shape.** The pass does not go through `merge_extra_pass`:
+there is no "primary" to fold into, only an aggregate assembled from every
+batch. `integration_meta` is the one shape its outcome persists as (oracle A8's
+`integration{}`), and it carries `attempts` where `extra_passes[<name>]`
+deliberately does not — for the extra passes the attempt list was telemetry
+about an optional opinion, here it is the audit trail of a trust axis. How
+those fields JOIN the aggregate's axes is the aggregation step's, not this
+module's.
+
 DIVERGENCES from the oracle
 ---------------------------
 1. **A pass that produced nothing demotes, and says so by name.** The oracle
@@ -186,11 +248,28 @@ DIVERGENCES from the oracle
    oracle's CLI writes the truncation flag to a `<prompt>.flags` sidecar because
    its orchestrator needs it to set `partial_coverage`; in-process there is no
    reason to launder that fact through the filesystem, and `Prompt` already
-   carries it next to the bytes.
+   carries it next to the bytes. `integration_prompt` too, for the same reason:
+   the oracle's builder prints `"1"`/`"0"` on stdout precisely so its caller can
+   set `GR_DIFF_TRUNCATED`, and that fact belongs beside the bytes it describes.
 4. **A non-positive `max_diff_bytes` raises** rather than being clamped back to
    the oracle's default — matching `promptbuild.build`, and for the same reason:
    a zero budget silently ships a prompt with no diff in it, which reads to the
-   model as "nothing changed".
+   model as "nothing changed". Same for `integration_prompt`'s
+   `max_prompt_bytes`.
+5. **Integration findings are TAGGED.** The oracle folds them into the aggregate
+   raw (`findings.extend(inf)`), so nothing in the stored record distinguishes a
+   cross-file finding from a within-batch one. `tag_integration_findings` puts
+   them through the same `_tag` rules every other extra pass uses, because which
+   lens produced a finding is the first thing a reader of `surface` needs and it
+   is unrecoverable once merged.
+6. **Untrusted batch content cannot forge prompt structure.** A batch's summary
+   and findings are MODEL OUTPUT being pasted into another model's prompt — the
+   same class of problem `_finding_lines` collapses titles for. The oracle
+   interpolates them raw, so a summary containing a newline could open a batch
+   block of its own; here every interpolated field is whitespace-collapsed, so
+   one batch is one block and one finding is one line. The 300-character detail
+   bound is the oracle's (it measures the collapsed text here, which is the same
+   budget spent on content rather than on whitespace).
 """
 
 from __future__ import annotations
@@ -199,13 +278,18 @@ import fnmatch
 import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from .adapters import REFUTER_VERDICTS
+from .batching import MAX_REGION_LINES, changed_regions
 from .config import SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOTS, Defaults
-from .promptbuild import Prompt
+from .promptbuild import RULES_BEGIN, RULES_END, Prompt
 from .textnorm import collapse_ws
 from .triage import MIN_REASON_CHARS
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from skodun.checklist import Selection
 
 #: Env kill switches. Set any of them to `0` to never schedule that pass.
 SECURITY_PASS_ENV = "SKODUN_SECURITY_PASS"
@@ -214,6 +298,26 @@ REFUTER_PASS_ENV = "SKODUN_REFUTER_PASS"
 
 #: The refuter pass's name, in `extra_passes` and in every note it writes.
 REFUTER_PASS = "refuter"
+
+#: The integration pass's name, in `integration{}`, in the reviewer-role table
+#: and in the `(integration) ` tag on every finding it produces.
+INTEGRATION_PASS = "integration"
+
+#: The reviewer role the integration pass prefers over the finder. One of
+#: `config.ROLES`, shipped since Phase 1 and unused until this pass existed.
+INTEGRATION_ROLE = "integrator"
+
+#: `checklist.select` modes. `integration` is `core` + `cross-file` only;
+#: `batch` never injects a cross-file rule. Both shipped in Phase 1 with no
+#: consumer; these are the two names that give them one.
+INTEGRATION_CHECKLIST_MODE = "integration"
+BATCH_CHECKLIST_MODE = "batch"
+
+#: What the integration pass's `status` may say. `skipped` is deliberately NOT
+#: here: a run that did not earn the pass records no `integration{}` at all
+#: (readers tolerate absence), so a `skipped` status would be a second, weaker
+#: way of saying the same thing.
+INTEGRATION_STATUSES = ("ran", "degraded", "failed")
 
 #: The diff budget, sourced from config so there is exactly one of this number
 #: (it is also the oracle's own `GROK_MAX_DIFF_BYTES` default).
@@ -406,6 +510,55 @@ def should_run_refuter(
     """Whether to spend a second provider's call re-examining the findings."""
     return refuter_decision(mode, finder_trustworthy, finder_findings_total,
                             cfg, env)[0]
+
+
+def should_run_integration(batch_count: Any) -> bool:
+    """Whether a batched review earns a cross-file integration pass.
+
+    Two batches or more, and nothing else — the oracle's `BATCH_COUNT -ge 2`.
+    One batch has no cross-batch relationship to find (that batch IS the whole
+    diff), and zero batches is the terminal "batching produced nothing" failure,
+    which needs a record and not another model call.
+
+    Deliberately NOT mode-gated, unlike the three passes above: the blind spot
+    this covers is cut by batching, not by `--now`, so a background prepush
+    review that had to be split needs it just as much. Deliberately NOT
+    kill-switchable either — see "The integration pass" in the module docstring.
+
+    A count that will not parse as an integer is treated as "unknown", which is
+    not "two or more", exactly as in `should_run_skeptic`.
+    """
+    try:
+        n = int(batch_count)
+    except (TypeError, ValueError):
+        n = 0
+    return n >= 2
+
+
+def batch_checklist_mode(batch_count: Any) -> str:
+    """Which `checklist.select` mode ONE batch's prompt asks for.
+
+    `batch` — never a cross-file rule — for every batch of a real split. A rule
+    about relationships between files, injected into a prompt holding one slice
+    of the change, asks the reviewer to check a contract whose other half is in
+    a batch it cannot see; that is a false-positive engine, and it is why the
+    cross-file rules go to the integration pass instead.
+
+    ORACLE BEHAVIOR at the sole-batch edge, and it is the one place this
+    diverges from the plan's "per-batch prompts select mode `batch`": ONE batch
+    selects `full`, because then there is no integration pass and that batch is
+    the whole diff. `pipeline.run_review` selects `"full"` for an unbatched
+    review, so this keeps a one-batch run byte-identical to the same diff
+    reviewed unbatched — anything else would make batching quietly review LESS.
+
+    An unparseable or degenerate count reads as "not the sole batch", i.e. never
+    cross-file: the fail-closed direction for a false-positive hazard.
+    """
+    try:
+        n = int(batch_count)
+    except (TypeError, ValueError):
+        n = 0
+    return "full" if n == 1 else BATCH_CHECKLIST_MODE
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +839,227 @@ def refuter_prompt(
 
 
 # ---------------------------------------------------------------------------
+# The integration prompt
+# ---------------------------------------------------------------------------
+# Ported from the oracle's `--run-batched` integration-context builder (an
+# inline `python3 - <<'PY'` heredoc, so this is a vendor-and-adapt port of real
+# code). The STRUCTURE is the oracle's — cross-file-only instruction, headers
+# without bodies, one `===== BATCH n =====` block per batch carrying files /
+# changed regions / summary / findings, and a whole-prompt byte cap that flags
+# rather than silently drops.
+#
+# PUBLIC OSS HYGIENE — this is shipped prompt data, sent to a model in every
+# repo that runs skodun, and is held to the same rule as any other committed
+# string: no upstream-project names, no one repo's layout vocabulary, no machine
+# paths. The oracle's own text cited a rule id out of its own registry as the
+# citation example; the example here is the one `promptbuild._INTRO` already
+# ships, so skodun has exactly ONE rule-id example across every prompt it sends
+# and no second project-flavoured literal in the tree. Like the refuter prompt
+# and unlike the security prompt, this text names no repo-specific concept at
+# all — it talks about batches, files and findings — so it needs no slot
+# interface and takes no config. There is deliberately no `%(slot)s` span to
+# fill, and `test_the_shipped_integration_prompt_is_generic_and_slot_free` pins
+# that.
+#
+# Apart from that ONE example the lead is the oracle's own wording, line for
+# line, and the JSON contract line is byte-identical to it (pinned by
+# `test_oracle_response_contract_is_byte_identical`) — it is a schema the model
+# is asked to match, so a stray comma there costs more than a whole class of
+# bugs here, exactly as `promptbuild`'s docstring says of the primary contract.
+#
+# `%d` is the batch count and is the ONLY `%` in the template; nothing else here
+# may contain a bare one (same rule as `_SECURITY_LEAD_TEMPLATE`). The oracle
+# interpolates the count with `%s` off an env var that defaults to `"?"`; in
+# process the count is `len(batch_summaries)` and always known, so `%d` refuses
+# a non-number rather than rendering a prompt that says "reviewed in ? batches".
+_INTEGRATION_LEAD_TEMPLATE: tuple[str, ...] = (
+    'You are a senior code reviewer doing the FINAL CROSS-FILE INTEGRATION',
+    'pass of a large pull request that was reviewed in %d separate batches.',
+    'Each batch below lists the files it covered, its changed regions (the',
+    '`diff --git` + `@@` hunk headers, which name the changed files and',
+    'enclosing functions), its one-line summary, and its within-batch',
+    'findings. Full hunk bodies are omitted (the diff was too large for one',
+    'prompt -- that is why it was batched). Your job is to surface ONLY',
+    'cross-file / integration problems that a single-batch review could not',
+    'see -- e.g. a caller in one file broken by a signature or behaviour',
+    'change in another, an inconsistent contract across files, a removed',
+    'symbol still used elsewhere, or a migration/schema change not matched by',
+    'its callers. Do NOT repeat within-batch findings already listed. Be',
+    'precise and conservative -- do not invent issues. Do NOT modify files or',
+    'run commands.',
+    '',
+    'Respond with ONLY a single JSON object (no prose, no markdown fences):',
+    '{"summary":"one-line cross-file assessment","findings":[{"file":"path",'
+    '"line":0,"severity":"high|medium|low",'
+    '"category":"bug|security|perf|correctness|other",'
+    '"title":"short title","detail":"why it matters"}]}',
+    'If there are no cross-file issues, return an empty findings array.',
+    'Additionally check against the repo rules below; cite the rule id in the',
+    'finding title when one is violated (e.g. "[no-blocking-handler] ...").',
+    '',
+)
+
+#: One batch's block frame. The number is the batch's POSITION in the list this
+#: builder was handed, which is the order the splitter produced and the order
+#: the aggregate reports — so `BATCH 2` here and `batches[1]` there are the same
+#: batch without a cross-reference.
+_INTEGRATION_BATCH = "===== BATCH %d ====="
+
+#: Said once per batch whose region list hit the cap, so a short list never
+#: reads as "this batch changed almost nothing".
+_REGIONS_OMITTED = "... (more changed regions omitted)"
+
+_INTEGRATION_TRUNCATED = "----- INTEGRATION CONTEXT TRUNCATED at %d bytes -----"
+
+#: How much of one within-batch finding's detail travels into the cross-file
+#: prompt. The oracle's `[:300]`: enough to say what the finding was about,
+#: bounded because this prompt carries EVERY batch's findings and a handful of
+#: essays would crowd out the change signal they are context for.
+_MAX_DETAIL_CHARS = 300
+
+
+@dataclass(frozen=True)
+class BatchSummary:
+    """One batch's contribution to the integration pass's view of the change.
+
+    `diff` is that batch's own diff BYTES, and `integration_prompt` reads
+    nothing out of them but `diff --git` and `@@` header lines. Handing over the
+    whole batch — rather than a pre-extracted list of header lines — is
+    deliberate: "no hunk body ever reaches this prompt" is the one property the
+    pass must have, and it belongs to the builder, not to every call site that
+    might forget. A caller that passes everything still cannot leak a body.
+
+    `files` is the batch's changed-file list (`Batch.files`), `summary` and
+    `findings` are what that batch's own review produced — both MODEL OUTPUT,
+    and treated as such: see DIVERGENCE 6.
+    """
+
+    files: Sequence[str] = ()
+    diff: bytes = b""
+    summary: str = ""
+    findings: Sequence[Any] = ()
+
+
+def integration_lead(batch_count: int) -> tuple[str, ...]:
+    """The integration prompt's lead lines, for a run of `batch_count` batches.
+
+    Present as a function for symmetry with `security_lead` / `refuter_lead`,
+    and it takes the batch count and nothing else — no config, no slots. What
+    this prompt says cannot be changed by the repo under review.
+    """
+    return tuple(("\n".join(_INTEGRATION_LEAD_TEMPLATE)
+                  % int(batch_count)).split("\n"))
+
+
+def _integration_finding_line(finding: Mapping[str, Any]) -> str:
+    """One within-batch finding as ONE line of cross-file context.
+
+    Every field is whitespace-collapsed (DIVERGENCE 6): a title carrying a
+    newline would otherwise open a line of its own, and a detail line reading
+    `===== BATCH 9 =====` at column 0 would forge a batch block. The placeholders
+    and the `(severity)` parens are `_finding_lines`' — one vocabulary for
+    rendering a finding into a prompt, and parens rather than brackets so a
+    model echoing the severity back cannot mint `[high]` as a rule-id citation
+    for `_rule_ids` to harvest.
+
+    A `line` is rendered only when it really is an integer, exactly as in
+    `_finding_lines`: a `line` that arrived as a mapping would otherwise print
+    its braces into the prompt.
+    """
+    where = collapse_ws(finding.get("file")) or "(file not stated)"
+    line_no = finding.get("line")
+    if isinstance(line_no, int) and not isinstance(line_no, bool):
+        where = "%s:%d" % (where, line_no)
+    severity = collapse_ws(finding.get("severity")) or "unrated"
+    title = collapse_ws(finding.get("title")) or "(no title)"
+    detail = collapse_ws(finding.get("detail"))[:_MAX_DETAIL_CHARS]
+    rendered = "(%s) %s -- %s" % (severity, where, title)
+    return rendered + (" -- " + detail if detail else "")
+
+
+def integration_prompt(
+    batch_summaries: Sequence[BatchSummary],
+    selection: Selection | None = None,
+    max_prompt_bytes: int = DEFAULT_MAX_DIFF_BYTES,
+    max_region_lines: int = MAX_REGION_LINES,
+) -> Prompt:
+    """The cross-file pass over the seams a batched review cut.
+
+    `batch_summaries` are the batches in SPLIT ORDER, at least two of them.
+    Fewer raises: with one batch there is nothing cross-batch to find, and a
+    prompt asking a model to compare one file list with itself would bill a call
+    for a foregone answer. Callers decide with `should_run_integration`; the
+    raise is there so a caller that forgot cannot express the mistake, the same
+    choice `merge_extra_pass(primary, None, ...)` makes (DIVERGENCE 1).
+
+    `selection` is a `checklist.select(..., mode="integration")` result — `core`
+    + `cross-file` rules — or None for a repo with no checklists. Its body is
+    fenced with `promptbuild`'s own REPO RULES markers, imported rather than
+    re-spelled, so every prompt skodun sends frames its rules identically.
+
+    `max_prompt_bytes` caps the WHOLE rendered prompt (the oracle caps the same
+    context at `MAX_DIFF_BYTES`). Over the cap, the text is cut, a truncation
+    marker is appended, and `Prompt.diff_truncated` is set: the axis the trust
+    invariant reads, and the axis the oracle's own caller sets from this
+    builder's `"1"`/`"0"`. This pass has no diff of its own, so there is nothing
+    else for that flag to mean here — a cut context is cross-file relationships
+    the model was never shown, which is exactly a coverage hole.
+    """
+    if max_prompt_bytes < 1:
+        raise ValueError(
+            f"max_prompt_bytes must be >= 1, got {max_prompt_bytes}")
+    summaries = list(batch_summaries or ())
+    if len(summaries) < 2:
+        raise ValueError(
+            "the integration pass needs at least 2 batch summaries (a single "
+            "batch has no cross-batch relationship to find and IS the whole "
+            f"diff); got {len(summaries)} — ask should_run_integration("
+            "batch_count) before building this prompt")
+
+    lines = list(integration_lead(len(summaries)))
+
+    # `.body` via getattr so a caller may hand over any selection-shaped value;
+    # the trailing-newline collapse is `promptbuild.build`'s, so a body that is
+    # nothing but newlines drops the section rather than emitting it empty.
+    rules = str(getattr(selection, "body", "") or "").rstrip("\n")
+    if rules:
+        lines.extend([RULES_BEGIN.decode("utf-8").rstrip("\n"), rules,
+                      RULES_END.decode("utf-8").rstrip("\n"), ""])
+
+    for position, batch in enumerate(summaries, 1):
+        lines.append(_INTEGRATION_BATCH % position)
+        files = [collapse_ws(f) for f in (batch.files or ())]
+        files = [f for f in files if f]
+        lines.append("Files: " + (", ".join(files) if files else "(unknown)"))
+        regions, capped = changed_regions(batch.diff or b"", max_region_lines)
+        if regions:
+            lines.append("Changed regions:")
+            lines.extend("  " + r for r in regions)
+            if capped:
+                lines.append("  " + _REGIONS_OMITTED)
+        lines.append("Summary: " + collapse_ws(batch.summary))
+        found = _as_findings(list(batch.findings or ()))
+        if found:
+            lines.append("Findings:")
+            lines.extend("  - " + _integration_finding_line(f) for f in found)
+        else:
+            lines.append("Findings: none")
+        lines.append("")
+
+    text = ("\n".join(lines) + "\n").encode("utf-8", "replace")
+    truncated = len(text) > max_prompt_bytes
+    if truncated:
+        # `errors="ignore"` on the way back, because the cut may land inside a
+        # multi-byte character; the marker then goes on the end, so the returned
+        # bytes are allowed to exceed the cap by its length. The oracle does
+        # both, and a prompt that says it was cut is worth those bytes.
+        cut = text[:max_prompt_bytes].decode("utf-8", "ignore")
+        text = (cut + "\n" + (_INTEGRATION_TRUNCATED % max_prompt_bytes)
+                + "\n").encode("utf-8", "replace")
+    return Prompt(text=text, diff_truncated=truncated, prompt_bytes=len(text))
+
+
+# ---------------------------------------------------------------------------
 # Merge
 # ---------------------------------------------------------------------------
 
@@ -723,7 +1097,12 @@ def _tag(finding: Mapping[str, Any], pass_name: str) -> dict:
     if not cat or cat == "other":
         if pass_name == "security":
             g["category"] = "security"
-        elif pass_name == "skeptic":
+        elif pass_name in ("skeptic", INTEGRATION_PASS):
+            # Both prompts offer the same `bug|security|perf|correctness|other`
+            # vocabulary, so a finding that named no category gets the same
+            # `other` from either lens. NOT `integration`: what kind of problem
+            # this is and which lens found it are different facts, and the tag
+            # on the title already carries the second one.
             g["category"] = g.get("category") or "other"
     # Tag the source pass without [brackets] so rule_ids extraction (which
     # treats [kebab-id] as house-rule citations) is not polluted.
@@ -749,6 +1128,123 @@ def _appended(previous: Any, addition: str) -> str:
 def failed_pass_reason(pass_name: str) -> str:
     """The standard `failure_reason` for a pass that returned nothing usable."""
     return "extra pass %s failed to produce a usable review" % pass_name
+
+
+def tag_integration_findings(findings: Sequence[Any]) -> list[dict]:
+    """Copy each cross-file finding and mark which lens produced it.
+
+    The integration pass's findings do not go through `merge_extra_pass` —
+    there is no primary review to fold them into, only an aggregate assembled
+    from every batch — but they get the SAME `_tag` treatment every other extra
+    pass's findings get, for the same reasons: a `(integration) ` title prefix
+    so a reader can tell a cross-file finding from a within-batch one, and a
+    `[rule-id]` citation left at position 0 with the tag moved into `detail` so
+    `rule_ids` extraction stays clean.
+
+    Entries that are not findings are dropped, by `_as_findings` — the one
+    definition of that question this module has. Nothing is mutated: `_tag`
+    copies before it writes. (DIVERGENCE 5: the oracle merges these raw.)
+    """
+    return [_tag(f, INTEGRATION_PASS)
+            for f in _as_findings(list(findings or ()))]
+
+
+def checklist_meta(mode: str, selection: Any) -> dict:
+    """The persisted shape of ONE checklist selection.
+
+    Recorded per batch (in the aggregate's `batches[]`) and for the integration
+    pass, so a stored review says which rules each prompt actually carried —
+    without which "the reviewer missed a cross-file problem" and "the reviewer
+    was never given the cross-file rules" are indistinguishable after the fact.
+
+    Duck-typed and total, like every other config-shaped reader here: a
+    `selection` of None yields the same KEYS with empty values, so a reader
+    never has to ask whether a key is missing because selection failed or
+    because this outcome spells it differently.
+
+    `Selection.body` is deliberately absent: it is prompt bytes, sometimes 18KB
+    of them, and an artifact is a record of what happened rather than a second
+    copy of what was sent.
+    """
+    return {
+        "mode": str(mode or ""),
+        "sections": list(getattr(selection, "sections", ()) or ()),
+        "bytes_total": int(getattr(selection, "bytes_total", 0) or 0),
+        "dropped": list(getattr(selection, "dropped", ()) or ()),
+        "over_budget": getattr(selection, "over_budget", False) is True,
+        "degraded": getattr(selection, "degraded", False) is True,
+        "note": str(getattr(selection, "note", "") or ""),
+    }
+
+
+def integration_meta(
+    status: str,
+    *,
+    ran: bool,
+    parse_ok: bool = False,
+    degraded: bool = False,
+    diff_truncated: bool = False,
+    findings_total: int = 0,
+    attempts: Sequence[Any] = (),
+    provenance: Mapping[str, Any] | None = None,
+    checklist: Mapping[str, Any] | None = None,
+    note: str = "",
+) -> dict:
+    """The fixed skeleton of the artifact's `integration{}` object.
+
+    ONE shape for every outcome the pass has (`ran`, `degraded`, `failed`), for
+    the reason `_refuter_meta` gives: a reader — and the aggregation step —
+    should never have to ask whether a key is missing because the pass did not
+    get that far or because this outcome spells it differently. The fourth
+    outcome, "not scheduled", records nothing at all: a run with fewer than two
+    batches has no `integration{}` key, and readers tolerate its absence.
+
+    `status` is checked against `INTEGRATION_STATUSES` because this is the field
+    a human reads first, and a typo in it would be invisible in an artifact.
+
+    `attempts` is carried, unlike in `extra_passes[<name>]`, whose meta object
+    deliberately drops it (see `pipeline._extra_pass`): there the attempt list
+    was telemetry about an optional opinion, here the pass is a trust axis of
+    the aggregate and its attempts are the audit trail for that verdict.
+
+    `provenance` is `{provider, model, effort}` for the attempt that answered,
+    exactly as `pipeline._provenance` builds it. Explicit `None`s when nothing
+    answered, never absent keys: a meta object that quietly omits them invites a
+    reader to assume the pass ran on the finder's model.
+
+    This function records; it decides nothing. How `parse_ok`/`degraded`/
+    `diff_truncated` JOIN the aggregate's own axes belongs to the aggregation
+    step, which is the only place that can see every batch as well as this.
+    """
+    if status not in INTEGRATION_STATUSES:
+        raise ValueError(
+            "unknown integration status %r; expected one of %s (a pass that "
+            "was never scheduled records no integration{} at all)"
+            % (status, ", ".join(INTEGRATION_STATUSES)))
+    prov = dict(provenance or {})
+    meta = {
+        "pass": INTEGRATION_PASS,
+        "ran": bool(ran),
+        "status": status,
+        "parse_ok": bool(parse_ok),
+        "degraded": bool(degraded),
+        "diff_truncated": bool(diff_truncated),
+        "findings_total": int(findings_total),
+        "attempts": list(attempts or ()),
+        "provider": prov.pop("provider", None),
+        "model": prov.pop("model", None),
+        "effort": prov.pop("effort", None),
+        "checklist": dict(checklist) if checklist is not None else None,
+        "note": str(note or ""),
+    }
+    # `_provenance` adds a `note` of its own when no attempt started a process;
+    # anything else it carries lands beside the three identity fields rather
+    # than being dropped.
+    prov_note = str(prov.pop("note", "") or "").strip()
+    if prov_note:
+        meta["note"] = "; ".join(n for n in (meta["note"], prov_note) if n)
+    meta.update(prov)
+    return meta
 
 
 def merge_extra_pass(

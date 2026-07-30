@@ -33,9 +33,18 @@ Three properties are load-bearing, and every decision below follows from them:
     therefore invent cut points inside a hunk body and corrupt it.) Pinned by
     `test_exotic_line_separator_bytes_are_not_cut_points`.
 
+`changed_regions` is the module's second export and the same kind of thing: a
+pure, byte-level read of a diff's STRUCTURE. It lives here rather than beside
+the prompt that consumes it because "what is a header line" is decided by the
+two markers the splitter already cuts on -- one definition, so a reader of a
+batch's change summary and the splitter that produced the batch can never
+disagree about where a file or a hunk begins.
+
 Note what this module deliberately does NOT do: it does not know about prompts,
 budgets-from-config, stores, or passes. It is a pure function over bytes, so the
-splitting rules can be pinned against the oracle directly.
+splitting rules can be pinned against the oracle directly. `changed_regions`
+keeps that boundary: it reports THAT its cap bit, and the caller owns the words
+that say so in a prompt.
 
 ORACLE PARITY. Ported from the oracle's `split_diff_into_batches`
 (`scripts/grok-prepush-review.sh` lines 842-959 -- an embedded Python heredoc,
@@ -84,6 +93,12 @@ _QUOTED_PATHS = re.compile(rb'"a/([^"]*)" "b/([^"]*)"$')
 #: unquoted form implies. Group 2 (the post-image path) is what we report: for a
 #: rename, the new name is the one a reviewer will look for.
 _PLAIN_PATHS = re.compile(rb"a/(.*) b/(.*?)$")
+
+#: How many `diff --git` / `@@` header lines `changed_regions` reports for one
+#: batch before it stops reading. The oracle's own `changed_regions(max_lines=120)`
+#: default: enough to map a large batch's changed regions, bounded so that a
+#: thousand-hunk batch cannot crowd every other batch out of one prompt.
+MAX_REGION_LINES = 120
 
 
 @dataclass(frozen=True)
@@ -262,3 +277,52 @@ def split(diff: bytes, budget: int) -> list[Batch]:
     flush()
 
     return batches
+
+
+def changed_regions(
+    diff: bytes, max_lines: int = MAX_REGION_LINES,
+) -> tuple[list[str], bool]:
+    r"""The `diff --git` / `@@` HEADER lines of `diff`, and whether the cap bit.
+
+    A compact map of WHICH files and -- through git's function context on the
+    `@@` line -- which regions and enclosing symbols a diff touches, with every
+    hunk BODY left out. That omission is the whole point: a diff gets batched
+    precisely because its bodies do not fit one prompt, so a cross-batch summary
+    that carried them would be the oversized prompt batching exists to avoid.
+    What is left is still real change signal, which is what lets a reader (the
+    integration pass) spot a cross-file break in a batch that reported nothing.
+
+    Returns `(lines, capped)`. `lines` are decoded with `errors="replace"` and
+    stripped of their line ending -- they are a LABEL, like `Batch.files`, and a
+    path or a function name need not be UTF-8. `capped` is True when reading
+    stopped at `max_lines`, so the list may be incomplete; the caller owns
+    whatever it wants to say about that. The flag is deliberately not a sentinel
+    line in the list: a marker string mixed in among real header lines is
+    indistinguishable from a diff that happens to contain one.
+
+    Lines are cut with `bytes.splitlines()` -- the same `\r`/`\n`/`\r\n` rule
+    `split` relies on, so this function and the splitter agree byte for byte
+    about where a line begins. (The oracle iterates the batch FILE, which breaks
+    on `\n` alone and can therefore keep a bare `\r` inside a reported header;
+    unobservable on git's own output, and stricter here.)
+
+    `max_lines < 1` is clamped to 1 rather than rejected, exactly as `split`
+    clamps a non-positive budget: a caller computing a cap by arithmetic can
+    land on zero, and reporting one region with `capped=True` says strictly more
+    than refusing to look.
+    """
+    if max_lines < 1:
+        max_lines = 1
+    out: list[str] = []
+    for ln in diff.splitlines():
+        if not (ln.startswith(_DIFF_GIT) or ln.startswith(_HUNK)):
+            continue
+        out.append(ln.rstrip(b"\r\n").decode("utf-8", "replace"))
+        if len(out) >= max_lines:
+            # ORACLE BEHAVIOR: the cap is checked AFTER the append and without
+            # looking ahead, so a diff with exactly `max_lines` headers reports
+            # `capped` even though nothing was actually dropped. Kept rather
+            # than corrected -- it is the oracle's observable behaviour, and it
+            # errs toward telling the reader the map may be partial.
+            return out, True
+    return out, False
