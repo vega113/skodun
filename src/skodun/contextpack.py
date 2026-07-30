@@ -71,9 +71,12 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Final
+
+from . import gitio
 
 # --- prompt format (byte-for-byte from the oracle; do not "tidy") -----------
 BEGIN_MARKER: Final = "----- BEGIN FILE CONTEXT: {path} -----\n"
@@ -235,6 +238,59 @@ def _read_all(repo: Path, path: str) -> bytes | None:
         f.close()
 
 
+def _oid_probe(repo: Path, oid: str, path: str) -> tuple[int, bytes] | None:
+    """`_probe` for a commit tree: size plus a peek, without loading the blob.
+
+    Two git calls rather than one, for the same reason the working-tree probe
+    takes a size and an 8 KiB read rather than the whole file: a committed
+    200 MB video is one `git diff --name-only` entry like any other, and
+    classification must not buffer it.
+
+    ORACLE PARITY, one narrow divergence shared with `_oid_read_all`: the
+    normalised path is what reaches git here, while the oracle passes the RAW
+    candidate and uses its normal form only as a safety test. So a path written
+    with a redundant `//` (which `<oid>:a//b` does not resolve) is `missing`
+    there and packed here. Unreachable from real input — git's own path streams
+    never contain one — and the direction is more context, never other content.
+    """
+    rel = _safe_rel(path)
+    if rel is None:
+        return None
+    size = gitio.blob_size(repo, oid, rel)
+    if size is None:
+        return None
+    peek = gitio.blob_bytes(repo, oid, rel, max_bytes=BINARY_PEEK_BYTES)
+    if peek is None:
+        return None
+    return size, peek
+
+
+def _oid_read_all(repo: Path, oid: str, path: str) -> bytes | None:
+    rel = _safe_rel(path)
+    if rel is None:
+        return None
+    return gitio.blob_bytes(repo, oid, rel)
+
+
+def _readers(
+    repo: Path, source: str, oid: str | None
+) -> tuple[Callable[[str], tuple[int, bytes] | None], Callable[[str], bytes | None]]:
+    """The (classify-probe, full-load) pair for `source`.
+
+    The selection happens exactly once, here, so the packing loop below cannot
+    read one source while reporting the other — the failure mode that would put
+    working-tree code in a prompt whose identity says "this commit".
+    """
+    if source == "oid":
+        # `pack` has already refused an empty oid, and one that got here anyway
+        # would still fail closed: `gitio` refuses an empty rev rather than
+        # letting `git cat-file blob :path` answer from the index.
+        rev = oid or ""
+        return (lambda p: _oid_probe(repo, rev, p),
+                lambda p: _oid_read_all(repo, rev, p))
+    return (lambda p: _probe(repo, p), lambda p: _read_all(repo, p))
+
+
 def _is_binary(data: bytes) -> bool:
     """A NUL anywhere in `data`, or >30% non-text bytes in the first 8 KiB."""
     if b"\0" in data:
@@ -294,10 +350,45 @@ def pack(
     statuses: dict[str, str],
     headroom: int,
     source: str = "wt",
+    oid: str | None = None,
     per_file_cap: int | None = None,
     pack_large_added: bool = True,
 ) -> Pack:
     """Pack full file contents for `files` into at most `headroom` bytes.
+
+    `source` decides WHERE the content is read from, and the two answers are not
+    interchangeable:
+
+      * `"wt"` — the working tree under `repo`. What a foreground review is of:
+        the code the developer has in front of them, uncommitted edits included.
+      * `"oid"` — the tree of commit `oid` (required, and refused if empty).
+        What a background review is of: the dispatcher reviews a ref that has
+        been PUSHED, and the working tree may since have moved on — a different
+        branch, a rebase, a half-finished edit. Reading it would review code
+        nobody pushed while the record says the push was reviewed. The bytes
+        come from `gitio.blob_bytes`, i.e. from the object store, so they are
+        also immune to a `.gitattributes` filter and to a concurrent edit.
+        `repo` then only locates the repository: `<oid>:<path>` is
+        tree-root-relative, so any directory inside it does.
+
+    Passing an `oid` with `source="wt"` is refused rather than ignored: it is the
+    one caller mistake whose consequence is silent (a working-tree pack that
+    every downstream field labels as the commit's).
+
+    Everything else is the same on both sources: binary detection, the caps,
+    selection order, the section format and the omission vocabulary, all pinned
+    against the oracle in each mode. Only the classification STEP at which a
+    non-blob path is caught differs — the working-tree reader rejects a directory
+    or a symlink up front, while an object read has a size for a directory
+    (`git cat-file -s` answers for a tree) and refuses it at the full read, and
+    reads a symlink as the target *path text* git stored in the blob. Neither is
+    a real candidate: `git diff --name-only` lists blobs.
+
+    The oid source does NOT replicate the working-tree hardening above
+    (`_safe_open`'s symlink walk, `O_NOFOLLOW`, the FIFO layers), because it is
+    structurally moot rather than merely unnecessary: an object read cannot
+    traverse a link out of the tree and cannot block on a pipe. `_safe_rel` is
+    still applied, so an absolute or `..` path is an omission on both sources.
 
     `statuses` is `gitio.Diff.statuses` (path -> git's one-letter code); a path
     absent from it is treated as `M`. `headroom` is what the diff left over —
@@ -327,14 +418,26 @@ def pack(
         changed in them, and only this packer can show what they now look like.
 
     Never raises for bad input: an unreadable, escaping, non-regular or
-    non-UTF-8 path becomes an omission with a reason. The only exception is an
-    unimplemented `source`, which is a programming error, not input.
+    non-UTF-8 path becomes an omission with a reason, and so does an oid that
+    does not resolve (every candidate `missing`, no exception). The exceptions
+    are an unimplemented `source` and an incoherent `source`/`oid` pair, which
+    are programming errors, not input.
     """
-    if source != "wt":
+    if source not in ("wt", "oid"):
         raise NotImplementedError(
             f"context source {source!r} is not implemented; only 'wt' "
-            "(working tree) is supported"
+            "(working tree) and 'oid' (commit tree) are supported"
         )
+    if source == "oid" and not oid:
+        # Not degraded to an empty pack: a caller with no oid to read cannot be
+        # served, and an empty oid is `git cat-file blob :path` — the INDEX.
+        raise ValueError("context source 'oid' requires a non-empty oid")
+    if source == "wt" and oid is not None:
+        raise ValueError(
+            f"oid {oid!r} passed with context source 'wt'; pass source='oid' to "
+            "read that commit's tree, or drop the oid to read the working tree"
+        )
+    probe_one, load_one = _readers(repo, source, oid)
     if per_file_cap is not None and per_file_cap < 1:
         per_file_cap = None
 
@@ -359,7 +462,7 @@ def pack(
         if st == "D":
             early_omit.append((path, "deleted"))
             continue
-        probed = _probe(repo, path)
+        probed = probe_one(path)
         if probed is None:
             early_omit.append((path, "missing"))
             continue
@@ -396,7 +499,7 @@ def pack(
             if used + _section_overhead(path) + size + 1 > headroom:
                 headroom_omit.append((path, "over-headroom"))
                 continue
-            data = _read_all(repo, path)
+            data = load_one(path)
             if data is None:  # vanished or swapped between classify and load
                 headroom_omit.append((path, "missing"))
                 continue
