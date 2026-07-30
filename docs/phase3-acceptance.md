@@ -47,6 +47,10 @@ $ python3 -m pytest -q          # oracle unset
 2634 passed, 160 skipped in 806.93s (0:13:26)
 ```
 
+(After the final-review fix commit `110e435`, which added `surface --repo`
+and its tests, the with-oracle suite is **2803 passed, 1 skipped**; the
+reconciliation below is unchanged in kind.)
+
 Both modes collect 2794 tests. Without the oracle, 160 skip: 159
 oracle-gated (they RUN with it: 2634 + 159 = 2793) plus the 1 skip present
 in both modes — the seam matrix's single documented N/A cell
