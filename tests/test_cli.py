@@ -2236,6 +2236,100 @@ def test_surface_refuses_an_unknown_hook_format(tmp_path, monkeypatch, capsys):
     assert "usage:" in cap.err
 
 
+# --- `--repo`: the CLI half of the MCP `surface` tool's own `repo` argument ---
+#
+# The MCP tool has taken a `repo` since Task 13 (`mcpserver._repo_arg` ->
+# `services.resolve_surface_branch(branch, repo)`); the CLI did not, so the one
+# phase whose thesis is that the two surfaces are ONE implementation had an
+# asymmetry in it. `--repo` moves BRANCH DISCOVERY ONLY -- the store is still
+# `SKODUN_DB`, because a per-repo store is an operational choice (see the
+# README's one-store-per-repository note), not something a reporting flag may
+# make for the user behind their back.
+
+
+def _renamed_branch(repo: Path, tmp_path: Path, branch: str) -> None:
+    """Rename `repo`'s checked-out branch, under `_tiny_repo`'s hermetic config."""
+    env = dict(os.environ)
+    env["GIT_CONFIG_GLOBAL"] = str(tmp_path / "gitconfig")
+    env["GIT_CONFIG_SYSTEM"] = str(tmp_path / "gitsystem")
+    subprocess.run(["git", "-C", str(repo), "branch", "-m", branch], check=True,
+                   capture_output=True, env=env)
+
+
+def test_surface_repo_reports_the_named_repositorys_branch_from_any_cwd(
+        tmp_path, monkeypatch, capsys):
+    """The cwd is not a repository at all, so the branch can only have come from
+    `--repo` -- and the round it matches is on a branch nothing else names."""
+    repo = _tiny_repo(tmp_path)
+    _renamed_branch(repo, tmp_path, "feat-elsewhere")
+    db = _surface_db(tmp_path, _loud_round(branch="feat-elsewhere"))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "gitsystem"))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    assert main(["surface", "--repo", str(repo)]) == 0
+    assert "NPE 0" in capsys.readouterr().out
+    assert _delivery_rows(db) == [("sk_1", "cli-text")]
+
+
+def test_surface_branch_beats_repo(tmp_path, monkeypatch, capsys):
+    """`--branch` overrides everything, `--repo` included: the round on the
+    repository's OWN branch stays undelivered."""
+    repo = _tiny_repo(tmp_path)                      # on `main`
+    db = _surface_db(tmp_path, _loud_round(branch="main"),
+                     _loud_round(id="sk_2", branch="explicit"))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "gitsystem"))
+    monkeypatch.chdir(tmp_path)
+    assert main(["surface", "--repo", str(repo), "--branch", "explicit"]) == 0
+    assert "NPE 0" in capsys.readouterr().out
+    assert _delivery_rows(db) == [("sk_2", "cli-text")]
+
+
+def test_surface_with_a_repo_that_is_no_repository_exits_2_never_traces_back(
+        tmp_path, monkeypatch, capsys):
+    """And it never quietly falls back to the cwd: the cwd here IS a repository
+    with an undelivered round, and that round must stay undelivered. Reporting
+    somebody else's branch because the named one could not be read is the one
+    answer this command may not give."""
+    repo = _tiny_repo(tmp_path)                      # on `main`, and the cwd
+    db = _surface_db(tmp_path, _loud_round(branch="main"))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "gitsystem"))
+    monkeypatch.chdir(repo)
+    assert main(["surface", "--repo", str(tmp_path / "no-such-directory")]) == 2
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert "branch" in cap.err
+    assert "Traceback" not in cap.out and "Traceback" not in cap.err
+    assert _delivery_rows(db) == []
+
+
+def test_surface_repo_defaults_to_none_and_the_mcp_tool_takes_the_same_argument():
+    """Symmetry, pinned: neither surface may grow a repo argument the other
+    lacks. `default=None` (not `Path(".")`) so `_cmd_surface` hands
+    `resolve_surface_branch` exactly what an absent MCP `repo` hands it."""
+    import argparse
+
+    from skodun.cli import build_parser
+    from skodun.mcpserver import default_registry
+
+    subs = [a for a in build_parser()._actions
+            if isinstance(a, argparse._SubParsersAction)]
+    repos = [a for a in subs[0].choices["surface"]._actions if a.dest == "repo"]
+    assert len(repos) == 1, repos
+    assert repos[0].default is None
+    assert repos[0].type is Path
+
+    tool = [t for t in default_registry() if t.name == "surface"]
+    assert len(tool) == 1, tool
+    assert "repo" in tool[0].input_schema["properties"]
+
+
 def test_surface_reports_an_unopenable_store_on_stderr(tmp_path, monkeypatch,
                                                        capsys):
     # A directory where the database file belongs: sqlite cannot open it.
@@ -2283,6 +2377,13 @@ _SURFACE_CASES = [
     ("surface-replay-nothing-to-deliver",
      ["surface", "--branch", "feat", "--include-delivered"], 0),
     ("surface-bad-format", ["surface", "--hook-format", "yaml"], 2),
+    # A `--repo` git cannot read is a refusal with a message, in every
+    # invocation form -- never a traceback, and never a silent fall back to
+    # whatever repository the cwd happens to be. The path is RELATIVE so no
+    # machine's layout is baked in; nothing by that name exists anywhere the
+    # suite runs.
+    ("surface-bad-repo",
+     ["surface", "--repo", "no-such-directory-for-skodun-surface"], 2),
 ]
 
 

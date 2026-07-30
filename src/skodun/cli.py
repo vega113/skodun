@@ -179,6 +179,17 @@ def build_parser() -> argparse.ArgumentParser:
     surf = sub.add_parser(
         "surface",
         help="report background review rounds nobody has been shown yet")
+    # BRANCH DISCOVERY ONLY, and `default=None` rather than `Path(".")` on
+    # purpose: `services.resolve_surface_branch` already takes a repo (the MCP
+    # `surface` tool has passed one since Task 13), and its own default is what
+    # an ABSENT argument means on both surfaces -- one definition of "here",
+    # not two. The store is untouched by this flag: which store to read is
+    # `SKODUN_DB`, an operational choice (see the README's one-store-per-
+    # repository note), and a reporting flag may not make it for the user.
+    surf.add_argument("--repo", type=Path, default=None,
+                      help="repository whose checked-out branch to report on "
+                           "(default: the current directory); --branch "
+                           "overrides it")
     surf.add_argument("--branch", default=None,
                       help="branch to report on (default: the checked-out one)")
     surf.add_argument("--hook-format", default="text", dest="hook_format",
@@ -608,7 +619,13 @@ def _cmd_surface(args) -> int:
                      2)
 
     fmt = args.hook_format
-    branch, why_not = services.resolve_surface_branch(args.branch)
+    # `--branch` beats `--repo` (`resolve_surface_branch` returns it untouched
+    # before any git call), and a `--repo` git cannot read is a REFUSAL, never a
+    # quiet fall back to the cwd: reporting a different repository's branch
+    # because the named one could not be read would deliver -- and permanently
+    # mark delivered -- rounds the caller never asked for.
+    branch, why_not = services.resolve_surface_branch(
+        args.branch, args.repo if args.repo is not None else ".")
     if not branch:
         return _warn(why_not, 2)
 
