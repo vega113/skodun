@@ -26,6 +26,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from skodun.gitio import capture_diff, diff_identity, git_common_dir, resolve_ba
 from skodun.pipeline import LockTimeout, PersistenceFailed, PreflightRefused, run_review
 from skodun.store import Store
 from skodun.triage import load_valid_artifact
+from skodun.trust import banner
 from tests.test_gitio import _git, _mkrepo
 
 # --------------------------------------------------------------------------
@@ -164,10 +166,24 @@ def _run(repo: Path, store: Store, **kw) -> dict:
     return run_review(repo, load_config(repo), store, **kw)
 
 
-def _last_stdout(capsys) -> str:
-    lines = capsys.readouterr().out.strip().splitlines()
-    assert lines, "nothing was printed to stdout"
-    return lines[-1]
+def _verdict(rec: dict, capsys) -> str:
+    """The banner for a record `run_review` just returned, and the proof that
+    the pipeline printed NOTHING while producing it.
+
+    `run_review` used to print this line itself. It no longer writes to stdout at
+    all -- `skodun mcp` serves JSON-RPC there from another thread, and one banner
+    line desynchronises the client's parser for the rest of the session -- so the
+    banner is rendered by the caller from the returned record, through
+    `trust.banner`, the ONE definition of it. That is what the CLI does
+    (`services.svc_review`) and what the MCP `review` tool does, and it is what
+    the assertions below now do.
+
+    The `out == ""` half is load-bearing: without it, re-adding a `print` inside
+    the pipeline would pass every one of these tests.
+    """
+    out = capsys.readouterr().out
+    assert out == "", f"the pipeline wrote to stdout: {out!r}"
+    return banner(rec)
 
 
 def _write_owner(lock: Path, pid: int, started: int, worktree: Path) -> None:
@@ -201,7 +217,7 @@ def test_clean_run_records_and_banners(tmp_path, capsys):
     assert rec["diff_truncated"] is False
     assert rec["findings"] == [] and rec["findings_total"] == 0
     assert rec["stop_reason"] == "EndTurn"
-    assert _last_stdout(capsys).startswith(
+    assert _verdict(rec, capsys).startswith(
         "SKODUN VERDICT: trustworthy=true findings=0")
     # The banner is rendered from the PERSISTED record, so the stored row and
     # the returned dict must be the same object's contents.
@@ -279,7 +295,7 @@ def test_findings_make_the_review_trustworthy_but_not_clean(tmp_path, capsys):
     rec = _run(repo, _store(tmp_path))
     assert rec["trustworthy"] is True and rec["findings_total"] == 1
     assert rec["status"] == "clean"   # "clean" is the TRUST status, not "no findings"
-    assert _last_stdout(capsys).startswith(
+    assert _verdict(rec, capsys).startswith(
         "SKODUN VERDICT: trustworthy=true findings=1")
 
 
@@ -334,7 +350,7 @@ def test_an_empty_outgoing_change_is_not_sent_to_the_model(tmp_path, capsys):
     assert _calls(tmp_path) == 0
     assert rec["trustworthy"] is True and rec["findings_total"] == 0
     assert rec["summary"] == "no outgoing changes"
-    assert _last_stdout(capsys).startswith("SKODUN VERDICT: trustworthy=true")
+    assert _verdict(rec, capsys).startswith("SKODUN VERDICT: trustworthy=true")
 
 
 # --------------------------------------------------------------------------
@@ -624,7 +640,7 @@ def test_degraded_envelope_is_not_trustworthy(tmp_path, capsys):
     assert rec["parse_ok"] is True          # it parsed; the RUN was cut short
     assert "Cancelled" in rec["degraded_reason"]
     assert _calls(tmp_path) == 1
-    assert _last_stdout(capsys).startswith("SKODUN VERDICT: trustworthy=false")
+    assert _verdict(rec, capsys).startswith("SKODUN VERDICT: trustworthy=false")
 
 
 def test_a_degraded_attempt_is_retried_in_a_fresh_run(tmp_path, capsys):
@@ -692,7 +708,7 @@ def test_a_missing_reviewer_binary_is_recorded_and_never_retried(tmp_path,
     assert rec["parse_ok"] is False and rec["status"] == "failed"
     assert len(rec["attempts"]) == 1        # retrying cannot conjure a binary
     assert "not found" in rec["failure_reason"]
-    assert _last_stdout(capsys).startswith("SKODUN VERDICT: trustworthy=false")
+    assert _verdict(rec, capsys).startswith("SKODUN VERDICT: trustworthy=false")
 
 
 # --------------------------------------------------------------------------
@@ -839,7 +855,7 @@ def test_skeptic_pass_runs_on_a_clean_review_and_can_break_the_clear(
     assert rec["extra_passes"]["skeptic"]["ran"] is True
     assert rec["findings_total"] == 1
     assert rec["trustworthy"] is True
-    assert _last_stdout(capsys).startswith(
+    assert _verdict(rec, capsys).startswith(
         "SKODUN VERDICT: trustworthy=true findings=1")
     prompt = (tmp_path / "bin" / "prompt_2.txt").read_text(encoding="utf-8")
     assert "ADVERSARIAL CLEAN-CHECK" in prompt
@@ -907,7 +923,7 @@ def test_a_degraded_extra_pass_demotes_the_primary(tmp_path, capsys,
     assert rec["parse_ok"] is True
     assert rec["trustworthy"] is False and rec["status"] == "degraded"
     assert rec["summary"].startswith("ok")   # the primary review is still here
-    assert _last_stdout(capsys).startswith(
+    assert _verdict(rec, capsys).startswith(
         "SKODUN VERDICT: trustworthy=false findings=0 degraded=true")
 
 
@@ -1047,21 +1063,40 @@ def test_a_crash_mid_run_releases_the_lock_and_downgrades_the_record(
     assert rows[0]["trustworthy"] is False
 
 
-def test_a_banner_failure_never_downgrades_an_already_persisted_record(
+def test_a_dead_stdout_never_downgrades_an_already_persisted_record(
         tmp_path, monkeypatch):
     """`skodun review | head` closes stdout under us. The record was already
-    saved and is correct; the `finally` block must not rewrite it to failed."""
+    saved and is correct; nothing on the way out may rewrite it to `failed`.
+
+    This used to inject a `BrokenPipeError` into `pipeline._emit_banner`. That
+    function is GONE -- the pipeline no longer writes to stdout at all, because
+    `skodun mcp` serves JSON-RPC on that stream from another thread -- so the
+    property is now stronger, and is asserted as such: with a stdout on which
+    EVERY operation raises, `run_review` still returns a clean, trustworthy,
+    persisted record and still releases the lock. The verdict line is the
+    caller's to write (`services.svc_review` renders it, `cli._emit` writes it),
+    strictly after the record was persisted and the `finally` block ran, and
+    `_emit` reports the code rather than the write failure.
+    """
+
+    class _DeadStdout:
+        """Every operation raises: not merely a closed pipe, an unusable stream."""
+
+        def write(self, *_a, **_k):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self, *_a, **_k):
+            raise BrokenPipeError(32, "Broken pipe")
+
     _fake_grok(tmp_path, _emit(CLEAN))
     repo = _repo(tmp_path)
     st = _store(tmp_path)
 
-    def boom(rec):
-        raise BrokenPipeError(32, "Broken pipe")
+    monkeypatch.setattr(sys, "stdout", _DeadStdout())
+    rec = _run(repo, st)
 
-    monkeypatch.setattr(pipeline, "banner", boom)
-    with pytest.raises(BrokenPipeError):
-        _run(repo, st)
     stored = st.list_reviews(None, 10)[0]
+    assert rec["id"] == stored["id"]
     assert stored["status"] == "clean" and stored["trustworthy"] is True
     assert not (git_common_dir(repo) / "grok-reviews-foreground.lock").exists()
 

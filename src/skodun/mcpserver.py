@@ -29,20 +29,27 @@ Everything else here follows from three more facts about the transport:
     queued behind it, because the queued one would review a working tree that
     has moved by the time it starts.
 
-The tools themselves are NOT here. They arrive through the registry seam below
-(`HandlerSpec`/`HandlerCall`/`HandlerResult`), which Task 14 fills with the
-service functions the CLI subcommands call. This module knows only that a
-handler takes a call and returns a status, some text, and a list of review ids
-whose delivery the transport must acknowledge AFTER the response has been
-written and flushed -- never before, because a round marked delivered from a
-buffer that never reached a reader is the undelivered-findings bug the delivery
-ledger exists to remove.
+The tools do not implement anything. They arrive through the registry seam
+(`HandlerSpec`/`HandlerCall`/`HandlerResult`) and every one of them is four lines
+over a `services` function -- the SAME function the corresponding `skodun`
+subcommand calls. That is the whole design of this surface: an agent and a human
+are looking at one product, so a refusal an agent reads is the refusal a human
+reads, word for word, because neither surface owns the words. `tools/list` is a
+curated mirror of the CLI's review loop and nothing more; a snapshot test pins
+the exact list, so growing it is a reviewed decision.
+
+The transport knows only that a handler takes a call and returns a status, some
+text, and a list of review ids whose delivery it must acknowledge AFTER the
+response has been written and flushed -- never before, because a round marked
+delivered from a buffer that never reached a reader is the undelivered-findings
+bug the delivery ledger exists to remove.
 """
 
 import json
 import sys
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from . import __version__
@@ -189,20 +196,468 @@ class _Deferred:
 _DEFERRED = _Deferred()
 
 
-def default_registry() -> tuple[HandlerSpec, ...]:
-    """The tools `skodun mcp` serves. EMPTY in this task, deliberately.
+# ---------------------------------------------------------------------------
+# The tools: exactly the CLI's own review loop, and nothing else
+# ---------------------------------------------------------------------------
+#
+# Every handler below is four lines and they are all the same four lines: read
+# the arguments, open a Store, call the `services` function the CLI subcommand
+# calls, return its `(status, text)` as a `HandlerResult`. That sameness IS the
+# feature -- an agent and a human are looking at one product, so a refusal an
+# agent reads must be the refusal a human reads, word for word, and the only way
+# to guarantee that is for neither surface to own the words.
+#
+# WHAT IS DELIBERATELY ABSENT is as much of the decision as what is here:
+#
+#   * no bulk anything. There is no `dismiss_all`, no `adopt_all`, no
+#     `triage_many`. A dismissal is a human naming ONE finding and saying why;
+#     a tool that dismissed a list would be exactly the auto-dismissal the
+#     per-finding path exists to keep out of the product, with an agent holding
+#     the pen.
+#   * no `dispatch`, no `worker`, no `install-hooks`, no `import-legacy`, no
+#     `shadow-compare`, no `providers`. Those are machinery and diagnostics a
+#     human runs, not steps in a review loop, and every one of them is a tool
+#     surface nobody would have reviewed.
+#   * no tool that writes configuration, and no tool that takes a store path.
+#     The store is `SKODUN_DB` or the default, resolved in ONE place
+#     (`cli._store_path`), and a tool argument for it would be a second answer.
+#
+# `tools/list`'s order is the order below, and a snapshot test pins the exact
+# list: adding a tool here is a reviewed decision, not a convenience.
 
-    Task 13 ships the transport; Task 14 registers the review-loop services
-    behind it. An accidental tool here would be an agent-facing surface nobody
-    reviewed, on a fail-closed gate.
+#: The `repo` property, spelled once: four tools take it and they must agree.
+_REPO_PROPERTY = {
+    "repo": {"type": "string",
+             "description": "path inside the repository to act on; defaults to "
+                            "the server's working directory"},
+}
+
+_REVIEW_ID_PROPERTY = {
+    "review_id": {"type": "string",
+                  "description": "the review id, as `log` and the verdict "
+                                 "banner print it"},
+}
+
+_INDEX_PROPERTY = {
+    "index": {"type": "integer", "minimum": 0,
+              "description": "the finding index, as `triage_list` prints it in "
+                             "`[n]`"},
+}
+
+_REASON_PROPERTY = {
+    "reason": {"type": "string",
+               "description": "the audited reason, in the reviewer's own words; "
+                              "it is stored verbatim and must say something "
+                              "specific about this finding"},
+}
+
+
+def _schema(properties: dict, required: tuple[str, ...] = ()) -> dict:
+    """One JSON Schema shape for every tool: an object, closed, explicit.
+
+    `additionalProperties: False` is not decoration. A client that misspells
+    `review_id` as `reviewID` would otherwise send a well-formed call that this
+    server answers "no such review: None" to, and the agent would go looking for
+    the review instead of for its own typo.
     """
-    return ()
+    return {"type": "object", "properties": dict(properties),
+            "required": list(required), "additionalProperties": False}
+
+
+def _repo_arg(params: dict, tool: str) -> tuple[Path | None, str]:
+    """`(repo, "")` or `(None, refusal)`. ABSENT means the server's own cwd.
+
+    `HandlerCall` carries no repo and `skodun mcp` takes no flags, deliberately
+    (Task 13): every tool carries its own arguments in its `inputSchema`, so a
+    transport-level flag would be a second place the same thing is configured.
+    The default is `.`, which for a client-spawned server is the project it was
+    spawned in.
+
+    A repo of the WRONG TYPE is refused rather than defaulted, and that asymmetry
+    is the point: defaulting a `{"repo": ["x"]}` to the cwd would answer a GATE
+    QUESTION ABOUT A DIFFERENT DIRECTORY than the one the client asked about, and
+    a wrong PASS is the one failure this product exists to make impossible. An
+    absent repo is a client saying "here"; a malformed one is a client saying
+    something this server must not guess at.
+    """
+    if "repo" not in params or params["repo"] is None:
+        return Path("."), ""
+    repo = params["repo"]
+    if not isinstance(repo, str) or not repo.strip():
+        return None, (f"skodun {tool}: repo must be a path inside a repository; "
+                      f"got {repo!r}")
+    return Path(repo), ""
+
+
+def _string_arg(params: dict, name: str, tool: str) -> tuple[str, str]:
+    """`(value, "")` or `("", refusal)`. The tool-level counterpart of argparse.
+
+    The CLI cannot reach these refusals -- argparse rejects a missing positional
+    before `_cmd_triage` runs -- so they have no wording to stay in step with, and
+    they are worded for the reader they DO have: an agent that will re-call the
+    tool. `inputSchema` already says the argument is required; a schema is
+    advisory, and this is the enforcement.
+    """
+    value = params.get(name)
+    if not isinstance(value, str) or not value.strip():
+        return "", (f"skodun {tool}: {name} is required and must be a non-empty "
+                    f"string; got {value!r}")
+    return value, ""
+
+
+def _int_arg(params: dict, name: str, tool: str) -> tuple[int | None, str]:
+    """`(value, "")` or `(None, refusal)`. Rejects `bool`, which is an `int`."""
+    value = params.get(name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, (f"skodun {tool}: {name} must be an integer; got "
+                      f"{value!r}")
+    return value, ""
+
+
+def _reason_arg(params: dict, tool: str) -> tuple[str | None, str]:
+    """`(reason-or-None, "")` or `(None, refusal)`. ABSENT is not the same as bad.
+
+    An absent reason is passed through as `None`, because the service owns that
+    refusal and its wording is the one the CLI prints -- the whole point of the
+    parity. A reason that is PRESENT but not a string is refused here, and this
+    check is not theoretical: `reason=["a", "b"]` reached
+    `store.record_triage_event` and came back out as
+    `sqlite3.ProgrammingError: Error binding parameter 11`, which the transport
+    would then hand the agent as its tool text. Nothing was written -- the
+    statement failed at bind time -- but "the tool failed: ProgrammingError" is
+    not something an agent can act on, and argparse cannot produce this shape at
+    all, so there is nothing to stay in step with.
+    """
+    value = params.get("reason")
+    if value is None:
+        return None, ""
+    if not isinstance(value, str):
+        return None, (f"skodun {tool}: reason must be a string, in the "
+                      f"reviewer's own words; got {value!r}")
+    return value, ""
+
+
+def _handle_gate(call: "HandlerCall") -> "HandlerResult":
+    from . import services
+    repo, refusal = _repo_arg(call.params, "gate")
+    if refusal:
+        # 2, which is also the gate's own "no trustworthy review covers this":
+        # a question this server could not understand has not been answered YES.
+        return HandlerResult(status=2, text=refusal)
+    with call.store_factory() as store:
+        status, text = services.svc_gate(store, repo)
+    return HandlerResult(status=status, text=text)
+
+
+def _handle_review(call: "HandlerCall") -> "HandlerResult":
+    """The long-running one. `call.cancel` is the whole point of it being so.
+
+    The token is set by the read loop when the client's stdin reaches EOF, and it
+    travels from here into `run_review`, its pass boundaries, the chain, and
+    finally the watchdog tick loop -- the only layer holding the provider's
+    process group. `svc_review` turns the resulting `ReviewCancelled` into
+    `(4, "... reason=review cancelled")`, so this thread returns an ordinary tool
+    result rather than raising, and the server joins it before exiting 0.
+
+    NOTHING is printed. `run_review` writes no stdout at all any more, and its
+    progress goes to stderr -- which for an MCP server is the client's log, where
+    a human debugging a slow review will actually look for it.
+    """
+    from . import services
+    repo, refusal = _repo_arg(call.params, "review")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    with call.store_factory() as store:
+        status, text = services.svc_review(store, repo, cancel=call.cancel)
+    return HandlerResult(status=status, text=text)
+
+
+def _handle_log(call: "HandlerCall") -> "HandlerResult":
+    from . import services
+    branch = call.params.get("branch")
+    limit = 20                          # the CLI's own `-n` default
+    if call.params.get("limit") is not None:
+        # `_int_arg`, not a second copy of `svc_log`'s message: a NON-POSITIVE
+        # limit is the service's refusal (and the string the CLI prints for it),
+        # while a limit of the wrong TYPE is this transport's, exactly as argparse
+        # owns `-n lots` for the CLI. `"5"` is refused rather than coerced -- the
+        # schema says integer, and coercing would make the tool laxer than the
+        # contract it publishes.
+        limit, refusal = _int_arg(call.params, "limit", "log")
+        if refusal:
+            return HandlerResult(status=2, text=refusal)
+    with call.store_factory() as store:
+        status, text = services.svc_log(
+            store, branch if isinstance(branch, str) and branch else None, limit)
+    # An empty listing is an answer, and an empty tool result is not readable as
+    # one: an agent cannot tell "no reviews" from "the tool broke".
+    return HandlerResult(status=status,
+                         text=text or "skodun log: no reviews recorded yet")
+
+
+def _handle_surface(call: "HandlerCall") -> "HandlerResult":
+    """The one tool with an ACKNOWLEDGEMENT, and the order is the product.
+
+    `pending_acks` comes back to the transport, which records the delivery only
+    after this response line has been WRITTEN AND FLUSHED, from a fresh Store
+    (this one closes with the call). Acknowledging here instead would mark rounds
+    delivered from a buffer that may never reach the client -- the undelivered-
+    findings failure the delivery ledger exists to remove, reintroduced by the
+    fix. A crash between the flush and the ack re-delivers, which is the designed
+    direction.
+    """
+    from . import delivery, services
+    params = call.params
+    repo, refusal = _repo_arg(params, "surface")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    fmt = params.get("hook_format", delivery.TEXT)
+    if fmt not in delivery.FORMATS:
+        return HandlerResult(
+            status=2,
+            text=f"skodun surface: unknown hook_format {fmt!r}; expected one of "
+                 f"{list(delivery.FORMATS)}")
+    branch, why_not = services.resolve_surface_branch(params.get("branch"), repo)
+    if not branch:
+        return HandlerResult(status=2, text=why_not)
+    with call.store_factory() as store:
+        status, text, pending = services.svc_surface(
+            store, branch, fmt, bool(params.get("include_delivered", False)))
+    if status != 0 or not text:
+        # A diagnostic, or nothing to report. Either way there is nothing
+        # delivered, so nothing to acknowledge.
+        return HandlerResult(
+            status=status,
+            text=text if status != 0 else services.surface_no_rounds_note(branch))
+    return HandlerResult(status=status, text=text, pending_acks=pending)
+
+
+def _handle_triage_list(call: "HandlerCall") -> "HandlerResult":
+    from . import services
+    review_id, refusal = _string_arg(call.params, "review_id", "triage_list")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    with call.store_factory() as store:
+        status, text = services.svc_triage_list(store, review_id)
+    return HandlerResult(
+        status=status,
+        text=text or f"skodun triage: review {review_id} has no findings")
+
+
+def _handle_triage_dismiss(call: "HandlerCall") -> "HandlerResult":
+    from . import services
+    review_id, refusal = _string_arg(call.params, "review_id", "triage_dismiss")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    index, refusal = _int_arg(call.params, "index", "triage_dismiss")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    reason, refusal = _reason_arg(call.params, "triage_dismiss")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    with call.store_factory() as store:
+        status, text = services.svc_triage_dismiss(store, review_id, index,
+                                                   reason)
+    return HandlerResult(status=status, text=text)
+
+
+def _handle_adopt_refuter(call: "HandlerCall") -> "HandlerResult":
+    from . import services
+    review_id, refusal = _string_arg(call.params, "review_id", "adopt_refuter")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    index, refusal = _int_arg(call.params, "index", "adopt_refuter")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    with call.store_factory() as store:
+        status, text = services.svc_adopt_refuter(store, review_id, index)
+    return HandlerResult(status=status, text=text)
+
+
+def _handle_triage_reopen(call: "HandlerCall") -> "HandlerResult":
+    from . import services
+    review_id, refusal = _string_arg(call.params, "review_id", "triage_reopen")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    index, refusal = _int_arg(call.params, "index", "triage_reopen")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    reason, refusal = _reason_arg(call.params, "triage_reopen")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    with call.store_factory() as store:
+        status, text = services.svc_triage_reopen(store, review_id, index,
+                                                  reason)
+    return HandlerResult(status=status, text=text)
+
+
+def default_registry() -> tuple[HandlerSpec, ...]:
+    """The tools `skodun mcp` serves: the CLI's review loop, mirrored exactly.
+
+    The list and its ORDER are pinned by a snapshot test. Growing it is a
+    reviewed decision about an agent-facing surface on a fail-closed gate, never
+    a convenience -- see the note above this function for what is deliberately
+    not here and why.
+    """
+    return (
+        HandlerSpec(
+            name="gate", long_running=False,
+            input_schema=_schema(_REPO_PROPERTY),
+            handler=_handle_gate,
+            description="Fail closed unless a trustworthy review covers this "
+                        "change. Exit status 0 = clean, 1 = findings remain "
+                        "open, 2 = no trustworthy review covers this content. "
+                        "The same decision `skodun gate` makes, from the same "
+                        "store."),
+        HandlerSpec(
+            name="review", long_running=True,
+            input_schema=_schema(_REPO_PROPERTY),
+            handler=_handle_review,
+            description="Review the outgoing change NOW, in the foreground, and "
+                        "record the verdict. LONG-RUNNING: it takes minutes and "
+                        "spends model calls, holds the foreground review lock, "
+                        "and only ONE may be in flight per server -- a second "
+                        "call while one is running is refused, not queued. "
+                        "Closing the session cancels the review in flight. "
+                        "Status 0 = clean, 1 = findings open, 2 = nothing ran, "
+                        "3 = gave up waiting for the lock, 4 = no trustworthy "
+                        "review exists."),
+        HandlerSpec(
+            name="log", long_running=False,
+            input_schema=_schema({
+                "branch": {"type": "string",
+                           "description": "restrict to one branch; defaults to "
+                                          "every branch"},
+                "limit": {"type": "integer", "minimum": 1,
+                          "description": "maximum rows, newest first "
+                                         "(default 20)"},
+            }),
+            handler=_handle_log,
+            description="Recent reviews, newest first, one line each: "
+                        "`<when> | <branch> | <files> | <high>-<medium>-<low> | "
+                        "<status> | <summary>`. A leading `!` marks a review "
+                        "that is NOT trustworthy."),
+        HandlerSpec(
+            name="surface", long_running=False,
+            input_schema=_schema({
+                **_REPO_PROPERTY,
+                "branch": {"type": "string",
+                           "description": "branch to report on; defaults to the "
+                                          "checked-out one"},
+                "hook_format": {"type": "string", "enum": ["text", "claude"],
+                                "description": "`text` for plain lines, "
+                                               "`claude` for the SessionStart "
+                                               "JSON envelope (default text)"},
+                "include_delivered": {
+                    "type": "boolean",
+                    "description": "replay rounds that were already delivered "
+                                   "too (default false)"},
+            }),
+            handler=_handle_surface,
+            description="Report background review rounds nobody has been shown "
+                        "yet, and record that you have now seen them. Silence is "
+                        "never a verdict: a round that produced nothing usable "
+                        "says so in words. This certifies NOTHING about the "
+                        "current change -- only `gate` answers that."),
+        HandlerSpec(
+            name="triage_list", long_running=False,
+            input_schema=_schema(_REVIEW_ID_PROPERTY, ("review_id",)),
+            handler=_handle_triage_list,
+            description="Every finding in one review with its EFFECTIVE triage "
+                        "state (OPEN / DISMISSED / REOPENED), plus the refuter's "
+                        "annotation where a refuter pass produced one. The "
+                        "`[n]` index is what the triage tools take."),
+        HandlerSpec(
+            name="triage_dismiss", long_running=False,
+            input_schema=_schema(
+                {**_REVIEW_ID_PROPERTY, **_INDEX_PROPERTY, **_REASON_PROPERTY},
+                ("review_id", "index", "reason")),
+            handler=_handle_triage_dismiss,
+            description="Dismiss ONE finding with an audited reason, which is "
+                        "stored verbatim and read by whoever audits the ledger "
+                        "later. A reason that says nothing specific about this "
+                        "finding is REFUSED. There is no bulk form, on purpose. "
+                        "This moves the gate, so it is a decision, not "
+                        "bookkeeping."),
+        HandlerSpec(
+            name="adopt_refuter", long_running=False,
+            input_schema=_schema(
+                {**_REVIEW_ID_PROPERTY, **_INDEX_PROPERTY},
+                ("review_id", "index")),
+            handler=_handle_adopt_refuter,
+            description="Dismiss ONE finding by adopting its refuter "
+                        "annotation as the audited reason -- the refuter's own "
+                        "words, not yours. Status 1 = REFUSED (the verdict was "
+                        "not `refuted`, the reasoning is too thin to audit, or "
+                        "no refuter pass stands behind the annotation); 2 = no "
+                        "such review or finding."),
+        HandlerSpec(
+            name="triage_reopen", long_running=False,
+            input_schema=_schema(
+                {**_REVIEW_ID_PROPERTY, **_INDEX_PROPERTY, **_REASON_PROPERTY},
+                ("review_id", "index", "reason")),
+            handler=_handle_triage_reopen,
+            description="Reopen ONE previously dismissed finding, with an "
+                        "audited reason for overturning the dismissal. It moves "
+                        "the gate from 0 back to 1, so the reason clears the "
+                        "same audit floor a dismissal does. Append-only: the "
+                        "dismissal it overturns stays in the ledger."),
+    )
+
+
+#: `review-now` and `gate-check`: STATIC text, on purpose. A prompt that
+#: interpolated a repo path or a branch would be a second place those are
+#: decided, and the tools already take them as arguments. Each one names the
+#: tools in the order they should be used and states the one rule an agent most
+#: needs to know about this product -- that a dismissal is a human's decision.
+_REVIEW_NOW_TEXT = """\
+Run a full skodun review of the outgoing change in this repository and report \
+what it found.
+
+1. Call the `review` tool. It takes minutes and spends model calls; do not call \
+it twice, and do not call it again if it reports that a review is already in \
+flight.
+2. Read the verdict line it returns. `trustworthy=false` means the review does \
+not cover this change and nothing may be concluded from it.
+3. If it reports findings, call `triage_list` with the review id from the \
+verdict line and summarise each finding for me: file, line, severity, title, \
+and whether a refuter annotation disagrees with it.
+4. Then STOP and wait for me. Do NOT dismiss anything. A dismissal is my \
+decision and it is recorded with my reason in an audit ledger; `triage_dismiss` \
+and `adopt_refuter` are tools for carrying out a decision I have already made, \
+not for tidying up a report.
+"""
+
+_GATE_CHECK_TEXT = """\
+Check whether a trustworthy review covers the current change in this \
+repository, and tell me what to do about the answer.
+
+1. Call the `gate` tool.
+2. Report its status and its verdict line verbatim, then explain it:
+   * 0 -- a trustworthy review covers exactly this content and no findings are \
+open. Safe to push.
+   * 1 -- findings remain open. List them with `triage_list` so I can decide; do \
+not dismiss any of them yourself.
+   * 2 -- NO trustworthy review covers this content. This is the fail-closed \
+answer and it is the normal one after any edit: the gate keys on the content, \
+not on the commit. Running the `review` tool is what fixes it.
+3. If there are undelivered background rounds, `surface` reports them -- but \
+nothing it reports certifies the current change. Only `gate` answers that.
+"""
 
 
 def default_prompts() -> tuple[PromptSpec, ...]:
-    """The prompts `skodun mcp` serves. Empty until Task 14 adds `review-now`
-    and `gate-check`."""
-    return ()
+    """The prompts `skodun mcp` serves, as `/mcp__skodun__<name>`."""
+    return (
+        PromptSpec(name="review-now",
+                   description="Review the outgoing change now and report the "
+                               "findings, without triaging any of them",
+                   text=_REVIEW_NOW_TEXT),
+        PromptSpec(name="gate-check",
+                   description="Ask the gate whether a trustworthy review "
+                               "covers this change, and explain the answer",
+                   text=_GATE_CHECK_TEXT),
+    )
 
 
 def default_store_factory():

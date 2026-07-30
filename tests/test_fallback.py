@@ -49,7 +49,8 @@ from skodun.gitio import (capture_diff, current_branch, diff_identity,
 from skodun.pipeline import PreflightRefused, lock_stale_ceiling_sec, run_review, worst_runtime_sec
 from skodun.store import Store
 from tests.test_gitio import _git, _mkrepo
-from tests.test_pipeline import CANCELLED, CLEAN, DIRTY, _emit, _emit_then_hang, _per_call
+from tests.test_pipeline import (CANCELLED, CLEAN, DIRTY, _emit, _emit_then_hang,
+                                 _per_call, _verdict)
 
 # --------------------------------------------------------------------------
 # configs under test
@@ -349,8 +350,8 @@ def test_exhausted_chain_fails_closed_and_gate_semantics(tmp_path, monkeypatch,
     assert rec["status"] == "failed" and rec["trustworthy"] is False
     assert "unavailable" in rec["failure_reason"]
     assert [a["provider"] for a in rec["attempts"]] == ["openai", "xai"]
-    assert capsys.readouterr().out.strip().splitlines()[-1].startswith(
-        "SKODUN VERDICT: trustworthy=false")
+    # `run_review` prints nothing; the banner is rendered from what it returned.
+    assert _verdict(rec, capsys).startswith("SKODUN VERDICT: trustworthy=false")
     # Nothing covers this content, so the gate refuses it.
     assert _gate(repo, st) == 2
     # ...and the invariant in the other direction: a quota outage cannot
