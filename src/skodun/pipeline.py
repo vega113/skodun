@@ -629,10 +629,17 @@ def _reviewer_for(cfg: Config, role: str) -> Reviewer | None:
     return None
 
 
-#: Extra pass -> the configured reviewer role it prefers over the finder, in
-#: the order the passes are scheduled. ONE table: `_pass_reviewer` reads it to
+#: Pass -> the configured reviewer role it prefers over the finder, in the
+#: order the passes are scheduled. ONE table: `_pass_reviewer` reads it to
 #: pick the reviewer and preflight reads it to validate every reviewer this run
 #: may reach for, so a new pass cannot be wired up on one side only.
+#:
+#: `integration` is in the table but is NOT a `--now` extra pass: it is the
+#: cross-file pass a BATCHED review runs over its own seams, scheduled by batch
+#: count (`passes.should_run_integration`) in either mode. It belongs here for
+#: exactly the reason the table exists — an `integrator` reviewer with a bogus
+#: provider must be refused before the lock and before any model call, not
+#: discovered by the luck of a diff that happened to need splitting.
 #:
 #: `skeptic` and `refuter` collide on the role name `refuter` — pre-existing
 #: (the skeptic already preferred that role before this pass existed) and
@@ -643,7 +650,8 @@ def _reviewer_for(cfg: Config, role: str) -> Reviewer | None:
 #: ever reads this table in a given run. If that mutual exclusion ever
 #: changes, this shared name needs a second look.
 _EXTRA_PASS_ROLES = {"security": "security", "skeptic": "refuter",
-                     "refuter": "refuter"}
+                     "refuter": "refuter",
+                     passes.INTEGRATION_PASS: passes.INTEGRATION_ROLE}
 
 
 def _pass_reviewer(cfg: Config, pass_name: str, finder: Reviewer) -> Reviewer:
