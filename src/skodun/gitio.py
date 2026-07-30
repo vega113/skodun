@@ -5,6 +5,11 @@ reads the WORKING TREE, because a foreground review is of what the developer has
 in front of them; `blob_bytes`/`blob_size` read the OBJECT STORE, because a
 background review is of a ref that has already been pushed and the working tree
 may since have moved on. Neither is a substitute for the other.
+`capture_ref_diff`/`resolve_ref_base` are the object-store-only counterparts of
+`capture_diff`/`resolve_base`: the same diff-capture and base-resolution jobs,
+done between two given oids instead of against the working tree and the
+checked-out `HEAD`, for exactly the same reason `blob_bytes` avoids the
+working tree.
 
 `diff_identity` is the join key between every review skodun stores and every
 record the legacy shell reviewer already wrote. It is defined by the oracle's
@@ -153,6 +158,65 @@ def resolve_base(repo: Path) -> Base:
     )
 
 
+_REF_FALLBACK_WARNING = (
+    "no main ref (github/main|origin/main|main) with a merge-base found; "
+    "reviewing {ref}..{oid} only -- a multi-commit branch may be "
+    "under-reviewed"
+)
+
+
+def resolve_ref_base(repo: Path, local_oid: str) -> Base:
+    """Resolve the base for a PUSHED ref that need not be checked out at all.
+
+    This is the dispatcher's base resolution for a NEW remote branch.
+    Candidate order and existence-only selection — the first of
+    `github/main`/`origin/main`/`main` that merely resolves, `break`ing
+    immediately with no fall-through to the next candidate even if it has no
+    merge-base — mirror `resolve_base` exactly; see its own docstring for why
+    fall-through would silently pick a different base_sha.
+
+    The one deliberate difference: `resolve_base` computes the outgoing
+    FOREGROUND change, whose tip is always the checked-out `HEAD`. A
+    background dispatch reviews a ref that was PUSHED and may never be
+    checked out — the checkout's actual `HEAD` can be a different branch
+    entirely, or simply stale — so `local_oid`, not `HEAD`, plays the "tip of
+    the range" role everywhere `resolve_base` hard-codes `HEAD`: the
+    merge-base call itself, and both of its no-merge-base fallbacks
+    (`local_oid^`, then `local_oid` for a single-commit branch). Using `HEAD`
+    for any of those would silently resolve — and therefore review — the
+    wrong range whenever the pushed branch and the checkout have diverged.
+    """
+    base_ref = ""
+    for cand in ("github/main", "origin/main", "main"):
+        if _run(repo, "rev-parse", "--verify", "-q", cand, ok_codes=(0, 1)).returncode == 0:
+            base_ref = cand
+            break
+
+    if base_ref:
+        mb = _run(repo, "merge-base", base_ref, local_oid, ok_codes=(0, 1, 128))
+        sha = mb.stdout.decode("utf-8", "replace").strip() if mb.returncode == 0 else ""
+        if sha:
+            return Base(ref=base_ref, sha=sha)
+
+    # No main ref, or one that shares no history with local_oid: fall back to
+    # its previous commit, reviewing only local_oid^..local_oid — warn loudly
+    # rather than silently reviewing a subset.
+    parent_rev = f"{local_oid}^"
+    parent = _run(repo, "rev-parse", "--verify", "-q", parent_rev, ok_codes=(0, 1, 128))
+    if parent.returncode == 0:
+        return Base(
+            ref=parent_rev,
+            sha=parent.stdout.decode("utf-8", "replace").strip(),
+            warning=_REF_FALLBACK_WARNING.format(ref=parent_rev, oid=local_oid),
+        )
+    # Single-commit branch: local_oid^ does not exist.
+    return Base(
+        ref=local_oid,
+        sha=_out(repo, "rev-parse", local_oid),
+        warning=_REF_FALLBACK_WARNING.format(ref=local_oid, oid=local_oid),
+    )
+
+
 @dataclass(frozen=True)
 class Diff:
     data: bytes
@@ -161,15 +225,20 @@ class Diff:
     truncated_untracked: bool = False
 
 
-def _tracked_statuses(repo: Path, base_sha: str) -> dict[str, str]:
+def _tracked_statuses(repo: Path, base_sha: str, *other: str) -> dict[str, str]:
     """path -> one-letter status from `git diff --name-status -z`.
 
     NUL-delimited, never text-mode + `.strip()`: under default `core.quotepath`
     git renders non-ASCII names as `"\\303\\244.txt"` in text mode, and stripping
     would eat filenames' real leading/trailing spaces. Records are `X\0path\0`
     except rename AND copy (`R`/`C`), which carry `old\0new` — the new name wins.
+
+    `*other` is empty for `capture_diff` (base_sha vs the working tree/index)
+    and is `(local_oid,)` for `capture_ref_diff` (base_sha vs a second oid,
+    commits only) — one parser shared between both callers, per the module's
+    "reuse the shipped -z name-status parsing" contract.
     """
-    toks = _paths(_run(repo, "diff", *_DIFF_FLAGS, "--name-status", "-z", base_sha).stdout)
+    toks = _paths(_run(repo, "diff", *_DIFF_FLAGS, "--name-status", "-z", base_sha, *other).stdout)
     statuses: dict[str, str] = {}
     i = 0
     while i < len(toks) and toks[i]:
@@ -253,6 +322,33 @@ def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
     if udiff:
         data = data + b"\n" + udiff
     return Diff(data=data, files=files, statuses=statuses, truncated_untracked=truncated)
+
+
+def capture_ref_diff(repo: Path, base_sha: str, local_oid: str) -> Diff:
+    """`base_sha..local_oid` — commits only. No untracked files, no working
+    tree, no index: everything here comes from the two given oids.
+
+    This is the background dispatcher's diff scope: it reviews a ref that has
+    been PUSHED, and that ref need not be checked out at all — its working
+    tree, if one even exists, may since have moved on to something else
+    entirely. `capture_diff` exists for the opposite reason: a FOREGROUND
+    review is of what the developer has in front of them right now. Reuses
+    `_tracked_statuses`'s `-z` name-status parsing (rename/copy records
+    included) between the two given oids; `diff_identity` is unchanged and
+    applies to the returned `Diff` exactly as it does to `capture_diff`'s.
+
+    Unlike `capture_diff`, `repo` is NOT normalised to the worktree root here,
+    and deliberately so: `git diff <rev> <rev>` with no pathspec always emits
+    paths relative to the repo TOP regardless of the invoking cwd (it is only
+    a working-tree/index diff, or `ls-files`, that are cwd-relative — the
+    exact mismatch `capture_diff` normalises away). There is also no
+    untracked-file listing here to keep path-consistent with, since a
+    ref-range diff between two commits has no untracked files by definition.
+    """
+    tracked = _run(repo, "--no-pager", "diff", *_DIFF_FLAGS, base_sha, local_oid).stdout
+    statuses = _tracked_statuses(repo, base_sha, local_oid)
+    files = list(statuses)
+    return Diff(data=tracked.rstrip(b"\n"), files=files, statuses=statuses)
 
 
 def _blob_rev(oid: str, path: str) -> str | None:
