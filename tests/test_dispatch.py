@@ -2609,3 +2609,405 @@ def test_the_installed_shim_drives_a_real_push_to_a_gate_passing_record(
     with Store.open(db) as st:
         result = run_gate(st, repo, load_config(repo))
     assert result.code == 0, result.message
+
+
+# ===========================================================================
+# TASK 11: dispatcher trust-boundary drills
+# ===========================================================================
+#
+# Everything above pins ONE seam at a time -- a unit, an in-process call, a
+# stub standing in for a racing peer. These five drive the acceptance
+# criteria's own scenarios end to end: real detached worker processes, real
+# concurrent dispatchers, a real signal a handler cannot catch. Every one of
+# them is reaped explicitly (`spawned`, or a manual `wait`/`killpg`) -- a
+# leaked child here would keep spending fake-CLI "model calls" against a store
+# the next test is about to replace.
+
+
+def test_a_sigkilled_worker_is_recovered_by_its_own_persisted_budget_and_the_gate_fails_closed(
+        tmp_path):
+    """Drill 1: SIGKILL a worker mid-run; only the startup sweep ever notices.
+
+    A `SIGKILL` cannot be caught, so it skips the worker's SIGTERM handler,
+    its watchdog and every `finally` block -- none of the cascade
+    `test_a_cancelled_worker_takes_the_providers_process_group_with_it` pins
+    (a SIGTERM the worker's own handler converts into an orderly cancellation)
+    ever runs. `pipeline.recover_stale`'s startup sweep is the ONLY thing left
+    that can ever close this record, and it has to do it from the record's own
+    persisted `worst_runtime_sec` -- test_pipeline.py's
+    `test_recover_stale_fails_old_running_records_and_leaves_fresh_ones`
+    fabricates its `running` row with `store.save_review` directly and never
+    has a real worker, a real reservation or a real budget at all.
+
+    The wall-clock wait for a real budget to actually elapse would cost a
+    real minute-plus at the shipped defaults, so the record is backdated
+    directly (as `test_pipeline.py`'s own `_running` helper does) rather than
+    slept for: the sweep's decision is about elapsed time, and faking the
+    clock on an otherwise completely real record is what keeps this
+    deterministic instead of a sleep of hope.
+    """
+    pgfile = tmp_path / "provider.pgid"
+    body = (f'python3 -c "import os,sys; open({str(pgfile)!r},\'w\')'
+            f'.write(str(os.getpgid(0)))"\n'
+            "sleep 120\n")
+    repo = _bg_repo(tmp_path, body=body)
+    db = tmp_path / "s.db"
+    rid, ident = _reserve(db, repo)
+
+    env = dict(os.environ)
+    env["SKODUN_DB"] = str(db)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [_SRC] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "skodun", "worker", "--record-id", rid,
+         "--repo", str(repo), "--branch", "feat", "--local-oid", ident["head"],
+         "--base-sha", ident["base_sha"], "--base-ref", ident["base_ref"]],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+        start_new_session=True)
+    pgid = None
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not pgfile.exists():
+            time.sleep(0.05)
+        assert pgfile.exists(), "the worker never reached the provider"
+        pgid = int(pgfile.read_text(encoding="utf-8"))
+        with Store.open(db) as st:
+            assert st.get_review(rid)["status"] == "running"
+
+        proc.kill()                      # SIGKILL: no handler, no `finally`
+        proc.wait(timeout=30)
+        assert proc.returncode != 0
+    finally:
+        # The provider is a session leader of its OWN (see `spawn_worker` /
+        # `runner._run_once`), so the SIGKILLed worker orphaned it rather than
+        # taking it down -- clean it up explicitly or it leaks for 120s.
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and _pgroup_alive(pgid):
+                time.sleep(0.05)
+
+    with Store.open(db) as st:
+        stuck = st.get_review(rid)
+    assert stuck["status"] == "running", "the SIGKILLed worker still finalized"
+    budget = stuck["worst_runtime_sec"]
+    assert isinstance(budget, int) and budget > 0, (
+        "the reservation carried no budget of its own -- the fixture, not the "
+        "drill, is broken")
+
+    past = time.strftime(store_mod._TS_FORMAT,
+                         time.gmtime(time.time() - budget - 5))
+    with Store.open(db) as st:
+        st.save_review(dict(stuck, reviewed_at=past))
+
+    cfg = load_config(repo)
+    with Store.open(db) as st:
+        swept = pipeline.recover_stale(st, cfg)
+        rec = st.get_review(rid)
+    assert swept == 1, "the stale sweep never recovered the SIGKILLed worker"
+    assert rec["status"] == "failed" and rec["trustworthy"] is False
+    assert rec["parse_ok"] is False
+    assert "stale" in rec["failure_reason"].lower()
+
+    from skodun.gate import run_gate
+    with Store.open(db) as st:
+        result = run_gate(st, repo, cfg)
+    assert result.code == 2, result.message
+
+
+def test_a_probe_that_precedes_a_racing_finalize_is_still_suppressed_inside_the_lease(
+        tmp_path, spawned, monkeypatch):
+    """Drill 2, race direction (a): dispatcher 2's evidence build genuinely
+    finishes BEFORE dispatcher 1 finalizes, and only the RESERVATION
+    TRANSACTION's own re-check -- not the stale evidence -- is what still
+    suppresses it.
+
+    `build_dedup_evidence`'s docstring names exactly this: "a racing
+    dispatcher can finalize a trustworthy review a millisecond after we
+    look". `test_a_suppressed_push_never_touches_an_in_flight_review` pins the
+    RULE with a review that is already finalized (via a direct `save_review`)
+    before the second dispatch even starts -- so its evidence build has
+    nothing stale to race. Here a real `threading.Event` handshake pauses
+    dispatcher 2 immediately after its REAL evidence probe returns and
+    strictly before it reaches `reserve_prepush`, and it is released only once
+    dispatcher 1's REAL detached worker has genuinely committed a trustworthy
+    `clean` review -- so the probe really was answered before the fact it
+    needed to know about existed.
+    """
+    repo = _bg_repo(tmp_path, body="sleep 2\n" + _emit(CLEAN))
+    db = tmp_path / "s.db"
+    push = _push_line(repo)
+
+    real_evidence = dispatch.build_dedup_evidence
+    probed = threading.Event()
+    release = threading.Event()
+
+    def paused_evidence(*a, **kw):
+        ev = real_evidence(*a, **kw)          # the real probe, computed NOW
+        probed.set()
+        assert release.wait(timeout=60), "dispatcher 1 never finalized"
+        return ev
+
+    assert run_dispatch(push, repo, db) == 0
+    (rid1,) = _ids(db)
+
+    monkeypatch.setattr(dispatch, "build_dedup_evidence", paused_evidence)
+    results: list[int] = []
+
+    def second() -> None:
+        results.append(run_dispatch(push, repo, db))
+
+    t = threading.Thread(target=second)
+    t.start()
+    try:
+        assert probed.wait(timeout=30), "dispatcher 2 never reached its probe"
+        with Store.open(db) as st:
+            assert st.get_review(rid1)["status"] == "running", (
+                "dispatcher 1 already finalized before dispatcher 2 even "
+                "probed -- this is not the race the drill exists to drive")
+        rec1 = _await(db, rid1)
+        assert rec1["status"] == "clean" and rec1["trustworthy"] is True
+    finally:
+        release.set()          # release even if an assertion above raised
+    t.join(timeout=30)
+    assert not t.is_alive()
+
+    assert results == [0]
+    assert _ids(db) == [rid1], "the suppressed push wrote a record of its own"
+    with Store.open(db) as st:
+        events = st._c.execute("SELECT * FROM dedup_events").fetchall()
+    assert len(events) == 1, "the suppression left no audit row"
+    assert events[0]["matched_review_id"] == rid1
+    assert events[0]["diff_hash"] == rec1["diff_hash"]
+
+
+def test_a_true_zero_delay_race_leaves_one_review_and_one_superseded_audit_row(
+        tmp_path, spawned):
+    """Drill 3, race direction (b): two REAL, concurrent dispatchers reserve
+    for the same branch at (as near as a `threading.Barrier` can make it) the
+    same instant, and dispatcher 1's row is caught genuinely `running` at the
+    moment it is retired.
+
+    `test_a_zero_delay_double_dispatch_leaves_exactly_one_reviewed_record`
+    already pins the OUTCOME of this race, but drives it by calling
+    `run_dispatch` twice in a row on the same thread -- "zero delay" there
+    means "no sleep between the two calls", not "the two reservation
+    transactions were actually in flight at once". A `Barrier` makes that
+    literal, and it is what makes the mid-race assertion below ("dispatcher
+    1's row is `running`, not merely superseded-and-not-yet-observed")
+    meaningful rather than incidental.
+    """
+    repo = _bg_repo(tmp_path, body="sleep 1.5\n" + _emit(CLEAN))
+    db = tmp_path / "s.db"
+    Store.open(db).close()          # settle the fresh-store migration first;
+                                     # that race is `test_a_fresh_store_
+                                     # survives_concurrent_openers`'s alone.
+
+    oid1 = _git(repo, "rev-parse", "feat")
+    (repo / "a.txt").write_text("two\nthree\nfour\n", encoding="utf-8")
+    _git(repo, "add", "."); _git(repo, "commit", "-m", "c2")
+    oid2 = _git(repo, "rev-parse", "feat")
+    assert oid1 != oid2
+
+    line1 = f"refs/heads/feat {oid1} refs/heads/feat {ZERO}\n"
+    line2 = f"refs/heads/feat {oid2} refs/heads/feat {ZERO}\n"
+
+    barrier = threading.Barrier(2)
+    results: dict[str, int] = {}
+
+    def racer(name: str, line: str) -> None:
+        barrier.wait(timeout=30)
+        results[name] = run_dispatch(line, repo, db)
+
+    threads = [threading.Thread(target=racer, args=("a", line1)),
+               threading.Thread(target=racer, args=("b", line2))]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=60)
+
+    assert results == {"a": 0, "b": 0}
+    rows = _rows(db)
+    assert len(rows) == 2, rows
+    running_now = [r for r in rows if r["status"] == "running"]
+    superseded_now = [r for r in rows if r["status"] == "superseded"]
+    assert len(running_now) == 1 and len(superseded_now) == 1, [
+        (r["id"], r["status"]) for r in rows]
+    winner_id = running_now[0]["id"]
+    loser_id = superseded_now[0]["id"]
+    assert superseded_now[0]["superseded_by"] == winner_id
+    assert superseded_now[0]["trustworthy"] is False
+
+    winner = _await(db, winner_id)
+    assert winner["status"] == "clean" and winner["trustworthy"] is True
+
+    # The loser's REAL worker gets the dispatcher's own best-effort SIGTERM
+    # once its pid is confirmed (`signal_superseded`), same as any other
+    # supersede -- so it typically ends up cancelled rather than clean. Either
+    # way, let it run to its own real end rather than asserting how it gets
+    # there; `test_a_deleted_branch_does_not_interfere_and_a_cleanly_
+    # finishing_superseded_worker_changes_nothing` pins the UNCANCELLED finish
+    # specifically, which this race does not reliably produce.
+    for proc in spawned:
+        proc.wait(timeout=60)
+
+    with Store.open(db) as st:
+        loser_final = st.get_review(loser_id)
+    assert loser_final["status"] == "superseded", (
+        "the loser's late-finishing worker overwrote the superseded audit row")
+    assert loser_final["superseded_by"] == winner_id
+    assert loser_final["trustworthy"] is False
+
+    final_rows = _rows(db)
+    reviewed = [r for r in final_rows if r["status"] == "clean"]
+    superseded = [r for r in final_rows if r["status"] == "superseded"]
+    assert len(reviewed) == 1 and len(superseded) == 1, final_rows
+
+
+def test_a_backdated_running_record_is_recovered_by_its_OWN_persisted_budget(
+        tmp_path):
+    """Drill 4: `recover_stale` prefers the record's OWN persisted
+    `worst_runtime_sec` over a fresh recomputation from the CURRENT config --
+    and this only tells the two apart when they actually disagree.
+
+    Every existing `recover_stale` test (`test_pipeline.py`'s
+    `test_recover_stale_fails_old_running_records_and_leaves_fresh_ones` and
+    its neighbours) backdates a HAND-BUILT record that carries no
+    `worst_runtime_sec` at all, so they only ever exercise the computed-ceiling
+    FALLBACK; the config never changes between reservation and sweep in any of
+    them, so a mutation that always recomputed from the CURRENT config would
+    still pass every single one. Here the record is reserved for real
+    (`reserve_prepush`, so its persisted budget is genuine) under a
+    SMALL-timeout config, and the config is then changed to a much LARGER one
+    before the sweep runs -- so "use the persisted budget" and "recompute from
+    the config as it is now" actively disagree about whether this record is
+    stale, and only the persisted-budget answer recovers it.
+    """
+    repo = _bg_repo(tmp_path, "\n[defaults]\ntimeout_sec = 1\n"
+                              "timeout_retries = 0\ndegraded_retries = 0\n")
+    db = tmp_path / "s.db"
+    small_cfg = load_config(repo)
+    rid, _ = _reserve(db, repo)
+    with Store.open(db) as st:
+        reserved = st.get_review(rid)
+    small_budget = reserved["worst_runtime_sec"]
+    # The reservation's own arithmetic (`reservation_defaults` takes the MAX
+    # of `[defaults]` and `[dispatch]`), not a bare `pipeline.worst_runtime_sec`
+    # over `[defaults]` alone -- the unmodified `[dispatch] timeout_sec` (240)
+    # is what actually dominates this small config.
+    assert small_budget == pipeline.worst_runtime_sec(
+        reservation_defaults(small_cfg.defaults, small_cfg.dispatch))
+
+    # The config changes to a much larger timeout BEFORE the sweep runs. The
+    # record's own persisted budget must not move with it.
+    (repo / ".skodun.toml").write_text(
+        CFG + "\n[defaults]\ntimeout_sec = 100000\n"
+              "timeout_retries = 0\ndegraded_retries = 0\n", encoding="utf-8")
+    big_cfg = load_config(repo)
+    big_ceiling = pipeline.worst_runtime_sec(
+        reservation_defaults(big_cfg.defaults, big_cfg.dispatch))
+    assert big_ceiling > small_budget * 100, "fixture no longer discriminates"
+
+    # Backdated just past the SMALL persisted budget -- nowhere near the big
+    # recomputed one.
+    past = time.strftime(store_mod._TS_FORMAT,
+                         time.gmtime(time.time() - small_budget - 5))
+    with Store.open(db) as st:
+        st.save_review(dict(reserved, reviewed_at=past))
+
+    with Store.open(db) as st:
+        swept = pipeline.recover_stale(st, big_cfg)
+        rec = st.get_review(rid)
+    assert swept == 1, "the persisted budget was ignored in favour of a recompute"
+    assert rec["status"] == "failed" and rec["trustworthy"] is False
+    assert "stale" in rec["failure_reason"].lower()
+
+
+def test_a_deleted_branch_does_not_interfere_and_a_cleanly_finishing_superseded_worker_changes_nothing(
+        tmp_path, spawned, capsys):
+    """Drill 5: a branch deletion dispatched while a review is running must
+    leave that review completely alone, and a REAL worker that is superseded
+    while genuinely still running -- but never signalled -- must not
+    resurrect its record with the ordinary, uncancelled `clean` answer it
+    finishes with.
+
+    The deletion half is new coverage: every existing deletion test
+    (`test_everything_else_is_skipped_with_a_reason_and_never_a_record`,
+    `test_a_config_failure_writes_one_record_per_ACTIONABLE_ref_only`) proves a
+    deletion writes no record of ITS OWN, never that a running review of the
+    SAME branch survives a deletion dispatched moments later.
+
+    The late-finish half is deliberately NOT driven through a second
+    `run_dispatch` call: `test_a_true_zero_delay_race_leaves_one_review_and_
+    one_superseded_audit_row` already shows that a REAL racing dispatch
+    signals a confirmable worker pid, and the signal turns the loser's own
+    completion into a CANCELLED one that `fail_if_running` refuses -- a
+    DIFFERENT conditional than `finalize_review`'s. Retiring the row directly
+    through `store.reserve_prepush` -- the exact call `run_dispatch` itself
+    makes for the decision, only without the dispatcher's own best-effort
+    SIGTERM on top of it -- lets this REAL worker process run its review to a
+    completely ordinary, uncancelled `clean` finish, so it is `finalize_
+    review`'s OWN conditional guard that refuses it, not the cancellation
+    path's. This is the drill the brief's second named mutation ("make
+    `finalize_review` unconditional") is checked against; the pre-reviewer log
+    line is the deterministic point at which the worker is known to have
+    already passed its own early "still running" check and be about to invoke
+    the (real, detached) provider -- not a sleep of hope.
+    """
+    repo = _bg_repo(tmp_path, body="sleep 1.2\n" + _emit(CLEAN))
+    db = tmp_path / "s.db"
+    assert run_dispatch(_push_line(repo), repo, db) == 0
+    (rid1,) = _ids(db)
+    with Store.open(db) as st:
+        assert st.get_review(rid1)["status"] == "running"
+
+    # The remote branch is deleted -- a real pre-push deletion notification --
+    # while that review is still in flight.
+    deletion = f"(delete) {ZERO} refs/heads/feat {'d' * 40}\n"
+    assert run_dispatch(deletion, repo, db) == 0
+    assert "deletion" in capsys.readouterr().err
+    assert len(spawned) == 1, "the deletion started a worker of its own"
+    assert _ids(db) == [rid1], "the deletion wrote a record of its own"
+    with Store.open(db) as st:
+        assert st.get_review(rid1)["status"] == "running", (
+            "an unrelated branch deletion disturbed a running review")
+
+    # Wait for the WORKER's own log to show it is past its early reservation
+    # check and about to invoke the (real, detached) provider -- observable
+    # state, not a guess about timing.
+    log = Path(str(db) + ".logs") / f"{rid1}.log"
+    marker = f"as {rid1} ..."
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if log.exists() and marker in log.read_text(encoding="utf-8",
+                                                     errors="replace"):
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("the worker never reached its pre-reviewer "
+                             "checkpoint")
+
+    # Retired directly through the reservation lease -- no signal reaches the
+    # still-running worker.
+    with Store.open(db) as st:
+        newer = st.reserve_prepush("feat", "f" * 40, "main", "b" * 40, "h2",
+                                   100, _evidence(valid=False))
+        assert st.get_review(rid1)["status"] == "superseded"
+    assert newer.superseded and newer.superseded[0]["id"] == rid1
+
+    # The real worker was never signalled; let it run all the way to its own
+    # ordinary, uncancelled completion.
+    spawned[0].wait(timeout=60)
+    with Store.open(db) as st:
+        rec1 = st.get_review(rid1)
+    assert rec1["status"] == "superseded", (
+        "the cleanly-finishing superseded worker overwrote a retired record")
+    assert rec1["superseded_by"] == newer.record_id
+    assert rec1["trustworthy"] is False
+    log_text = log.read_text(encoding="utf-8", errors="replace")
+    assert "cancelled" not in log_text.lower(), (
+        "the worker was signalled -- this drill needs an UNCANCELLED finish "
+        "to reach finalize_review's own conditional")
