@@ -23,12 +23,14 @@ from skodun.gitio import (
     blob_sha1,
     blob_size,
     capture_diff,
+    capture_ref_diff,
     current_branch,
     diff_identity,
     git_common_dir,
     head_sha,
     is_primary_checkout,
     resolve_base,
+    resolve_ref_base,
 )
 from tests.conftest import oracle_dir
 
@@ -436,6 +438,236 @@ def test_capture_diff_normalises_subdirectory_to_worktree_root(tmp_path):
     # every listed path opens relative to the worktree root
     for f in from_sub.files:
         assert (repo / f).exists(), f"{f!r} is not openable from the worktree root"
+
+
+# --------------------------------------------------------------------------
+# ref-range diff scope (Task 5: the background dispatcher's reads)
+#
+# `capture_ref_diff`/`resolve_ref_base` are the PUSHED-ref analogues of
+# `capture_diff`/`resolve_base`: a background review is of `base_sha..
+# local_oid` -- commits only -- because the ref being reviewed need not be
+# checked out at all, and its working tree (if any) may since have moved on.
+# --------------------------------------------------------------------------
+
+
+def test_ref_diff_excludes_untracked_and_worktree_edits(tmp_path):
+    repo = _mkrepo(tmp_path)  # c0: a.txt == "one\n"
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "c1")
+    local_oid = _git(repo, "rev-parse", "HEAD")
+
+    # Dirty the worktree AFTER local_oid is committed: an untracked file plus
+    # a further uncommitted edit to the tracked file. Neither was pushed.
+    (repo / "a.txt").write_text("DIRTY WORKTREE\n", encoding="utf-8")
+    (repo / "untracked.txt").write_text("should never appear\n", encoding="utf-8")
+
+    d = capture_ref_diff(repo, base_sha, local_oid)
+    assert d.statuses == {"a.txt": "M"}
+    assert d.files == ["a.txt"]
+    assert b"two" in d.data  # the committed content is there...
+    assert b"DIRTY WORKTREE" not in d.data  # ...the worktree edit is not...
+    assert b"should never appear" not in d.data  # ...and neither is the untracked file
+    assert "untracked.txt" not in d.files
+    assert d.truncated_untracked is False
+
+
+def test_ref_diff_same_content_pushed_twice_gives_identical_identity(tmp_path):
+    """Two distinct commits (different oids, e.g. a re-push after a rebase)
+    carrying the SAME net content diff against the same base must hash the
+    same -- the identity is a function of diff bytes, not of the oid."""
+    repo = _mkrepo(tmp_path)
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "c1")
+    first_oid = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "reset", "--hard", base_sha)
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "c1-repushed")
+    second_oid = _git(repo, "rev-parse", "HEAD")
+    assert first_oid != second_oid  # not vacuous: genuinely different oids
+
+    d1 = capture_ref_diff(repo, base_sha, first_oid)
+    d2 = capture_ref_diff(repo, base_sha, second_oid)
+    assert diff_identity(d1.data) == diff_identity(d2.data)
+
+
+def test_ref_diff_rename_record_parsed_between_two_oids(tmp_path):
+    """`R100\\0old\\0new` between two committed oids -- no working tree or
+    index involved at all -- is still a three-token record; new name wins."""
+    repo = _mkrepo(tmp_path)
+    (repo / "old.txt").write_text("".join(f"line {i}\n" for i in range(40)), encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "c1")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "mv", "old.txt", "new.txt")
+    (repo / "tail.txt").write_text("t\n", encoding="utf-8")  # 4th token must not desync
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "c2-rename")
+    local_oid = _git(repo, "rev-parse", "HEAD")
+
+    d = capture_ref_diff(repo, base_sha, local_oid)
+    assert d.statuses.get("new.txt") == "R"
+    assert "old.txt" not in d.statuses  # old name never leaks into the file list
+    assert d.statuses.get("tail.txt") == "A"  # parser stayed in sync after 3 tokens
+
+
+def test_ref_diff_uses_local_oid_not_checked_out_head(tmp_path):
+    """The pushed oid is deliberately OLDER than the checked-out HEAD: a
+    mutant that swapped `local_oid` for `HEAD` would diff against the wrong
+    (newer) commit, and this test would see the newer commit's bytes instead
+    of the older, actually-pushed one. A same-as-HEAD fixture could not tell
+    the two apart."""
+    repo = _mkrepo(tmp_path)  # c0: a.txt == "one\n"
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    (repo / "a.txt").write_text("OLDER PUSHED VALUE\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "c1-pushed")
+    older_oid = _git(repo, "rev-parse", "HEAD")  # the oid that was actually pushed
+
+    # Checked-out HEAD moves further, past the pushed oid.
+    (repo / "a.txt").write_text("NEWER CHECKED OUT VALUE\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "c2-local-only")
+    checked_out_head = _git(repo, "rev-parse", "HEAD")
+    assert checked_out_head != older_oid  # not vacuous
+
+    d = capture_ref_diff(repo, base_sha, older_oid)
+    assert b"OLDER PUSHED VALUE" in d.data
+    assert b"NEWER CHECKED OUT VALUE" not in d.data
+
+
+def test_ref_diff_no_textconv_suppresses_textconv_driver(tmp_path):
+    """`--no-textconv` is load-bearing for `capture_ref_diff` too: without it
+    the hashed pushed-ref diff would depend on the repo's `.gitattributes` +
+    `diff.<driver>.textconv` config, not the pushed bytes. The driver is
+    asserted LIVE first (raw `git diff` output shows it), so this cannot pass
+    by the driver simply never firing."""
+    repo = _mkrepo(tmp_path)
+    # .gitattributes lands in the BASE commit so it is not itself part of the diff
+    (repo / ".gitattributes").write_text("tc.txt diff=tcdrv\n", encoding="utf-8")
+    (repo / "tc.txt").write_text("textconv target\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "attrs")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+
+    (repo / "tc.txt").write_text("textconv target EDITED\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "edit")
+    local_oid = _git(repo, "rev-parse", "HEAD")
+
+    tc = _exec_script(tmp_path / "textconv.sh", '#!/bin/sh\nsed "s/^/TEXTCONV-/" "$1"\n')
+    _git(repo, "config", "diff.tcdrv.textconv", str(tc))
+
+    raw = subprocess.run(
+        ["git", "-C", str(repo), "--no-pager", "diff", base_sha, local_oid],
+        capture_output=True,
+    ).stdout
+    assert b"TEXTCONV-" in raw, "textconv driver did not fire; test would be vacuous"
+
+    d = capture_ref_diff(repo, base_sha, local_oid)
+    assert b"TEXTCONV-" not in d.data
+    assert b"textconv target EDITED" in d.data  # the real content survived
+
+
+def test_ref_base_merge_base_uses_local_oid_not_checked_out_head(tmp_path):
+    """`resolve_ref_base` merge-bases against `local_oid`, never the checked-
+    out `HEAD` -- pinned by a fixture where the two give DIFFERENT merge-bases
+    with `main`, so a mutant swapping one for the other returns the wrong sha
+    rather than merely a coincidentally-matching one."""
+    repo = _mkrepo(tmp_path)  # c0 on main
+    c0 = _git(repo, "rev-parse", "HEAD")
+    (repo / "a.txt").write_text("m1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "main-c1")
+    c1 = _git(repo, "rev-parse", "HEAD")
+    (repo / "a.txt").write_text("m2\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "main-c2")  # main tip now c2
+
+    # "feat": the PUSHED branch (never checked out again after this) --
+    # branches off main at c1.
+    _git(repo, "checkout", c1)
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "feat.txt").write_text("f\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat-1")
+    local_oid = _git(repo, "rev-parse", "HEAD")
+
+    # The checked-out HEAD ends up somewhere else entirely: "other" branches
+    # off main's ROOT commit c0, so ITS merge-base with main is c0, not c1.
+    _git(repo, "checkout", c0)
+    _git(repo, "checkout", "-b", "other")
+    (repo / "other.txt").write_text("o\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "other-1")
+    assert _git(repo, "rev-parse", "HEAD") != local_oid  # not vacuous
+
+    # Precondition: the two merge-bases really do differ.
+    assert _git(repo, "merge-base", "main", local_oid) == c1
+    assert _git(repo, "merge-base", "main", "HEAD") == c0
+
+    base = resolve_ref_base(repo, local_oid)
+    assert base == Base(ref="main", sha=c1)
+
+
+def test_ref_base_falls_back_with_warning_relative_to_local_oid(tmp_path):
+    """No main ref resolves: the fallback is `local_oid^`, never `HEAD^` --
+    pinned by making the checked-out HEAD's parent differ from local_oid's."""
+    repo = _mkrepo(tmp_path)
+    (repo / "a.txt").write_text("m1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "main-c1")
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "feat.txt").write_text("f\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat-1")
+    local_oid = _git(repo, "rev-parse", "HEAD")
+    local_oid_parent = _git(repo, "rev-parse", f"{local_oid}^")
+
+    # Checked-out HEAD moves on past local_oid, so HEAD^ != local_oid^.
+    (repo / "feat.txt").write_text("f2\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat-2")
+    assert _git(repo, "rev-parse", "HEAD^") != local_oid_parent  # not vacuous
+
+    _git(repo, "branch", "-D", "main")  # no candidate main ref resolves
+
+    base = resolve_ref_base(repo, local_oid)
+    assert base.ref == f"{local_oid}^"
+    assert base.sha == local_oid_parent
+    assert base.warning is not None
+
+
+def test_ref_base_single_commit_repo_falls_back_to_local_oid_itself(tmp_path):
+    repo = _mkrepo(tmp_path)  # exactly one commit; local_oid^ does not exist
+    local_oid = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-b", "feat")  # so "main" is not the checked-out branch
+    _git(repo, "branch", "-D", "main")
+    base = resolve_ref_base(repo, local_oid)
+    assert base.ref == local_oid
+    assert base.sha == local_oid
+    assert base.warning is not None
+
+
+def test_ref_base_first_existing_candidate_wins_no_fallthrough(tmp_path):
+    """ORACLE PARITY (mirrored): candidate selection is existence-only, not
+    merge-base-able -- `github/main` exists but shares no history, so
+    `resolve_ref_base` falls straight to `local_oid^` without ever trying
+    `origin/main`/`main`, exactly as `resolve_base` does for `HEAD`."""
+    repo = _unrelated_history_repo(tmp_path)
+    local_oid = _git(repo, "rev-parse", "HEAD")
+    base = resolve_ref_base(repo, local_oid)
+    # main WOULD have produced a merge-base -- proving the fallback is not vacuous.
+    assert _git(repo, "merge-base", "main", local_oid)
+    assert base.ref == f"{local_oid}^"
+    assert base.sha == _git(repo, "rev-parse", f"{local_oid}^")
+    assert base.warning is not None
 
 
 # --------------------------------------------------------------------------
