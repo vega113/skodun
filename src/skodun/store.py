@@ -210,6 +210,20 @@ def _iso_now() -> str:
     return time.strftime(_TS_FORMAT, time.gmtime())
 
 
+def _opt_positive_int(value: object) -> int | None:
+    """A positive plain `int`, or None for everything else.
+
+    Used for the nullable numeric review columns, whose NULL means "not set".
+    `isinstance(True, int)` is True in Python, so the bool check is explicit and
+    comes first; a float, a numeric string or a non-positive number is stored as
+    NULL rather than coerced, because a column that means "how long this review
+    may legitimately run" must never carry a value nobody computed.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def _provider_state_bypassed(env: Mapping[str, str]) -> bool:
     """Unset, empty/whitespace-only, or exactly `"0"` -> state applies;
     anything else -> bypassed.
@@ -372,8 +386,9 @@ class Store:
             """INSERT INTO reviews (id, reviewed_at, branch, head, base_ref, base_sha,
                  diff_hash, context_hash, mode, model, adapter, status, parse_ok,
                  degraded, diff_truncated, trustworthy, stop_reason, findings_total,
-                 sev_high, sev_medium, sev_low, summary, source, artifact_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 sev_high, sev_medium, sev_low, summary, source, artifact_json,
+                 worst_runtime_sec)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET
                  reviewed_at=excluded.reviewed_at, branch=excluded.branch,
                  head=excluded.head, base_ref=excluded.base_ref,
@@ -386,7 +401,13 @@ class Store:
                  findings_total=excluded.findings_total, sev_high=excluded.sev_high,
                  sev_medium=excluded.sev_medium, sev_low=excluded.sev_low,
                  summary=excluded.summary, source=excluded.source,
-                 artifact_json=excluded.artifact_json""",
+                 artifact_json=excluded.artifact_json,
+                 -- The v3 runtime-budget column, written from the SAME dict the
+                 -- artifact is serialized from, so the indexed value and the
+                 -- artifact can never disagree (the Phase 1 rule). NULL when the
+                 -- record carries no usable budget, which is every pre-Phase-3
+                 -- row and every unbatched foreground review that predates it.
+                 worst_runtime_sec=excluded.worst_runtime_sec""",
             (rec["id"], rec.get("reviewed_at"), rec.get("branch"), rec.get("head"),
              rec.get("base_ref"), rec.get("base_sha"), rec.get("diff_hash"),
              rec.get("context_hash", ""), rec.get("mode"), rec.get("model"),
@@ -396,7 +417,8 @@ class Store:
              int(rec.get("findings_total") or 0), int(sev.get("high") or 0),
              int(sev.get("medium") or 0), int(sev.get("low") or 0),
              rec.get("summary"), rec.get("source", "skodun"),
-             json.dumps(rec, ensure_ascii=False)))
+             json.dumps(rec, ensure_ascii=False),
+             _opt_positive_int(rec.get("worst_runtime_sec"))))
 
     def get_review(self, review_id: str) -> dict | None:
         row = self._c.execute("SELECT artifact_json FROM reviews WHERE id=?",

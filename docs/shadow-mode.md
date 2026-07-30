@@ -18,6 +18,18 @@ format (`pid=`, `started=`, `worktree=`). Each can therefore judge the other's
 liveness, and the two never hit the inference backend concurrently. If one waits
 on the other, that is the design working, not a bug.
 
+**One known coexistence limitation, for batched reviews.** A diff too large for
+one prompt is reviewed in batches, which makes a legitimate holder run for
+`batch_count + 1` reviewer budgets instead of one. skodun publishes that budget
+in an additive `budget` file inside the lock directory, and a skodun waiter
+honours it. The legacy scripts read only `owner` and apply their own fixed
+ceiling (2580 s), so a **batched** skodun review that runs longer than that can
+still have its lock reclaimed by a legacy waiter — after which both systems
+would be reviewing at once. Accepted for the transition: it needs an oversized
+diff *and* an overlapping legacy run to bite, and it disappears with the legacy
+scripts. If you are deliberately exercising a huge diff in shadow mode, do not
+start a legacy review alongside it.
+
 ## Prerequisites
 
 - The `grok` CLI installed and authenticated. skodun resolves it via

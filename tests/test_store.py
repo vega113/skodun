@@ -945,6 +945,40 @@ def test_the_v3_reviews_columns_are_nullable_and_default_null(tmp_path):
     assert st.get_review("r1") is not None
 
 
+@pytest.mark.parametrize("value,stored", [
+    (1260, 1260), (None, None), (0, None), (-5, None), ("1260", None),
+    (True, None), (12.5, None),
+])
+def test_worst_runtime_sec_is_indexed_from_the_same_dict_as_the_artifact(
+        tmp_path, value, stored):
+    """T8 writes this column: a batched review's record carries the budget its
+    own shape implies, and `pipeline.recover_stale` reads it instead of
+    recomputing from a config that may since have changed.
+
+    Indexed value and artifact come from ONE dict, so they cannot disagree (the
+    Phase 1 rule). Only a positive plain int is a budget: `isinstance(True, int)`
+    is True in Python, and a numeric STRING in a column the sweep compares
+    against an age would be a silent type surprise -- both land as NULL, i.e.
+    "not set", which is exactly how every pre-Phase-3 row reads.
+    """
+    st = Store.open(tmp_path / "s.db")
+    rec = dict(REC)
+    if value is not None:
+        rec["worst_runtime_sec"] = value
+    st.save_review(rec)
+    row = st._c.execute("SELECT worst_runtime_sec FROM reviews WHERE id=?",
+                        (rec["id"],)).fetchone()
+    assert row["worst_runtime_sec"] == stored
+    # The artifact keeps whatever the caller wrote, verbatim: it is the record.
+    assert st.get_review(rec["id"]).get("worst_runtime_sec") == value
+    # An upsert of the same id keeps the two in step.
+    st.save_review({**rec, "worst_runtime_sec": 99})
+    row = st._c.execute("SELECT worst_runtime_sec FROM reviews WHERE id=?",
+                        (rec["id"],)).fetchone()
+    assert row["worst_runtime_sec"] == 99
+    assert st.get_review(rec["id"])["worst_runtime_sec"] == 99
+
+
 def test_the_v3_delta_seeds_one_dismiss_event_per_existing_triage_row(tmp_path):
     """The legacy `triage` table is single-row-per-ledger-key and becomes
     READ-ONLY at v3. Every dismissal a human already recorded has to arrive in
@@ -1420,6 +1454,7 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_gate.py",
     "tests/test_fallback.py",
     "tests/test_pipeline.py",
+    "tests/test_batched_review.py",
     "tests/test_legacy_import.py",
     "tests/test_shadow.py",
     "tests/test_refuter.py",
@@ -1479,7 +1514,11 @@ def test_store_touching_modules_run_clean_under_resourcewarning_error(tmp_path):
     proc = subprocess.run(
         [sys.executable, "-W", "error::ResourceWarning", "-m", "pytest", "-q",
          "--deselect", _THIS_TEST_NODEID, *_STORE_TOUCHING_MODULES],
-        cwd=repo_root, env=env, capture_output=True, text=True, timeout=300)
+        # Generous, and it has to be: this subset drives real child processes
+        # (fake CLIs under a watchdog) and grows with every module added above,
+        # so a tight cap turns "the suite got bigger" into a spurious failure.
+        # It is a net against a HUNG subprocess, not a performance budget.
+        cwd=repo_root, env=env, capture_output=True, text=True, timeout=1200)
     assert proc.returncode == 0, (
         f"store-touching subset failed under -W error::ResourceWarning "
         f"(exit {proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
