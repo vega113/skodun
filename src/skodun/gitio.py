@@ -1,4 +1,10 @@
-"""Git IO: base resolution, diff capture, and the diff identity hash.
+"""Git IO: base resolution, diff capture, object reads, and the diff identity hash.
+
+Two kinds of read live here and they answer different questions. `capture_diff`
+reads the WORKING TREE, because a foreground review is of what the developer has
+in front of them; `blob_bytes`/`blob_size` read the OBJECT STORE, because a
+background review is of a ref that has already been pushed and the working tree
+may since have moved on. Neither is a substitute for the other.
 
 `diff_identity` is the join key between every review skodun stores and every
 record the legacy shell reviewer already wrote. It is defined by the oracle's
@@ -247,6 +253,141 @@ def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
     if udiff:
         data = data + b"\n" + udiff
     return Diff(data=data, files=files, statuses=statuses, truncated_untracked=truncated)
+
+
+def _blob_rev(oid: str, path: str) -> str | None:
+    """The `<oid>:<path>` argument for a blob read, or None if either is unsafe.
+
+    Every rejection here closes a way for the argument to name something other
+    than "this path in that commit's tree":
+
+      * **An empty oid is the INDEX.** `git cat-file blob :a.txt` prints the
+        STAGED bytes and exits 0 — it does not fail. An object read exists
+        precisely to avoid the not-yet-pushed states of a repo, so the one input
+        that silently serves one has to be refused rather than passed on.
+        Pinned by `test_blob_bytes_refuses_an_empty_rev_rather_than_reading_the_index`.
+      * **A colon in the oid re-splits the argument.** git splits `<rev>:<path>`
+        at the FIRST colon, so `oid=":0"` yields `:0:a.txt` — the index again,
+        and a colon anywhere else silently renames the path being read.
+      * **A leading `-` is an option**, not a revision.
+      * **A `.` or `..` first component is cwd-relative**: `<rev>:../a.txt`
+        resolves against the process's directory inside the repo, not the tree
+        root, so the same argument names different blobs from different
+        directories. Everything else in `<rev>:<path>` IS tree-root-relative,
+        which is why these functions — unlike `capture_diff` — need no
+        worktree-root normalisation.
+
+    A NUL byte would make `subprocess` raise `ValueError` (not `OSError`); it is
+    rejected here so the callers' promise of None-on-any-failure does not rest
+    on one exception class.
+    """
+    if not oid or not path:
+        return None
+    if oid.startswith("-") or ":" in oid or "\0" in oid:
+        return None
+    if path.startswith(("/", "\\")) or "\0" in path:
+        return None
+    if path.replace("\\", "/").split("/", 1)[0] in (".", ".."):
+        return None
+    return f"{oid}:{path}"
+
+
+def _cat_file(repo: Path, *args: str) -> subprocess.CompletedProcess | None:
+    """`git cat-file ...` with no exception surface at all: None if it could not
+    be run (git absent, un-encodable argument), otherwise the result."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo), "cat-file", *args], capture_output=True
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def blob_size(repo: Path, oid: str, path: str) -> int | None:
+    """Byte size of `path` in commit `oid`'s tree, or None on ANY failure.
+
+    CAVEAT, relied upon by `contextpack` and shared with the oracle: `cat-file
+    -s` answers for any object type, so a DIRECTORY has a size here. Only the
+    blob read rejects a tree, so a directory among the candidates is classified
+    on its size and refused later — see `test_a_tree_path_has_a_size_but_no_
+    blob_bytes`.
+    """
+    rev = _blob_rev(oid, path)
+    if rev is None:
+        return None
+    cp = _cat_file(repo, "-s", rev)
+    if cp is None or cp.returncode != 0:
+        return None
+    try:
+        return int(cp.stdout.strip() or b"0")
+    except ValueError:
+        return None
+
+
+def blob_bytes(
+    repo: Path, oid: str, path: str, *, max_bytes: int | None = None
+) -> bytes | None:
+    """Content of `path` in commit `oid`'s tree, or None on ANY failure.
+
+    This is how the background dispatcher reads code: it reviews a ref that has
+    been PUSHED, so the reviewed content must come from the pushed commit's
+    tree. The working tree is a different thing that may have moved on, and a
+    review of it would be a review of code nobody pushed.
+
+    `max_bytes` reads only that prefix, without buffering the rest: a peek for
+    binary detection must not pull a committed 200 MB video into memory, and
+    such a file is one `git diff --name-only` entry like any other. The read is
+    a `Popen` rather than a `run` for exactly that reason.
+
+    No filter is applied — no `--filters`, no `--textconv`. The bytes are the
+    object's own, so what gets reviewed cannot depend on the developer's
+    `.gitattributes` or config, the same guarantee `_DIFF_FLAGS` buys for diffs.
+
+    Two properties worth naming because callers lean on them:
+
+      * **An empty blob comes back as `b""`, never None.** The packer reports
+        None as `missing` and packs `b""`; conflating them would report a
+        legitimately empty committed file as absent.
+      * **A symlink reads as its target *path*, not its target's content.** git
+        stores a symlink as a blob holding the target string, so an object read
+        cannot traverse one. That is why the working-tree packer's symlink
+        hardening has no analogue on this side.
+    """
+    rev = _blob_rev(oid, path)
+    if rev is None:
+        return None
+    if max_bytes is None:
+        cp = _cat_file(repo, "blob", rev)
+        if cp is None or cp.returncode != 0:
+            return None
+        return cp.stdout
+    if max_bytes <= 0:
+        # A zero-length peek cannot tell an empty blob from a missing one, so
+        # let the size probe answer the existence question.
+        return b"" if blob_size(repo, oid, path) is not None else None
+    try:
+        proc = subprocess.Popen(
+            ["git", "-C", str(repo), "cat-file", "blob", rev],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, ValueError):
+        return None
+    try:
+        data = proc.stdout.read(max_bytes) if proc.stdout else b""
+    except OSError:
+        data = b""
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+        proc.kill()  # a blob longer than the peek leaves git still writing
+        proc.wait()
+    if data:
+        return data
+    # Nothing on stdout: an empty blob, a missing path and a tree all look the
+    # same from here, and the kill may have pre-empted git's real exit code, so
+    # the exit code cannot decide it. The size probe can.
+    return b"" if blob_size(repo, oid, path) is not None else None
 
 
 def git_common_dir(repo: Path) -> Path:

@@ -598,11 +598,6 @@ def test_budget_reserves_a_newline_even_when_the_file_has_one(tmp_path):
     assert pack(tmp_path, ["a.txt"], {}, headroom=exact + 1).included == ["a.txt"]
 
 
-def test_source_oid_not_implemented(tmp_path):
-    with pytest.raises(NotImplementedError):
-        pack(tmp_path, [], {}, headroom=10, source="oid")
-
-
 def test_duplicate_paths_collapse(tmp_path):
     (tmp_path / "a.txt").write_text("hello\n", encoding="utf-8")
     p = pack(tmp_path, ["a.txt", "a.txt"], {}, headroom=10_000)
@@ -779,6 +774,280 @@ def test_non_roundtrippable_surrogate_is_escaped_not_raised(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# `source="oid"`: packing from a commit's tree instead of the working tree
+#
+# This is the background dispatcher's source. It reviews a ref that has already
+# been PUSHED, so the content packed into the prompt has to come from the
+# pushed commit's tree: the working tree is a different thing that may have
+# moved on, and packing it would put code nobody pushed in front of the model
+# while the review's identity says otherwise. Every test in this section that
+# could pass by reading either place instead makes the two DIFFER first.
+# --------------------------------------------------------------------------
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _mkrepo(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    _git(root, "init", "-b", "main")
+    _git(root, "config", "user.email", "t@t")
+    _git(root, "config", "user.name", "t")
+    # Pinned, not inherited: a machine with `core.autocrlf=true` would rewrite
+    # line endings between the worktree and the blob, and the tests below
+    # compare the two byte-for-byte.
+    _git(root, "config", "core.autocrlf", "false")
+    return root
+
+
+def _commit_all(repo: Path, message: str = "c") -> str:
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def test_oid_source_packs_the_committed_bytes_not_the_worktree(tmp_path):
+    """THE load-bearing property of the oid source."""
+    repo = _mkrepo(tmp_path / "r")
+    (repo / "a.txt").write_text("COMMITTED\n", encoding="utf-8")
+    oid = _commit_all(repo)
+    # Everything a worktree read could pick up instead, at once: an edit, and
+    # that same edit staged (`<empty oid>:a.txt` would serve the index).
+    (repo / "a.txt").write_text("WORKTREE\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+
+    p = pack(repo, ["a.txt"], {}, headroom=10_000, source="oid", oid=oid)
+    assert p.included == ["a.txt"]
+    assert p.body == (b"----- BEGIN FILE CONTEXT: a.txt -----\n"
+                      b"COMMITTED\n"
+                      b"----- END FILE CONTEXT -----\n")
+    assert b"WORKTREE" not in p.body
+    assert p.sha256 == hashlib.sha256(p.body).hexdigest()
+    # Not vacuous: the same call against the working tree really does differ,
+    # so this is not a property both sources happen to share on this fixture.
+    wt = pack(repo, ["a.txt"], {}, headroom=10_000)
+    assert b"WORKTREE" in wt.body
+    assert wt.sha256 != p.sha256
+
+
+def test_oid_source_packs_a_path_the_worktree_no_longer_has(tmp_path):
+    """A file deleted from the worktree after the push is still in the pushed
+    tree, and the review is of that tree. A worktree read reports `missing`."""
+    repo = _mkrepo(tmp_path / "r")
+    (repo / "a.txt").write_text("still-committed\n", encoding="utf-8")
+    oid = _commit_all(repo)
+    (repo / "a.txt").unlink()
+
+    p = pack(repo, ["a.txt"], {}, headroom=10_000, source="oid", oid=oid)
+    assert p.included == ["a.txt"]
+    assert b"still-committed\n" in p.body
+    assert pack(repo, ["a.txt"], {}, headroom=10_000).omitted == [("a.txt", "missing")]
+
+
+def test_oid_source_reads_the_named_commit_not_the_newest_one(tmp_path):
+    """The dispatcher may be packing an older pushed oid while HEAD has moved
+    on. `HEAD` is never a substitute for the oid the range was taken from."""
+    repo = _mkrepo(tmp_path / "r")
+    (repo / "a.txt").write_text("FIRST\n", encoding="utf-8")
+    first = _commit_all(repo, "c0")
+    (repo / "a.txt").write_text("SECOND\n", encoding="utf-8")
+    second = _commit_all(repo, "c1")
+    assert first != second
+
+    p = pack(repo, ["a.txt"], {}, headroom=10_000, source="oid", oid=first)
+    assert b"FIRST\n" in p.body
+    assert b"SECOND" not in p.body
+
+
+def test_oid_source_classification_and_omission_accounting(tmp_path):
+    """The full omission vocabulary, produced from a tree rather than a tree of
+    files: same reasons, same order, same header."""
+    repo = _mkrepo(tmp_path / "r")
+    (repo / "keep.py").write_text("k" * 200, encoding="utf-8")
+    (repo / "gone.py").write_text("g\n", encoding="utf-8")
+    (repo / "b.bin").write_bytes(b"\x00\x01\x02" * 100)
+    # Clean for the whole 8 KiB peek, NUL after it: only the full-content
+    # re-check on load can catch this one, and it must still say `binary`.
+    (repo / "late.bin").write_bytes(b"a" * 9000 + b"\x00" + b"b" * 10)
+    (repo / "new.py").write_text("tiny added file", encoding="utf-8")
+    _commit_all(repo, "c0")
+    # The pushed commit no longer carries gone.py.
+    (repo / "gone.py").unlink()
+    oid = _commit_all(repo, "c1")
+
+    files = ["keep.py", "gone.py", "b.bin", "late.bin", "new.py", "absent.py"]
+    st = {"gone.py": "D", "new.py": "A"}
+    p = pack(repo, files, st, headroom=100_000, source="oid", oid=oid)
+    assert p.included == ["keep.py"]
+    assert _reasons(p) == {"gone.py": "deleted", "b.bin": "binary",
+                           "late.bin": "binary", "new.py": "already-in-diff",
+                           "absent.py": "missing"}
+    assert {r for _, r in p.omitted} <= set(REASONS)
+    assert p.body.startswith(
+        b"Context omitted for: gone.py (deleted), b.bin (binary), "
+        b"late.bin (binary), new.py (already-in-diff), absent.py (missing)\n"
+    )
+
+    # A path missing from the TREE with no status of its own is `missing`, not
+    # a silent skip: what the prompt does not carry, it says it does not carry.
+    p2 = pack(repo, ["gone.py"], {}, headroom=10_000, source="oid", oid=oid)
+    assert p2.included == []
+    assert p2.omitted == [("gone.py", "missing")]
+    assert p2.body == b"Context omitted for: gone.py (missing)\n"
+
+
+def test_oid_source_respects_the_caps(tmp_path):
+    repo = _mkrepo(tmp_path / "r")
+    (repo / "a.txt").write_text("a" * 100, encoding="utf-8")
+    (repo / "b.txt").write_text("b" * 10, encoding="utf-8")
+    oid = _commit_all(repo)
+
+    capped = pack(repo, ["a.txt", "b.txt"], {}, headroom=10_000,
+                  source="oid", oid=oid, per_file_cap=50)
+    assert capped.included == ["b.txt"]
+    assert ("a.txt", "over-file-cap") in capped.omitted
+
+    # Room for b.txt's section (78 bytes) plus the header that reports a.txt
+    # (43), and not for a.txt's own 168.
+    tight = pack(repo, ["a.txt", "b.txt"], {}, headroom=130,
+                 source="oid", oid=oid)
+    assert tight.included == ["b.txt"]
+    assert ("a.txt", "over-headroom") in tight.omitted
+    assert len(tight.body) <= 130
+
+    zero = pack(repo, ["a.txt"], {}, headroom=0, source="oid", oid=oid)
+    assert zero.body == b"" and zero.included == []
+    assert zero.omitted == [("a.txt", "over-headroom")]
+
+
+def test_oid_and_worktree_sources_agree_on_a_clean_tree(tmp_path):
+    """Same accounting, not merely a working oid path: with the worktree equal
+    to the commit, both sources must produce identical bytes, hash, inclusions
+    and omissions across the headroom range and under a per-file cap.
+    (Regular files only: a directory or a symlink is classified at a different
+    step on each side — see the gitio tests — and neither is a real candidate,
+    `git diff --name-only` listing only blobs.)
+    """
+    repo = _mkrepo(tmp_path / "r")
+    (repo / "sub").mkdir()
+    (repo / "big.py").write_text("x" * 5000, encoding="utf-8")
+    (repo / "mid.py").write_text("m" * 2000, encoding="utf-8")
+    (repo / "tie_a.txt").write_text("a" * 300, encoding="utf-8")
+    (repo / "tie_b.txt").write_text("b" * 300, encoding="utf-8")
+    (repo / "empty.txt").write_text("", encoding="utf-8")
+    (repo / "no_eol.txt").write_text("tail-without-newline", encoding="utf-8")
+    (repo / "bin.dat").write_bytes(b"\x00\x01\x02" * 100)
+    (repo / "late_nul.dat").write_bytes(b"a" * 9000 + b"\x00" + b"b" * 10)
+    (repo / "sub" / "nested.py").write_text("n" * 400, encoding="utf-8")
+    (repo / "new_big.py").write_text("z" * 20_000, encoding="utf-8")
+    (repo / "new_small.py").write_text("tiny", encoding="utf-8")
+    oid = _commit_all(repo)
+
+    files = ["big.py", "mid.py", "tie_b.txt", "tie_a.txt", "empty.txt",
+             "no_eol.txt", "bin.dat", "late_nul.dat", "sub/nested.py",
+             "new_big.py", "new_small.py", "gone.py", "absent.py",
+             "../etc/passwd", "/etc/passwd"]
+    st = {"new_big.py": "A", "new_small.py": "A", "gone.py": "D"}
+    seen: set[str] = set()
+    for headroom, cap in ((0, None), (400, None), (1000, None), (6000, None),
+                          (100_000, None), (100_000, 1000)):
+        wt = pack(repo, files, st, headroom=headroom, per_file_cap=cap)
+        oid_pack = pack(repo, files, st, headroom=headroom, per_file_cap=cap,
+                        source="oid", oid=oid)
+        assert oid_pack.body == wt.body, (headroom, cap)
+        assert oid_pack.sha256 == wt.sha256
+        assert oid_pack.included == wt.included
+        assert oid_pack.omitted == wt.omitted
+        assert oid_pack.bytes_total == wt.bytes_total
+        seen.update(r for _, r in oid_pack.omitted)
+    # Not vacuous: every reason a tree can produce really did occur.
+    assert seen == set(REASONS)
+
+
+def test_oid_source_is_byte_deterministic_across_worktree_churn(tmp_path):
+    repo = _mkrepo(tmp_path / "r")
+    (repo / "a.txt").write_text("a" * 300, encoding="utf-8")
+    (repo / "b.txt").write_text("b" * 100, encoding="utf-8")
+    (repo / "c.bin").write_bytes(b"\x00" * 50)
+    oid = _commit_all(repo)
+
+    first = pack(repo, ["a.txt", "b.txt", "c.bin", "absent.py"], {},
+                 headroom=10_000, source="oid", oid=oid)
+    # Churn everything the working tree can offer: edit, delete, add, stage.
+    (repo / "a.txt").write_text("EDITED\n", encoding="utf-8")
+    (repo / "b.txt").unlink()
+    (repo / "absent.py").write_text("appeared\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    second = pack(repo, ["a.txt", "b.txt", "c.bin", "absent.py"], {},
+                  headroom=10_000, source="oid", oid=oid)
+
+    assert second.body == first.body
+    assert second.sha256 == first.sha256 == hashlib.sha256(first.body).hexdigest()
+    assert second.included == first.included == ["a.txt", "b.txt"]
+    assert second.omitted == first.omitted
+    assert b"EDITED" not in second.body
+    assert b"appeared" not in second.body
+    assert ("absent.py", "missing") in second.omitted
+
+
+def test_bad_oid_omits_every_candidate_as_missing_and_never_raises(tmp_path):
+    repo = _mkrepo(tmp_path / "r")
+    (repo / "a.txt").write_text("a" * 100, encoding="utf-8")
+    (repo / "b.txt").write_text("b" * 100, encoding="utf-8")
+    _commit_all(repo)
+
+    expected = b"Context omitted for: a.txt (missing), b.txt (missing)\n"
+    for bad in ("0" * 40, "not-an-oid", "refs/heads/nope", "deadbeef"):
+        p = pack(repo, ["a.txt", "b.txt"], {}, headroom=10_000,
+                 source="oid", oid=bad)
+        assert p.included == [], bad
+        assert p.omitted == [("a.txt", "missing"), ("b.txt", "missing")], bad
+        assert p.body == expected
+        assert p.sha256 == hashlib.sha256(expected).hexdigest()
+    # A directory that is not a repository at all is the same story.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    p = pack(plain, ["a.txt"], {}, headroom=10_000, source="oid", oid="0" * 40)
+    assert _reasons(p) == {"a.txt": "missing"}
+
+
+def test_oid_source_rejects_paths_that_leave_the_tree(tmp_path):
+    repo = _mkrepo(tmp_path / "r")
+    (repo / "a.txt").write_text("in-tree\n", encoding="utf-8")
+    oid = _commit_all(repo)
+    (tmp_path / "outside.txt").write_text("OUTSIDE\n", encoding="utf-8")
+
+    p = pack(repo, ["../outside.txt", "/etc/passwd", "C:/Windows/win.ini",
+                    "a\x00b.txt"], {}, headroom=10_000, source="oid", oid=oid)
+    assert p.included == []
+    assert {r for _, r in p.omitted} == {"missing"}
+    assert b"OUTSIDE" not in p.body
+    assert b"root:" not in p.body
+
+
+def test_oid_source_needs_an_oid_and_wt_source_must_not_be_given_one(tmp_path):
+    """Both mistakes are programming errors, and the second is the dangerous
+    one: a caller that passes an oid but leaves `source` at its default would
+    otherwise get a silent working-tree pack labelled as the commit's."""
+    with pytest.raises(ValueError):
+        pack(tmp_path, [], {}, headroom=10, source="oid")
+    with pytest.raises(ValueError):
+        pack(tmp_path, [], {}, headroom=10, source="oid", oid="")
+    with pytest.raises(ValueError):
+        pack(tmp_path, [], {}, headroom=10, oid="0" * 40)
+    with pytest.raises(ValueError):
+        pack(tmp_path, [], {}, headroom=10, source="wt", oid="0" * 40)
+
+
+def test_unknown_source_is_not_implemented(tmp_path):
+    for source in ("index", "OID", "wt2", ""):
+        with pytest.raises(NotImplementedError):
+            pack(tmp_path, [], {}, headroom=10, source=source)
+
+
+# --------------------------------------------------------------------------
 # Oracle parity
 # --------------------------------------------------------------------------
 
@@ -844,8 +1113,9 @@ def _build_fixture(root: Path) -> tuple[list[str], dict[str, str], str]:
 
 
 def _run_oracle(oracle: Path, worktree: Path, paths: list[str], diff_text: str,
-                headroom: int, per_file_cap: int | None,
-                tmp: Path) -> tuple[bytes, str, list[str], list[tuple[str, str]]]:
+                headroom: int, per_file_cap: int | None, tmp: Path,
+                source: str = "wt", oid: str = "",
+                ) -> tuple[bytes, str, list[str], list[tuple[str, str]]]:
     """Drive `scripts/grok-context-pack.py` through its env interface."""
     script = oracle / ORACLE_SCRIPT
     assert script.is_file(), f"oracle script not found: {script}"
@@ -858,7 +1128,8 @@ def _run_oracle(oracle: Path, worktree: Path, paths: list[str], diff_text: str,
         "GR_WORKTREE": str(worktree),
         "GR_FILE_LIST": str(lst),
         "GR_DIFF_FILE": str(dpath),
-        "GR_CONTEXT_SOURCE": "wt",
+        "GR_CONTEXT_SOURCE": source,
+        "GR_CONTEXT_OID": oid,
         "GR_CONTEXT_HEADROOM": str(headroom),
         # skodun always packs large adds (>=16KiB); that is the oracle's
         # opt-in branch, so the parity run opts in.
@@ -970,3 +1241,98 @@ def test_oracle_parity_cases_are_not_vacuous(tmp_path):
     assert full >= 1
     # ...and they are not all the same partial pack.
     assert len(bodies) >= 5
+
+
+def _commit_the_fixture(root: Path) -> str:
+    """Commit the parity fixture tree; return the commit oid.
+
+    A FIFO cannot go into an index at all, so it is removed for the commit and
+    put back afterwards. It stays in the candidate list, where an object read
+    reports it `missing` exactly as any absent path.
+    """
+    fifo = root / "pipe.fifo"
+    had_fifo = fifo.is_fifo()
+    if had_fifo:
+        fifo.unlink()
+    oid = _commit_all(root, "fixture")
+    if had_fifo:
+        os.mkfifo(fifo)
+    return oid
+
+
+def _diverge_the_worktree(root: Path) -> None:
+    """Make the working tree differ from the commit, so an oid-source parity
+    pass cannot be a coincidence of the two being identical."""
+    (root / "big.py").write_text("W" * 5000, encoding="utf-8")
+    (root / "mid.py").unlink()
+
+
+@pytest.mark.skipif(oracle_dir() is None, reason="SKODUN_ORACLE_DIR unset")
+@pytest.mark.parametrize("headroom", ORACLE_HEADROOMS)
+def test_oracle_parity_oid_source(tmp_path, headroom):
+    """The oid source is a port of the oracle's own `GR_CONTEXT_SOURCE=oid`.
+
+    `sub` is in the candidate list on purpose: it is a directory, and
+    `cat-file -s` answers for a tree, so BOTH packers classify it packable on
+    its size probe and only the full blob read rejects it. That shared quirk is
+    part of what parity means here.
+    """
+    root = _mkrepo(tmp_path / "wt")
+    paths, statuses, diff_text = _build_fixture(root)
+    oid = _commit_the_fixture(root)
+    paths = paths + ["sub"]
+    _diverge_the_worktree(root)
+
+    want_body, want_hash, want_included, want_omitted = _run_oracle(
+        oracle_dir(), root, paths, diff_text, headroom, None, tmp_path,
+        source="oid", oid=oid)
+    got = pack(root, paths, statuses, headroom=headroom, source="oid", oid=oid)
+    assert got.body == want_body
+    assert got.sha256 == want_hash
+    assert got.included == want_included
+    assert got.omitted == want_omitted
+    assert got.bytes_total == len(want_body)
+    # Neither packer read the working tree: those 5000 W's exist only there.
+    assert b"WWWW" not in got.body
+    if headroom == 100_000:
+        # ...and both packed a file the working tree no longer even has.
+        assert "mid.py" in got.included
+
+
+@pytest.mark.skipif(oracle_dir() is None, reason="SKODUN_ORACLE_DIR unset")
+def test_oracle_parity_oid_source_with_per_file_cap(tmp_path):
+    root = _mkrepo(tmp_path / "wt")
+    paths, statuses, diff_text = _build_fixture(root)
+    oid = _commit_the_fixture(root)
+    _diverge_the_worktree(root)
+
+    want_body, want_hash, want_included, want_omitted = _run_oracle(
+        oracle_dir(), root, paths, diff_text, 100_000, 1000, tmp_path,
+        source="oid", oid=oid)
+    got = pack(root, paths, statuses, headroom=100_000, per_file_cap=1000,
+               source="oid", oid=oid)
+    assert got.body == want_body
+    assert got.sha256 == want_hash
+    assert got.included == want_included
+    assert got.omitted == want_omitted
+    # Guard against a vacuous pass: the cap must actually have bitten.
+    assert ("big.py", "over-file-cap") in got.omitted
+
+
+@pytest.mark.skipif(oracle_dir() is None, reason="SKODUN_ORACLE_DIR unset")
+def test_oracle_parity_oid_source_with_a_bad_oid(tmp_path):
+    """A bad oid is an omission story on both sides, never an error."""
+    root = _mkrepo(tmp_path / "wt")
+    paths, statuses, diff_text = _build_fixture(root)
+    _commit_the_fixture(root)
+
+    want_body, want_hash, want_included, want_omitted = _run_oracle(
+        oracle_dir(), root, paths, diff_text, 100_000, None, tmp_path,
+        source="oid", oid="0" * 40)
+    got = pack(root, paths, statuses, headroom=100_000,
+               source="oid", oid="0" * 40)
+    assert got.body == want_body
+    assert got.sha256 == want_hash
+    assert got.included == want_included == []
+    assert got.omitted == want_omitted
+    assert {r for _, r in got.omitted} == {"deleted", "missing"}

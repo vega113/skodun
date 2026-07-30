@@ -19,7 +19,9 @@ import pytest
 from skodun.gitio import (
     Base,
     GitError,
+    blob_bytes,
     blob_sha1,
+    blob_size,
     capture_diff,
     current_branch,
     diff_identity,
@@ -632,3 +634,185 @@ def test_current_branch_and_head_sha(tmp_path):
     _git(repo, "checkout", "-b", "feat")
     assert current_branch(repo) == "feat"
     assert head_sha(repo) == _git(repo, "rev-parse", "HEAD")
+
+
+# --------------------------------------------------------------------------
+# object-store blob reads
+#
+# These are the background dispatcher's reads. It reviews a ref that has been
+# PUSHED, so the content it packs must come from the pushed commit's tree; the
+# working tree is a different thing that may have moved on, and reading it
+# would review code nobody pushed. Every failure here degrades to None so the
+# packer can turn it into an omission reason instead of an exception.
+# --------------------------------------------------------------------------
+
+
+def test_blob_bytes_reads_the_committed_bytes_not_the_worktree(tmp_path):
+    repo = _mkrepo(tmp_path)  # a.txt == "one\n", committed
+    oid = _git(repo, "rev-parse", "HEAD")
+    (repo / "a.txt").write_text("WORKTREE\n", encoding="utf-8")
+
+    assert blob_bytes(repo, oid, "a.txt") == b"one\n"
+    assert blob_size(repo, oid, "a.txt") == 4
+    # Not vacuous: the working tree really does hold something else.
+    assert (repo / "a.txt").read_bytes() == b"WORKTREE\n"
+    # ...and staging the edit does not move the answer either.
+    _git(repo, "add", "a.txt")
+    assert blob_bytes(repo, oid, "a.txt") == b"one\n"
+
+
+def test_blob_bytes_returns_none_for_every_failure(tmp_path):
+    repo = _mkrepo(tmp_path)
+    oid = _git(repo, "rev-parse", "HEAD")
+
+    assert blob_bytes(repo, oid, "nope.txt") is None       # not in that tree
+    assert blob_size(repo, oid, "nope.txt") is None
+    assert blob_bytes(repo, "0" * 40, "a.txt") is None     # well-formed, absent
+    assert blob_bytes(repo, "not-an-oid", "a.txt") is None  # unresolvable
+    assert blob_size(repo, "0" * 40, "a.txt") is None
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    assert blob_bytes(plain, oid, "a.txt") is None         # no repo at all
+    # An embedded NUL makes `subprocess` raise `ValueError`, which is NOT an
+    # `OSError`: catching only `OSError` would let it escape and kill a review
+    # over one bad filename.
+    assert blob_bytes(repo, oid, "a\x00b.txt") is None
+    assert blob_size(repo, oid, "a\x00b.txt") is None
+
+
+def test_blob_bytes_refuses_an_empty_rev_rather_than_reading_the_index(tmp_path):
+    """`<oid>:<path>` with an empty oid is `:<path>` — the INDEX, not a tree.
+
+    This is why the guard exists rather than being left to git: an empty (or
+    colon-carrying) oid does not fail, it silently answers from the staged
+    state, which is exactly the not-yet-pushed content an object read exists to
+    avoid. The precondition assertion below drives the real git to prove it.
+    """
+    repo = _mkrepo(tmp_path)
+    (repo / "a.txt").write_text("STAGED\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    for arg in (":a.txt", ":0:a.txt"):
+        probe = subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "blob", arg], capture_output=True
+        )
+        assert probe.returncode == 0 and probe.stdout == b"STAGED\n", arg
+
+    for bad in ("", ":", ":0", "-x", "--version"):
+        assert blob_bytes(repo, bad, "a.txt") is None, bad
+        assert blob_size(repo, bad, "a.txt") is None, bad
+
+
+def test_blob_bytes_prefix_read_stops_at_max_bytes(tmp_path):
+    """A peek must not buffer the whole blob: a committed 200 MB video is one
+    `git diff --name-only` entry like any other."""
+    repo = _mkrepo(tmp_path)
+    (repo / "big.txt").write_text("x" * 5000, encoding="utf-8")
+    (repo / "empty.txt").write_text("", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "c1")
+    oid = _git(repo, "rev-parse", "HEAD")
+
+    assert blob_bytes(repo, oid, "big.txt", max_bytes=10) == b"x" * 10
+    assert blob_size(repo, oid, "big.txt") == 5000
+    assert len(blob_bytes(repo, oid, "big.txt")) == 5000
+    # An empty blob must come back as b"", distinguishable from a missing one:
+    # the packer reports the second as `missing` and packs the first.
+    assert blob_bytes(repo, oid, "empty.txt", max_bytes=10) == b""
+    assert blob_bytes(repo, oid, "empty.txt") == b""
+    assert blob_size(repo, oid, "empty.txt") == 0
+    assert blob_bytes(repo, oid, "nope.txt", max_bytes=10) is None
+
+
+def test_blob_reads_are_tree_root_relative_and_refuse_cwd_relative_paths(tmp_path):
+    """`<rev>:<path>` is tree-root-relative — EXCEPT for a `./` or `../` path,
+    which git resolves against the cwd and which therefore names a different
+    blob depending on which directory of the repo the call was made from. Such
+    a path is refused rather than silently resolved, so `repo` never has to be
+    normalised to the worktree root the way `capture_diff` must normalise it.
+    """
+    repo = _mkrepo(tmp_path)
+    (repo / "sub").mkdir()
+    (repo / "sub" / "nested.txt").write_text("nested\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "c1")
+    oid = _git(repo, "rev-parse", "HEAD")
+
+    # Same answer from the root and from a subdirectory.
+    assert blob_bytes(repo, oid, "sub/nested.txt") == b"nested\n"
+    assert blob_bytes(repo / "sub", oid, "sub/nested.txt") == b"nested\n"
+    assert blob_bytes(repo / "sub", oid, "a.txt") == b"one\n"
+    # `../a.txt` from `sub/` is the one git WOULD resolve (to `a.txt`).
+    for bad in ("../a.txt", "./a.txt", "/a.txt", "", ".", ".."):
+        assert blob_bytes(repo / "sub", oid, bad) is None, bad
+        assert blob_size(repo / "sub", oid, bad) is None, bad
+
+
+def test_blob_bytes_reads_a_non_utf8_path(tmp_path):
+    """A path git hands us as surrogate-escaped text must still name its blob.
+
+    The tree entry is built through the index rather than the filesystem: APFS
+    and others refuse a filename that is not valid UTF-8, so a test that wrote
+    one would pass on some machines and skip on others. `gitio._paths` decodes
+    git's path stream with `surrogateescape` precisely so the bytes round-trip
+    back out through `subprocess`, and this is where that round-trip pays off.
+    """
+    repo = _mkrepo(tmp_path)
+    name = b"caf\xe9.txt".decode("utf-8", "surrogateescape")
+    sha = subprocess.run(
+        ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+        input=b"nonascii-blob\n", capture_output=True, check=True,
+    ).stdout.decode().strip()
+    _git(repo, "update-index", "--add", "--cacheinfo", f"100644,{sha},{name}")
+    tree = _git(repo, "write-tree")
+    oid = _git(repo, "commit-tree", tree, "-p", "HEAD", "-m", "nonascii")
+
+    assert blob_bytes(repo, oid, name) == b"nonascii-blob\n"
+    assert blob_size(repo, oid, name) == len(b"nonascii-blob\n")
+
+
+def test_blob_bytes_of_a_symlink_is_its_target_path_not_the_target_file(tmp_path):
+    """An object read cannot traverse a symlink: git stores one as a blob whose
+    content is the target *string*, so what comes back is path text, never the
+    bytes of whatever it points at. That is why the working-tree packer's
+    symlink hardening has no analogue on the object side.
+    """
+    repo = _mkrepo(tmp_path)
+    (repo / "secret.txt").write_text("SECRET\n", encoding="utf-8")
+    os.symlink(repo / "secret.txt", repo / "link.txt")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "c1")
+    oid = _git(repo, "rev-parse", "HEAD")
+
+    got = blob_bytes(repo, oid, "link.txt")
+    assert got == str(repo / "secret.txt").encode("utf-8")
+    assert b"SECRET" not in got
+
+
+def test_a_tree_path_has_a_size_but_no_blob_bytes(tmp_path):
+    """`cat-file -s` answers for ANY object type, a directory included, while
+    only a blob has blob bytes. Pinned because the packer's classify step
+    trusts the size probe: a directory therefore reaches the full read, and
+    that read is what rejects it. The oracle takes the same route (its own
+    size probe answers for the tree too), so the packed bytes still match —
+    see `test_oracle_parity_oid_source`.
+    """
+    repo = _mkrepo(tmp_path)
+    (repo / "sub").mkdir()
+    (repo / "sub" / "nested.txt").write_text("nested\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "c1")
+    oid = _git(repo, "rev-parse", "HEAD")
+
+    assert blob_size(repo, oid, "sub") is not None
+    assert blob_bytes(repo, oid, "sub") is None
+    # The peek cannot tell a tree from an empty blob, and says so as b"".
+    assert blob_bytes(repo, oid, "sub", max_bytes=8192) == b""
+
+
+def test_blob_reads_accept_a_ref_not_only_a_sha(tmp_path):
+    """The dispatcher passes a sha, but nothing in the contract narrows the rev
+    to one: `HEAD`, a branch and a tag all resolve, which is what lets tests
+    and future callers name a commit the way git does."""
+    repo = _mkrepo(tmp_path)
+    for rev in ("HEAD", "main", _git(repo, "rev-parse", "HEAD")[:8]):
+        assert blob_bytes(repo, rev, "a.txt") == b"one\n", rev
