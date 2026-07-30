@@ -1,0 +1,17 @@
+# SYNTHESIZED. Before the handshake, exactly two methods are allowed: `ping`
+# (a client may check liveness whenever it likes) and `initialize` itself.
+# Everything else is -32002 "server not initialized".
+> {"jsonrpc":"2.0","id":1,"method":"ping"}
+< {"jsonrpc": "2.0", "id": 1, "result": {"$keys": []}}
+> {"jsonrpc":"2.0","id":2,"method":"tools/list"}
+< {"jsonrpc": "2.0", "id": 2, "error": {"code": -32002, "message": "server not initialized"}, "result": {"$absent": true}}
+> {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}}
+< {"jsonrpc": "2.0", "id": 3, "error": {"code": -32002, "message": "server not initialized"}}
+> {"jsonrpc":"2.0","id":4,"method":"prompts/list"}
+< {"jsonrpc": "2.0", "id": 4, "error": {"code": -32002, "message": "server not initialized"}}
+# The refusal is not a latch: the handshake still works afterwards, and the
+# very same request then succeeds.
+> {"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+< {"jsonrpc": "2.0", "id": 5, "result": {"protocolVersion": "2025-06-18"}}
+> {"jsonrpc":"2.0","id":6,"method":"tools/list"}
+< {"jsonrpc": "2.0", "id": 6, "result": {"tools": {"$type": "array"}}}

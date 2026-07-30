@@ -27,12 +27,14 @@ are guarded below:
     exit codes; `dispatch`, which reserves records and starts workers but
     decides nothing about a push (and whose exit code is 0 on EVERY path
     for that reason -- a hook must not block on review machinery);
-    `install-hooks`, which writes a file and reports on it; and `surface`,
+    `install-hooks`, which writes a file and reports on it; `surface`,
     whose STDOUT IS A PAYLOAD -- a SessionStart hook feeds it to an agent
     verbatim, and under `--hook-format claude` it is a single JSON object,
     so a banner appended to it would corrupt exactly the output that is
-    meant to be consumed. Everything `surface` has to say ABOUT itself goes
-    to stderr for the same reason.
+    meant to be consumed; and `mcp`, whose stdout is a PROTOCOL -- one
+    non-JSON-RPC line there desynchronises the client's parser for the rest
+    of the session. Everything `surface` and `mcp` have to say ABOUT
+    themselves goes to stderr for the same reason.
 """
 
 import argparse
@@ -186,6 +188,14 @@ def build_parser() -> argparse.ArgumentParser:
     surf.add_argument("--include-delivered", action="store_true",
                       dest="include_delivered",
                       help="replay rounds that were already delivered too")
+
+    # The agent surface. NO options, deliberately: every tool carries its own
+    # arguments in its `inputSchema`, so a flag here would be a second place
+    # configuration could live -- and one this command would have to ignore for
+    # every tool that does not use it.
+    sub.add_parser(
+        "mcp",
+        help="serve the review loop to agents over stdio (MCP JSON-RPC)")
 
     hooks = sub.add_parser(
         "install-hooks",
@@ -699,6 +709,36 @@ def _cmd_surface(args) -> int:
                 f"recorded ({e!r}); {len(pending)} round(s) will be reported "
                 f"again", 2)
         return 0
+
+
+def _cmd_mcp(args) -> int:
+    """Serve MCP on stdio. Exit codes:
+
+      0  the session ended -- the client closed stdin, or went away
+      2  there was no session: the server could not be loaded or started
+
+    Exactly two, and no verdict banner: this command's STDOUT IS A PROTOCOL
+    STREAM, so every diagnostic goes to stderr (`_warn`), and "the client
+    disconnected" is not a failure -- a non-zero exit is how MCP client
+    harnesses report a crashed server, which is a different thing that must stay
+    distinguishable. There is deliberately no "there were findings" code either:
+    a gate verdict belongs to the `gate` TOOL's result, not to the lifetime of
+    the transport that carried it.
+
+    `_blackhole_stdout` is handed to the server for the dead-reader case:
+    CPython flushes stdout again during finalisation, and a failure there is
+    reported as exit status 120, which is not in this contract either.
+    """
+    try:
+        from . import mcpserver
+    except BaseException as e:
+        return _warn(f"skodun mcp: could not load the MCP server: {e!r}", 2)
+    try:
+        return mcpserver.serve_stdio(on_stdout_lost=_blackhole_stdout)
+    except BaseException as e:
+        # `serve_stdio` itself is guarded end to end; reaching here means the
+        # process had no usable stdio to serve on in the first place.
+        return _warn(f"skodun mcp: could not serve on stdio: {e!r}", 2)
 
 
 def _cmd_install_hooks(args) -> int:
@@ -1433,6 +1473,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_dispatch(args)
         if args.command == "worker":
             return _cmd_worker(args)
+        if args.command == "mcp":
+            return _cmd_mcp(args)
         if args.command == "install-hooks":
             return _cmd_install_hooks(args)
         # Unreachable while the subparsers are `required=True`, and kept as

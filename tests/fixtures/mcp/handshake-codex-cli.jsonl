@@ -1,0 +1,14 @@
+# CAPTURED handshake from the codex CLI 0.144.5 (see README for the probe).
+# The three `>` payloads are the client's own bytes, verbatim; the `<`
+# expectations are synthesized from the pinned protocol decisions.
+#
+# A DIFFERENT protocol revision from the other captured client, and also one
+# this server recognizes: the reply echoes 2025-06-18. This pair is the whole
+# reason negotiation is a rule and not a constant.
+> {"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"elicitation":{"form":{},"url":{}}},"clientInfo":{"name":"codex-mcp-client","title":"Codex","version":"0.144.5"}}}
+< {"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-06-18", "capabilities": {"$keys": ["tools", "prompts"]}, "serverInfo": {"name": "skodun", "version": {"$type": "string"}}}}
+> {"jsonrpc":"2.0","method":"notifications/initialized"}
+# `params._meta.progressToken` rides along on this client's requests. An
+# unknown params key is ignored, not a -32602.
+> {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"progressToken":0}}}
+< {"jsonrpc": "2.0", "id": 1, "result": {"tools": {"$type": "array"}}}

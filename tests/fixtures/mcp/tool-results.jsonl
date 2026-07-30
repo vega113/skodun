@@ -1,0 +1,28 @@
+!requires-fakes
+# SYNTHESIZED. The tool-result envelope Task 14's services are consumed
+# through: the CLI's own text in `content[0].text`, the CLI's own exit code in
+# `structuredContent.status`, and `isError` = "that status is not 0".
+#
+# `isError` is a TOOL-LEVEL flag inside a successful JSON-RPC response, never a
+# JSON-RPC error: a refusal is the tool answering, and an agent that saw a
+# protocol error instead would have no refusal text to read.
+> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}
+< {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-11-25"}}
+> {"jsonrpc":"2.0","method":"notifications/initialized"}
+> {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"text":"SKODUN GATE: PASS(0)"}}}
+< {"jsonrpc": "2.0", "id": 2, "result": {"$keys": ["content", "isError", "structuredContent"], "content": [{"$keys": ["type", "text"], "type": "text", "text": "SKODUN GATE: PASS(0)"}], "isError": false, "structuredContent": {"$keys": ["status"], "status": 0}}}
+# A non-zero status: same envelope, `isError` true, the text still present.
+> {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"refuse","arguments":{}}}
+< {"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": {"$contains": "refused"}}], "isError": true, "structuredContent": {"status": 2}}}
+# A handler that RAISES is not a crashed server and not a protocol error: it is
+# a tool-level failure, reported fail-closed as status 2 ("no trustworthy review
+# covers this"), with the exception named for the log.
+> {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"boom","arguments":{}}}
+< {"jsonrpc": "2.0", "id": 4, "result": {"content": [{"type": "text", "text": {"$contains": "boom"}}], "isError": true, "structuredContent": {"status": 2}}}
+# ... and the server is still serving afterwards.
+> {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"echo","arguments":{"text":"still here"}}}
+< {"jsonrpc": "2.0", "id": 5, "result": {"content": [{"type": "text", "text": "still here"}], "isError": false}}
+# tools/list carries a name, a description and an inputSchema per tool -- an
+# agent cannot call a tool whose arguments it has to guess.
+> {"jsonrpc":"2.0","id":6,"method":"tools/list"}
+< {"jsonrpc": "2.0", "id": 6, "result": {"tools": [{"name": "echo", "description": {"$type": "string"}, "inputSchema": {"type": "object"}}, {"name": "refuse", "inputSchema": {"$type": "object"}}, {"name": "boom", "inputSchema": {"$type": "object"}}, {"name": "review", "inputSchema": {"$type": "object"}}]}}

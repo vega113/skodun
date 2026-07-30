@@ -1,0 +1,27 @@
+# SYNTHESIZED. Nothing on this stream is trusted to be JSON, or even to be
+# text. Every unusable line is answered -32700 with id null (there is no id to
+# echo when the line did not parse) and the LOOP CONTINUES -- the last request
+# in each file below is the proof that it did.
+#
+# Not text at all: three bytes that are not valid UTF-8.
+>b64 //79
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": {"$contains": "parse error"}}, "result": {"$absent": true}}
+# Text, but not JSON.
+> this is not json, it is an apology
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": {"$contains": "parse error"}}}
+# JSON, but truncated mid-object.
+> {"jsonrpc":"2.0","id":2,"method":"pi
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32700}}
+# A NUL byte glued to the end of an otherwise valid request. Valid UTF-8,
+# invalid JSON: it must NOT be silently stripped and executed.
+>b64 eyJqc29ucnBjIjoiMi4wIiwiaWQiOjEsIm1ldGhvZCI6InBpbmcifQA=
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32700}}
+# Two NUL bytes on their own.
+>b64 AAA=
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32700}}
+# A lone `2` -- valid JSON, not a JSON-RPC message.
+> 2
+< {"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": {"$contains": "object"}}}
+# Still serving.
+> {"jsonrpc":"2.0","id":9,"method":"ping"}
+< {"jsonrpc": "2.0", "id": 9, "result": {"$keys": []}}

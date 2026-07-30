@@ -1,0 +1,18 @@
+# SYNTHESIZED. Notifications arrive between requests and produce nothing, and
+# the requests around them keep their own ids. A response carrying somebody
+# else's id is worse than no response: the client resolves the wrong call.
+> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}
+< {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-11-25"}}
+> {"jsonrpc":"2.0","method":"notifications/initialized"}
+> {"jsonrpc":"2.0","id":"a","method":"ping"}
+< {"jsonrpc": "2.0", "id": "a", "result": {"$keys": []}}
+> {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":0,"progress":1}}
+> {"jsonrpc":"2.0","id":0,"method":"ping"}
+< {"jsonrpc": "2.0", "id": 0, "result": {"$keys": []}}
+> {"jsonrpc":"2.0","method":"notifications/initialized"}
+> {"jsonrpc":"2.0","id":-3,"method":"ping"}
+< {"jsonrpc": "2.0", "id": -3, "result": {"$keys": []}}
+> {"jsonrpc":"2.0","id":"","method":"ping"}
+< {"jsonrpc": "2.0", "id": "", "result": {"$keys": []}}
+> {"jsonrpc":"2.0","id":9007199254740993,"method":"ping"}
+< {"jsonrpc": "2.0", "id": 9007199254740993, "result": {"$keys": []}}

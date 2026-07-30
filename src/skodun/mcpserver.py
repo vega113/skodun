@@ -1,0 +1,788 @@
+"""The MCP stdio seam: hand-rolled newline-delimited JSON-RPC 2.0, stdlib only.
+
+An MCP client speaks to this server over a pipe, and the pipe has exactly one
+rule: **stdout carries nothing but newline-delimited JSON-RPC**. One stray byte
+-- a `print`, a warning, a banner, half a line written by another thread -- and
+the client's parser desynchronises and every later response is misattributed.
+Diagnostics therefore go to stderr, every response is one `write` plus one
+`flush` under one lock, and the protocol suite asserts that stdout parses
+line-by-line with zero residue.
+
+Everything else here follows from three more facts about the transport:
+
+  * **The stream is hostile input.** It is not a client library, it is bytes. A
+    line may not be UTF-8, may not be JSON, may be a 40 MiB JSON document, may
+    be a JSON-RPC batch array (which MCP removed), may name a method this
+    server never implemented. None of those may end the session or raise: each
+    one gets its answer and the loop reads the next line.
+  * **A message with no id has nowhere to send an answer.** So an id-less
+    message is a NOTIFICATION whatever it names, and one naming a request-only
+    method (`initialize`, `tools/call`, ...) is ignored WITHOUT BEING EXECUTED.
+    Executing it would dismiss a finding, or acknowledge a delivery, with
+    nobody told and no response line to order the acknowledgement behind.
+  * **One review at a time, and never on the read loop's thread.** Reviews take
+    minutes. Run one inline and the server stops answering `ping` -- clients
+    take that for a hung server -- and stops noticing EOF, which is how a
+    review learns its client is gone. So the single tool registered
+    `long_running=True` runs on one background thread, capacity 1: a second
+    call while it is busy is answered "review already in flight" rather than
+    queued behind it, because the queued one would review a working tree that
+    has moved by the time it starts.
+
+The tools themselves are NOT here. They arrive through the registry seam below
+(`HandlerSpec`/`HandlerCall`/`HandlerResult`), which Task 14 fills with the
+service functions the CLI subcommands call. This module knows only that a
+handler takes a call and returns a status, some text, and a list of review ids
+whose delivery the transport must acknowledge AFTER the response has been
+written and flushed -- never before, because a round marked delivered from a
+buffer that never reached a reader is the undelivered-findings bug the delivery
+ledger exists to remove.
+"""
+
+import json
+import sys
+import threading
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Callable
+
+from . import __version__
+
+if TYPE_CHECKING:            # the annotation only; importing `store` for real
+    from .store import Store  # would make every `skodun mcp` pay for sqlite3
+                              # before it has served a single line
+
+#: The protocol revision this server declares when it does not recognise the
+#: client's. Negotiation is a RULE, not a constant: probes against the two
+#: installed clients found claude-code 2.1.118 asking for `2025-11-25` and
+#: codex-cli 0.144.5 asking for `2025-06-18` on the same day, so echoing a
+#: revision we support is the only answer that keeps both happy (both captures
+#: are committed under `tests/fixtures/mcp/`).
+MCP_PROTOCOL_VERSION = "2025-11-25"
+
+#: Every revision whose `initialize`/`ping`/`tools`/`prompts` subset is the one
+#: implemented here -- which is all of them: that subset is the oldest and most
+#: stable part of MCP, and the only part skodun serves. `structuredContent` in a
+#: tool result post-dates the oldest two, and is additive: a client that does
+#: not know the field ignores it and reads `content` as it always did.
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26",
+                               "2024-11-05")
+
+#: `serverInfo.name`. The client shows it; the version travels beside it.
+SERVER_NAME = "skodun"
+
+#: A line longer than this is drained and refused. 8 MiB is far above any real
+#: `tools/call` (a review argument is a path and a few flags) and far below the
+#: size at which a single line becomes a memory problem for a machine that is
+#: about to run a code review.
+MAX_LINE_BYTES = 8 * 1024 * 1024
+
+#: How much of an oversized line is read at a time while discarding it.
+_DRAIN_CHUNK_BYTES = 1 << 20
+
+# JSON-RPC 2.0 error codes, plus the one MCP adds.
+PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
+METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
+NOT_INITIALIZED = -32002
+
+#: Verbatim: clients match on it, and the pinned wording is what the protocol
+#: suite asserts.
+NOT_INITIALIZED_MESSAGE = "server not initialized"
+
+#: The tool-level text a second concurrent review call gets. A TOOL error, not
+#: a protocol error: the agent asked a reasonable question and the answer is
+#: "not now", which it can read, retry, and reason about.
+BUSY_TEXT = "review already in flight"
+
+#: The status a busy refusal and a failed handler report. 2 is the gate
+#: contract's "no trustworthy review covers this content" -- the conservative
+#: reading of every outcome where nothing ran to completion.
+BUSY_STATUS = 2
+HANDLER_FAILURE_STATUS = 2
+
+#: The delivery channel rounds surfaced through this transport are acknowledged
+#: under (`delivery.CHANNELS`).
+MCP_CHANNEL = "mcp"
+
+#: The methods a client may send before the handshake. `initialize` for obvious
+#: reasons; `ping` because a client is allowed to check that the process it just
+#: spawned is alive before it commits to a handshake, and answering `{}` tells
+#: it nothing it could not already see.
+PRE_INIT_METHODS = frozenset({"initialize", "ping"})
+
+
+@dataclass(frozen=True)
+class HandlerSpec:
+    """One tool: its name, whether it is the long-running one, its JSON Schema,
+    and the callable that runs it.
+
+    `description` is a fifth, DEFAULTED field beyond the four the plan pins:
+    `tools/list` carries a description per tool, and an agent that has to guess
+    what a tool does from its name is a worse agent. Defaulted so the pinned
+    four remain sufficient to construct one.
+    """
+
+    name: str
+    long_running: bool
+    input_schema: dict
+    handler: Callable[["HandlerCall"], "HandlerResult"]
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class HandlerCall:
+    """What a handler is given: the call's `arguments`, a way to open a Store,
+    and the cancellation token for this call.
+
+    `store_factory` rather than a Store, because sqlite connections are bound
+    to the thread that created them: the long-running handler runs on another
+    thread and would get `ProgrammingError` from any connection this loop
+    opened. Per-call connections also mean a handler's Store lifetime is exactly
+    its call, which is what makes the post-response acknowledgement open a fresh
+    one.
+    """
+
+    params: dict
+    store_factory: Callable[[], "Store"]
+    cancel: threading.Event
+
+
+@dataclass(frozen=True)
+class HandlerResult:
+    """What a handler returns: the CLI's exit code, the CLI's text, and the
+    review ids whose delivery this transport must acknowledge once the response
+    is out.
+
+    `pending_acks` defaults to empty: a tool with nothing to deliver should not
+    have to say so.
+    """
+
+    status: int
+    text: str
+    pending_acks: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PromptSpec:
+    """A static MCP prompt -- the `/mcp__skodun__<name>` slash command surface."""
+
+    name: str
+    description: str
+    text: str
+
+
+class _RpcError(Exception):
+    """A protocol-level refusal raised by a method handler."""
+
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class _Deferred:
+    """Sentinel: this method answered (or will answer) for itself."""
+
+
+_DEFERRED = _Deferred()
+
+
+def default_registry() -> tuple[HandlerSpec, ...]:
+    """The tools `skodun mcp` serves. EMPTY in this task, deliberately.
+
+    Task 13 ships the transport; Task 14 registers the review-loop services
+    behind it. An accidental tool here would be an agent-facing surface nobody
+    reviewed, on a fail-closed gate.
+    """
+    return ()
+
+
+def default_prompts() -> tuple[PromptSpec, ...]:
+    """The prompts `skodun mcp` serves. Empty until Task 14 adds `review-now`
+    and `gate-check`."""
+    return ()
+
+
+def default_store_factory():
+    """Open a Store at the one location the CLI resolves.
+
+    Imported lazily and from `cli` on purpose: `_store_path` is the single
+    definition of "where the store lives" (`SKODUN_DB`, else the XDG-ish
+    default), and a second spelling of it here would be a second answer that
+    starts disagreeing the first time one of them changes.
+    """
+    from .cli import _store_path
+    from .store import Store
+    return Store.open(_store_path())
+
+
+def _validate_result(res) -> str | None:
+    """Why `res` is not a usable `HandlerResult`, or None.
+
+    A handler is Task 14's code, and this transport is a fail-closed component's
+    outermost layer: a handler that returns a dict, or a status that is a string,
+    must become a tool-level error the agent can read rather than a
+    `TypeError` traceback on stderr and a client waiting forever for a response
+    that will never come.
+    """
+    if not isinstance(res, HandlerResult):
+        return f"expected a HandlerResult, got {type(res).__name__}"
+    if isinstance(res.status, bool) or not isinstance(res.status, int):
+        return "status is not an int"
+    if not isinstance(res.text, str):
+        return "text is not a str"
+    if not isinstance(res.pending_acks, (list, tuple)):
+        return "pending_acks is not a list"
+    if any(not isinstance(i, str) or not i for i in res.pending_acks):
+        return "pending_acks holds something that is not a review id"
+    return None
+
+
+def tool_result(res: HandlerResult) -> dict:
+    """The MCP tool-result envelope for a `HandlerResult`.
+
+    The CLI's own text in `content[0].text`, the CLI's own exit code in
+    `structuredContent.status`, and `isError` = "that status is not 0". A
+    refusal is the TOOL answering -- `isError` inside a successful JSON-RPC
+    response -- never a JSON-RPC error, because an agent that got a protocol
+    error would have no refusal text to read and nothing to do about it.
+    """
+    return {"content": [{"type": "text", "text": res.text}],
+            "isError": res.status != 0,
+            "structuredContent": {"status": int(res.status)}}
+
+
+class McpServer:
+    """The read loop, the dispatch table, and the write lock."""
+
+    def __init__(self, registry=(), *, prompts=(), store_factory=None,
+                 stdin=None, stdout=None, stderr=None, acknowledge=None,
+                 version: str = __version__, on_stdout_lost=None):
+        self._specs: tuple[HandlerSpec, ...] = tuple(registry)
+        self._registry: dict[str, HandlerSpec] = {}
+        long_running: list[str] = []
+        for spec in self._specs:
+            if spec.name in self._registry:
+                raise ValueError(
+                    f"duplicate tool name {spec.name!r} in the MCP registry")
+            self._registry[spec.name] = spec
+            if spec.long_running:
+                long_running.append(spec.name)
+        if len(long_running) > 1:
+            # Capacity 1 is a property of the design, not of the registry's
+            # contents: a second long-running tool needs a second slot and a
+            # queueing policy nobody has decided on.
+            raise ValueError(
+                f"at most one long-running tool may be registered; got "
+                f"{long_running}")
+        self._prompt_specs: tuple[PromptSpec, ...] = tuple(prompts)
+        self._prompts: dict[str, PromptSpec] = {}
+        for prompt in self._prompt_specs:
+            if prompt.name in self._prompts:
+                raise ValueError(f"duplicate prompt name {prompt.name!r}")
+            self._prompts[prompt.name] = prompt
+
+        self._store_factory = store_factory or default_store_factory
+        if stdin is None:
+            stdin = getattr(sys.stdin, "buffer", None)
+        if stdout is None:
+            stdout = getattr(sys.stdout, "buffer", None)
+        if stdin is None or stdout is None:
+            raise ValueError("the MCP server needs a binary stdin and stdout")
+        self._stdin = stdin
+        self._stdout = stdout
+        self._stderr = sys.stderr if stderr is None else stderr
+        self._acknowledge = acknowledge
+        self._version = version
+        self._on_stdout_lost = on_stdout_lost
+
+        #: Whether the `initialize` REQUEST has been answered. This -- not the
+        #: notification below -- is what the -32002 gate reads: a client that
+        #: pipelines `tools/list` behind `initialize` without waiting for the
+        #: notification is asking a question this server can answer, and nothing
+        #: it can ask before the handshake mutates anything.
+        self._initialized = False
+        #: Whether `notifications/initialized` arrived. Recorded, not enforced:
+        #: it is the fact a stricter gate would be built on, and both observed
+        #: clients send it immediately after the handshake.
+        self._initialized_notified = False
+        self._stdout_lost = False
+        self._write_lock = threading.Lock()
+        self._slot_lock = threading.Lock()
+        #: Occupancy of the single review slot: True while a long-running
+        #: HANDLER is executing. Deliberately not "a thread exists" -- see
+        #: `_long_running_body`.
+        self._review_active = False
+        #: Every worker thread started, alive or not: `_shutdown` joins them.
+        #: Liveness and occupancy are different questions.
+        self._workers: list[threading.Thread] = []
+        self._worker_cancel: threading.Event | None = None
+
+        self._methods = {
+            "initialize": self._m_initialize,
+            "ping": self._m_ping,
+            "tools/list": self._m_tools_list,
+            "tools/call": self._m_tools_call,
+            "prompts/list": self._m_prompts_list,
+            "prompts/get": self._m_prompts_get,
+        }
+
+    # -- the loop ---------------------------------------------------------
+
+    def serve(self) -> int:
+        """Read until EOF (or until stdout dies) and return the exit code.
+
+        Always 0. A stdio server has two endings and neither is a failure: the
+        client closed stdin, or the client went away. A non-zero exit is how
+        every MCP client harness reports "your server crashed", which is a
+        different thing and must stay distinguishable.
+        """
+        try:
+            self._read_loop()
+        except BaseException as e:          # never a traceback out of a server
+            self._note(f"the read loop stopped unexpectedly: {e!r}")
+        return self._shutdown()
+
+    def _read_loop(self) -> None:
+        # `_stdout_lost` is read without the write lock on purpose: it is only
+        # ever set (never cleared), so a stale False costs at most one more line
+        # of work, and taking the write lock on every iteration would serialise
+        # the read loop behind the review thread's response.
+        while not self._stdout_lost:
+            try:
+                chunk = self._stdin.readline(MAX_LINE_BYTES + 1)
+            except BaseException as e:
+                self._note(f"stdin is no longer readable ({e!r}); ending the "
+                           f"session")
+                return
+            if chunk == b"":
+                return                      # EOF: the client is done
+            if len(chunk) == MAX_LINE_BYTES + 1 and not chunk.endswith(b"\n"):
+                # An oversized line: DRAIN the rest of it before answering, so
+                # its tail is not read back as a sequence of fragments -- each
+                # of which would draw its own -32700, and one of which could
+                # parse as a message the client never sent.
+                self._drain_oversized_line()
+                self._note(f"discarded a line longer than the "
+                           f"{MAX_LINE_BYTES}-byte cap")
+                self._respond_error(
+                    None, PARSE_ERROR,
+                    f"parse error: the line exceeds the {MAX_LINE_BYTES}-byte "
+                    f"limit")
+                continue
+            self._handle_line(chunk)
+
+    def _drain_oversized_line(self) -> None:
+        while True:
+            try:
+                more = self._stdin.readline(_DRAIN_CHUNK_BYTES)
+            except BaseException:
+                return
+            if more == b"" or more.endswith(b"\n"):
+                return                      # EOF, or the line finally ended
+
+    def _handle_line(self, chunk: bytes) -> None:
+        try:
+            text = chunk.decode("utf-8")
+        except UnicodeDecodeError as e:
+            self._note(f"a line was not valid UTF-8 ({e})")
+            self._respond_error(None, PARSE_ERROR,
+                                "parse error: the line is not valid UTF-8")
+            return
+        stripped = text.strip()
+        if not stripped:
+            # Framing, not a message. A writer that flushed a bare newline has
+            # not asked anything, and -32700 per blank line would fill the
+            # client's log with errors about nothing.
+            return
+        try:
+            msg = json.loads(stripped)
+        except ValueError as e:
+            self._note(f"a line was not valid JSON ({e})")
+            self._respond_error(None, PARSE_ERROR, f"parse error: {e}")
+            return
+
+        if isinstance(msg, list):
+            # MCP removed JSON-RPC batching. An array is not a batch to unpack:
+            # its members' responses would be lines no client is waiting for.
+            self._respond_error(
+                None, INVALID_REQUEST,
+                "invalid request: JSON-RPC batches are not supported; send one "
+                "message per line")
+            return
+        if not isinstance(msg, dict):
+            self._respond_error(
+                None, INVALID_REQUEST,
+                "invalid request: a JSON-RPC message must be a JSON object")
+            return
+
+        method = msg.get("method")
+        if "id" not in msg or msg["id"] is None:
+            # No id -> a notification, whatever it names. An explicit
+            # `id: null` lands here too: JSON-RPC reserves null for responses
+            # whose id could not be determined, MCP forbids it on requests, and
+            # answering with id null is exactly what a client cannot match to a
+            # call.
+            self._handle_notification(msg, method)
+            return
+        id_ = msg["id"]
+        if isinstance(id_, bool) or not isinstance(id_, (str, int)):
+            # `bool` first: it is an `int` subclass, and `id: true` is not an id.
+            # An id we cannot echo is answered with null, per JSON-RPC.
+            self._respond_error(None, INVALID_REQUEST,
+                                "invalid request: id must be a string or an "
+                                "integer")
+            return
+        if msg.get("jsonrpc") != "2.0":
+            self._respond_error(id_, INVALID_REQUEST,
+                                'invalid request: jsonrpc must be "2.0"')
+            return
+        if not isinstance(method, str) or not method:
+            self._respond_error(id_, INVALID_REQUEST,
+                                "invalid request: method must be a non-empty "
+                                "string")
+            return
+        if method not in self._methods:
+            # Named back on purpose: the client's log is where a version
+            # mismatch or a typo in a config file gets diagnosed.
+            self._respond_error(id_, METHOD_NOT_FOUND,
+                                f"unknown method: {method}")
+            return
+        if not self._initialized and method not in PRE_INIT_METHODS:
+            self._respond_error(id_, NOT_INITIALIZED, NOT_INITIALIZED_MESSAGE)
+            return
+        params = msg.get("params")
+        if params is None:
+            params = {}                     # a method that needs none
+        if not isinstance(params, dict):
+            self._respond_error(id_, INVALID_PARAMS,
+                                "invalid params: params must be an object")
+            return
+
+        try:
+            result = self._methods[method](params, id_)
+        except _RpcError as e:
+            self._respond_error(id_, e.code, e.message)
+            return
+        except BaseException as e:
+            # A bug in this server, not in the request. The client still gets an
+            # answer: a request with no response is a client that waits forever.
+            self._note(f"{method} failed inside the server: {e!r}")
+            self._respond_error(id_, INTERNAL_ERROR, f"internal error: {e!r}")
+            return
+        if result is _DEFERRED:
+            return
+        self._respond_result(id_, result)
+
+    def _handle_notification(self, msg: dict, method) -> None:
+        if method == "notifications/initialized" and msg.get("jsonrpc") == "2.0":
+            self._initialized_notified = True
+            return
+        if isinstance(method, str) and method in self._methods:
+            # A request-only method with no id: IGNORED WITHOUT EXECUTION.
+            # There is no response line to carry its result, so running it
+            # would mutate triage or delivery state with nobody told -- and, for
+            # the long-running tool, would occupy the single review slot for a
+            # call nobody is waiting on.
+            self._note(f"ignored an id-less {method}: a request-only method "
+                       f"sent as a notification has nowhere to send its answer")
+            return
+        # An unknown notification is ignored in silence, per the spec: a
+        # notification never gets a response, not even an error one.
+
+    # -- the methods ------------------------------------------------------
+
+    def _m_initialize(self, params: dict, id_) -> dict:
+        requested = params.get("protocolVersion")
+        if requested is not None and not isinstance(requested, str):
+            raise _RpcError(INVALID_PARAMS,
+                            "invalid params: protocolVersion must be a string")
+        negotiated = (requested if requested in SUPPORTED_PROTOCOL_VERSIONS
+                      else MCP_PROTOCOL_VERSION)
+        # Idempotent on purpose: a second handshake is answered rather than
+        # refused. Nothing here is stateful enough for a re-handshake to
+        # corrupt, and refusing one would invent a failure mode.
+        self._initialized = True
+        return {"protocolVersion": negotiated,
+                "capabilities": {"tools": {}, "prompts": {}},
+                "serverInfo": {"name": SERVER_NAME, "version": self._version}}
+
+    def _m_ping(self, params: dict, id_) -> dict:
+        return {}
+
+    def _m_tools_list(self, params: dict, id_) -> dict:
+        # Registration order, not sorted: the registry is a curated list and its
+        # order is a decision Task 14 makes. No `nextCursor`, so no conformant
+        # client ever sends a `cursor`: the whole list is one page, and a
+        # curated review-loop mirror is never going to need two.
+        return {"tools": [{"name": s.name, "description": s.description,
+                           "inputSchema": s.input_schema} for s in self._specs]}
+
+    def _m_tools_call(self, params: dict, id_):
+        name = params.get("name")
+        if not isinstance(name, str) or not name:
+            raise _RpcError(INVALID_PARAMS,
+                            "invalid params: name must name a tool")
+        arguments = params.get("arguments")
+        if arguments is None:
+            arguments = {}                  # a tool called without arguments
+        if not isinstance(arguments, dict):
+            raise _RpcError(INVALID_PARAMS,
+                            "invalid params: arguments must be an object")
+        spec = self._registry.get(name)
+        if spec is None:
+            # A protocol error, not an `isError` result: no tool ran, so there
+            # is no tool output to report.
+            raise _RpcError(INVALID_PARAMS, f"invalid params: unknown tool: "
+                                            f"{name}")
+        if spec.long_running:
+            if not self._start_long_running(spec, arguments, id_):
+                self._respond_tool(id_, HandlerResult(
+                    status=BUSY_STATUS, text=BUSY_TEXT, pending_acks=[]))
+            return _DEFERRED
+        self._respond_tool(id_, self._run_handler(spec, arguments,
+                                                 threading.Event()))
+        return _DEFERRED
+
+    def _m_prompts_list(self, params: dict, id_) -> dict:
+        return {"prompts": [{"name": p.name, "description": p.description}
+                            for p in self._prompt_specs]}
+
+    def _m_prompts_get(self, params: dict, id_) -> dict:
+        name = params.get("name")
+        if not isinstance(name, str) or not name:
+            raise _RpcError(INVALID_PARAMS,
+                            "invalid params: name must name a prompt")
+        prompt = self._prompts.get(name)
+        if prompt is None:
+            raise _RpcError(INVALID_PARAMS,
+                            f"invalid params: unknown prompt: {name}")
+        # `arguments` is accepted and ignored: these prompts are static, and a
+        # client that sends an empty argument object must not get a refusal.
+        return {"description": prompt.description,
+                "messages": [{"role": "user",
+                              "content": {"type": "text", "text": prompt.text}}]}
+
+    # -- handlers ---------------------------------------------------------
+
+    def _run_handler(self, spec: HandlerSpec, arguments: dict,
+                     cancel: threading.Event) -> HandlerResult:
+        call = HandlerCall(params=arguments, store_factory=self._store_factory,
+                           cancel=cancel)
+        try:
+            res = spec.handler(call)
+        except BaseException as e:
+            # A handler that raised is a TOOL failure, reported fail-closed:
+            # status 2, `isError` true, the exception named for the log. Not a
+            # crashed server, and not a protocol error either.
+            self._note(f"the {spec.name} tool raised: {e!r}")
+            return HandlerResult(
+                status=HANDLER_FAILURE_STATUS,
+                text=f"skodun {spec.name}: the tool failed: {e!r}",
+                pending_acks=[])
+        problem = _validate_result(res)
+        if problem is not None:
+            self._note(f"the {spec.name} tool returned something unusable "
+                       f"({problem})")
+            return HandlerResult(
+                status=HANDLER_FAILURE_STATUS,
+                text=f"skodun {spec.name}: the tool returned something "
+                     f"unusable ({problem})",
+                pending_acks=[])
+        return res
+
+    def _start_long_running(self, spec: HandlerSpec, arguments: dict,
+                            id_) -> bool:
+        """Start the one long-running tool, or report that the slot is taken."""
+        with self._slot_lock:
+            if self._review_active:
+                self._note(f"refused a second {spec.name} call: {BUSY_TEXT}")
+                return False
+            self._review_active = True
+            cancel = threading.Event()
+            worker = threading.Thread(
+                target=self._long_running_body,
+                args=(spec, arguments, id_, cancel),
+                name=f"skodun-mcp-{spec.name}", daemon=True)
+            # Finished threads are dropped here, so a session that runs reviews
+            # all day does not accumulate a list of dead ones.
+            self._workers = [t for t in self._workers if t.is_alive()]
+            self._workers.append(worker)
+            self._worker_cancel = cancel
+            worker.start()
+            return True
+
+    def _long_running_body(self, spec: HandlerSpec, arguments: dict, id_,
+                           cancel: threading.Event) -> None:
+        try:
+            res = self._run_handler(spec, arguments, cancel)
+        finally:
+            # THE SLOT IS FREED WHEN THE HANDLER IS DONE, BEFORE THE RESPONSE IS
+            # WRITTEN. A client that has just been told a review finished may
+            # legitimately ask for the next one microseconds later, and refusing
+            # it because this thread has not returned from its own `write` yet
+            # would be a lie: nothing is in flight. Capacity 1 is about handlers
+            # executing, not about threads existing -- which is also why
+            # `_shutdown` joins from `_workers` rather than from this flag.
+            with self._slot_lock:
+                self._review_active = False
+        try:
+            self._respond_tool(id_, res)
+        except BaseException as e:
+            # `threading.excepthook` would print a traceback -- on stderr, so
+            # not a protocol violation, but a lie about what happened: the
+            # client would be left waiting for a response instead.
+            self._note(f"the {spec.name} thread failed: {e!r}")
+            self._respond_error(id_, INTERNAL_ERROR, f"internal error: {e!r}")
+
+    # -- writing ----------------------------------------------------------
+
+    def _respond_tool(self, id_, res: HandlerResult) -> bool:
+        """Write a tool result, then -- and only then -- acknowledge deliveries.
+
+        THE ORDER IS THE PRODUCT. Acknowledging first is the mutation that
+        passes every other test: a report lost on the way out would be recorded
+        as delivered and never shown again, which is the failure the delivery
+        ledger exists to prevent, reintroduced by the fix. A crash between the
+        flush and the acknowledgement re-delivers instead, which is the designed
+        direction.
+        """
+        written = self._respond_result(id_, tool_result(res))
+        if written and res.pending_acks:
+            self._ack(list(res.pending_acks))
+        return written
+
+    def _respond_result(self, id_, result) -> bool:
+        payload = self._encode({"jsonrpc": "2.0", "id": id_, "result": result})
+        if payload is None:
+            return self._respond_error(
+                id_, INTERNAL_ERROR,
+                "internal error: the result could not be serialised")
+        return self._write(payload)
+
+    def _respond_error(self, id_, code: int, message: str) -> bool:
+        payload = self._encode({"jsonrpc": "2.0", "id": id_,
+                                "error": {"code": code, "message": message}})
+        if payload is None:                 # unreachable: code and message are
+            payload = self._encode({        # an int and a str by construction
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": INTERNAL_ERROR, "message": "internal error"}})
+        return self._write(payload) if payload is not None else False
+
+    def _encode(self, obj) -> bytes | None:
+        try:
+            # `ensure_ascii=True` deliberately: it cannot fail on a lone
+            # surrogate (which lossily-decoded provider output can carry), and
+            # the result is pure ASCII, so the encode below cannot fail either.
+            return json.dumps(obj, ensure_ascii=True,
+                              separators=(",", ":")).encode("ascii") + b"\n"
+        except BaseException as e:
+            self._note(f"a response could not be serialised: {e!r}")
+            return None
+
+    def _write(self, payload: bytes) -> bool:
+        """One write plus one flush, under one lock.
+
+        The lock is the whole reason a long-running tool may answer from its own
+        thread: two threads writing a line each without it can interleave into
+        one line made of halves. The flush is inside it for the same reason a
+        delivery is not acknowledged from a buffer -- bytes sitting in a buffer
+        have not reached the client.
+        """
+        with self._write_lock:
+            if self._stdout_lost:
+                return False
+            try:
+                self._stdout.write(payload)
+                self._stdout.flush()
+                return True
+            except BaseException as e:
+                # The client is gone (broken pipe, closed fd) or the disk is
+                # full. Nothing left to say and nobody to say it to: stop.
+                self._stdout_lost = True
+                self._note(f"stdout is no longer writable ({e!r}); ending the "
+                           f"session")
+                if self._on_stdout_lost is not None:
+                    try:
+                        self._on_stdout_lost()
+                    except BaseException:
+                        pass
+                return False
+
+    def _ack(self, ids: list[str]) -> None:
+        try:
+            if self._acknowledge is not None:
+                self._acknowledge(ids)
+            else:
+                self._default_acknowledge(ids)
+        except BaseException as e:
+            # The report already reached the client, so a failed ledger write
+            # costs a repeat, not a loss -- and must not become the failure.
+            self._note(f"{len(ids)} delivered round(s) could not be "
+                       f"acknowledged ({e!r}); they will be reported again")
+
+    def _default_acknowledge(self, ids: list[str]) -> None:
+        """Acknowledge with a FRESH Store: the handler's own closed with its
+        call, and this runs after the response is already out."""
+        from . import delivery
+        with self._store_factory() as store:
+            delivery.acknowledge(store, ids, MCP_CHANNEL)
+
+    # -- shutdown ---------------------------------------------------------
+
+    def _shutdown(self) -> int:
+        """Cancel the review in flight, wait for it, and report a clean 0.
+
+        The join is UNBOUNDED on purpose. A review holds the foreground lock and
+        is about to write a record; abandoning it mid-write to make the process
+        exit a little sooner would leave a `running` row behind and a provider
+        process group with no parent. What bounds this wait is the cancellation
+        token, which Task 14 threads all the way into the provider watchdog.
+
+        The token is the LAST review's. Only one review executes at a time, so
+        any earlier thread still in `_workers` has already finished its handler
+        and is only finishing a write -- there is nothing left in it to cancel.
+        """
+        with self._slot_lock:
+            workers, cancel = list(self._workers), self._worker_cancel
+        if cancel is not None:
+            cancel.set()
+        for worker in workers:
+            if worker.is_alive():
+                self._note(f"waiting for {worker.name} to finish before exiting")
+                worker.join()
+        return 0
+
+    # -- diagnostics ------------------------------------------------------
+
+    def _note(self, message: str) -> None:
+        """Say something on STDERR. Never stdout, never raises.
+
+        Stdout is the protocol channel: one diagnostic written there
+        desynchronises the client's parser for the rest of the session.
+        """
+        try:
+            print(f"skodun mcp: {message}", file=self._stderr, flush=True)
+        except BaseException:
+            pass                # a diagnostic may never become the failure
+
+
+def serve_stdio(registry=None, *, prompts=None, store_factory=None,
+                on_stdout_lost=None) -> int:
+    """Serve MCP on this process's stdin/stdout. Returns the exit code (0).
+
+    The binary buffers, not the text layers: the protocol is UTF-8 bytes with a
+    hard line cap, and a text wrapper would add its own encoding and newline
+    translation between this module and the pipe.
+    """
+    server = McpServer(
+        registry=default_registry() if registry is None else registry,
+        prompts=default_prompts() if prompts is None else prompts,
+        store_factory=store_factory,
+        stdin=getattr(sys.stdin, "buffer", None),
+        stdout=getattr(sys.stdout, "buffer", None),
+        stderr=sys.stderr,
+        on_stdout_lost=on_stdout_lost)
+    return server.serve()
