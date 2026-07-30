@@ -1111,10 +1111,11 @@ def test_run_review_derives_the_lock_ceiling_from_the_configured_width(
     seen: dict = {}
     real = pipeline._acquire_fg_lock
 
-    def spy(common_dir, worktree, *, wait, poll, stale, grace=30.0):
+    def spy(common_dir, worktree, *, wait, poll, stale, grace=30.0,
+            budget_sec=None):
         seen["stale"] = stale
         return real(common_dir, worktree, wait=wait, poll=poll, stale=stale,
-                    grace=grace)
+                    grace=grace, budget_sec=budget_sec)
 
     monkeypatch.setattr(pipeline, "_acquire_fg_lock", spy)
     _run(repo, _store(tmp_path))

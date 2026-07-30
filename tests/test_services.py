@@ -317,6 +317,100 @@ def test_svc_review_re_raises_keyboard_interrupt_past_every_guard(monkeypatch,
             services.svc_review(store, repo)
 
 
+def test_svc_gate_re_raises_keyboard_interrupt_and_records_nothing(monkeypatch,
+                                                                   tmp_path):
+    """`svc_review` re-raises Ctrl-C at four guards; `svc_gate`'s single
+    `except BaseException` used to swallow it.
+
+    Two costs, and the second is the one that lasts. A run the user CANCELLED
+    was reported as `FAIL(2) could not run the gate: KeyboardInterrupt()`,
+    which is a verdict about the change rather than about the interruption --
+    and 130 is what the shell expects, which no code in this contract can say.
+    Worse, `_record_setup_failure` wrote a `gate_events` row for it, so the
+    audit trail claims a gate decision was taken on a run that never took one.
+    """
+    from skodun import config
+
+    def boom(*_a, **_k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(config, "load_config", boom)
+    repo = _mkrepo(tmp_path)
+    db = _db(tmp_path)
+    with Store.open(db) as store:
+        with pytest.raises(KeyboardInterrupt):
+            services.svc_gate(store, repo)
+    with Store.open(db) as store:
+        rows = list(store._c.execute("SELECT * FROM gate_events"))
+    assert rows == [], "a cancelled run was recorded as a gate decision"
+
+
+def test_an_ordinary_gate_setup_failure_is_still_a_recorded_fail_2(monkeypatch,
+                                                                   tmp_path):
+    """The other half: letting Ctrl-C through must not have been done by
+    letting everything through. An ordinary exception is STILL exit 2, still
+    reported in words, and still written to the audit trail -- this is a
+    fail-closed gate, and 2 is the conservative value in its contract."""
+    from skodun import config
+
+    def boom(*_a, **_k):
+        raise RuntimeError("unparseable config")
+
+    monkeypatch.setattr(config, "load_config", boom)
+    repo = _mkrepo(tmp_path)
+    db = _db(tmp_path)
+    with Store.open(db) as store:
+        status, text = services.svc_gate(store, repo)
+    assert status == 2
+    assert "SKODUN GATE: FAIL(2) could not run the gate" in text
+    assert "unparseable config" in text
+    with Store.open(db) as store:
+        rows = list(store._c.execute("SELECT * FROM gate_events"))
+    assert len(rows) == 1
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda st, repo: services.svc_gate(st, repo), id="svc_gate"),
+    pytest.param(lambda st, repo: services.svc_log(st, None, 10), id="svc_log"),
+    pytest.param(lambda st, repo: services.svc_surface(st, "feat", "text", False),
+                 id="svc_surface"),
+    pytest.param(lambda st, repo: services.resolve_surface_branch(None, repo),
+                 id="resolve_surface_branch"),
+    pytest.param(lambda st, repo: services.svc_adopt_refuter(st, "r1", 0),
+                 id="svc_adopt_refuter"),
+    pytest.param(
+        lambda st, repo: services.svc_triage_reopen(st, "r1", 0, GOOD_REASON),
+        id="svc_triage_reopen"),
+])
+def test_no_service_guard_turns_a_ctrl_c_into_a_synthetic_failure(
+        monkeypatch, tmp_path, call):
+    """Every `except BaseException` in this module, swept in one place.
+
+    Each one exists to stop an ordinary failure (an unreadable store, a git that
+    will not run, a ledger that stopped answering) from escaping as a traceback,
+    and each was catching Ctrl-C as well -- reporting a synthetic 2 for a run the
+    user chose to abandon, and taking the CLI's 130 mapping away from it. A
+    future service copying the pattern gets caught here rather than in a user's
+    terminal.
+    """
+    from skodun import config, delivery, gitio, triage
+
+    def boom(*_a, **_k):
+        raise KeyboardInterrupt
+
+    for module, name in ((config, "load_config"), (gitio, "current_branch"),
+                         (delivery, "surface"), (triage, "adopt_refuter"),
+                         (triage, "reopen")):
+        monkeypatch.setattr(module, name, boom)
+    repo = _mkrepo(tmp_path)
+    db = _db(tmp_path, _round(id="r1", findings=[_finding(0)], findings_total=1,
+                              artifact=_artifact(_finding(0))))
+    with Store.open(db) as store:
+        monkeypatch.setattr(store, "list_reviews", boom)
+        with pytest.raises(KeyboardInterrupt):
+            call(store, repo)
+
+
 # ==========================================================================
 # the refusal strings live in one place
 # ==========================================================================

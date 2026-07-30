@@ -33,6 +33,16 @@ pinned by a test:
 
 `svc_surface` is the one three-valued shape (`status, text, pending_acks`) and its
 contract is spelled on the function.
+
+One rule cuts across every guard here: **`KeyboardInterrupt` is re-raised, never
+absorbed.** The `except BaseException` blocks exist so that an unreadable store,
+a git that will not run or a ledger that stopped answering comes back as a
+status and a sentence instead of a traceback — none of them is about a user who
+pressed Ctrl-C. Absorbing it costs the CLI its 130 (the shell's 128 + SIGINT,
+which no code in any of these contracts can say) and, in `svc_gate`, wrote a
+`gate_events` row asserting a decision about a change nothing ever examined.
+An ORDINARY exception still produces the conservative code it always did.
+`test_no_service_guard_turns_a_ctrl_c_into_a_synthetic_failure` sweeps them.
 """
 
 from pathlib import Path
@@ -83,6 +93,15 @@ def svc_gate(store, repo) -> tuple[int, str]:
     `gate.py` is a broken installation rather than a decision this function can
     make, and the CLI's contract for that case (`main`'s general handler, exit 2)
     depends on the exception reaching it.
+
+    `KeyboardInterrupt` is re-raised, exactly as `svc_review` re-raises it: 130
+    is what the shell expects for a Ctrl-C and none of the codes above can say
+    it, and reporting a cancelled run as `FAIL(2) could not run the gate` would
+    also write a `gate_events` row claiming a decision was taken about a change
+    nothing ever looked at. `SystemExit` is deliberately NOT re-raised with it —
+    it carries an exit code of its own, and letting an arbitrary one (0
+    included) out of a fail-closed gate is the one direction this function may
+    never fail in.
     """
     from .cli import _record_setup_failure, _repo_root
     from .config import load_config
@@ -96,6 +115,8 @@ def svc_gate(store, repo) -> tuple[int, str]:
         root = _repo_root(repo)
         cfg = load_config(root)
         result = run_gate(store, root, cfg)  # records its own event; never raises
+    except KeyboardInterrupt:
+        raise
     except BaseException as e:
         note = f"SKODUN GATE: FAIL(2) could not run the gate: {e!r}"
         _record_setup_failure(store, repo, note)
@@ -239,6 +260,8 @@ def svc_log(store, branch, limit) -> tuple[int, str]:
                    f"{rows_wanted}")
     try:
         rows = store.list_reviews(branch, rows_wanted)
+    except KeyboardInterrupt:
+        raise           # a cancelled listing is 130's, not "the store is broken"
     except BaseException as e:
         return 2, f"skodun log: could not read the store: {e!r}"
 
@@ -279,17 +302,24 @@ def surface_no_rounds_note(branch) -> str:
 
 
 def resolve_surface_branch(branch, repo=".") -> tuple[str, str]:
-    """`(branch, "")`, or `("", why-not)`. Never raises.
+    """`(branch, "")`, or `("", why-not)`. Never turns a git failure into one.
 
     A detached HEAD answers `HEAD` here, which matches no round and reports
     nothing — correct: rounds are keyed to a branch, and a detached checkout is
     not on one. Naming the branch explicitly is how a caller asks anyway.
+
+    The one exception it does let through is `KeyboardInterrupt`, for the reason
+    every guard in this module lets it through: a user who hit Ctrl-C during the
+    `git rev-parse` did not discover that the branch is unknowable, and the CLI
+    owes them 130 rather than a refusal quoting their own interrupt back at them.
     """
     if branch:
         return str(branch), ""
     try:
         from . import gitio
         branch = gitio.current_branch(Path(repo))
+    except KeyboardInterrupt:
+        raise
     except BaseException as e:
         return "", (f"skodun surface: could not work out which branch to report "
                     f"on ({e!r}); pass --branch")
@@ -324,6 +354,8 @@ def svc_surface(store, branch, fmt="text",
     try:
         status, text, pending = delivery.surface(store, branch, fmt,
                                                  bool(include_delivered))
+    except KeyboardInterrupt:
+        raise           # 130's, not "the ledger is unreadable"
     except BaseException as e:
         return 2, f"skodun surface: could not read the delivery ledger: {e!r}", []
     return int(status), text, list(pending)
@@ -466,6 +498,8 @@ def svc_adopt_refuter(store, review_id, index) -> tuple[int, str]:
         return 2, f"skodun triage: {e}"
     except TriageError as e:
         return 1, f"skodun triage: refused: {e}"
+    except KeyboardInterrupt:
+        raise           # 130's; the guard below is for a store that broke
     except BaseException as e:
         # A store that stopped accepting writes is not a refusal about the
         # annotation — nothing was decided and nothing was recorded.
@@ -524,6 +558,8 @@ def svc_triage_reopen(store, review_id, index, reason) -> tuple[int, str]:
         # The finding exists and the reopen was declined — an unauditable
         # reason, or a finding that is not dismissed.
         return 1, f"skodun triage: refused: {e}"
+    except KeyboardInterrupt:
+        raise           # 130's; the guard below is for a store that broke
     except BaseException as e:
         # A store that stopped accepting writes is not a refusal about the
         # reason: nothing was decided and nothing was recorded.

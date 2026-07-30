@@ -73,6 +73,29 @@ class ReviewCancelled(BaseException):
         self.partial = partial
 
 
+def _is_path_shaped(binary: str) -> bool:
+    """Whether `binary` should be resolved as a path rather than walked
+    through `PATH`: it contains `/`, or the platform's own separator on a
+    platform where that differs from `/`.
+
+    THE ONE definition of the path-vs-PATH split. Two callers decide the same
+    thing with it -- `chain._binary_is_absent`'s pre-spawn existence check and
+    `cli._fmt_binary`'s `providers` diagnostic -- about the same values (the
+    per-adapter `SKODUN_<X>_BIN` overrides, grok's own `~/.grok/bin/grok`
+    default), and both have to agree with how the adapter's own `Popen` call
+    would resolve them. Before it was factored out, `cli._fmt_binary` carried a
+    second copy, free to drift.
+
+    It lives HERE, in the leaf, for the same reason `ReviewCancelled` does. It
+    was in `pipeline`, which made `skodun providers` -- a read-only diagnostic
+    an operator reaches for precisely when a review will not run -- depend on
+    the entire review pipeline importing cleanly, i.e. unavailable exactly when
+    it is needed. `runner` imports nothing from the package, so no caller pays
+    for anyone else's import graph to ask this question.
+    """
+    return "/" in binary or (os.sep != "/" and os.sep in binary)
+
+
 def _cancelled(cancel: "threading.Event | None") -> bool:
     """Whether `cancel` is a set token. Total, and never raises.
 

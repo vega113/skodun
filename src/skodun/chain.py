@@ -10,13 +10,16 @@ relocated. `pipeline._run_chain` remains a one-line compatibility alias for
 later tasks call `chain.run_chain` directly.
 
 A few helpers `run_chain` depends on are genuinely SHARED with other pipeline
-code (`_chain_for` is also walked by `run_review`'s preflight; `_is_path_shaped`
-is also `cli._fmt_binary`'s diagnostic; `_note`, `_iso_now` and
-`PROVIDER_UNAVAILABLE_TTL_SEC` are used well beyond one reviewer chain) and so
-stay defined in `pipeline.py`; the functions below import them from there,
-lazily (inside the function body, exactly the pattern `cli._fmt_binary`
-already uses for `_is_path_shaped`) so that neither module has to import the
-other at module load time.
+code (`_chain_for` is also walked by `run_review`'s preflight; `_note`,
+`_iso_now` and `PROVIDER_UNAVAILABLE_TTL_SEC` are used well beyond one reviewer
+chain) and so stay defined in `pipeline.py`; the functions below import them
+from there, lazily (inside the function body) so that neither module has to
+import the other at module load time.
+
+`_is_path_shaped` is the exception, and it went the other way: it is shared with
+`cli._fmt_binary`, which is a read-only diagnostic that must not need the review
+pipeline to import at all, so it lives in the leaf (`runner`, imported at module
+scope here) rather than in `pipeline`.
 """
 
 from __future__ import annotations
@@ -112,17 +115,16 @@ def _binary_is_absent(binary: str) -> bool:
 
     Checked BEFORE spawning, so a missing CLI costs no process and its
     `attempts[]` row is honestly free of execution fields. A path-shaped value
-    (see `pipeline._is_path_shaped`) is tested as a path (the per-adapter
+    (see `runner._is_path_shaped`) is tested as a path (the per-adapter
     `SKODUN_<X>_BIN` overrides and grok's `~/.grok/bin/grok` default are both
     paths); a bare name goes through `PATH`. Existence only, not
     executability: a file that is there but not runnable is a permissions
     problem the spawn should report in its own words rather than something to
     route around as "the provider is unavailable".
     """
-    from .pipeline import _is_path_shaped
     if not binary:
         return True
-    if _is_path_shaped(binary):
+    if runner._is_path_shaped(binary):
         return not Path(binary).exists()
     return shutil.which(binary) is None
 

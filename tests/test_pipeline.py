@@ -1064,19 +1064,27 @@ def test_a_crash_mid_run_releases_the_lock_and_downgrades_the_record(
 
 
 def test_a_dead_stdout_never_downgrades_an_already_persisted_record(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, capsys):
     """`skodun review | head` closes stdout under us. The record was already
     saved and is correct; nothing on the way out may rewrite it to `failed`.
 
-    This used to inject a `BrokenPipeError` into `pipeline._emit_banner`. That
-    function is GONE -- the pipeline no longer writes to stdout at all, because
-    `skodun mcp` serves JSON-RPC on that stream from another thread -- so the
-    property is now stronger, and is asserted as such: with a stdout on which
-    EVERY operation raises, `run_review` still returns a clean, trustworthy,
-    persisted record and still releases the lock. The verdict line is the
-    caller's to write (`services.svc_review` renders it, `cli._emit` writes it),
-    strictly after the record was persisted and the `finally` block ran, and
-    `_emit` reports the code rather than the write failure.
+    THROUGH THE REAL CALLER, and that is the whole point of this test's shape.
+    It used to inject a `BrokenPipeError` into `pipeline._emit_banner` and then,
+    once Task 14 moved banner emission out to the CLI, into a `sys.stdout` that
+    `run_review` no longer touches at ALL -- so it was asserting that a function
+    which writes nothing survives an unwritable stream, which is true of every
+    function in the package and pins nothing. `skodun review | head` is a CLI
+    shape: the write, the failure, and the decision about what that failure
+    costs all live in `cli._emit`, reached through `services.svc_review`.
+
+    So this drives `cli.main(["review", ...])` with a stdout on which every
+    operation raises, and asserts the two halves that matter:
+
+      * the CLI still returns the REVIEW's exit code (0 here), not the
+        interpreter's 1 and not a code invented by the write failure -- `_emit`
+        blackholes the dead stream and reports the code it was given;
+      * the persisted record is untouched: still `clean`, still trustworthy,
+        and the foreground lock is released.
     """
 
     class _DeadStdout:
@@ -1090,15 +1098,47 @@ def test_a_dead_stdout_never_downgrades_an_already_persisted_record(
 
     _fake_grok(tmp_path, _emit(CLEAN))
     repo = _repo(tmp_path)
-    st = _store(tmp_path)
+    db = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    capsys.readouterr()
 
+    real_stdout = sys.stdout
     monkeypatch.setattr(sys, "stdout", _DeadStdout())
-    rec = _run(repo, st)
+    try:
+        code = main(["review", "--repo", str(repo)])
+    finally:
+        # `_emit` redirects the dead stream at devnull; put the captured one
+        # back so a later assertion failure in this test can still be reported.
+        monkeypatch.setattr(sys, "stdout", real_stdout)
 
-    stored = st.list_reviews(None, 10)[0]
-    assert rec["id"] == stored["id"]
-    assert stored["status"] == "clean" and stored["trustworthy"] is True
+    assert code == 0, "the write failure decided the exit code"
+    with Store.open(db) as st:
+        rows = st.list_reviews(None, 10)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "clean" and rows[0]["trustworthy"] is True
     assert not (git_common_dir(repo) / "grok-reviews-foreground.lock").exists()
+
+
+def test_run_review_itself_writes_nothing_to_stdout(tmp_path, monkeypatch):
+    """The other half, and the reason the test above had to move: `run_review`
+    does not write to stdout at all -- `skodun mcp` serves JSON-RPC on that
+    stream from another thread, and one stray line desynchronises the client's
+    parser for the rest of the session. Pinned directly rather than left as an
+    implication of a broken-pipe test that would pass either way."""
+
+    class _Forbidden:
+        def write(self, *_a, **_k):
+            raise AssertionError("run_review wrote to stdout")
+
+        def flush(self, *_a, **_k):
+            raise AssertionError("run_review flushed stdout")
+
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path)
+    st = _store(tmp_path)
+    monkeypatch.setattr(sys, "stdout", _Forbidden())
+    rec = _run(repo, st)
+    assert rec["status"] == "clean"
 
 
 def test_a_persistence_failure_is_reported_as_no_review_recorded(tmp_path,

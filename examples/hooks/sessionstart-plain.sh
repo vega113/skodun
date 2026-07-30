@@ -57,9 +57,14 @@ else
   exit 0
 fi
 
-# Passed through untouched. `surface` prints NOTHING when there is nothing
-# undelivered, so a quiet branch costs a silent command and no screen space; its
-# own notes go to stderr, so a wrapper capturing stdout gets only the report.
+# Passed through untouched. `surface` prints NOTHING AT ALL when there is
+# nothing undelivered AND `--hook-format` was given, so a quiet branch costs a
+# silent command and no screen space -- not even on stderr, which is not
+# redirected here and which a shell profile shows the user at every session
+# start. (Typed bare by a human, `skodun surface` still says why it printed
+# nothing; naming a hook format is how this script says it is a machine.)
+# FAILURES are never suppressed: they still go to stderr, because a failure is
+# the reason no report appeared and an operator needs to see it.
 #
 # The exit status is discarded on purpose: a non-zero means the report did not
 # land or was not recorded, in which case the round stays undelivered and is

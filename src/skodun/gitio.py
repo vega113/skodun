@@ -403,10 +403,11 @@ def blob_size(repo: Path, oid: str, path: str) -> int | None:
     """Byte size of `path` in commit `oid`'s tree, or None on ANY failure.
 
     CAVEAT, relied upon by `contextpack` and shared with the oracle: `cat-file
-    -s` answers for any object type, so a DIRECTORY has a size here. Only the
-    blob read rejects a tree, so a directory among the candidates is classified
-    on its size and refused later — see `test_a_tree_path_has_a_size_but_no_
-    blob_bytes`.
+    -s` answers for any object type, so a DIRECTORY has a size here. Only a blob
+    READ rejects a tree, so a directory among the candidates is classified on its
+    size and refused later — see `test_a_tree_path_has_a_size_but_no_blob_bytes`.
+    `_blob_object_type` below is what does the rejecting, and it is the ONE probe
+    in this module that answers "is this actually a blob".
     """
     rev = _blob_rev(oid, path)
     if rev is None:
@@ -418,6 +419,24 @@ def blob_size(repo: Path, oid: str, path: str) -> int | None:
         return int(cp.stdout.strip() or b"0")
     except ValueError:
         return None
+
+
+def _blob_object_type(repo: Path, rev: str) -> str | None:
+    """`git cat-file -t <rev>`'s answer, or None if it could not be obtained.
+
+    The only probe here that distinguishes OBJECT TYPES. `cat-file -s` cannot:
+    it sizes a tree and a commit (a gitlink) as happily as a blob, which is why
+    a directory among the packer's candidates survives classification. And the
+    `blob` read cannot be used as a type test from a LIMITED read, because that
+    read is killed mid-stream on purpose — the exit code it leaves behind may be
+    git's or may be the signal's, so "it failed" and "we stopped it" are
+    indistinguishable there. This is one extra `cat-file` on the one path that
+    would otherwise have to guess, never on the bytes-producing path.
+    """
+    cp = _cat_file(repo, "-t", rev)
+    if cp is None or cp.returncode != 0:
+        return None
+    return cp.stdout.strip().decode("ascii", "replace") or None
 
 
 def blob_bytes(
@@ -443,7 +462,11 @@ def blob_bytes(
 
       * **An empty blob comes back as `b""`, never None.** The packer reports
         None as `missing` and packs `b""`; conflating them would report a
-        legitimately empty committed file as absent.
+        legitimately empty committed file as absent. The converse holds too, and
+        it is what the type probe below buys: anything that is NOT a blob (a
+        directory, a gitlink) is None on EVERY read form, limited or not. `b""`
+        means "an empty committed file" everywhere in this module, so a limited
+        read may never use it to mean "there is nothing readable here".
       * **A symlink reads as its target *path*, not its target's content.** git
         stores a symlink as a blob holding the target string, so an object read
         cannot traverse one. That is why the working-tree packer's symlink
@@ -458,9 +481,10 @@ def blob_bytes(
             return None
         return cp.stdout
     if max_bytes <= 0:
-        # A zero-length peek cannot tell an empty blob from a missing one, so
-        # let the size probe answer the existence question.
-        return b"" if blob_size(repo, oid, path) is not None else None
+        # A zero-length peek reads nothing, so it cannot tell an empty blob from
+        # a missing one — or from a tree, which `cat-file -s` sizes too. The TYPE
+        # is the probe that can, and the same one the read below falls back to.
+        return b"" if _blob_object_type(repo, rev) == "blob" else None
     try:
         proc = subprocess.Popen(
             ["git", "-C", str(repo), "cat-file", "blob", rev],
@@ -482,8 +506,12 @@ def blob_bytes(
         return data
     # Nothing on stdout: an empty blob, a missing path and a tree all look the
     # same from here, and the kill may have pre-empted git's real exit code, so
-    # the exit code cannot decide it. The size probe can.
-    return b"" if blob_size(repo, oid, path) is not None else None
+    # the exit code cannot decide it. The size probe CANNOT decide it either --
+    # `cat-file -s` sizes a tree, so it answered 32 for a directory and this
+    # read handed the caller `b""`, i.e. "an empty committed file", for a
+    # directory that the unlimited read on the very same path calls None. The
+    # object TYPE is the probe that separates all three.
+    return b"" if _blob_object_type(repo, rev) == "blob" else None
 
 
 def git_common_dir(repo: Path) -> Path:

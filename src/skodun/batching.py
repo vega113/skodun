@@ -84,9 +84,26 @@ _DIFF_GIT = b"diff --git "
 #: starting with `@@` at column 0 is a hunk header.
 _HUNK = b"@@"
 
-#: `diff --git "a/x y" "b/x y"` -- git quotes paths containing spaces or, under
-#: `core.quotepath`, non-ASCII bytes.
-_QUOTED_PATHS = re.compile(rb'"a/([^"]*)" "b/([^"]*)"$')
+#: `diff --git "a/x y" "b/x y"` -- git quotes paths containing spaces, a `"`, a
+#: `\`, a control character or, under `core.quotepath` (its default), any
+#: non-ASCII byte.
+#:
+#: `(?:[^"\\]|\\.)*` rather than `[^"]*`, because the quoting is C-STYLE: a `"`
+#: inside the path arrives as `\"`, and a matcher that stopped at the first bare
+#: `"` matched nothing at all for such a header -- `_file_of` then fell through
+#: to its last resort and reported the ENTIRE two-path tail
+#: (`"a/we\"ird.py" "b/we\"ird.py"`) as the filename. The alternation consumes
+#: escape PAIRS, so `\\` at the end of a component cannot swallow the closing
+#: quote either.
+_QUOTED_PATHS = re.compile(rb'"a/((?:[^"\\]|\\.)*)" "b/((?:[^"\\]|\\.)*)"$')
+
+#: One C escape inside a quoted path: `\ooo` (octal byte) or `\<char>`.
+_C_ESCAPE = re.compile(rb"\\([0-7]{1,3}|.)", re.DOTALL)
+
+#: The single-character C escapes git emits, per `quote_c_style` in quote.c.
+_C_ESCAPES = {b"a": b"\a", b"b": b"\b", b"f": b"\f", b"n": b"\n",
+              b"r": b"\r", b"t": b"\t", b"v": b"\v",
+              b"\\": b"\\", b'"': b'"'}
 
 #: `diff --git a/old b/new`. Group 1 is greedy so that a path containing the
 #: literal " b/" splits at its LAST occurrence, which is what git's own
@@ -137,6 +154,29 @@ def _blen(lines: list[bytes]) -> int:
     return sum(len(ln) for ln in lines)
 
 
+def _unquote_c(raw: bytes) -> bytes:
+    """The real bytes behind one C-quoted path body (the part between the
+    quotes), with every git escape undone.
+
+    Worth doing rather than reporting the escaped text: under `core.quotepath`
+    -- git's DEFAULT -- every non-ASCII byte is emitted as `\\ooo`, so an
+    undecoded label names `caf\\303\\251.py`, a path that exists nowhere. A
+    caller packing per-batch context looks that up and finds nothing.
+
+    Total, never raising: an unrecognised escape keeps its own character (which
+    is what git's own unquoting does for anything not in its table), so the
+    worst case is a label that is merely no better than the raw text. `files` is
+    a label, never a key.
+    """
+    def sub(m: "re.Match[bytes]") -> bytes:
+        body = m.group(1)
+        if len(body) <= 3 and all(0x30 <= c <= 0x37 for c in body):
+            return bytes([int(body, 8) & 0xFF])
+        return _C_ESCAPES.get(body, body)
+
+    return _C_ESCAPE.sub(sub, raw)
+
+
 def _file_of(section: list[bytes]) -> str:
     """Best-effort changed-file name from a section's first `diff --git` line.
 
@@ -150,7 +190,7 @@ def _file_of(section: list[bytes]) -> str:
         rest = ln[len(_DIFF_GIT) :].rstrip(b"\r\n")
         m = _QUOTED_PATHS.match(rest)
         if m:
-            return m.group(2).decode("utf-8", "replace")
+            return _unquote_c(m.group(2)).decode("utf-8", "replace")
         m = _PLAIN_PATHS.match(rest)
         if m:
             return m.group(2).strip().strip(b'"').decode("utf-8", "replace")
