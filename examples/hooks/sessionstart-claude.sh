@@ -22,6 +22,19 @@
 # appears in someone's session, and that is a choice for the person whose session
 # it is.
 #
+# ONE STORE PER REPOSITORY. Background rounds are keyed by BRANCH NAME, and the
+# store defaults to ONE GLOBAL FILE (~/.local/share/skodun/skodun.db). If you use
+# skodun in more than one repository, two of them on a branch called `main` share
+# a namespace: each can supersede the other's in-flight rounds and consume the
+# other's reports -- this hook would then deliver, and permanently mark delivered,
+# a round belonging to a different project. Give each repository its own store:
+#
+#   export SKODUN_DB="$HOME/.local/share/skodun/myproject.db"   # in your profile
+#
+# and make sure the same value is in effect for `git push` (the pre-push shim and
+# the background worker read it too). The gate is unaffected either way -- it is
+# content-addressed -- so this is about delivery, not about verdicts.
+#
 # It never fails a session. Every path exits 0, including the ones where skodun
 # is not installed at all -- a hook that breaks a session start is a hook that
 # gets deleted, taking the delivery of every future finding with it.

@@ -74,7 +74,7 @@ Background:
 | `skodun install-hooks [--repo DIR] [--force]` | Install (or re-install) the pre-push shim into this repository's real hooks directory, chaining any hook that was already there. See "Pre-push hooks and background review" below for what the shim does and what `--force` means. | `0` installed · `1` refused — a foreign hook is there and needs `--force` (or to be moved aside yourself) · `2` this is not a repository skodun can install into at all. |
 | `skodun dispatch [--repo DIR] [remote-name] [remote-url]` | Reserve and dispatch background reviews for a push. This is what the installed pre-push shim calls; nobody runs it by hand. It decides nothing about the push itself — every failure becomes a stderr warning and a durable `failed` review record, never a blocked push. | Always `0` — dispatching is not a verdict; `skodun gate` is. |
 | `skodun worker --record-id ID --repo DIR --branch B --local-oid OID --base-sha SHA [--base-ref REF]` | The detached background review process `dispatch` spawns for one reservation. Internal: hidden from `--help` because its flags are reservation bookkeeping nobody types by hand, but it stays fully usable (and debuggable) by name. | `0` the reservation reached a terminal state (reviewed, cancelled, or already retired by a newer push) · `2` it could not do its job at all (no store, or no such reservation). Nothing in production reads this code. |
-| `skodun surface [--branch B] [--hook-format text\|claude] [--include-delivered]` | Report background review rounds nobody has been shown yet, and record that they were delivered. Silence is never a verdict: a round that produced nothing usable says so explicitly (`NO REVIEW HAPPENED`) rather than reading as "0 findings". Certifies nothing about the change in the working tree right now — only `skodun gate` does that. See "Pre-push hooks and background review" below. | `0` reported (including "nothing to report") · `2` no store, no branch, an unwritable report, or an unrecordable delivery. |
+| `skodun surface [--repo DIR] [--branch B] [--hook-format text\|claude] [--include-delivered]` | Report background review rounds nobody has been shown yet, and record that they were delivered. Silence is never a verdict: a round that produced nothing usable says so explicitly (`NO REVIEW HAPPENED`) rather than reading as "0 findings". Certifies nothing about the change in the working tree right now — only `skodun gate` does that. See "Pre-push hooks and background review" below. | `0` reported (including "nothing to report") · `2` no store, no branch, an unwritable report, or an unrecordable delivery. |
 | `skodun mcp` | Serve the review loop to agents over stdio (MCP JSON-RPC): the same `gate` / `review` / `log` / `surface` / `triage` decisions the CLI makes, exposed as tools and two prompts. No flags — every tool carries its own arguments. See "MCP server" below. | `0` the session ended (the client closed stdin, or disconnected) · `2` the server could not be loaded or started. |
 
 `skodun` with no subcommand is a usage error, not a `0` — a silent success is
@@ -292,6 +292,52 @@ except that installing refuses even under `--force` if that backup name is alrea
 holding a *different* hook than the one currently installed, so a second `--force`
 run can never silently destroy the first backup.
 
+### One store per repository (required if you use skodun in more than one)
+
+**Background review rounds are keyed by BRANCH NAME, and the store defaults to one
+global file** (`~/.local/share/skodun/skodun.db`). Two repositories sharing one
+store therefore share a namespace: if both have a branch called `main`, they can
+supersede and deliver *each other's* rounds. Concretely —
+
+- Pushing repo A's `main` looks like a newer push of the same branch to repo B's
+  in-flight round, so the dispatcher retires that round and **signals its live
+  background worker to stop**.
+- `skodun surface` on `main` in repo A renders repo B's round too, and marks it
+  delivered — so repo B's next session shows nothing, for a report nobody there
+  ever saw.
+
+The gate itself is unaffected either way: `skodun gate` is content-addressed
+(`diff_hash` + `base_sha`), so it can never answer `0` for another repository's
+change. The damage is confined to background review — killed workers and reports
+consumed by the wrong session.
+
+**The supported setup is one store per repository**, via `SKODUN_DB`. Point it at a
+path inside (or named after) each repository, from wherever that repository's
+environment is set up — a shell profile:
+
+```sh
+# ~/.zshrc or ~/.bashrc
+export SKODUN_DB="$HOME/.local/share/skodun/myproject.db"
+```
+
+or, per checkout, a `direnv` `.envrc` at the repository root:
+
+```sh
+# <repo>/.envrc  -- `direnv allow` once
+export SKODUN_DB="$HOME/.local/share/skodun/$(basename "$PWD").db"
+```
+
+(keep the store *outside* the working tree — a database file inside it is
+something a future `git add -A` will happily commit).
+
+Whatever sets it must be in effect for `git push` as well as for your editor and
+shell: the pre-push shim, the background worker, and `skodun surface` all read the
+same variable, and they must all land on the same file. A single-repository user
+needs none of this — the default global store is correct for them.
+
+Scoping this properly needs a `repo` column on the `reviews` table, which is a
+schema change deferred to a later phase; see "Known limitations" below.
+
 ### Bypassing review for a push
 
 Two independent switches, either one enough to skip review entirely for a push
@@ -333,9 +379,13 @@ states plainly when a round produced no usable answer at all, and only marks a
 round delivered once its report has actually reached a reader.
 
 ```
-skodun surface [--branch B] [--hook-format text|claude] [--include-delivered]
+skodun surface [--repo DIR] [--branch B] [--hook-format text|claude] [--include-delivered]
 ```
 
+- `--repo` picks the repository whose checked-out branch to report on, so the
+  command works from any directory (the MCP `surface` tool's `repo` argument does
+  the same thing). It moves *branch discovery only* — which store is read is
+  still `SKODUN_DB`. `--branch` overrides it.
 - `--branch` defaults to the checked-out branch.
 - `--hook-format text` (the default) prints plain lines for a shell profile, a
   tmux hook, or a CI step; `--hook-format claude` prints exactly one JSON object —
@@ -426,6 +476,34 @@ In `~/.codex/config.toml`:
 command = "skodun"
 args = ["mcp"]
 ```
+
+## Known limitations (Phase 4 candidates)
+
+Recorded so each is a decision rather than a surprise. None of them can make the
+gate answer `0` for a change no trustworthy review covers — that is the one
+property everything here is arranged around — but each is a real rough edge.
+
+- **Background rounds have no repo dimension.** `reviews` is keyed by branch, so
+  two repositories sharing one store collide on common branch names. The fix is a
+  `repo` column (the git common dir) scoping the supersede query, the undelivered
+  query, and `log --branch`; it is a schema change, so it waits for the next store
+  version. Until then, use one store per repository — see "One store per
+  repository" above.
+- **Stale-review recovery JSON-parses the whole `reviews` table on every push.**
+  The cleanup pass that reclaims abandoned `running` rows loads and decodes every
+  stored artifact to find rows whose status is an indexed column. It is fast on a
+  small store and grows linearly with review history, on the synchronous `git
+  push` path. It only needs the indexed columns.
+- **Worker logs are never pruned.** Every background review gets its own log file
+  beside the store (`<db>.logs/<record-id>.log`) and nothing deletes them. They
+  are small, but they accumulate for as long as you use skodun. Retention is a
+  later phase; deleting them by hand is safe (nothing reads them back).
+- **The pre-push shim does not check that buffering stdin succeeded.** It tees
+  git's ref list to a temp file so the chained hook and skodun read the same
+  bytes; if that write fails (a full disk), the chained hook gets a truncated or
+  empty ref list rather than the live stdin. Only the "no temp file at all" case
+  is currently handled — that one correctly skips skodun and hands the chained
+  hook the original stdin.
 
 ## Requirements
 
