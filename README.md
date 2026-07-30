@@ -389,7 +389,12 @@ skodun surface [--repo DIR] [--branch B] [--hook-format text|claude] [--include-
 - `--branch` defaults to the checked-out branch.
 - `--hook-format text` (the default) prints plain lines for a shell profile, a
   tmux hook, or a CI step; `--hook-format claude` prints exactly one JSON object —
-  the Claude Code `SessionStart` hook envelope.
+  the Claude Code `SessionStart` hook envelope. Passing the flag at all says "a
+  machine is calling", which changes exactly one thing: with nothing to report,
+  the command is silent on **both** streams instead of noting on stderr that
+  there was nothing undelivered. That note is for a human who typed the command
+  and got silence; in a shell profile it is a line at every session start.
+  Failures still go to stderr either way — a failure is *why* nothing appeared.
 - `--include-delivered` replays rounds already recorded as delivered too, without
   affecting the ledger.
 

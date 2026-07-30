@@ -1023,10 +1023,16 @@ def test_blob_bytes_of_a_symlink_is_its_target_path_not_the_target_file(tmp_path
 def test_a_tree_path_has_a_size_but_no_blob_bytes(tmp_path):
     """`cat-file -s` answers for ANY object type, a directory included, while
     only a blob has blob bytes. Pinned because the packer's classify step
-    trusts the size probe: a directory therefore reaches the full read, and
-    that read is what rejects it. The oracle takes the same route (its own
-    size probe answers for the tree too), so the packed bytes still match —
-    see `test_oracle_parity_oid_source`.
+    trusts the size probe: a directory therefore reaches a blob read, and that
+    read is what rejects it. The oracle takes the same route (its own size probe
+    answers for the tree too), so the packed bytes still match — see
+    `test_oracle_parity_oid_source`.
+
+    BOTH read forms reject it, and that consistency is the point. `b""` from a
+    prefix read does not mean "not a blob" anywhere in this module — it means
+    "an empty committed file", which the packer packs. A limited read that
+    answered `b""` for a directory would hand a caller a phantom empty file
+    whose only defence was that a second, unlimited read happened to run later.
     """
     repo = _mkrepo(tmp_path)
     (repo / "sub").mkdir()
@@ -1037,8 +1043,37 @@ def test_a_tree_path_has_a_size_but_no_blob_bytes(tmp_path):
 
     assert blob_size(repo, oid, "sub") is not None
     assert blob_bytes(repo, oid, "sub") is None
-    # The peek cannot tell a tree from an empty blob, and says so as b"".
-    assert blob_bytes(repo, oid, "sub", max_bytes=8192) == b""
+    assert blob_bytes(repo, oid, "sub", max_bytes=8192) is None
+    # The zero-length peek takes its own code path and must agree.
+    assert blob_bytes(repo, oid, "sub", max_bytes=0) is None
+    # ...while an EMPTY BLOB still reads as b"" on every one of those forms:
+    # this rejection must not be "anything with no bytes is absent".
+    (repo / "empty.txt").write_text("", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "c2")
+    oid2 = _git(repo, "rev-parse", "HEAD")
+    assert blob_bytes(repo, oid2, "empty.txt") == b""
+    assert blob_bytes(repo, oid2, "empty.txt", max_bytes=8192) == b""
+    assert blob_bytes(repo, oid2, "empty.txt", max_bytes=0) == b""
+
+
+def test_a_submodule_path_is_not_a_blob_on_either_read_form(tmp_path):
+    """A gitlink is a COMMIT object in the tree, so `cat-file -s` sizes it too.
+    Same rule as a directory: not a blob, so neither read form invents bytes
+    for it."""
+    (tmp_path / "inner").mkdir()
+    (tmp_path / "outer").mkdir()
+    inner = _mkrepo(tmp_path / "inner")
+    repo = _mkrepo(tmp_path / "outer")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add",
+         str(inner), "mod")
+    _git(repo, "commit", "-m", "add submodule")
+    oid = _git(repo, "rev-parse", "HEAD")
+
+    assert blob_size(repo, oid, "mod") is not None
+    assert blob_bytes(repo, oid, "mod") is None
+    assert blob_bytes(repo, oid, "mod", max_bytes=8192) is None
+    assert blob_bytes(repo, oid, "mod", max_bytes=0) is None
 
 
 def test_blob_reads_accept_a_ref_not_only_a_sha(tmp_path):

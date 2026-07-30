@@ -966,6 +966,45 @@ def test_oid_and_worktree_sources_agree_on_a_clean_tree(tmp_path):
     assert seen == set(REASONS)
 
 
+def test_a_directory_candidate_is_classified_on_its_size_and_never_packed(tmp_path):
+    """The oracle-parity quirk `_oid_probe` deliberately preserves, pinned
+    WITHOUT the oracle -- `test_oracle_parity_oid_source` is skipped when no
+    oracle checkout is present, and this classification is otherwise held up by
+    nothing.
+
+    `gitio.blob_bytes` answers None for a directory on every read form, because
+    `b""` from a byte reader means "an empty committed file". The oracle instead
+    sizes the tree, peeks nothing, and classifies it PACKABLE -- so which reason
+    a directory lands on depends on the headroom: `over-headroom` when the
+    envelope filled before its turn, `missing` when the full read got to refuse
+    it. Reporting `missing` in both cases would be a defensible answer and the
+    WRONG one, because it is not the answer the oracle gives.
+
+    What never varies, and is the part that matters: a directory is never
+    included and its bytes never reach the body.
+    """
+    repo = _mkrepo(tmp_path / "r")
+    (repo / "sub").mkdir()
+    (repo / "sub" / "nested.py").write_text("n" * 400, encoding="utf-8")
+    (repo / "big.py").write_text("x" * 5000, encoding="utf-8")
+    oid = _commit_all(repo)
+
+    roomy = pack(repo, ["big.py", "sub"], {}, headroom=100_000,
+                 source="oid", oid=oid)
+    assert roomy.included == ["big.py"]
+    assert ("sub", "missing") in roomy.omitted
+
+    # Tight enough that nothing fits, so `sub` never reaches a read at all.
+    tight = pack(repo, ["big.py", "sub"], {}, headroom=40,
+                 source="oid", oid=oid)
+    assert tight.included == []
+    assert ("sub", "over-headroom") in tight.omitted
+
+    for p in (roomy, tight):
+        assert "sub" not in p.included
+        assert b"nested" not in p.body
+
+
 def test_oid_source_is_byte_deterministic_across_worktree_churn(tmp_path):
     repo = _mkrepo(tmp_path / "r")
     (repo / "a.txt").write_text("a" * 300, encoding="utf-8")

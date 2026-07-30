@@ -79,8 +79,12 @@ RECORDED LIMITATION (transitional): a coexisting LEGACY waiter reads only
 `owner` and honours its own fixed ceiling, so during shadow coexistence a
 batched foreground run longer than that could still be reclaimed by the legacy
 scripts. Accepted — the sidecar is additive by design, and coexistence ends when
-the legacy scripts do. Note also that an explicit `SKODUN_LOCK_STALE_SECONDS`
-cannot shrink a holder's published budget: the escape hatch for a genuinely
+the legacy scripts do. Note also that `SKODUN_LOCK_STALE_SECONDS` is a WAITER's
+knob and only a waiter's: it says how long THIS process waits before reclaiming
+from someone else, and it can shrink neither the budget this process publishes
+as a HOLDER (`run_review` passes the ceiling its own batch plan implies, never
+the override) nor the budget a PEER holder published (`_lock_is_reclaimable`
+takes `max(own ceiling, holder budget)`). The escape hatch for a genuinely
 wedged batched lock is removing the lock directory, which is what the
 `LockTimeout` message already tells the operator.
 
@@ -675,11 +679,15 @@ def _acquire_fg_lock(common_dir: Path, worktree: Path, *, wait: float,
     its own `mkdir` and its owner write — the one moment that holder cannot
     defend itself. `EEXIST` is contention, exactly as it has always been.
 
-    `budget_sec` is the holder's own runtime budget for the sidecar, and it
-    defaults to `stale` — which is the same number by construction: `run_review`
-    derives both from `budget.lock_stale_ceiling` for the batch plan its diff
-    implies. It is a parameter so that a caller with a better figure (or a test)
-    can publish it explicitly.
+    `budget_sec` is the holder's own runtime budget for the sidecar, and it is
+    a DIFFERENT fact from `stale`: `stale` is how long this process will wait
+    before reclaiming from someone else (an operator may shrink it with
+    `SKODUN_LOCK_STALE_SECONDS`), while the sidecar says how long this holder
+    legitimately needs. `run_review` passes `budget.lock_stale_ceiling` for the
+    batch plan its diff implies, so an override cannot make the holder advertise
+    less than it needs. It defaults to `stale` only for the callers that have no
+    separate figure (tests, and the direct-call sites in the suite), where the
+    two coincide by construction.
     """
     lock = Path(common_dir) / LOCK_NAME
     worktree = Path(worktree).resolve()
@@ -800,20 +808,15 @@ def _chain_for(cfg: Config, head: Reviewer) -> list[Reviewer]:
     return chain
 
 
-def _is_path_shaped(binary: str) -> bool:
-    """Whether `binary` should be resolved as a path rather than walked
-    through `PATH`: it contains `/`, or the platform's own separator on a
-    platform where that differs from `/`.
-
-    The ONE definition of the path-vs-PATH split, shared by
-    `chain._binary_is_absent` and `cli._fmt_binary`'s diagnostic -- both
-    decide whether a per-adapter `SKODUN_<X>_BIN` override or grok's own
-    `~/.grok/bin/grok` default gets checked directly, exactly how the
-    adapter's own `Popen` call would resolve it. Before this was factored
-    out, `cli._fmt_binary` carried its own copy of this exact condition,
-    free to drift from this one.
-    """
-    return "/" in binary or (os.sep != "/" and os.sep in binary)
+#: `runner._is_path_shaped`, aliased under this module's name -- the same
+#: arrangement `ReviewCancelled` gets below, and for the same reason. It USED to
+#: be defined here, which made `cli._fmt_binary` (and therefore the whole of
+#: `skodun providers`, a read-only diagnostic) import `pipeline` to ask one
+#: question about a string -- so a pipeline that will not import took the
+#: diagnostic for diagnosing it down too. It moved to the leaf; nothing here
+#: reads it any more, and the name stays resolvable because several docstrings
+#: and the by-name spy in `test_cli.py` grew up pointing at it.
+_is_path_shaped = runner._is_path_shaped
 
 
 #: The chain executor itself now lives in `chain.py` as `run_chain`; this
@@ -1095,10 +1098,22 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     # second `git rev-parse` would be a second definition of "the root" that
     # could drift from the one the diff was captured against.
     root = gitio._worktree_root(repo)
+    # TWO numbers, not one, and they are equal only when the operator has
+    # overridden nothing. `stale` is how long THIS process is willing to wait
+    # before reclaiming from someone else -- an operator's `SKODUN_LOCK_STALE_
+    # SECONDS` belongs there and nowhere else. `budget_sec` is what this holder
+    # ADVERTISES it legitimately needs, which is a fact about its own batch plan
+    # and about nothing the operator typed. Letting the override supply both
+    # published a budget smaller than this holder's plan for the entire window
+    # between `mkdir` and the under-lock republish below, and a small-diff
+    # waiter reading it inside that window would reclaim a live batched holder:
+    # the exact overlap the sidecar exists to prevent.
+    #
     # `**_cancel_kw`: `_acquire_fg_lock` is spied on by name in the suite too, so
     # a run with no token must call it exactly as it always has.
     lock = _acquire_fg_lock(gitio.git_common_dir(repo), root,
                             wait=wait, poll=poll, stale=stale,
+                            budget_sec=ceiling,
                             **_cancel_kw(cancel))
 
     rid = _new_id(id_prefix)

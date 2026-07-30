@@ -252,6 +252,21 @@ def _oid_probe(repo: Path, oid: str, path: str) -> tuple[int, bytes] | None:
     with a redundant `//` (which `<oid>:a//b` does not resolve) is `missing`
     there and packed here. Unreachable from real input — git's own path streams
     never contain one — and the direction is more context, never other content.
+
+    ORACLE PARITY, second point, and the reason the `peek is None` branch below
+    does not simply give up: `gitio.blob_bytes` answers None for anything that is
+    not a blob, on every read form. That is the right answer for a byte reader —
+    `b""` there would mean "an empty committed file" — but it is NOT the oracle's
+    classification. The oracle sizes a directory with its own `cat-file -s`, gets
+    an empty peek from a `cat-file blob` that printed nothing, and therefore
+    classifies the directory PACKABLE on its size, dropping it only when the full
+    read comes back empty. Which reason a candidate ends up with depends on that
+    (a directory can be reported `over-headroom` when the envelope filled before
+    its turn came, and `missing` otherwise), so classifying it early here would
+    change the omission vocabulary of a real pack. It stays a classification
+    quirk, taken deliberately and pinned by `test_oracle_parity_oid_source`; the
+    outcome is unchanged either way, because `_oid_read_all` still refuses it and
+    NOTHING non-blob can reach the packed body.
     """
     rel = _safe_rel(path)
     if rel is None:
@@ -261,7 +276,10 @@ def _oid_probe(repo: Path, oid: str, path: str) -> tuple[int, bytes] | None:
         return None
     peek = gitio.blob_bytes(repo, oid, rel, max_bytes=BINARY_PEEK_BYTES)
     if peek is None:
-        return None
+        # Not "gone": a commit tree is immutable, so a path `blob_size` just
+        # answered for cannot vanish before the peek. The only way here is a
+        # non-blob object, which the oracle peeks as empty. See above.
+        peek = b""
     return size, peek
 
 
@@ -377,12 +395,14 @@ def pack(
 
     Everything else is the same on both sources: binary detection, the caps,
     selection order, the section format and the omission vocabulary, all pinned
-    against the oracle in each mode. Only the classification STEP at which a
-    non-blob path is caught differs — the working-tree reader rejects a directory
-    or a symlink up front, while an object read has a size for a directory
-    (`git cat-file -s` answers for a tree) and refuses it at the full read, and
-    reads a symlink as the target *path text* git stored in the blob. Neither is
-    a real candidate: `git diff --name-only` lists blobs.
+    against the oracle in each mode. What differs is only how a non-blob path is
+    caught — the working-tree reader rejects a directory or a symlink up front,
+    while an object read still has a SIZE for a directory (`git cat-file -s`
+    answers for a tree, exactly as the oracle's own size probe does) and it is
+    the blob READ beside it that refuses, so `_oid_probe` returns None and the
+    path is `missing`. An object read of a symlink yields the target *path text*
+    git stored in the blob. Neither is a real candidate: `git diff --name-only`
+    lists blobs, and `missing` is what both packers report either way.
 
     The oid source does NOT replicate the working-tree hardening above
     (`_safe_open`'s symlink walk, `O_NOFOLLOW`, the FIFO layers), because it is

@@ -488,6 +488,15 @@ def test_a_tool_argument_of_the_wrong_type_is_a_message_never_a_traceback(
                                 "reason": GOOD_REASON}),
             ("log", {"limit": "lots"}),
             ("surface", {"hook_format": "yaml"}),
+            # `bool(x)` is not validation: it says True for `"false"`, for
+            # `"no"`, for `0.1` and for any non-empty container, so a client
+            # sending the STRING "false" -- the single most likely way to get
+            # this wrong over JSON-RPC -- would silently get the opposite of
+            # what it asked for, and replay rounds the ledger already delivered.
+            ("surface", {"include_delivered": "false"}),
+            ("surface", {"include_delivered": "true"}),
+            ("surface", {"include_delivered": 1}),
+            ("surface", {"include_delivered": []}),
             # Found by probing, not by inspection: a LIST reason reached
             # `store.record_triage_event` and came back as
             # `sqlite3.ProgrammingError: Error binding parameter 11`, which the
@@ -754,6 +763,28 @@ def test_the_surface_tool_and_the_surface_command_render_the_same_report(
     res = _tool("surface", tool_db, branch="feat")
     assert res.text == cli_text
     assert res.pending_acks == ["sk_1"]
+
+
+def test_include_delivered_takes_real_booleans_and_defaults_to_false(tmp_path):
+    """The other half of the refusal above: rejecting `"false"` must not have
+    been done by rejecting everything. A JSON `true` replays a round the ledger
+    already holds; `false` and an absent argument do not."""
+    db = _round_db(tmp_path / "d")
+    first = _tool("surface", db, branch="feat", include_delivered=False)
+    assert first.status == 0 and first.pending_acks == ["sk_1"]
+    with Store.open(db) as st:
+        delivery.acknowledge(st, ["sk_1"], "mcp")
+
+    # Delivered now, so the default and an explicit False both report nothing.
+    for params in ({}, {"include_delivered": False}):
+        again = _tool("surface", db, branch="feat", **params)
+        assert again.status == 0, (params, again)
+        assert again.pending_acks == [], (params, again)
+        assert "no undelivered" in again.text, (params, again)
+
+    replay = _tool("surface", db, branch="feat", include_delivered=True)
+    assert replay.status == 0
+    assert "NPE 0" in replay.text
 
 
 # ==========================================================================

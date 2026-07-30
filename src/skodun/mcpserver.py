@@ -314,6 +314,31 @@ def _int_arg(params: dict, name: str, tool: str) -> tuple[int | None, str]:
     return value, ""
 
 
+def _bool_arg(params: dict, name: str, tool: str,
+              default: bool = False) -> tuple[bool, str]:
+    """`(value, "")` or `(default, refusal)`. ABSENT is not the same as bad.
+
+    An absent argument (or an explicit JSON `null`) is the caller declining to
+    set it, and takes `default` — the same reading `_repo_arg` gives an absent
+    repo. Anything else must be a real `bool`.
+
+    `bool(params.get(name, False))` is what this replaces, and it is not
+    validation: it says True for the STRING `"false"`, for `"no"`, for `0.1` and
+    for any non-empty container. Over JSON-RPC a stringified boolean is the most
+    likely way a client gets this wrong, and coercion turns that mistake into the
+    OPPOSITE of what was asked — which for `include_delivered` means replaying,
+    and re-acknowledging, rounds the ledger has already delivered. A refusal
+    tells the agent to re-call; a silent reinterpretation tells it nothing.
+    """
+    if name not in params or params[name] is None:
+        return default, ""
+    value = params[name]
+    if not isinstance(value, bool):
+        return default, (f"skodun {tool}: {name} must be true or false; got "
+                         f"{value!r}")
+    return value, ""
+
+
 def _reason_arg(params: dict, tool: str) -> tuple[str | None, str]:
     """`(reason-or-None, "")` or `(None, refusal)`. ABSENT is not the same as bad.
 
@@ -417,12 +442,16 @@ def _handle_surface(call: "HandlerCall") -> "HandlerResult":
             status=2,
             text=f"skodun surface: unknown hook_format {fmt!r}; expected one of "
                  f"{list(delivery.FORMATS)}")
+    include_delivered, refusal = _bool_arg(params, "include_delivered",
+                                           "surface")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
     branch, why_not = services.resolve_surface_branch(params.get("branch"), repo)
     if not branch:
         return HandlerResult(status=2, text=why_not)
     with call.store_factory() as store:
         status, text, pending = services.svc_surface(
-            store, branch, fmt, bool(params.get("include_delivered", False)))
+            store, branch, fmt, include_delivered)
     if status != 0 or not text:
         # A diagnostic, or nothing to report. Either way there is nothing
         # delivered, so nothing to acknowledge.

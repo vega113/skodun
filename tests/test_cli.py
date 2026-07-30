@@ -1357,10 +1357,10 @@ def test_providers_shows_a_found_executable_binary(tmp_path, monkeypatch, capsys
 def test_providers_shows_a_found_but_not_executable_binary(tmp_path, monkeypatch,
                                                             capsys):
     """`_fmt_binary` additionally checks `os.X_OK`, which
-    `pipeline._binary_is_absent`'s existence-only contract deliberately does
+    `chain._binary_is_absent`'s existence-only contract deliberately does
     not -- that is the one remaining difference between the two; the
-    path-vs-PATH split itself is `pipeline._is_path_shaped`, one definition
-    shared by both (see `test_fmt_binary_reuses_pipelines_path_vs_path_split`
+    path-vs-PATH split itself is `runner._is_path_shaped`, one definition
+    shared by both (see `test_fmt_binary_reuses_runners_path_vs_path_split`
     below). Nothing pinned that this branch actually fires until now:
     replacing it with an unconditional `"executable"` used to pass the whole
     suite."""
@@ -1378,37 +1378,64 @@ def test_providers_shows_a_found_but_not_executable_binary(tmp_path, monkeypatch
     assert "found, NOT executable" in line, line
 
 
-def test_fmt_binary_reuses_pipelines_path_vs_path_split(monkeypatch):
+def test_fmt_binary_reuses_runners_path_vs_path_split(monkeypatch):
     """`cli._fmt_binary` must not carry its own copy of the path-vs-PATH
-    split -- it has to call through to `pipeline._is_path_shaped`, the one
-    definition `pipeline._binary_is_absent` also uses. Re-inlining a
-    divergent copy in `cli.py` would still pass every other assertion in this
-    module (the same `NOT FOUND` / `executable` / `found, NOT executable`
-    strings, for the same inputs) while silently drifting from the pipeline's
-    own split -- this test catches exactly that, by spying on the shared
-    helper directly rather than comparing rendered output."""
-    from skodun import cli, pipeline
+    split -- it has to call through to `runner._is_path_shaped`, the one
+    definition `chain._binary_is_absent` also uses. Re-inlining a divergent
+    copy in `cli.py` would still pass every other assertion in this module
+    (the same `NOT FOUND` / `executable` / `found, NOT executable` strings,
+    for the same inputs) while silently drifting from the split the spawn
+    itself uses -- this test catches exactly that, by spying on the shared
+    helper directly rather than comparing rendered output.
+
+    The spy moved from `pipeline` to `runner` with the helper. `runner` is a
+    leaf that imports nothing from the package, and that is the whole point:
+    `skodun providers` is a read-only diagnostic an operator runs when a review
+    will not start, so needing `pipeline` to import made it unavailable on
+    exactly the installations it exists to diagnose. One definition still, in a
+    place that costs nothing to reach."""
+    from skodun import cli, runner
 
     calls = []
-    real = pipeline._is_path_shaped
+    real = runner._is_path_shaped
 
     def spy(binary):
         calls.append(binary)
         return real(binary)
 
-    monkeypatch.setattr(pipeline, "_is_path_shaped", spy)
+    monkeypatch.setattr(runner, "_is_path_shaped", spy)
 
     assert cli._fmt_binary("/some/path/grok") == "NOT FOUND"
     assert calls == ["/some/path/grok"], (
-        "cli._fmt_binary did not call pipeline._is_path_shaped for a "
+        "cli._fmt_binary did not call runner._is_path_shaped for a "
         "path-shaped input -- it may be re-inlining the split instead of "
         "importing the shared helper")
 
     calls.clear()
     cli._fmt_binary("grok")
     assert calls == ["grok"], (
-        "cli._fmt_binary did not call pipeline._is_path_shaped for a bare "
+        "cli._fmt_binary did not call runner._is_path_shaped for a bare "
         "name either")
+
+
+def test_providers_does_not_need_the_review_pipeline_to_import(monkeypatch,
+                                                               tmp_path, capsys):
+    """The reason the helper moved. `skodun providers` reports where each
+    adapter's CLI lives and whether it is runnable -- which is what an operator
+    reaches for when a review will not start. Depending on `pipeline` importing
+    cleanly made it fail on precisely those installations.
+
+    `skodun.pipeline` is replaced IN `sys.modules` by a stand-in that raises on
+    any attribute access, so `from .pipeline import <anything>` anywhere under
+    this command is a hard failure -- the import statement itself resolves
+    through `sys.modules` and then reads the attribute off this object. Exit 0
+    therefore means the command genuinely never reached for it.
+    """
+    monkeypatch.setitem(sys.modules, "skodun.pipeline", _KaboomModule())
+    monkeypatch.setenv("SKODUN_GROK_BIN", str(tmp_path / "nope" / "grok"))
+    assert main(["providers", "--repo", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "NOT FOUND" in out and "Traceback" not in out
 
 
 def test_providers_a_directory_is_never_reported_executable(tmp_path, monkeypatch,
@@ -2193,6 +2220,48 @@ def test_nothing_undelivered_is_a_silent_stdout_and_a_note_on_stderr(
     cap = capsys.readouterr()
     assert cap.out == ""
     assert "feat" in cap.err
+
+
+@pytest.mark.parametrize("fmt", ["text", "claude"])
+def test_nothing_undelivered_is_SILENT_on_both_streams_for_a_hook(
+        tmp_path, monkeypatch, capsys, fmt):
+    """`--hook-format` is how a MACHINE caller identifies itself, and the
+    shipped `examples/hooks/sessionstart-plain.sh` runs
+    `"$@" surface --hook-format text || true` with stderr NOT redirected. So the
+    "nothing undelivered" note -- correct and wanted for a human who typed
+    `skodun surface` and got silence -- printed a line into every quiet shell
+    start, which is exactly the kind of noise that gets a profile snippet
+    deleted, taking the delivery of every future finding with it.
+
+    Suppressed for a hook, kept for a human (the test above). Only the NOTE:
+    every real failure still goes to stderr in both cases, pinned below.
+    """
+    db = _surface_db(tmp_path)
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["surface", "--branch", "feat", "--hook-format", fmt]) == 0
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert cap.err == "", (
+        "a hook-format caller was given a note on the stream a shell profile "
+        "shows the user at every session start")
+
+
+@pytest.mark.parametrize("fmt_argv", [[], ["--hook-format", "text"]])
+def test_a_real_surface_failure_still_reaches_stderr_with_a_hook_format(
+        tmp_path, monkeypatch, capsys, fmt_argv):
+    """The suppression above is scoped to the no-rounds NOTE and nothing else.
+    A store that will not open is a FAILURE: it is why the hook printed nothing,
+    and silencing it would leave an operator with a hook that has quietly
+    reported nothing for weeks."""
+    def unopenable(*_a, **_k):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "nope" / "dir" / "s.db"))
+    monkeypatch.setattr(Store, "open", unopenable)
+    assert main(["surface", "--branch", "feat", *fmt_argv]) == 2
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert "could not open the store" in cap.err
 
 
 def test_include_delivered_replays(tmp_path, monkeypatch, capsys):

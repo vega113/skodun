@@ -1021,10 +1021,11 @@ def test_the_sidecar_grows_when_the_under_lock_plan_is_bigger(tmp_path, capsys,
     real_acquire = pipeline._acquire_fg_lock
     real_chain = pipeline._run_chain
 
-    def acquire(common_dir, worktree, *, wait, poll, stale, grace=30.0):
+    def acquire(common_dir, worktree, *, wait, poll, stale, grace=30.0,
+                budget_sec=None):
         seen["pre_lock_stale"] = stale
         held = real_acquire(common_dir, worktree, wait=wait, poll=poll,
-                            stale=stale, grace=grace)
+                            stale=stale, grace=grace, budget_sec=budget_sec)
         seen["sidecar_at_acquire"] = pipeline._holder_budget(held.path)
         for i in range(3):      # the worktree grows while we hold the lock
             (Path(worktree) / f"g{i}.txt").write_text(_body(f"g{i}"),
@@ -1076,6 +1077,57 @@ def test_an_operator_stale_override_does_not_shrink_the_holders_own_budget(
     assert seen["sidecar"] == float(pipeline.lock_stale_ceiling_sec(
         cfg.defaults, pipeline.max_chain_width(cfg)))
     assert seen["sidecar"] > 5
+
+
+def test_an_operator_stale_override_does_not_shrink_the_budget_at_ACQUISITION(
+        tmp_path, monkeypatch):
+    """The test above samples the sidecar at the first model call, i.e. AFTER
+    `_grow_lock_budget` has republished it from the authoritative under-lock
+    plan. That leaves a window: acquisition itself publishes a number, and
+    everything from `mkdir` until the under-lock capture finishes is spent
+    advertising it. If acquisition published the operator's own
+    `SKODUN_LOCK_STALE_SECONDS` instead of the ceiling this holder's diff
+    implies, a peer polling inside that window reads a budget SMALLER than the
+    holder needs and reclaims a live batched review -- the exact overlap the
+    sidecar exists to prevent, reintroduced in the one window nothing sampled.
+
+    So the assertion is on the value published AT ACQUISITION, and it is paired
+    with the waiter-side consequence: with the holder aged past the override but
+    still well inside its own ceiling, `_lock_is_reclaimable` at the waiter's
+    small figure must answer False.
+    """
+    monkeypatch.setenv("SKODUN_LOCK_STALE_SECONDS", "5")
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path)
+    cfg = load_config(repo)
+    ceiling = float(pipeline.lock_stale_ceiling_sec(
+        cfg.defaults, pipeline.max_chain_width(cfg)))
+    assert ceiling > 60, "the override has to be meaningfully smaller"
+    seen: dict = {}
+    real = pipeline._acquire_fg_lock
+
+    def acquire(*a, **kw):
+        held = real(*a, **kw)
+        seen["at_acquire"] = pipeline._holder_budget(held.path)
+        # Age the holder past the operator's 5s override, but leave it well
+        # inside the ceiling its own plan legitimately needs. The pid stays
+        # ours, so this is a LIVE holder and `_release_fg_lock`'s ABA guard
+        # still recognises it on the way out.
+        _write_owner(held.path, os.getpid(),
+                     int(time.time() - ceiling / 2), repo)
+        seen["reclaimable"] = pipeline._lock_is_reclaimable(held.path, 5.0, 30.0)
+        return held
+
+    monkeypatch.setattr(pipeline, "_acquire_fg_lock", acquire)
+    _run(repo, _store(tmp_path))
+
+    assert seen["at_acquire"] == ceiling, (
+        "acquisition published the operator's waiter override as this holder's "
+        "own budget")
+    assert seen["reclaimable"] is False, (
+        "a small-diff waiter could reclaim a live holder in the window between "
+        "acquisition and the under-lock republish")
+    assert not _lock_of(repo).exists()
 
 
 def test_the_sidecar_is_never_shrunk_by_a_smaller_under_lock_plan(tmp_path):

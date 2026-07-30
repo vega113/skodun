@@ -56,6 +56,26 @@ def _store_path() -> Path:
     return Path(raw) if raw else Path.home() / _DEFAULT_DB
 
 
+class _GivenFormat(argparse.Action):
+    """`--hook-format`, plus a flag saying it was actually typed.
+
+    argparse cannot otherwise tell `skodun surface` from `skodun surface
+    --hook-format text`: both leave `hook_format == "text"`. `_cmd_surface`
+    needs the difference, because naming a hook format is how a MACHINE caller
+    identifies itself, and one of that command's outputs (the "nothing
+    undelivered" note on stderr) exists for a human and is noise for a hook.
+
+    The default STAYS `text` — that is genuinely the format an absent flag
+    selects — so nothing about the parsed value changes. Only the extra
+    `hook_format_given` boolean is new, and `surf.set_defaults` supplies its
+    False.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        namespace.hook_format_given = True
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="skodun")
     p.add_argument("--version", action="version", version=f"skodun {__version__}")
@@ -192,10 +212,17 @@ def build_parser() -> argparse.ArgumentParser:
                            "overrides it")
     surf.add_argument("--branch", default=None,
                       help="branch to report on (default: the checked-out one)")
+    # `_GivenFormat` rather than a `default=None` sentinel: the default really is
+    # `text` (that is the format an absent flag SELECTS, and
+    # `test_the_hook_format_choices_are_the_delivery_modules_own` pins it against
+    # `delivery.TEXT`), and what `_cmd_surface` additionally needs to know is
+    # whether the flag was TYPED -- a caller that names a hook format is a
+    # machine, and the "nothing undelivered" note is written for a human.
     surf.add_argument("--hook-format", default="text", dest="hook_format",
-                      choices=("text", "claude"),
+                      action=_GivenFormat, choices=("text", "claude"),
                       help="`text` for plain lines, `claude` for the SessionStart "
                            "JSON envelope (default: text)")
+    surf.set_defaults(hook_format_given=False)
     surf.add_argument("--include-delivered", action="store_true",
                       dest="include_delivered",
                       help="replay rounds that were already delivered too")
@@ -646,6 +673,22 @@ def _cmd_surface(args) -> int:
             # Silence on stdout, on purpose: a hook that injects an empty report
             # at every session start is noise. The human at the terminal still
             # gets an answer, on the stream a hook does not read.
+            #
+            # ...unless the caller named a `--hook-format`, in which case it IS
+            # the hook and stderr is not private either. The plain-text session
+            # template under `examples/hooks/` runs `"$@" surface --hook-format
+            # text || true` with stderr unredirected, so this note printed a
+            # line into every quiet shell start -- the kind of noise that gets a
+            # profile snippet deleted, taking the delivery of every future
+            # finding with it. A HUMAN typing `skodun surface` and getting
+            # silence still needs to be told which silence it was, so the
+            # note is suppressed only for the machine caller. Every real
+            # FAILURE below is unaffected and still reaches stderr in both
+            # cases: it is the reason the hook printed nothing, and an operator
+            # who never learns that has a hook that has quietly reported
+            # nothing for weeks.
+            if args.hook_format_given:
+                return 0
             return _warn(services.surface_no_rounds_note(branch), 0)
 
         if not _emit_delivery(text):
@@ -732,8 +775,8 @@ def _fmt_binary(binary: str) -> str:
     goes through `PATH`, exactly how the adapter's own `Popen` call would
     resolve it -- `shutil.which` already requires `os.X_OK` along the way, so
     a match there is never merely "a file exists". The path-vs-PATH split
-    itself is `pipeline._is_path_shaped`, imported rather than re-inlined, so
-    it stays the ONE definition `pipeline._binary_is_absent` also uses; this
+    itself is `runner._is_path_shaped`, imported rather than re-inlined, so
+    it stays the ONE definition `chain._binary_is_absent` also uses; this
     function's job on top of that shared split is to additionally check
     EXECUTABILITY, not just existence: `providers` is read by a human deciding
     whether a review can actually run, and "there but not runnable" is a
@@ -747,10 +790,16 @@ def _fmt_binary(binary: str) -> str:
     point is "can a review actually run".
     """
     # Imported here, not at module scope: this keeps every OTHER `skodun`
-    # subcommand from paying `pipeline`'s (heavier) import graph just because
-    # `providers` needs one split it shares with it -- the same reasoning
+    # subcommand from paying an import it does not need -- the same reasoning
     # `_cmd_review` already applies to its own `pipeline` import.
-    from .pipeline import _is_path_shaped
+    #
+    # From `runner`, NOT from `pipeline`, and that is the point rather than an
+    # incidental tidy-up. `runner` imports nothing from the package; `pipeline`
+    # pulls in the whole review graph. Reaching through `pipeline` for one
+    # string predicate made `skodun providers` -- the read-only diagnostic an
+    # operator runs when a review will not start -- fail on exactly the
+    # installations it exists to diagnose.
+    from .runner import _is_path_shaped
 
     if not binary:
         return "NOT FOUND"

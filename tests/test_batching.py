@@ -460,6 +460,60 @@ def test_quoted_path_with_a_space_is_unquoted():
     assert got[0].files == ["dir/with space.py"]
 
 
+def test_quoted_path_containing_an_escaped_quote_is_still_one_path():
+    r"""git C-QUOTES, so a `"` inside a path arrives as `\"` — and a quoted-form
+    matcher written as `"a/([^"]*)" "b/([^"]*)"` stops at that escaped quote and
+    matches nothing, leaving the whole two-path tail as the "filename".
+
+    `files` is a label rather than a key, so the damage is confined to the
+    manifest and to per-batch context packing (which would then look up a
+    filename that is really `"a/x" "b/x"` and find nothing). Still wrong, and
+    the escape is not exotic: any path with a `"` or a `\` in it produces one.
+    """
+    diff = (
+        b'diff --git "a/we\\"ird.py" "b/we\\"ird.py"\n'
+        b"index 1111111..2222222 100644\n"
+        b'--- "a/we\\"ird.py"\n'
+        b'+++ "b/we\\"ird.py"\n'
+    ) + _hunk(1, 3)
+    got = split(diff, 10_000)
+    assert got[0].files == ['we"ird.py']
+
+
+def test_quoted_path_with_a_trailing_backslash_component_is_not_mis_split():
+    r"""`\\` is an escaped backslash, not the start of an escaped quote. A
+    matcher that skipped the character after EVERY backslash without pairing
+    them would swallow the closing `"` here."""
+    diff = (
+        b'diff --git "a/back\\\\slash.py" "b/back\\\\slash.py"\n'
+        b"index 1111111..2222222 100644\n"
+    ) + _hunk(1, 3)
+    got = split(diff, 10_000)
+    assert got[0].files == ["back\\slash.py"]
+
+
+def test_octal_escaped_non_ascii_path_is_decoded_to_its_real_name():
+    """`core.quotepath` (git's default) renders every non-ASCII byte as `\\ooo`.
+    Undecoded, the manifest names `caf\\303\\251.py` — a path that exists
+    nowhere, so per-batch context packing for it finds nothing."""
+    diff = (
+        b'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n'
+        b"index 1111111..2222222 100644\n"
+    ) + _hunk(1, 3)
+    got = split(diff, 10_000)
+    assert got[0].files == ["café.py"]
+
+
+def test_an_unterminated_quoted_header_is_still_a_label_never_an_error():
+    """Fail-safe: `files` is a label. A header no form recognises degrades to
+    the raw tail rather than raising or dropping the section."""
+    diff = (b'diff --git "a/unterminated.py\n'
+            b"index 1111111..2222222 100644\n") + _hunk(1, 3)
+    got = split(diff, 10_000)
+    assert len(got) == 1
+    assert len(got[0].files) == 1 and got[0].files[0]
+
+
 def test_files_are_deduplicated_in_first_appearance_order():
     """One name per file per batch, however many headers carry it.
 

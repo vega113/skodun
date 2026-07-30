@@ -1531,6 +1531,16 @@ def test_operating_on_a_closed_store_raises_programming_error_not_swallowed(tmp_
 #: one). `test_passes.py` matches `Store` in a grep only because of two
 #: `svc/credential/Store.go` / `UserStore.scala` fixture PATH STRINGS -- it
 #: never opens one -- so it is deliberately excluded.
+#:
+#: HAND-MAINTAINED, and therefore drifted: six modules that open a `Store`
+#: were simply never added, and nothing said so. `test_the_sweep_lists_every_
+#: store_touching_module` below is what closes that permanently -- a module can
+#: now be left out only by being named in `_SWEEP_EXCLUDED` with a reason.
+#:
+#: `test_batched_review.py` is here but matches no `Store.open` grep: it opens
+#: one through `test_pipeline._store`. The guard below is one-directional for
+#: exactly that reason -- it requires every grep hit to be accounted for, never
+#: that every listed module be a grep hit.
 _STORE_TOUCHING_MODULES = (
     "tests/test_store.py",
     "tests/test_cli.py",
@@ -1544,6 +1554,32 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_refuter.py",
     "tests/test_triage.py",
     "tests/test_delivery.py",
+    "tests/test_chain.py",
+    "tests/test_mcpserver.py",
+    "tests/test_seams.py",
+    "tests/test_services.py",
+)
+
+#: Store-touching modules deliberately kept OUT of the subprocess sweep, with
+#: the reason recorded beside each. This is the only sanctioned way to leave one
+#: out: a module that is neither here nor in `_STORE_TOUCHING_MODULES` fails
+#: `test_the_sweep_lists_every_store_touching_module`.
+#:
+#: Both exclusions are about RUNTIME and nothing else. The sweep re-runs whole
+#: modules in a subprocess, so its cost is the sum of theirs, and it is already
+#: the single most expensive test in the suite. These two are the two that drive
+#: real subprocess reviews under real sleeps, and neither buys much here: what
+#: this sweep can actually catch is an EXPLICIT `ResourceWarning` (a GC-emitted
+#: one is unraisable -- see the test's own docstring), which is a property of
+#: the store code both of them share with the sixteen modules above.
+_SWEEP_EXCLUDED = (
+    ("tests/test_mcptools.py",
+     "drives real end-to-end MCP reviews in subprocesses with real waits; the "
+     "slowest module in the suite, and it exercises no store path the sixteen "
+     "swept modules do not"),
+    ("tests/test_cancellation.py",
+     "spawns real child processes and sleeps through SIGTERM/SIGKILL grace "
+     "windows; its cost is wall-clock waiting, not store work"),
 )
 
 
@@ -1556,6 +1592,51 @@ _STORE_TOUCHING_MODULES = (
 _RESOURCEWARNING_SUBPROCESS_GUARD_ENV = "_SKODUN_RESOURCEWARNING_SUBPROCESS_ACTIVE"
 _THIS_TEST_NODEID = ("tests/test_store.py::"
                      "test_store_touching_modules_run_clean_under_resourcewarning_error")
+
+
+def test_the_sweep_lists_every_store_touching_module():
+    """The cheap half, and the one that makes the expensive half trustworthy.
+
+    `_STORE_TOUCHING_MODULES` is hand-maintained, and it had silently fallen six
+    modules behind: `test_cancellation`, `test_chain`, `test_mcpserver`,
+    `test_mcptools`, `test_seams` and `test_services` all open a `Store` and
+    none of them was swept. Nothing failed, because a list that is merely
+    INCOMPLETE still passes every assertion the sweep makes about the modules it
+    does name -- which is the whole failure mode of a hand-maintained inventory.
+
+    So: grep, and require every module that opens a `Store` to be either swept
+    or explicitly excluded WITH A REASON. Milliseconds, no subprocess, and it is
+    what turns "someone remembered" into a property of the suite. Runtime is a
+    legitimate reason to exclude one -- that is what `_SWEEP_EXCLUDED` is for --
+    but it now has to be written down rather than achieved by omission.
+    """
+    tests_dir = Path(__file__).resolve().parent
+    excluded = dict(_SWEEP_EXCLUDED)
+    accounted = set(_STORE_TOUCHING_MODULES) | set(excluded)
+
+    missing = []
+    for path in sorted(tests_dir.glob("test_*.py")):
+        if "Store.open" not in path.read_text(encoding="utf-8"):
+            continue
+        name = f"tests/{path.name}"
+        if name not in accounted:
+            missing.append(name)
+    assert missing == [], (
+        f"{len(missing)} module(s) open a Store but are neither in "
+        f"_STORE_TOUCHING_MODULES nor in _SWEEP_EXCLUDED: {missing}. Add them "
+        f"to the sweep, or exclude them with the reason recorded.")
+
+    # An exclusion has to say something, and has to name a module that exists --
+    # a stale entry would silently re-open the hole it was written to document.
+    for name, reason in _SWEEP_EXCLUDED:
+        assert (tests_dir.parent / name).is_file(), f"stale exclusion: {name}"
+        assert len(reason) > 30, f"{name}'s exclusion reason says nothing"
+        assert name not in _STORE_TOUCHING_MODULES, (
+            f"{name} is both swept and excluded")
+    # ...and every swept module has to exist too, or the subprocess below fails
+    # with a pytest usage error rather than an assertion anyone can read.
+    for name in _STORE_TOUCHING_MODULES:
+        assert (tests_dir.parent / name).is_file(), f"no such module: {name}"
 
 
 def test_store_touching_modules_run_clean_under_resourcewarning_error(tmp_path):
