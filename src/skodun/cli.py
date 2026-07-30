@@ -239,6 +239,12 @@ def _repo_root(repo: Path) -> Path:
 
     So both seams resolve this first and pass the ROOT everywhere: to
     `load_config`, and on to `run_gate`/`run_review`.
+
+    It STAYS in this module even though its callers moved into `services.py`
+    (which imports it from here, lazily), because `cli._repo_root` is named as
+    the definition by `dispatch.py`'s own docstring and by the tests -- and
+    `providers`, which is a CLI-only diagnostic and not a service, still needs
+    it. One definition, wherever the readers already look for it.
     """
     from . import gitio
     return gitio._worktree_root(repo)
@@ -402,22 +408,25 @@ def _emit_delivery(text: str) -> bool:
 
 
 def _cmd_gate(args) -> int:
-    # Every failure inside this seam is exit 2, for the same reason every
-    # failure inside `run_gate` is: an exception escaping here would leave the
-    # interpreter's own exit code of 1, and 1 is the one value that means
-    # "findings remain open". Setup failures -- an unparseable config, an
-    # unopenable store -- happen strictly before any review is consulted, so
-    # reporting them as findings would be a lie in the dangerous direction.
-    from .config import load_config
-    from .gate import run_gate
+    """Parse, open the store, ask `services.svc_gate`, print, return its code.
+
+    Every failure inside this seam is exit 2, for the same reason every failure
+    inside `run_gate` is: an exception escaping here would leave the
+    interpreter's own exit code of 1, and 1 is the one value that means
+    "findings remain open".
+
+    The imports sit outside every guard, deliberately: an unimportable
+    `gate.py`/`services.py` is a broken installation, and `main`'s general
+    handler (which reports 2) is where that belongs -- pinned by
+    `test_gate_import_keyboard_interrupt_maps_to_2_via_mains_general_handler`.
+    """
+    from .services import svc_gate
     from .store import Store
 
-    repo = Path(args.repo)
-
-    # The store is opened FIRST so that a setup failure below still has
-    # somewhere to be recorded. THIS failure cannot be: there is no store yet,
-    # so returning 2 with no `gate_events` row is the only option available --
-    # and it is the safe one, because an unrecordable refusal is still a
+    # The store is opened FIRST so that a setup failure inside the service still
+    # has somewhere to be recorded. THIS failure cannot be: there is no store
+    # yet, so returning 2 with no `gate_events` row is the only option available
+    # -- and it is the safe one, because an unrecordable refusal is still a
     # refusal. (Only a lenient verdict needs its record to be trustworthy.)
     try:
         store = Store.open(_store_path())
@@ -425,18 +434,8 @@ def _cmd_gate(args) -> int:
         return _emit(f"SKODUN GATE: FAIL(2) could not open the store: {e!r}", 2)
 
     with store:
-        try:
-            # The ROOT, not `--repo`: the config and the diff identity must be
-            # resolved against the same directory or the gate decides about a
-            # different change depending on the cwd. See `_repo_root`.
-            root = _repo_root(repo)
-            cfg = load_config(root)
-            result = run_gate(store, root, cfg)  # records its own event; never raises
-        except BaseException as e:
-            note = f"SKODUN GATE: FAIL(2) could not run the gate: {e!r}"
-            _record_setup_failure(store, repo, note)
-            return _emit(note, 2)
-        return _emit(result.message, result.code)
+        code, message = svc_gate(store, Path(args.repo))
+    return _emit(message, code)
 
 
 def _cmd_review(args) -> int:
@@ -446,40 +445,40 @@ def _cmd_review(args) -> int:
       1  trustworthy, findings open       4  no trustworthy review exists
       2  preflight refusal (nothing ran)
 
-    `run_review` prints the verdict banner itself on every path where a record
-    was persisted, because the banner has to be rendered from that record and
-    not from anything recomputed here. This function's job is the other half of
-    the invariant: every path that never reached a record still ends with a
-    `banner_failure` line as the last line of stdout.
+    THIS seam owns three things and nothing else: the store's lifetime, the
+    verdict line on stdout, and the exit code. The decision -- and the banner
+    text, rendered by `trust.banner` from the record that was persisted -- comes
+    from `services.svc_review`, which the MCP `review` tool calls identically.
+    `run_review` itself prints nothing at all: its stdout would be an MCP
+    transport's JSON-RPC stream.
+
+    The banner invariant holds through every path: `svc_review` returns a
+    `banner_failure` line for every outcome that never reached a record, and the
+    two failures ABOVE it (an unimportable service, an unopenable store) carry
+    one from here.
     """
     # Outside the guard below on purpose: it is what RENDERS the banner, so a
     # failure to import it is the one import failure no banner can report.
     from .trust import banner_failure
 
     try:
-        # Inside the guard: an import error here -- a partial install, a
-        # syntax error introduced in `pipeline.py`, a missing stdlib module in
-        # a stripped environment -- used to escape to `main`, which reports on
+        # Inside the guard: an import error here -- a partial install, a syntax
+        # error introduced in `services.py`, a missing stdlib module in a
+        # stripped environment -- used to escape to `main`, which reports on
         # stderr and leaves stdout without the verdict line the contract
         # promises. 2, not 4: nothing ran, so this is a refusal, not a review
         # that came back badly.
-        from .config import load_config
-        from .gitio import GitError
-        from .pipeline import (LockTimeout, PersistenceFailed, PreflightRefused,
-                               run_review)
+        from .services import svc_review
         from .store import Store
     except KeyboardInterrupt:
         # Ctrl-C during the import itself: nothing ran, but that is not what
         # this is -- `main()` maps this to 130, not to the 2 the `except
-        # BaseException` immediately below would otherwise give it. See the
-        # module-level note on why every one of `_cmd_review`'s five
-        # `BaseException` guards needs this immediately above it.
+        # BaseException` immediately below would otherwise give it.
         raise
     except BaseException as e:
         return _emit(banner_failure(
             f"could not load the review pipeline: {e!r}; no review ran"), 2)
 
-    repo = Path(args.repo)
     try:
         store = Store.open(_store_path())
     except KeyboardInterrupt:
@@ -489,61 +488,11 @@ def _cmd_review(args) -> int:
         return _emit(banner_failure(f"could not open the review store: {e!r}"), 4)
 
     with store:
-        try:
-            # Before the config, and for the same reason the gate does it: the
-            # config has to be read from the same directory the diff identity is
-            # computed against. See `_repo_root`. A `--repo` that is not inside a
-            # worktree at all raises here, which is a preflight refusal -- nothing
-            # ran -- and lands on the same 2 the `GitError` handler below gives.
-            root = _repo_root(repo)
-        except KeyboardInterrupt:
-            raise
-        except BaseException as e:
-            return _emit(banner_failure(f"{e}; no review ran"), 2)
-        try:
-            cfg = load_config(root)
-        except KeyboardInterrupt:
-            raise
-        except BaseException as e:
-            # A config that will not load is a refusal before anything ran, not a
-            # review that came back badly: 2, the preflight code.
-            return _emit(banner_failure(f"could not load the config: {e!r}"), 2)
-
-        try:
-            rec = run_review(root, cfg, store)
-        except PreflightRefused as e:
-            return _emit(banner_failure(str(e)), 2)
-        except LockTimeout as e:
-            return _emit(banner_failure(str(e)), 3)
-        except PersistenceFailed:
-            return _emit(banner_failure("no review was recorded"), 4)
-        except GitError as e:
-            # A directory that is not a git checkout at all, a git that will not
-            # run, a repo with no HEAD: every git call the pipeline makes happens
-            # before the reviewer is launched, so this is a preflight failure --
-            # nothing ran -- and preflight refusals are 2, not "the review failed".
-            return _emit(banner_failure(f"{e}; no review ran"), 2)
-        except KeyboardInterrupt:
-            # `run_review`'s own `finally` has already downgraded the `running`
-            # record to `failed` and released the foreground lock (pipeline.py,
-            # "never leave a `running` record or a held lock behind") by the time
-            # this exception reaches here -- this guard only has to let it keep
-            # going rather than let the `except BaseException` below turn it into
-            # a lying "the review failed" 4.
-            raise
-        except BaseException as e:
-            # Anything else: the review did not complete, so it certifies nothing.
-            return _emit(banner_failure(f"the review failed: {e!r}"), 4)
-
-        # The banner is already out; only the exit code is left, and it is read
-        # back off the persisted record like everything else.
-        if rec.get("trustworthy") is not True:
-            return 4
-        try:
-            total = int(rec.get("findings_total") or 0)
-        except (TypeError, ValueError):
-            total = 1     # an uncountable findings list is not a clean review
-        return 1 if total > 0 else 0
+        # `svc_review` re-raises `KeyboardInterrupt` past every one of its own
+        # guards so `main`'s carve-out can report 130; the `with` closes the
+        # store on the way past.
+        code, text = svc_review(store, Path(args.repo))
+    return _emit(text, code)
 
 
 def _cmd_dispatch(args) -> int:
@@ -632,43 +581,36 @@ def _cmd_surface(args) -> int:
     calling it must not be able to read a verdict out of its status. `skodun
     gate` is the only thing that answers that question.
 
-    THE ORDER BELOW IS THE PRODUCT. `delivery.surface` renders and acknowledges
-    only the QUIET rounds (nothing deliverable can be lost by marking a
-    trustworthy zero-finding round now); everything with content is acknowledged
-    HERE, after `_emit_delivery` has confirmed the write AND the flush. Marking
-    first is the mutation that passes every other test in this file: a report
-    dropped on the way out would be recorded as delivered and never shown again,
-    which is precisely the undelivered-findings failure this command exists to
-    fix, reintroduced by the fix.
+    THE ORDER BELOW IS THE PRODUCT. `services.svc_surface` renders and
+    acknowledges only the QUIET rounds (nothing deliverable can be lost by
+    marking a trustworthy zero-finding round now); everything with content is
+    acknowledged HERE, after `_emit_delivery` has confirmed the write AND the
+    flush. Marking first is the mutation that passes every other test in this
+    file: a report dropped on the way out would be recorded as delivered and
+    never shown again, which is precisely the undelivered-findings failure this
+    command exists to fix, reintroduced by the fix.
 
     A failed emit therefore leaves the rounds undelivered and says so on stderr.
     So does a failed ACK -- but that one has already reached the reader, so the
     cost is a repeat rather than a loss. Delivered-twice is the designed failure
     mode in both directions.
+
+    THE ACK CHANNEL IS THIS TRANSPORT'S OWN (`cli-text`/`cli-claude`), because
+    only whoever performed the write knows whether it landed. The MCP `surface`
+    tool acknowledges the same ids under `mcp`, after ITS response line is
+    flushed, from a fresh Store -- same discipline, different channel.
     """
     try:
-        from . import delivery
+        from . import delivery, services
         from .store import Store
     except BaseException as e:
         return _warn(f"skodun surface: could not load the delivery surface: {e!r}",
                      2)
 
     fmt = args.hook_format
-    branch = args.branch
+    branch, why_not = services.resolve_surface_branch(args.branch)
     if not branch:
-        # A detached HEAD answers `HEAD` here, which matches no round and reports
-        # nothing -- correct: rounds are keyed to a branch, and a detached
-        # checkout is not on one. `--branch` is how a human asks anyway.
-        try:
-            from . import gitio
-            branch = gitio.current_branch(Path("."))
-        except BaseException as e:
-            return _warn(
-                f"skodun surface: could not work out which branch to report on "
-                f"({e!r}); pass --branch", 2)
-    if not branch:
-        return _warn("skodun surface: could not work out which branch to report "
-                     "on; pass --branch", 2)
+        return _warn(why_not, 2)
 
     try:
         store = Store.open(_store_path())
@@ -676,20 +618,18 @@ def _cmd_surface(args) -> int:
         return _warn(f"skodun surface: could not open the store: {e!r}", 2)
 
     with store:
-        try:
-            _status, text, pending = delivery.surface(
-                store, branch, fmt, bool(args.include_delivered))
-        except BaseException as e:
-            return _warn(
-                f"skodun surface: could not read the delivery ledger: {e!r}", 2)
+        status, text, pending = services.svc_surface(
+            store, branch, fmt, bool(args.include_delivered))
+        if status != 0:
+            # `text` is a diagnostic, not a payload: onto stderr with it, where a
+            # hook consuming stdout cannot mistake it for a report.
+            return _warn(text, status)
 
         if not text:
             # Silence on stdout, on purpose: a hook that injects an empty report
             # at every session start is noise. The human at the terminal still
             # gets an answer, on the stream a hook does not read.
-            return _warn(
-                f"skodun surface: no undelivered background review rounds on "
-                f"branch {branch}", 0)
+            return _warn(services.surface_no_rounds_note(branch), 0)
 
         if not _emit_delivery(text):
             return _warn(
@@ -1154,46 +1094,27 @@ def _deltas(c) -> dict:
 def _cmd_log(args) -> int:
     """Print recent reviews, newest first. `2` if the store cannot be read.
 
-    The likeliest way to run this is `skodun log | head`, so every line goes
+    The likeliest way to run this is `skodun log | head`, so the listing goes
     through `_emit` rather than a bare `print`: an early-exiting reader closes
-    the pipe partway through the listing, and a `BrokenPipeError` escaping
-    would hand the shell the interpreter's own exit code of 1 -- a value this
-    command's contract does not even have. The exit code below is always the
-    one the contract promises for the outcome that was already decided (0 or
-    2), never whatever printing happened to return.
+    the pipe partway through it, and a `BrokenPipeError` escaping would hand the
+    shell the interpreter's own exit code of 1 -- a value this command's contract
+    does not even have. The exit code returned is always the one the contract
+    promises for the outcome the service already decided (0 or 2), never whatever
+    printing happened to return.
+
+    An empty store prints NOTHING and exits 0: `svc_log` returns `""`, and a
+    blank line is not an empty listing.
     """
-    # `-n` becomes SQLite's LIMIT, where a NEGATIVE value means "no limit" --
-    # so `log -n -1` would dump the whole store while reading like a request
-    # for fewer rows than the default. Below 1 there is no row count to ask
-    # for, so this is a usage error rather than something to clamp silently.
-    if args.limit < 1:
-        return _emit(
-            f"skodun log: -n must be a positive row count, got {args.limit}", 2)
+    from .services import svc_log
+
     try:
         from .store import Store
-        from .trust import coerce_count, one_line
-        with Store.open(_store_path()) as store:
-            rows = store.list_reviews(args.branch, args.limit)
+        store = Store.open(_store_path())
     except BaseException as e:
         return _emit(f"skodun log: could not read the store: {e!r}", 2)
-
-    for rec in rows:
-        trustworthy = rec.get("trustworthy") is True
-        sev = rec.get("severity") if isinstance(rec.get("severity"), dict) else {}
-        files = rec.get("files_changed")
-        nfiles = len(files) if isinstance(files, list) else 0
-        # A summary carrying a stray newline must not be able to fake a second
-        # row in what is meant to be a one-line-per-review listing. Same
-        # definition the banner uses -- see `trust.one_line`.
-        summary = one_line(rec.get("summary") or "")
-        mark = "!" if not trustworthy else " "
-        # Counts read by THE project's single count rule, so `log` and `banner`
-        # can never disagree about the same stored row.
-        _emit(f"{mark}{rec.get('reviewed_at')} | {rec.get('branch')} | {nfiles} | "
-              f"{coerce_count(sev.get('high'))}-{coerce_count(sev.get('medium'))}"
-              f"-{coerce_count(sev.get('low'))} | "
-              f"{rec.get('status')} | {summary}", 0)
-    return 0
+    with store:
+        code, text = svc_log(store, args.branch, args.limit)
+    return _emit(text, code) if text else code
 
 
 def _cmd_triage(args) -> int:
@@ -1230,13 +1151,23 @@ def _cmd_triage(args) -> int:
     shipped contract that pre-push hooks and humans already read, and this task
     is not the place to change what `skodun triage <id> <n> "<reason>"` returns.
     """
-    from .store import Store, _TS_FORMAT
+    from .services import (TRIAGE_ADOPT_USAGE, TRIAGE_REOPEN_USAGE,
+                           svc_adopt_refuter, svc_triage_dismiss,
+                           svc_triage_list, svc_triage_reopen)
+    from .store import Store
 
-    # `--list`, `--adopt-refuter` and `--reopen` are different commands sharing
-    # one parser, so `triage --list <id> <index> "<reason>"` parses cleanly and
-    # then throws the index and the reason away. Someone who typed a reason
-    # believes a finding was dismissed; they get a listing and a 0. Reject every
-    # mixture instead of picking one of the meanings.
+    # ARGPARSE-SHAPED MISUSE IS DECIDED HERE, before a store is opened, because
+    # it is a question about argv rather than about the ledger. `--list`,
+    # `--adopt-refuter` and `--reopen` are different commands sharing one parser,
+    # so `triage --list <id> <index> "<reason>"` parses cleanly and then throws
+    # the index and the reason away. Someone who typed a reason believes a
+    # finding was dismissed; they get a listing and a 0. Reject every mixture
+    # instead of picking one of the meanings.
+    #
+    # The MCP surface cannot reach any of these: each mode is its OWN tool there,
+    # with its own `inputSchema`, so a mixture is unrepresentable. What the two
+    # surfaces DO share -- a missing index, a missing reason -- is refused with
+    # the same words, from the `services` constants imported above.
     modes = [name for name, on in (("--list", args.list_only),
                                    ("--adopt-refuter", args.adopt_refuter),
                                    ("--reopen", args.reopen)) if on]
@@ -1249,27 +1180,21 @@ def _cmd_triage(args) -> int:
             "skodun triage: --list takes only a review id; drop the finding "
             "index and the reason to list, or drop --list to dismiss", 2)
     if args.reopen and (args.finding_index is None or args.reason is None):
-        # Both are mandatory: one finding at a time, and never without a stated
-        # reason for overturning a dismissal somebody else may have recorded.
-        return _emit(
-            "skodun triage: usage: skodun triage --reopen <review-id> "
-            "<finding-index> \"<reason>\"  (one finding at a time, and the "
-            "reason is required)", 2)
+        return _emit(TRIAGE_REOPEN_USAGE, 2)
     if args.adopt_refuter:
         # Same class of mixture, and the same refusal to guess. The reason is
         # SYNTHESIZED from the annotation, so a reason typed alongside the flag
         # is silently discarded -- and its author would have every right to
-        # believe their words were the ones recorded in the ledger.
+        # believe their words were the ones recorded in the ledger. There is no
+        # `reason` argument on the MCP tool at all, so this refusal has no
+        # counterpart to stay in step with.
         if args.reason is not None:
             return _emit(
                 "skodun triage: --adopt-refuter takes only a review id and a "
                 "finding index; the reason comes from the refuter's own "
                 "annotation, so drop yours or drop the flag", 2)
         if args.finding_index is None:
-            return _emit(
-                "skodun triage: usage: skodun triage --adopt-refuter "
-                "<review-id> <finding-index>  (one finding at a time, on "
-                "purpose)", 2)
+            return _emit(TRIAGE_ADOPT_USAGE, 2)
 
     try:
         store = Store.open(_store_path())
@@ -1277,132 +1202,20 @@ def _cmd_triage(args) -> int:
         return _emit(f"skodun triage: could not open the store: {e!r}", 2)
 
     with store:
-        review = store.get_review(args.review_id)
-        if review is None:
-            return _emit(f"skodun triage: no such review: {args.review_id!r}", 2)
-
-        from .textnorm import finding_key
-        from .triage import (ArtifactError, FindingNotFound, TriageError,
-                             adopt_refuter, dismiss, load_valid_artifact,
-                             refuter_annotation, refuter_line, refuter_pass_ran,
-                             refuter_same_provider_as_finder, reopen, shown_field,
-                             status_token)
-
-        try:
-            review = load_valid_artifact(review)
-        except ArtifactError as e:
-            return _emit(f"skodun triage: invalid review artifact: {e}", 2)
-
         if args.list_only:
-            # The EFFECTIVE state of every finding in this review's scope, from
-            # the store's one definition of it -- the same answer the gate gets
-            # from `triage_for`, which is a filter over exactly this map. A
-            # second, independent "latest decision" query here could print
-            # DISMISSED for a finding the gate still counts as open.
-            states = store.triage_state(review["branch"], review["base_sha"])
-            # An annotation is shown only on a record where a refuter pass
-            # actually ran. On a record where none did, a `refuter` key is
-            # something the FINDER wrote about its own finding (see
-            # `triage.refuter_pass_ran`), and printing it as
-            # `refuter(<provider>/<model>)` would be this program vouching for a
-            # second opinion that was never sought -- which is the same misleading
-            # line whether or not `--adopt-refuter` goes on to refuse it.
-            annotated = refuter_pass_ran(review)
-            for i, f in enumerate(review["findings"]):
-                fkey = finding_key(f.get("file", ""), f.get("title", ""))
-                # `OPEN`, `DISMISSED <when>`, or `REOPENED <when>, dismissed
-                # <when>` -- one definition, in `triage.status_token`, which
-                # bounds and strips the stored timestamps the same way every
-                # other untrusted field on this line is bounded and stripped.
-                status = status_token(states.get(fkey))
-                # EVERY field on this line is finder-authored, untrusted model
-                # text reaching the terminal the same way a refuter's `reasoning`
-                # does -- `severity`, `file` and `line` are read straight off the
-                # parsed payload, exactly like `title`. `shown_field` strips the
-                # same control/ANSI exposure and bounds the same way, so no field
-                # can forge an extra row or rewrite this line's own status the
-                # instant it is printed. Only `[{i}]` and `({status})` are ours.
-                _emit(f"[{i}] {shown_field(f.get('severity'))} "
-                      f"{shown_field(f.get('file'))}:{shown_field(f.get('line'))} "
-                      f"{shown_field(f.get('title'))} ({status})", 0)
-                # One extra line for an annotated finding, and never more than
-                # one: `refuter_line` flattens and bounds every field it prints,
-                # so arbitrary model text cannot forge a second `[n]` row. An
-                # annotation is shown whatever its verdict says -- the listing
-                # reports what the refuter answered; only `--adopt-refuter`
-                # decides what may be acted on.
-                annotation = refuter_annotation(f) if annotated else None
-                if annotation is not None:
-                    _emit(refuter_line(annotation), 0)
-            return 0
-
-        if args.reopen:
-            try:
-                reopen(store, review, args.finding_index, args.reason,
-                       now=time.strftime(_TS_FORMAT, time.gmtime()))
-            except (FindingNotFound, ArtifactError) as e:
-                # The finding or the review does not exist: nothing was decided.
-                return _emit(f"skodun triage: {e}", 2)
-            except TriageError as e:
-                # The finding exists and the reopen was declined -- an
-                # unauditable reason, or a finding that is not dismissed.
-                return _emit(f"skodun triage: refused: {e}", 1)
-            except BaseException as e:
-                # A store that stopped accepting writes is not a refusal about
-                # the reason: nothing was decided and nothing was recorded.
-                return _emit(
-                    f"skodun triage: could not record the reopen: {e!r}", 2)
-            return _emit(
-                f"skodun triage: reopened finding {args.finding_index} on review "
-                f"{args.review_id}; it counts as open again", 0)
-
-        if args.adopt_refuter:
-            try:
-                adopt_refuter(store, review, args.finding_index,
-                              now=time.strftime(_TS_FORMAT, time.gmtime()))
-            except (FindingNotFound, ArtifactError) as e:
-                return _emit(f"skodun triage: {e}", 2)
-            except TriageError as e:
-                return _emit(f"skodun triage: refused: {e}", 1)
-            except BaseException as e:
-                # A store that stopped accepting writes is not a refusal about the
-                # annotation -- nothing was decided and nothing was recorded.
-                return _emit(
-                    f"skodun triage: could not record the dismissal: {e!r}", 2)
-
-            # The refuter exists so that a DIFFERENT provider examines the
-            # findings; a model asked to check its own work is agreeable about it.
-            # A config may still put the refuter on the finder's provider -- the
-            # operator's call, and better than no re-examination -- and the pass
-            # records that it happened. This is the one moment where that fact has
-            # consequences, so it is said out loud here rather than left in the
-            # artifact for nobody to read. A WARNING and not a refusal: adoption is
-            # an explicit human act, and the human is the authority this path
-            # exists to consult; turning an operator's own configuration into a
-            # hard block would be a second, implicit policy on top of the explicit
-            # per-finding one.
-            if refuter_same_provider_as_finder(review):
-                _emit("skodun triage: WARNING the refuter answered from the same "
-                      "provider as the finder, so this verdict is a model "
-                      "re-examining its own work", 0)
-            return _emit(
-                f"skodun triage: adopted the refuter's dismissal of finding "
-                f"{args.finding_index} on review {args.review_id}", 0)
-
-        if args.finding_index is None or args.reason is None:
-            return _emit(
-                "skodun triage: usage: skodun triage <review-id> <finding-index> "
-                "\"<reason>\"  |  skodun triage --list <review-id>", 2)
-
-        try:
-            dismiss(store, review, args.finding_index, args.reason,
-                    now=time.strftime(_TS_FORMAT, time.gmtime()))
-        except (TriageError, ArtifactError) as e:
-            return _emit(f"skodun triage: rejected: {e}", 2)
-
-        return _emit(
-            f"skodun triage: dismissed finding {args.finding_index} on review "
-            f"{args.review_id}", 0)
+            code, text = svc_triage_list(store, args.review_id)
+        elif args.reopen:
+            code, text = svc_triage_reopen(store, args.review_id,
+                                           args.finding_index, args.reason)
+        elif args.adopt_refuter:
+            code, text = svc_adopt_refuter(store, args.review_id,
+                                           args.finding_index)
+        else:
+            code, text = svc_triage_dismiss(store, args.review_id,
+                                            args.finding_index, args.reason)
+    # A review with no findings lists nothing and exits 0; a blank line is not
+    # an empty listing.
+    return _emit(text, code) if text else code
 
 
 def main(argv: list[str] | None = None) -> int:

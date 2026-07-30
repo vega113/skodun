@@ -1,10 +1,11 @@
-"""The foreground review pipeline: one `--now` review, start to banner.
+"""The foreground review pipeline: one `--now` review, start to record.
 
 This is the module that turns every other module into a review. It resolves the
 base, captures the diff, selects checklist sections, packs file context, builds
 the prompt, runs the reviewer under a watchdog with two independent retry axes,
-runs the two extra passes, persists one artifact, and prints the verdict banner
-from what it persisted. Ported from the oracle's `--now` path
+runs the two extra passes, persists one artifact, and RETURNS it -- the verdict
+banner is rendered by whoever asked (see "The banner comes from the record"
+below). Ported from the oracle's `--now` path
 (`scripts/grok-prepush-review.sh`) and its foreground lock
 (`scripts/grok-review-now.sh:138-325`).
 
@@ -129,15 +130,23 @@ bug. An exhausted chain is an explicit, untrustworthy `failed` record: the
 whole point of the mechanism is that it fails closed, never that it finds a
 way to produce a pass.
 
-The banner comes from the record
---------------------------------
-The last line of stdout is always a verdict, and on every path where a record
-exists it is rendered from the *persisted* record — read back, never recomputed
-— so the banner and the row the gate later reads cannot disagree. Paths that
-never persisted anything raise, and the caller (`cli.py`) renders
-`banner_failure`. That is the only division of labour here: this module prints
-the record-backed banner, the CLI prints the failure banner and owns the exit
-codes.
+The banner comes from the record, and THIS MODULE NEVER PRINTS IT
+-----------------------------------------------------------------
+`run_review` returns the *persisted* record — read back, never recomputed — and
+its caller renders the verdict from that, through `trust.banner`, the one
+definition of it. Paths that never persisted anything raise, and the caller
+renders `banner_failure` instead. So the banner and the row the gate later reads
+still cannot disagree, and the division of labour is sharper than it was: this
+module decides and records, the caller presents and owns the exit code.
+
+The reason it changed is the MCP transport. `run_review` used to `print` the
+banner itself, and `skodun mcp`'s stdout is a JSON-RPC stream that another
+thread may be mid-write on: one banner line there desynchronises the client's
+parser for the rest of the session. A process-global `redirect_stdout` would be
+no better, for the same reason. STDOUT IS NOT THIS MODULE'S TO WRITE TO.
+
+Progress notes still go to stderr by default. A caller that wants them
+elsewhere passes `progress_sink=`; see `_note`.
 """
 
 from __future__ import annotations
@@ -157,7 +166,7 @@ from . import (batching, budget, chain, checklist, contextpack, gitio, ids,
 from .adapters import REFUTER_CONTRACT, get_adapter
 from .config import Config, Defaults, Reviewer
 from .store import Store, _TS_FORMAT
-from .trust import banner, is_trustworthy
+from .trust import is_trustworthy
 
 #: The legacy lock directory name. Interop-critical: see the module docstring.
 LOCK_NAME = "grok-reviews-foreground.lock"
@@ -226,8 +235,35 @@ class PersistenceFailed(PipelineError):
 # ---------------------------------------------------------------------------
 
 
+#: The per-THREAD progress sink, installed by `run_review(progress_sink=...)`.
+#:
+#: Thread-local, and not a parameter threaded through thirty call sites, because
+#: progress is a property of the RUN and a run is a thread: the MCP server
+#: answers `ping` on its read loop while a review narrates itself from its own
+#: thread, and those two must not be able to see each other's sink. A module
+#: global would be exactly that cross-talk; a parameter on `_note` would mean
+#: passing one through `_orchestrate`, `_run_sub`, `_extra_pass`, `_refuter_pass`
+#: and every helper that says anything, where forgetting one is a silent hole.
+#:
+#: It is NOT a stdout redirect. A process-global `redirect_stdout` would corrupt
+#: the JSON-RPC stream this exists to keep clean.
+_PROGRESS = threading.local()
+
+
 def _note(message: str) -> None:
-    """Progress goes to stderr; stdout carries the verdict and nothing else."""
+    """One progress line. To this thread's sink if it has one, else to stderr.
+
+    Never stdout: the caller owns that stream, and for `skodun mcp` it is a
+    protocol. Never raises — a broken sink or a broken stderr must not be what
+    fails a review, and a sink that raises still gets the line onto stderr.
+    """
+    sink = getattr(_PROGRESS, "sink", None)
+    if sink is not None:
+        try:
+            sink(message)
+            return
+        except BaseException:
+            pass   # fall through: a broken sink must not silence the review
     try:
         print(f"skodun: {message}", file=sys.stderr, flush=True)
     except BaseException:
@@ -613,11 +649,22 @@ def _lock_is_reclaimable(lock: Path, stale: float, grace: float) -> bool:
 def _acquire_fg_lock(common_dir: Path, worktree: Path, *, wait: float,
                      poll: float, stale: float,
                      grace: float = LOCK_WRITE_GRACE_SEC,
-                     budget_sec: float | None = None) -> Lock:
+                     budget_sec: float | None = None,
+                     cancel: "threading.Event | None" = None) -> Lock:
     """Take the foreground lock, waiting up to `wait` seconds for it.
 
     Waiting on a busy lock is the safe behaviour; racing it is not. Raises
     `LockTimeout` if the holder outlasts the wait.
+
+    `cancel` makes the WAIT abortable, which matters because the wait is the
+    longest thing a foreground review does before it does anything: the default
+    is the whole stale ceiling, tens of minutes. An agent that closed its MCP
+    session must not leave this loop polling for half an hour on its behalf. So
+    the token is checked at the top of every iteration — which covers the
+    pre-acquisition case on the first pass — and the sleep between polls WAITS on
+    the token rather than on the clock, so EOF is noticed in milliseconds
+    instead of at the next tick. Nothing is held at that point (no lock, no
+    record), so the abort is a bare raise.
 
     Acquisition is `mkdir` — the atomic no-replace primitive — and the two files
     inside it are published in a FIXED ORDER: `budget` first, `owner` last.
@@ -642,6 +689,10 @@ def _acquire_fg_lock(common_dir: Path, worktree: Path, *, wait: float,
     noted = False
 
     while True:
+        if runner._cancelled(cancel):
+            raise ReviewCancelled(
+                "the review was cancelled while it waited for the foreground "
+                "review lock")
         taken = True
         try:
             lock.mkdir(parents=True)
@@ -682,7 +733,10 @@ def _acquire_fg_lock(common_dir: Path, worktree: Path, *, wait: float,
                 f"gave up after {wait:g}s waiting for the foreground review "
                 f"lock held by pid={_owner_pid(lock) or 'unknown'}; re-run "
                 f"when that review finishes, or remove {lock} if it is wedged")
-        time.sleep(poll)
+        if runner._sleep_or_cancelled(cancel, poll):
+            raise ReviewCancelled(
+                "the review was cancelled while it waited for the foreground "
+                "review lock")
 
 
 def _release_fg_lock(lock: Lock) -> bool:
@@ -769,6 +823,20 @@ def _is_path_shaped(binary: str) -> bool:
 #: still call the bare name `_run_chain`, so the patched value is what they
 #: see.
 _run_chain = chain.run_chain
+
+
+def _cancel_kw(cancel: "threading.Event | None") -> dict:
+    """`{"cancel": token}`, or `{}` when there is no token.
+
+    Used at the `_run_chain` call sites the FOREGROUND owns, and the reason is
+    the alias above: `_run_chain` is monkeypatched BY NAME across the suite, so a
+    run with no cancellation token must call it with exactly the argument list it
+    has always been called with -- otherwise a stand-in written against the
+    shipped signature starts failing on a keyword it never needed. A run that HAS
+    a token passes it, because the watchdog tick loop is the only layer holding
+    the provider's pgid and therefore the only one that can take the model down.
+    """
+    return {} if cancel is None else {"cancel": cancel}
 
 
 def _provenance(outcome: _Outcome) -> dict:
@@ -891,18 +959,80 @@ def _adapter_for(reviewer: Reviewer):
 def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                lock_wait: float | None = None, lock_poll: float | None = None,
                id_prefix: str = "sk_",
-               lock_stale: float | None = None) -> dict:
+               lock_stale: float | None = None, *,
+               progress_sink=None,
+               cancel: "threading.Event | None" = None) -> dict:
     """Run one foreground review and return the record that was persisted.
 
-    Prints progress to stderr and the verdict banner — rendered from the record
-    read back out of the store — as the last line of stdout. Raises
-    `PreflightRefused`, `LockTimeout` or `PersistenceFailed` on the paths where
-    no record could be produced; `cli.py` maps those to exit codes and to a
-    `banner_failure` line, so the "last stdout line is a verdict" invariant
-    holds on every path, including the ones that never got this far.
+    WRITES NOTHING TO STDOUT. Progress goes to stderr (or to `progress_sink`);
+    the verdict is the caller's to render, from the returned record, through
+    `trust.banner`. Raises `PreflightRefused`, `LockTimeout` or
+    `PersistenceFailed` on the paths where no record could be produced;
+    `services.svc_review` maps those to exit codes and to a `banner_failure`
+    line, so the "last stdout line is a verdict" invariant holds on every path,
+    including the ones that never got this far.
+
+    Two keyword-only parameters, both defaulting to the shipped behaviour so that
+    every existing call site is unchanged:
+
+    * **`progress_sink`** — a `callable(str)` that receives each progress line
+      instead of stderr, for the length of THIS call and on THIS thread only
+      (`_note`). `None` keeps the stderr behaviour.
+    * **`cancel`** — a `threading.Event` the caller sets to stop the review. It is
+      the same token Task 10 threads through the background worker, and it is
+      checked in the same three kinds of place: the lock wait, every pass
+      boundary, and the provider watchdog's tick loop (which is what actually
+      takes the model's process group down). `ReviewCancelled` is a
+      `BaseException` precisely so the broad `except Exception` demote-don't-
+      destroy guards in `_extra_pass`/`_refuter_pass`/`_run_sub` cannot convert a
+      cancellation into a mere pass failure that then FINALIZES a trustworthy
+      primary review.
+
+      What a cancellation leaves behind depends on where it lands, and the three
+      cases are deliberate:
+
+        before the record is persisted   NO record at all. Nothing trustworthy
+                                         can exist for content whose review
+                                         never even started being written down,
+                                         and an empty `failed` row would be a
+                                         trace of nothing.
+        after `_save`, before finalize   the shipped `finally` demotes it to
+                                         `failed` (`mark_failed` moves the status
+                                         AND the trust axes, and leaves the
+                                         findings alone).
+        during the final commit          the POST-COMMIT linearization check
+                                         below demotes the committed row through
+                                         `store.mark_cancelled`, which is
+                                         `cancellation_transform` as one atomic
+                                         statement. A token set while SQLite held
+                                         the write lock is invisible to the
+                                         checkpoint before it, and without this
+                                         a killed review would stand as a
+                                         trustworthy one.
+
+      The lock is released on every one of them by the same `finally`.
     """
     repo = Path(repo)
     d = cfg.defaults
+    if progress_sink is not None:
+        # Installed for the duration of this call, on this thread, and always
+        # removed again: a sink left behind would capture the NEXT review's
+        # progress on a reused thread.
+        _PROGRESS.sink = progress_sink
+    try:
+        return _run_review(repo, cfg, store, mode, lock_wait, lock_poll,
+                           id_prefix, lock_stale, cancel, d)
+    finally:
+        if progress_sink is not None:
+            _PROGRESS.sink = None
+
+
+def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
+                lock_wait: float | None, lock_poll: float | None,
+                id_prefix: str, lock_stale: float | None,
+                cancel: "threading.Event | None", d: Defaults) -> dict:
+    """`run_review`'s body. Split off ONLY so the progress sink can be installed
+    and removed around it without wrapping 400 lines in another indent level."""
 
     # --- 1. preflight -----------------------------------------------------
     # Refused so that a model session bound to the main checkout cannot review
@@ -965,13 +1095,20 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
     # second `git rev-parse` would be a second definition of "the root" that
     # could drift from the one the diff was captured against.
     root = gitio._worktree_root(repo)
+    # `**_cancel_kw`: `_acquire_fg_lock` is spied on by name in the suite too, so
+    # a run with no token must call it exactly as it always has.
     lock = _acquire_fg_lock(gitio.git_common_dir(repo), root,
-                            wait=wait, poll=poll, stale=stale)
+                            wait=wait, poll=poll, stale=stale,
+                            **_cancel_kw(cancel))
 
     rid = _new_id(id_prefix)
     persisted = False
     finalized = False
     try:
+        # The first boundary INSIDE the lock. Everything above it left nothing
+        # behind; from here the `finally` is what cleans up, so the check moves
+        # inside the guard.
+        _checkpoint(cancel, None, "before the diff was captured")
         # --- 4. identity: base, diff, diff hash. No dedup: `--now` always
         # runs a fresh review; the dedup probe is dispatcher machinery.
         base = gitio.resolve_base(repo)
@@ -1020,6 +1157,13 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
             worst_runtime_sec=budget.worst_runtime(d, width, planned),
         )
 
+        # THE PRE-PERSISTENCE BOUNDARY, and it covers all three of the persist
+        # sites below (the empty-diff record, the no-batches record, and the
+        # `running` save the reviewed paths start from). A cancellation here
+        # leaves NO record: the `finally` only demotes what was persisted, which
+        # is the honest answer for content whose review never started.
+        _checkpoint(cancel, None, "before anything was recorded")
+
         if diff.data.rstrip(b"\n") == b"":
             # ORACLE PARITY: `--now` with nothing outgoing prints a clean
             # verdict rather than spending a model call on an empty diff. It is
@@ -1041,7 +1185,6 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                        rule_ids=[], extra_passes={}, failure_reason="")
             stored = _persist(store, rec)
             finalized = True
-            _emit_banner(stored)
             return stored
 
         # --- 5. the security hold, decided BEFORE anything is persisted ---
@@ -1083,7 +1226,6 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                        failure_reason="diff batching produced no batches")
             stored = _persist(store, rec)
             finalized = True
-            _emit_banner(stored)
             return stored
 
         # --- 6/7. the primary review: ONE prompt, or a batch orchestration.
@@ -1122,7 +1264,7 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                     rec, diff, batches=plan, cfg=cfg, d=d, root=root,
                     store=store, scratch=scratch, finder=finder, branch=branch,
                     base_ref=base.ref, base_sha=base.sha,
-                    head_label=f"{head} (working tree)")
+                    head_label=f"{head} (working tree)", cancel=cancel)
                 answering_provider = _answering_provider(rec, finder)
             else:
                 # --- 6b. UNBATCHED: checklist -> context pack -> prompt ----
@@ -1219,7 +1361,7 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                 _note(f"reviewing {len(diff.files)} file(s) vs {base.ref} as "
                       f"{rid} ...")
                 outcome = _run_chain(finder, cfg, d, prompt.text, root, store,
-                                     scratch, "primary")
+                                     scratch, "primary", **_cancel_kw(cancel))
                 rec["attempts"] = outcome.attempts
                 _apply(rec, outcome)
                 # Whoever ACTUALLY answered, not whoever was asked: after a
@@ -1259,7 +1401,7 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                         branch, base.ref, base.sha, f"{head} (working tree)",
                         diff.data, d.max_diff_bytes, d.security_prompt_slots),
                     _pass_reviewer(cfg, "security", finder), cfg, d, root,
-                    store, scratch)
+                    store, scratch, cancel=cancel)
 
             if passes.should_run_skeptic(
                     mode,
@@ -1272,7 +1414,7 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                         branch, base.ref, base.sha, f"{head} (working tree)",
                         diff.data, d.max_diff_bytes),
                     _pass_reviewer(cfg, "skeptic", finder), cfg, d, root,
-                    store, scratch)
+                    store, scratch, cancel=cancel)
 
             # --- 10. the refuter: a DIFFERENT provider re-examines the
             # finder's findings. It EXECUTES last, so the published record is
@@ -1289,7 +1431,7 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                         finder_findings, diff.data, branch, base.ref, base.sha,
                         f"{head} (working tree)", d.max_diff_bytes),
                     _pass_reviewer(cfg, "refuter", finder), cfg, d, root,
-                    store, scratch, finder_provider)
+                    store, scratch, finder_provider, cancel=cancel)
             elif skip_note:
                 # `skip_note` is non-empty for exactly one case: an eligible
                 # review with no refuter configured (`refuter_decision`'s own
@@ -1303,13 +1445,33 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                 # know about, not a no-op default configuration.
                 rec = passes.skipped_refuter_pass(rec, skip_note)
 
-        # --- 11. persist the final record, then banner from what was stored
+        # --- 11. persist the final record and hand it back -----------------
         rec["trustworthy"] = is_trustworthy(
             rec["parse_ok"], rec["degraded"], rec["diff_truncated"])
         rec["status"] = _status_for(rec)
+        # THE LAST BOUNDARY THIS FUNCTION OWNS, and it is not decoration: the
+        # record above carries clean axes, and `save_review` recomputes trust
+        # from those axes ALONE -- so a token set during the write-up would
+        # otherwise be committed as a trustworthy review of content the model
+        # was killed halfway through looking at. `persisted and not finalized`
+        # sends it to the `finally`, which demotes the row it saved.
+        _checkpoint(cancel, rec, "after the review, before it was recorded")
         stored = _persist(store, rec)
         finalized = True
-        _emit_banner(stored)
+        if runner._cancelled(cancel):
+            # STEP 8's foreground twin: THE POST-COMMIT LINEARIZATION CHECK. The
+            # checkpoint above injects BEFORE the store call and therefore cannot
+            # see a token set while SQLite held the write lock -- and that token
+            # would otherwise leave a trustworthy record for a review that was
+            # cancelled. `mark_cancelled` is `cancellation_transform` as one
+            # atomic statement (its docstring says so), guarded on
+            # `trustworthy=1`, so it demotes exactly the rows that need it and
+            # leaves the findings alone.
+            if store.mark_cancelled(rid, "cancelled during finalization"):
+                _note("cancelled during finalization; the committed record was "
+                      "demoted")
+            raise ReviewCancelled(
+                "the review was cancelled during finalization", partial=stored)
         return stored
     finally:
         # --- 12. never leave a `running` record or a held lock behind -----
@@ -1353,11 +1515,22 @@ def _checkpoint(cancel: "threading.Event | None", partial: dict | None,
 def cancellation_transform(rec: dict, boundary: str) -> dict:
     """A cancelled review's record, DEMOTED. The one definition of that.
 
-    Called by the worker on all three of its cancellation paths (a partial that
+    Called by the worker on all three of its cancellation paths: a partial that
     came out of `run_prepush_review`, a token set between its return and the
-    finalize, and the post-commit linearization check) and by Task 14's
-    foreground persist path. It is one function because the transform is not
-    obvious and getting it wrong is silent:
+    finalize, and the post-commit linearization check.
+
+    THE FOREGROUND applies the same transform, but through the store rather than
+    through this function, and the difference is which one is atomic. A cancelled
+    `--now` review has a row already committed by the time it needs demoting, so
+    it goes through `store.mark_failed` (the shipped `finally`) or
+    `store.mark_cancelled` (the post-commit check) — and `mark_cancelled` IS this
+    transform written as one UPDATE, with the same three rules and the same
+    reasons. Re-deriving the dict here and re-saving it would be a second write
+    of a record the store has already accepted, racing nothing and buying
+    nothing.
+
+    It is one function because the transform is not obvious and getting it wrong
+    is silent:
 
     * `findings` and `usable_output` are PRESERVED. A round cancelled after two
       batches answered really did produce those findings, and a surface that
@@ -1687,16 +1860,14 @@ def _persist(store: Store, rec: dict) -> dict:
     return stored
 
 
-def _emit_banner(stored: dict) -> None:
-    """Print the verdict banner. Called only AFTER the record is final.
-
-    Order matters: `run_review` marks the run finalized between the save and
-    this call, so a stdout failure here (a broken pipe from
-    `skodun review | head`) can never make the `finally` block downgrade a
-    review that was already persisted correctly.
-    """
-    print(banner(stored))
-    sys.stdout.flush()
+#: `_emit_banner` USED TO LIVE HERE and is deliberately gone rather than left
+#: unused. It printed `trust.banner(stored)` to stdout as `run_review`'s last
+#: act, which made this module a writer on a stream it does not own: `skodun
+#: mcp` serves JSON-RPC on stdout from a thread that may be mid-write while a
+#: review finishes on another. The record is returned instead, and
+#: `services.svc_review` renders the banner from it — one definition, one writer,
+#: and the "banner comes from the persisted record" property is unchanged because
+#: what is returned IS the read-back record.
 
 
 def _apply(rec: dict, outcome: _Outcome) -> None:
@@ -2374,7 +2545,8 @@ def _failed_pass(rec: dict, name: str, reason: str, note: str) -> dict:
 
 def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
                 cfg: Config, d: Defaults, cwd: Path, store: Store,
-                scratch: Path) -> dict:
+                scratch: Path, *,
+                cancel: "threading.Event | None" = None) -> dict:
     """Run one extra pass and merge it into `rec`, returning the new record.
 
     `reviewer` is the caller's choice, and the caller makes a DELIBERATE one:
@@ -2404,6 +2576,10 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
     can refuse, which is strictly more useful than an exception that leaves
     only a `failed` stub behind.
     """
+    # A PASS BOUNDARY, and the cheapest place to notice a cancellation: nothing
+    # has been spent on this pass yet, and `rec` is the record as it stands so the
+    # exception carries the findings already produced.
+    _checkpoint(cancel, rec, f"before the {name} pass")
     _note(f"{name} pass ...")
     try:
         prompt = build_prompt()
@@ -2416,8 +2592,14 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
               f"(partial coverage, one-call bound)")
     try:
         outcome = _run_chain(reviewer, cfg, d, prompt.text, cwd, store,
-                             scratch, name)
+                             scratch, name, **_cancel_kw(cancel))
     except Exception as e:
+        # `Exception`, NEVER `BaseException`. `ReviewCancelled` is outside
+        # `Exception` exactly so it passes straight through here: catching it
+        # would turn a killed review into a merely-failed PASS, and the caller
+        # would go on to finalize the primary review as a trustworthy one. Pinned
+        # by `test_a_cancellation_during_an_extra_pass_...`; the named mutation is
+        # widening this clause.
         _note(f"{name} pass failed; demoting review: {e!r}")
         reason = f"extra pass {name} failed: {e!r}"
         return _failed_pass(rec, name, reason, reason)
@@ -2481,7 +2663,8 @@ def _refuter_failed(rec: dict, finder_findings_total: int, note: str,
 def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
                   reviewer: Reviewer, cfg: Config, d: Defaults, cwd: Path,
                   store: Store, scratch: Path,
-                  finder_provider: str) -> dict:
+                  finder_provider: str, *,
+                  cancel: "threading.Event | None" = None) -> dict:
     """Run the refuter pass and annotate `rec`, returning the new record.
 
     Structurally a sibling of `_extra_pass` and semantically its opposite in
@@ -2499,6 +2682,7 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
     request, classify and validate the verdicts shape — and what gives this
     pass Task 7's fallback support for free.
     """
+    _checkpoint(cancel, rec, "before the refuter pass")
     _note("refuter pass (annotation only) ...")
     try:
         prompt = build_prompt()
@@ -2516,8 +2700,13 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
 
     try:
         outcome = _run_chain(reviewer, cfg, d, prompt.text, cwd, store, scratch,
-                             "refuter", contract=REFUTER_CONTRACT)
+                             "refuter", contract=REFUTER_CONTRACT,
+                             **_cancel_kw(cancel))
     except Exception as e:
+        # `Exception`, NEVER `BaseException` -- see `_extra_pass`. This clause is
+        # the more dangerous of the two to widen: this pass demotes NOTHING, so a
+        # swallowed cancellation here would leave a clean, trustworthy primary
+        # review standing and finalize it.
         _note(f"refuter pass failed; the review keeps its verdict: {e!r}")
         return _refuter_failed(rec, finder_findings_total,
                                f"the refuter pass failed: {e!r}",

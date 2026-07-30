@@ -464,11 +464,34 @@ def test_a_duplicate_tool_name_is_refused_at_construction():
         _server(registry=(*fakes.registry(), dupe))
 
 
-def test_the_default_registry_is_empty_until_task_14_fills_it():
-    """This task ships the transport, not the tools. An accidental tool here
-    would be an agent-facing surface nobody reviewed."""
-    assert mcpserver.default_registry() == ()
-    assert mcpserver.default_prompts() == ()
+def test_the_default_registry_is_the_curated_review_loop():
+    """Task 13 shipped this transport with an EMPTY registry, deliberately: an
+    accidental tool would be an agent-facing surface nobody reviewed, on a
+    fail-closed gate. Task 14 filled it, so what this pins now is the shape of
+    the hand-off rather than its emptiness -- every entry is a well-formed
+    `HandlerSpec` with a callable behind it, and exactly one of them is the
+    long-running review.
+
+    WHICH tools, in WHICH order, and with WHICH schemas is `test_mcptools.py`'s
+    snapshot; this module owns the transport and stops at "the registry the
+    transport is handed is usable".
+    """
+    registry = mcpserver.default_registry()
+    prompts = mcpserver.default_prompts()
+    assert registry and prompts, "the shipped server serves no tools at all"
+    for spec in registry:
+        assert isinstance(spec, HandlerSpec)
+        assert spec.name and callable(spec.handler)
+        assert isinstance(spec.input_schema, dict) and spec.input_schema
+        assert spec.description
+    assert [s.name for s in registry if s.long_running] == ["review"]
+    for prompt in prompts:
+        assert isinstance(prompt, PromptSpec)
+        assert prompt.name and prompt.description and prompt.text
+    # Constructible: duplicate names and a second long-running tool are refused
+    # at construction, so this is also the assertion that the shipped registry
+    # satisfies those two rules.
+    _server(registry=registry, prompts=prompts)
 
 
 def test_a_handler_that_returns_nonsense_is_a_tool_error_not_a_crash():

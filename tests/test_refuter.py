@@ -47,6 +47,7 @@ from tests.test_fallback import (FAKE_OPENAI_MODEL, FAKE_XAI_MODEL,
                                  _codex_stream, _fake_cli)
 from tests.test_gitio import _git, _mkrepo
 from tests.test_pipeline import CLEAN, DIRTY, _emit, _per_call
+from tests.test_pipeline import _verdict as _banner_of
 
 # --------------------------------------------------------------------------
 # offline fixtures
@@ -721,7 +722,8 @@ def test_the_refuter_runs_on_a_second_provider_and_annotates(tmp_path, capsys):
     assert rec["findings_total"] == 1 and rec["trustworthy"] is True
     assert rec["parse_ok"] is True and rec["degraded"] is False
     assert rec["adapter"] == "grok" and rec["model"] == FAKE_XAI_MODEL
-    assert capsys.readouterr().out.strip().splitlines()[-1].startswith(
+    # `run_review` prints nothing; the banner is rendered from what it returned.
+    assert _banner_of(rec, capsys).startswith(
         "SKODUN VERDICT: trustworthy=true findings=1")
 
 

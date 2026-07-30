@@ -1,0 +1,1095 @@
+"""The MCP tools: a curated mirror of the CLI, and the parity that makes it one.
+
+Task 13 built the transport and left the registry empty. This module is about
+what went into it, and almost every test here is a comparison rather than an
+assertion about a value: the tools are four lines each over the same `services`
+functions the CLI subcommands call, so the interesting question is never "does
+the tool work" but "does it answer EXACTLY what the CLI answers".
+
+Three properties are worth more than the rest and each has its own section:
+
+  * **The list is curated.** A snapshot pins the eight tool names and their
+    order. A ninth tool is a new agent-facing surface on a fail-closed gate, and
+    it should cost a failing test to add.
+  * **Refusals are word-for-word identical across surfaces.** A human reading an
+    agent's transcript, or the other way round, must not be looking at two
+    products. Every refusal below is produced twice -- once through
+    `cli.main(argv)` and once through the tool handler -- and compared as
+    STRINGS.
+  * **A delivery is acknowledged only after the response really left.** The
+    transport's rule from Task 13, now with a real `surface` behind it: a flush
+    that raises leaves the rounds undelivered, and a completed buffer write is
+    never "delivered".
+
+The end-to-end cancellation drill lives here too, because the mechanism only
+exists once both ends are real: a `skodun mcp` SUBPROCESS, a hanging fake
+provider, and a closed stdin.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+import skodun
+from skodun import delivery, mcpserver, services
+from skodun.cli import main
+from skodun.mcpserver import HandlerCall, HandlerResult, McpServer
+from skodun.store import Store
+from tests.test_cli import (_annotation, _artifact, _delivery_rows, _finding,
+                            _loud_round, _round, _surface_db)
+from tests.test_gitio import _git, _mkrepo
+
+_SRC = str(Path(skodun.__file__).resolve().parents[1])
+
+#: The tools `skodun mcp` serves, in `tools/list` order. THE SNAPSHOT.
+EXPECTED_TOOLS = ["gate", "review", "log", "surface", "triage_list",
+                  "triage_dismiss", "adopt_refuter", "triage_reopen"]
+
+EXPECTED_PROMPTS = ["review-now", "gate-check"]
+
+GOOD_REASON = "the guard at line 12 already rejects a None handler before this"
+#: `test_cli.py`'s own thin-reasoning fixture, so both surfaces are refused
+#: for the SAME reason rather than for two different ones.
+THIN = "nope."
+
+
+@pytest.fixture(autouse=True)
+def _never_the_real_store(tmp_path, monkeypatch):
+    """`SKODUN_DB` inside `tmp_path`, `SKODUN_CONFIG` at a path that does not
+    exist: nothing here may reach the developer's own store or provider config."""
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "autouse" / "skodun.db"))
+    monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "absent" / "config.toml"))
+    # The provider binaries too, and not as belt-and-braces: `adapters.grok`
+    # prefers `~/.grok/bin/grok` over PATH, so on any machine that has grok
+    # installed a PATH-only fake would silently lose and a test would run the
+    # real CLI. Nothing here should reach a provider at all; pinning them at a
+    # path that does not exist is what makes that a failure rather than a bill.
+    monkeypatch.setenv("SKODUN_GROK_BIN", str(tmp_path / "no-bin" / "grok"))
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(tmp_path / "no-bin" / "codex"))
+
+
+# --------------------------------------------------------------------------
+# helpers: one call through each surface
+# --------------------------------------------------------------------------
+
+def _specs() -> dict:
+    return {s.name: s for s in mcpserver.default_registry()}
+
+
+def _tool(name: str, db: Path, **params) -> HandlerResult:
+    """Call one tool through the registry seam, exactly as the server does.
+
+    A fresh Store per call, from a factory, because that is the contract the
+    transport imposes: sqlite connections are thread-bound and the review tool
+    answers from another thread.
+    """
+    spec = _specs()[name]
+    return spec.handler(HandlerCall(params=params,
+                                    store_factory=lambda: Store.open(db),
+                                    cancel=threading.Event()))
+
+
+def _cli(argv: list[str], capsys) -> tuple[int, str]:
+    """`(code, stdout-as-the-tool-would-return-it)`.
+
+    `_emit` adds the trailing newline a terminal wants and the tool text does
+    not carry, so it is stripped here -- that is the ONLY difference the two
+    surfaces are allowed to have, and stripping it is what lets everything else
+    be compared as an exact string.
+    """
+    capsys.readouterr()
+    code = main(argv)
+    return code, capsys.readouterr().out.rstrip("\n")
+
+
+def _seeded(tmp_path: Path, *findings, review_id="rev1", **extra) -> Path:
+    db = tmp_path / "parity.db"
+    with Store.open(db) as st:
+        st.save_review(_artifact(list(findings) or [_finding()],
+                                 review_id=review_id, **extra))
+    return db
+
+
+def _lkey(file="a0.py", title="NPE 0", branch="feat", base_sha="s" * 40) -> str:
+    """The triage ledger's key for one finding. `triage_for` is keyed by FINDING
+    key and `triage_history` by LEDGER key; using the wrong one reads as "nothing
+    was ever recorded"."""
+    from skodun.textnorm import finding_key, ledger_key
+    return ledger_key(branch, base_sha, finding_key(file, title))
+
+
+def _both(db: Path, argv: list[str], tool: str, capsys,
+          **params) -> tuple[tuple[int, str], tuple[int, str]]:
+    """Run one refusal through both surfaces against the SAME store."""
+    cli = _cli(argv, capsys)
+    res = _tool(tool, db, **params)
+    return cli, (res.status, res.text)
+
+
+# ==========================================================================
+# the curated list
+# ==========================================================================
+
+def test_the_tool_list_is_exactly_the_review_loop_and_nothing_more():
+    """THE SNAPSHOT. A ninth tool must cost a failing test.
+
+    Every name here is a `skodun` subcommand's service. What is NOT here is the
+    point of the test: no bulk dismissal (a dismissal is a human naming ONE
+    finding), no `dispatch`/`worker`/`install-hooks`/`import-legacy`/
+    `shadow-compare`/`providers` (machinery and diagnostics, not review-loop
+    steps), and no tool that writes configuration or takes a store path.
+    """
+    assert [s.name for s in mcpserver.default_registry()] == EXPECTED_TOOLS
+
+
+def test_there_is_no_bulk_tool_of_any_kind():
+    """Named separately from the snapshot because it is the rule the snapshot
+    exists to protect, and a reader deleting the snapshot should still trip."""
+    for spec in mcpserver.default_registry():
+        assert not re.search(r"all|bulk|many|batch", spec.name), spec.name
+        # No tool takes a LIST of anything either: that is the other shape a
+        # bulk dismissal arrives in.
+        for prop in spec.input_schema["properties"].values():
+            assert prop.get("type") != "array", (spec.name, prop)
+
+
+def test_exactly_one_tool_is_long_running_and_it_is_review():
+    """Capacity 1 is a property of the design (Task 13), and `review` is the tool
+    that holds the foreground lock and spends minutes of model time."""
+    long_running = [s.name for s in mcpserver.default_registry() if s.long_running]
+    assert long_running == ["review"]
+
+
+def test_every_tool_carries_an_explicit_closed_schema_and_a_description():
+    """An `inputSchema` is what a client validates against and what an agent
+    reads. `additionalProperties: False` is load-bearing: a misspelled
+    `review_id` would otherwise be a well-formed call this server answers
+    "no such review: None" to, and the agent would go hunting for the review
+    instead of for its own typo."""
+    for spec in mcpserver.default_registry():
+        schema = spec.input_schema
+        assert schema["type"] == "object", spec.name
+        assert schema["additionalProperties"] is False, spec.name
+        assert isinstance(schema["required"], list), spec.name
+        assert set(schema["required"]) <= set(schema["properties"]), spec.name
+        for name, prop in schema["properties"].items():
+            assert "type" in prop, (spec.name, name)
+            assert prop.get("description"), (spec.name, name)
+        assert len(spec.description) > 40, spec.name
+
+
+def test_the_required_arguments_are_the_ones_without_a_default():
+    """A triage tool with an optional `review_id` would be a tool that dismisses
+    "whatever review it can find"."""
+    required = {s.name: set(s.input_schema["required"])
+                for s in mcpserver.default_registry()}
+    assert required["gate"] == set()            # `repo` defaults to the cwd
+    assert required["review"] == set()
+    assert required["log"] == set()
+    assert required["surface"] == set()
+    assert required["triage_list"] == {"review_id"}
+    assert required["triage_dismiss"] == {"review_id", "index", "reason"}
+    assert required["adopt_refuter"] == {"review_id", "index"}
+    assert required["triage_reopen"] == {"review_id", "index", "reason"}
+
+
+def test_the_prompts_are_the_two_static_ones():
+    prompts = mcpserver.default_prompts()
+    assert [p.name for p in prompts] == EXPECTED_PROMPTS
+    for p in prompts:
+        assert p.description and p.text.strip()
+        # STATIC: a prompt that interpolated a repo or a branch would be a second
+        # place those are decided, and the tools already take them as arguments.
+        assert "{" not in p.text and "%s" not in p.text
+
+
+def test_the_review_now_prompt_tells_the_agent_not_to_triage_anything():
+    """The one rule an agent most needs to know about this product: a dismissal
+    moves the gate and it is a human's decision, recorded with their reason."""
+    text = {p.name: p.text for p in mcpserver.default_prompts()}["review-now"]
+    assert "Do NOT dismiss" in text
+    assert "triage_list" in text
+
+
+def test_the_tool_list_reaches_a_client_over_the_wire(tmp_path):
+    """The snapshot again, through a real `skodun mcp` process, because
+    `default_registry()` being right is not the same as it being SERVED."""
+    payload = (
+        b'{"jsonrpc":"2.0","id":1,"method":"initialize",'
+        b'"params":{"protocolVersion":"2025-11-25"}}\n'
+        b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
+        b'{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n'
+        b'{"jsonrpc":"2.0","id":3,"method":"prompts/list"}\n')
+    p = subprocess.run([sys.executable, "-m", "skodun", "mcp"], input=payload,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       env=_env(tmp_path), timeout=120)
+    assert p.returncode == 0, p.stderr
+    lines = [json.loads(x) for x in p.stdout.decode().splitlines()]
+    tools = lines[1]["result"]["tools"]
+    assert [t["name"] for t in tools] == EXPECTED_TOOLS
+    for t in tools:
+        assert t["description"] and t["inputSchema"]["type"] == "object"
+    assert [x["name"] for x in lines[2]["result"]["prompts"]] == EXPECTED_PROMPTS
+
+
+def _env(tmp_path: Path) -> dict:
+    env = dict(os.environ)
+    env["SKODUN_DB"] = str(tmp_path / "mcp.db")
+    env["SKODUN_CONFIG"] = str(tmp_path / "absent-config.toml")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [_SRC] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    return env
+
+
+# ==========================================================================
+# one definition: the tools and the CLI call the same code
+# ==========================================================================
+
+def test_every_tool_handler_goes_through_the_services_module():
+    """The named mutation is "a divergent copy of `svc_gate` in `cli.py`".
+
+    Neither transport may contain review-loop logic. This is checked at the
+    SOURCE level because that is where a copy would appear: `cli.py` must not
+    import `gate`, `triage` or `delivery.surface` any more, and `mcpserver.py`
+    must not either -- both reach them only through `services`.
+    """
+    cli_src = (Path(skodun.__file__).parent / "cli.py").read_text(encoding="utf-8")
+    mcp_src = (Path(skodun.__file__).parent
+               / "mcpserver.py").read_text(encoding="utf-8")
+    # The DECISION functions, matched as BARE calls: `(?<![\w.])` is what lets
+    # `svc_adopt_refuter(...)` through while `adopt_refuter(...)` fails, which is
+    # exactly the distinction under test -- a transport may ROUTE to a decision,
+    # never make one. (`cli._cmd_providers` still imports `triage.shown_field`, a
+    # RENDERER for a diagnostic listing that is no part of the review loop, so the
+    # rule names the decisions rather than the module.)
+    decisions = ("run_gate", "run_review", "load_valid_artifact", "adopt_refuter",
+                 "dismiss", "reopen", "triage_state")
+    for name in decisions:
+        pattern = rf"(?<![\w.]){name}\s*\("
+        assert not re.search(pattern, cli_src), f"cli.py calls {name}()"
+        assert not re.search(pattern, mcp_src), f"mcpserver.py calls {name}()"
+    assert "from .gate import" not in cli_src and "from .gate import" not in mcp_src
+    for surface_src in (cli_src, mcp_src):
+        assert "services" in surface_src
+    # `delivery.surface` -- the renderer -- is reached through `svc_surface`; the
+    # CLI still calls `delivery.acknowledge`, which is the TRANSPORT's own job.
+    assert "delivery.surface(" not in cli_src
+    assert "delivery.surface(" not in mcp_src
+
+
+def test_the_gate_tool_and_the_gate_command_answer_identically(tmp_path,
+                                                              monkeypatch,
+                                                              capsys):
+    """The seam nothing else spans: two transports, one store, one decision.
+
+    A gate is the only thing in this product that a push is allowed to depend on,
+    so "the agent's gate" and "the human's gate" being the same gate is not a
+    nicety.
+    """
+    repo = _mkrepo(tmp_path)
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    db = tmp_path / "gate.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+
+    cli_code, cli_text = _cli(["gate", "--repo", str(repo)], capsys)
+    res = _tool("gate", db, repo=str(repo))
+
+    assert (res.status, res.text) == (cli_code, cli_text)
+    assert cli_code == 2, "an unreviewed change must fail closed on both surfaces"
+    assert "SKODUN GATE: FAIL(2)" in cli_text
+
+
+def test_the_log_tool_and_the_log_command_render_the_same_lines(tmp_path,
+                                                               monkeypatch,
+                                                               capsys):
+    db = _seeded(tmp_path, _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli_code, cli_text = _cli(["log"], capsys)
+    res = _tool("log", db)
+    assert (res.status, res.text) == (cli_code, cli_text)
+    assert "feat" in cli_text
+
+
+def test_the_triage_list_tool_and_the_command_render_the_same_listing(
+        tmp_path, monkeypatch, capsys):
+    db = _seeded(tmp_path, _finding(0, _annotation()), _finding(1))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli_code, cli_text = _cli(["triage", "--list", "rev1"], capsys)
+    res = _tool("triage_list", db, review_id="rev1")
+    assert (res.status, res.text) == (cli_code, cli_text)
+    assert "[0]" in cli_text and "refuter(" in cli_text
+
+
+def test_an_empty_listing_is_words_on_the_tool_surface_and_silence_on_the_cli(
+        tmp_path, monkeypatch, capsys):
+    """The ONE place the two surfaces deliberately differ, and why.
+
+    `skodun log` with an empty store prints nothing: a blank line is not an empty
+    listing, and a shell script counting lines must get zero. An agent handed an
+    empty tool result cannot tell "no reviews" from "the tool broke", so the tool
+    says so in words. Both exit 0 -- the DECISION is identical, only the
+    presentation of "nothing" differs.
+    """
+    db = tmp_path / "empty.db"
+    Store.open(db).close()
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli_code, cli_text = _cli(["log"], capsys)
+    res = _tool("log", db)
+    assert cli_code == 0 and cli_text == ""
+    assert res.status == 0 and "no reviews" in res.text
+
+
+# ==========================================================================
+# refusal parity, word for word
+# ==========================================================================
+
+@pytest.mark.parametrize("reason", ["fp", "false positive", "wontfix", "nope"])
+def test_a_placeholder_reason_is_refused_with_the_same_words_on_both_surfaces(
+        tmp_path, monkeypatch, capsys, reason):
+    """The audit floor is the product: a dismissal whose reason says nothing is a
+    silent dismissal with a receipt. An agent must not be able to get past it by
+    asking a different door."""
+    db = _seeded(tmp_path, _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "rev1", "0", reason], "triage_dismiss",
+                      capsys, review_id="rev1", index=0, reason=reason)
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 2 and "rejected" in cli[1]
+    with Store.open(db) as st:
+        assert st.triage_for("feat", "s" * 40) == {}, "a refusal recorded something"
+
+
+@pytest.mark.parametrize("verdict", ["confirmed", "uncertain"])
+def test_adopting_a_non_refuted_verdict_is_refused_identically(tmp_path,
+                                                               monkeypatch,
+                                                               capsys, verdict):
+    db = _seeded(tmp_path, _finding(0, _annotation(verdict=verdict)))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--adopt-refuter", "rev1", "0"],
+                      "adopt_refuter", capsys, review_id="rev1", index=0)
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 1, "a refusal about the ledger is a 1, not a 2"
+    assert verdict in cli[1]
+
+
+def test_adopting_a_thin_reasoning_is_refused_identically(tmp_path, monkeypatch,
+                                                          capsys):
+    db = _seeded(tmp_path, _finding(0, _annotation(reasoning=THIN, thin_reasoning=True)))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--adopt-refuter", "rev1", "0"],
+                      "adopt_refuter", capsys, review_id="rev1", index=0)
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 1
+
+
+def test_an_annotation_no_refuter_pass_stands_behind_is_refused_identically(
+        tmp_path, monkeypatch, capsys):
+    """The forged-annotation path: a FINDER can write a `refuter` key into its own
+    finding. Both surfaces refuse to act on it, with the same words."""
+    db = _seeded(tmp_path, _finding(0, _annotation()), extra_passes={})
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--adopt-refuter", "rev1", "0"],
+                      "adopt_refuter", capsys, review_id="rev1", index=0)
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 1 and "no refuter pass ran" in cli[1]
+
+
+@pytest.mark.parametrize("index", [1, 99])
+def test_an_out_of_range_index_is_refused_identically(tmp_path, monkeypatch,
+                                                      capsys, index):
+    db = _seeded(tmp_path, _finding(0, _annotation()))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--adopt-refuter", "rev1", str(index)],
+                      "adopt_refuter", capsys, review_id="rev1", index=index)
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 2, "no such finding: the command never had an opinion"
+
+
+def test_an_unknown_review_is_refused_identically(tmp_path, monkeypatch, capsys):
+    db = _seeded(tmp_path, _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--list", "nope"], "triage_list", capsys,
+                      review_id="nope")
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 2 and "no such review" in cli[1]
+
+
+def test_an_unauditable_reopen_reason_is_refused_identically(tmp_path,
+                                                             monkeypatch,
+                                                             capsys):
+    """A reopen moves the gate from 0 back to 1, so it clears the same floor."""
+    from skodun.triage import dismiss
+
+    db = _seeded(tmp_path, _finding(0))
+    with Store.open(db) as st:
+        dismiss(st, st.get_review("rev1"), 0, GOOD_REASON,
+                now="2026-07-27T10:00:00Z")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--reopen", "rev1", "0", "fp"],
+                      "triage_reopen", capsys, review_id="rev1", index=0,
+                      reason="fp")
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 1
+
+
+def test_reopening_a_finding_that_is_not_dismissed_is_refused_identically(
+        tmp_path, monkeypatch, capsys):
+    db = _seeded(tmp_path, _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--reopen", "rev1", "0", GOOD_REASON],
+                      "triage_reopen", capsys, review_id="rev1", index=0,
+                      reason=GOOD_REASON)
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 1
+
+
+def test_a_missing_index_is_refused_with_the_services_usage_string(tmp_path,
+                                                                  monkeypatch,
+                                                                  capsys):
+    """The two surfaces reach this refusal by different roads -- argparse for the
+    CLI, the handler's own check for the tool -- and land on the SAME string,
+    because it lives in `services` and neither of them owns it."""
+    db = _seeded(tmp_path, _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli_code, cli_text = _cli(["triage", "--reopen", "rev1"], capsys)
+    res = _tool("triage_reopen", db, review_id="rev1", index=0)
+    assert cli_code == 2 and cli_text == services.TRIAGE_REOPEN_USAGE
+    assert res.status == 2 and res.text == services.TRIAGE_REOPEN_USAGE, res.text
+    # An ABSENT reason is the service's refusal, not the handler's: that is what
+    # keeps the two surfaces on the same string. A reason that is present but of
+    # the wrong type is the handler's, and argparse cannot produce that shape.
+    dismiss = _tool("triage_dismiss", db, review_id="rev1", index=0)
+    assert dismiss.text == services.TRIAGE_DISMISS_USAGE, dismiss.text
+
+
+def test_a_tool_argument_of_the_wrong_type_is_a_message_never_a_traceback(
+        tmp_path):
+    """`inputSchema` is advisory -- this server does not validate against it -- so
+    every handler checks its own arguments. A `TypeError` here would be a client
+    waiting forever for a response that became a stderr traceback."""
+    db = _seeded(tmp_path, _finding(0))
+    for name, params in [
+            ("triage_list", {"review_id": 7}),
+            ("triage_list", {}),
+            ("adopt_refuter", {"review_id": "rev1", "index": "zero"}),
+            ("adopt_refuter", {"review_id": "rev1", "index": True}),
+            ("triage_dismiss", {"review_id": "rev1", "index": None,
+                                "reason": GOOD_REASON}),
+            ("log", {"limit": "lots"}),
+            ("surface", {"hook_format": "yaml"}),
+            # Found by probing, not by inspection: a LIST reason reached
+            # `store.record_triage_event` and came back as
+            # `sqlite3.ProgrammingError: Error binding parameter 11`, which the
+            # transport would hand the agent as its tool text.
+            ("triage_dismiss", {"review_id": "rev1", "index": 0,
+                                "reason": ["a", "b"]}),
+            ("triage_reopen", {"review_id": "rev1", "index": 0, "reason": 7}),
+    ]:
+        res = _tool(name, db, **params)
+        assert res.status == 2, (name, params, res)
+        assert res.text and "Traceback" not in res.text, (name, res.text)
+        assert "Error binding" not in res.text, (name, res.text)
+    # ...and nothing any of them touched was recorded.
+    with Store.open(db) as st:
+        assert st.triage_for("feat", "s" * 40) == {}
+
+
+def test_a_non_positive_log_limit_is_refused_identically(tmp_path, monkeypatch,
+                                                        capsys):
+    db = _seeded(tmp_path, _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["log", "-n", "0"], "log", capsys, limit=0)
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 2 and "positive" in cli[1]
+
+
+# ==========================================================================
+# the decisions that DO record something
+# ==========================================================================
+
+def test_a_dismissal_through_the_tool_records_and_moves_the_gate_exactly_as_the_cli(
+        tmp_path, monkeypatch, capsys):
+    """Parity where it costs something: the same ledger row, from either door.
+
+    Run separately against two identical stores rather than twice against one,
+    because the second dismissal of the same finding is a different question.
+    """
+    cli_db = _seeded(tmp_path / "a", _finding(0))
+    tool_db = _seeded(tmp_path / "b", _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(cli_db))
+
+    cli_code, cli_text = _cli(["triage", "rev1", "0", GOOD_REASON], capsys)
+    res = _tool("triage_dismiss", tool_db, review_id="rev1", index=0,
+                reason=GOOD_REASON)
+
+    assert (res.status, res.text) == (cli_code, cli_text)
+    assert cli_code == 0
+    for db in (cli_db, tool_db):
+        with Store.open(db) as st:
+            state = st.triage_for("feat", "s" * 40)
+            assert len(state) == 1, db
+            history = st.triage_history(_lkey())
+            assert [h["event"] for h in history] == ["dismiss"]
+            assert history[-1]["reason"] == GOOD_REASON, "stored verbatim"
+
+
+def test_adopting_through_the_tool_stores_the_refuters_own_words(tmp_path):
+    """The reason is SYNTHESIZED from the annotation, so the tool has no `reason`
+    argument at all -- an agent cannot author a dismissal reason here and
+    attribute it to a model."""
+    db = _seeded(tmp_path, _finding(0, _annotation()))
+    assert "reason" not in _specs()["adopt_refuter"].input_schema["properties"]
+    res = _tool("adopt_refuter", db, review_id="rev1", index=0)
+    assert res.status == 0, res.text
+    with Store.open(db) as st:
+        assert len(st.triage_for("feat", "s" * 40)) == 1
+        reason = st.triage_history(_lkey())[-1]["reason"]
+    assert "refuter" in reason and "model-x" in reason, reason
+
+
+def test_a_reopen_through_the_tool_is_append_only(tmp_path):
+    from skodun.triage import dismiss
+
+    db = _seeded(tmp_path, _finding(0))
+    with Store.open(db) as st:
+        dismiss(st, st.get_review("rev1"), 0, GOOD_REASON,
+                now="2026-07-27T10:00:00Z")
+    res = _tool("triage_reopen", db, review_id="rev1", index=0,
+                reason="the guard was deleted in the refactor and this crashes")
+    assert res.status == 0, res.text
+    with Store.open(db) as st:
+        assert st.triage_for("feat", "s" * 40) == {}, "the finding is open again"
+        assert [h["event"] for h in st.triage_history(_lkey())] == \
+            ["dismiss", "reopen"]
+
+
+# ==========================================================================
+# surface: the acknowledgement is the transport's, after its own write
+# ==========================================================================
+
+def _round_db(tmp_path: Path, *records) -> Path:
+    """A store holding undelivered background rounds. `_loud_round` and
+    `_surface_db` are `test_cli.py`'s own fixtures, imported rather than
+    re-spelled: a round shaped differently from the one the CLI's surface tests
+    use would make the parity assertions below prove nothing."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    return _surface_db(tmp_path, *(records or (_loud_round(),)))
+
+
+def _rpc(method: str, id_=None, **params) -> bytes:
+    msg = {"jsonrpc": "2.0", "method": method}
+    if id_ is not None:
+        msg["id"] = id_
+    if params:
+        msg["params"] = params
+    return json.dumps(msg).encode("utf-8") + b"\n"
+
+
+_HANDSHAKE = (_rpc("initialize", 100, protocolVersion="2025-11-25")
+              + _rpc("notifications/initialized"))
+
+
+class _Recorder:
+    """A binary stdout that can be told to fail from the Nth write or flush on.
+
+    FROM THE Nth, not always, and that is the whole point of the counters: a
+    stream that fails on its FIRST flush loses the handshake, the read loop stops,
+    and the tool under test never runs at all -- a test written that way passes
+    whatever the acknowledgement order is. `from_=2` lets the handshake through
+    and kills the TOOL RESULT's write, which is the only interesting moment.
+    """
+
+    def __init__(self, *, fail_write_from=None, fail_flush_from=None):
+        self.chunks: list[bytes] = []
+        self.writes = 0
+        self.flushes = 0
+        self.fail_write_from = fail_write_from
+        self.fail_flush_from = fail_flush_from
+
+    def write(self, data) -> int:
+        self.writes += 1
+        if self.fail_write_from is not None and self.writes >= self.fail_write_from:
+            raise BrokenPipeError(32, "Broken pipe")
+        self.chunks.append(bytes(data))
+        return len(data)
+
+    def flush(self) -> None:
+        self.flushes += 1
+        if self.fail_flush_from is not None and self.flushes >= self.fail_flush_from:
+            raise BrokenPipeError(32, "Broken pipe")
+
+    @property
+    def data(self) -> bytes:
+        return b"".join(self.chunks)
+
+
+def _serve(db: Path, payload: bytes, out: _Recorder) -> int:
+    server = McpServer(
+        registry=mcpserver.default_registry(),
+        prompts=mcpserver.default_prompts(),
+        stdin=io.BytesIO(payload), stdout=out, stderr=io.StringIO(),
+        store_factory=lambda: Store.open(db))
+    return server.serve()
+
+
+#: `test_cli.py`'s own ledger reader, so both surfaces' delivery assertions are
+#: made against one definition of "what the ledger says".
+_delivered = _delivery_rows
+
+
+def test_the_surface_tool_delivers_a_round_and_acknowledges_it_as_mcp(tmp_path):
+    db = _round_db(tmp_path)
+    out = _Recorder()
+    code = _serve(db, _HANDSHAKE + _rpc("tools/call", 1, name="surface",
+                                        arguments={"branch": "feat"}), out)
+    assert code == 0
+    body = json.loads(out.data.decode().splitlines()[1])
+    assert body["result"]["isError"] is False
+    assert "NPE 0" in body["result"]["content"][0]["text"]
+    assert _delivered(db) == [("sk_1", "mcp")], (
+        "the round was not acknowledged under this transport's own channel")
+
+
+def test_a_flush_that_raises_leaves_the_round_undelivered(tmp_path):
+    """THE ORDER IS THE PRODUCT. A report acknowledged before the flush would be
+    recorded as delivered and never shown again -- the undelivered-findings
+    failure the ledger exists to remove, reintroduced by the fix. A crash between
+    the flush and the ack re-delivers instead, which is the designed direction.
+
+    The flush is what this test attacks rather than the write, because a buffered
+    write that "succeeded" is exactly the mistake: bytes in a buffer have not
+    reached a reader.
+    """
+    db = _round_db(tmp_path)
+    # The handshake's flush succeeds; the TOOL RESULT's flush raises. Anything
+    # simpler loses the handshake and never reaches the tool.
+    out = _Recorder(fail_flush_from=2)
+    code = _serve(db, _HANDSHAKE + _rpc("tools/call", 1, name="surface",
+                                        arguments={"branch": "feat"}), out)
+    assert code == 0
+    assert out.flushes >= 2, "the tool result was never even attempted"
+    assert _delivered(db) == [], (
+        "the round was acknowledged from a buffer that never reached the client")
+
+
+def test_a_write_that_raises_leaves_the_round_undelivered(tmp_path):
+    db = _round_db(tmp_path)
+    out = _Recorder(fail_write_from=2)      # the handshake lands; the report does not
+    _serve(db, _HANDSHAKE + _rpc("tools/call", 1, name="surface",
+                                 arguments={"branch": "feat"}), out)
+    assert out.writes >= 2, "the tool result was never even attempted"
+    assert _delivered(db) == []
+
+
+def test_a_quiet_round_is_acknowledged_by_the_service_not_by_the_transport(
+        tmp_path):
+    """A trustworthy round with zero findings renders NOTHING, so there is nothing
+    a write could lose: `delivery.surface` acknowledges it immediately under the
+    `quiet` channel, and it never appears in `pending_acks`. That is why an
+    empty report is still progress rather than a round re-scanned forever."""
+    db = _round_db(tmp_path / "quiet", _round())     # clean, zero findings
+    res = _tool("surface", db, branch="feat")
+    assert res.pending_acks == []
+    assert _delivered(db) == [("sk_1", "quiet")]
+    assert "no undelivered" in res.text
+
+
+def test_the_surface_tool_reports_nothing_to_report_in_words(tmp_path):
+    db = tmp_path / "none.db"
+    Store.open(db).close()
+    res = _tool("surface", db, branch="feat")
+    assert res.status == 0
+    assert res.text == services.surface_no_rounds_note("feat")
+    assert res.pending_acks == []
+
+
+def test_all_four_delivery_channels_are_reachable_and_persisted(tmp_path,
+                                                               monkeypatch,
+                                                               capsys):
+    """`cli-text`, `cli-claude`, `mcp`, `quiet` -- every value in
+    `delivery.CHANNELS`, each written by the surface that owns it."""
+    seen = {}
+    for fmt, channel in (("text", "cli-text"), ("claude", "cli-claude")):
+        db = _round_db(tmp_path / f"cli-{fmt}")
+        monkeypatch.setenv("SKODUN_DB", str(db))
+        assert main(["surface", "--branch", "feat", "--hook-format", fmt]) == 0
+        capsys.readouterr()
+        seen[channel] = _delivered(db)
+
+    db = _round_db(tmp_path / "mcp")
+    out = _Recorder()
+    _serve(db, _HANDSHAKE + _rpc("tools/call", 1, name="surface",
+                                 arguments={"branch": "feat"}), out)
+    seen["mcp"] = _delivered(db)
+
+    quiet_db = _round_db(tmp_path / "quiet2", _round())
+    _tool("surface", quiet_db, branch="feat")
+    seen["quiet"] = _delivered(quiet_db)
+
+    assert {c: rows[0][1] for c, rows in seen.items()} == {
+        "cli-text": "cli-text", "cli-claude": "cli-claude", "mcp": "mcp",
+        "quiet": "quiet"}
+    assert set(seen) == delivery.CHANNELS
+
+
+def test_the_surface_tool_and_the_surface_command_render_the_same_report(
+        tmp_path, monkeypatch, capsys):
+    cli_db = _round_db(tmp_path / "a")
+    tool_db = _round_db(tmp_path / "b")
+    monkeypatch.setenv("SKODUN_DB", str(cli_db))
+    capsys.readouterr()
+    assert main(["surface", "--branch", "feat"]) == 0
+    cli_text = capsys.readouterr().out
+    res = _tool("surface", tool_db, branch="feat")
+    assert res.text == cli_text
+    assert res.pending_acks == ["sk_1"]
+
+
+# ==========================================================================
+# review: one at a time, and cancellable end to end
+# ==========================================================================
+
+def test_a_second_review_call_is_refused_while_one_is_in_flight(tmp_path):
+    """Capacity 1, with the REAL review tool behind it.
+
+    Two foreground reviews would race for the foreground lock, and the loser
+    would sit in a lock wait for the whole stale ceiling. Refused, not queued: a
+    queued review would review a working tree that has moved by the time it runs.
+    """
+    started, release = threading.Event(), threading.Event()
+    shipped = mcpserver.default_registry()          # ONE tuple: `is` must match
+    real = {s.name: s for s in shipped}["review"].handler
+
+    def slow(call):
+        """The shipped review handler, held open so the second call has something
+        to be refused by. The handler itself is real -- what is faked is only the
+        moment it finishes."""
+        started.set()
+        release.wait(30)
+        return real(call)
+
+    registry = tuple(
+        mcpserver.HandlerSpec(name=s.name, long_running=s.long_running,
+                              input_schema=s.input_schema,
+                              handler=slow if s.name == "review" else s.handler,
+                              description=s.description)
+        for s in shipped)
+
+    db = tmp_path / "busy.db"
+    Store.open(db).close()
+    reader, writer = os.pipe()
+    out = _Recorder()
+    server = McpServer(registry=registry, stdin=os.fdopen(reader, "rb"),
+                       stdout=out, stderr=io.StringIO(),
+                       store_factory=lambda: Store.open(db))
+    box: dict = {}
+    t = threading.Thread(target=lambda: box.setdefault("code", server.serve()),
+                         daemon=True)
+    t.start()
+    try:
+        with os.fdopen(writer, "wb", buffering=0) as w:
+            w.write(_HANDSHAKE)
+            w.write(_rpc("tools/call", 1, name="review",
+                         arguments={"repo": str(tmp_path)}))
+            assert started.wait(30), "the review never started"
+            w.write(_rpc("tools/call", 2, name="review",
+                         arguments={"repo": str(tmp_path)}))
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                ids = [json.loads(x).get("id")
+                       for x in out.data.decode().splitlines()]
+                if 2 in ids:
+                    break
+                time.sleep(0.02)
+            busy = [json.loads(x) for x in out.data.decode().splitlines()
+                    if json.loads(x).get("id") == 2]
+            assert busy, "the second review was queued instead of refused"
+            assert busy[0]["result"]["isError"] is True
+            assert busy[0]["result"]["content"][0]["text"] == mcpserver.BUSY_TEXT
+            assert busy[0]["result"]["structuredContent"]["status"] == 2
+            release.set()
+    finally:
+        release.set()
+        t.join(timeout=60)
+    assert not t.is_alive()
+    assert box.get("code") == 0
+
+
+# --- the end-to-end cancellation drill ------------------------------------
+
+_HANG_BODY = """\
+python3 -c "import os; open('$D/started.pgid','w').write(str(os.getpgid(0)))"
+trap '' TERM
+sleep 300
+"""
+
+CFG = """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "grok-4.20-0309-reasoning"
+role = "finder"
+"""
+
+
+def _hang_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """A repo with an outgoing change and a fake grok that hangs mid-review."""
+    from tests.test_pipeline import _fake_grok
+
+    _fake_grok(tmp_path, _HANG_BODY)
+    repo = _mkrepo(tmp_path)
+    (repo / ".skodun.toml").write_text(CFG, encoding="utf-8")
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    return repo, tmp_path / "bin"
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:                 # pragma: no cover
+        return True
+    return True
+
+
+def test_closing_stdin_cancels_the_review_in_flight_end_to_end(tmp_path):
+    """THE DRILL. A real `skodun mcp` process, a real review, and a closed stdin.
+
+    Every link in the chain is exercised exactly once here and nowhere else:
+    stdin EOF -> the server sets the token -> `svc_review` -> `run_review`'s pass
+    boundaries -> `chain.run_chain` -> the watchdog tick loop, which is the only
+    layer holding the provider's process group. Then back out: the pipeline's
+    `finally` demotes the record and releases the lock, the server JOINS the
+    review thread, and the process exits 0.
+
+    The four assertions are the four ways this fails in production: the process
+    hangs (or exits non-zero, which every client harness reports as a crashed
+    server), the record is left `running` for a stale sweep to find a whole budget
+    later, the foreground lock is left behind so the next review waits out the
+    ceiling, or the model keeps burning quota on a review nobody will read.
+    """
+    from skodun.gitio import git_common_dir
+
+    repo, bindir = _hang_repo(tmp_path)
+    env = _env(tmp_path)
+    env["SKODUN_GROK_BIN"] = str(bindir / "grok")
+    env["SKODUN_ALLOW_MAIN"] = "1"
+    env["SKODUN_SECURITY_PASS"] = "0"
+    env["SKODUN_SKEPTIC_PASS"] = "0"
+    env["SKODUN_LOCK_WAIT_SECONDS"] = "5"
+    env["SKODUN_LOCK_POLL_SECONDS"] = "0.05"
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "skodun", "mcp"], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+        start_new_session=True)
+    pgid_file = bindir / "started.pgid"
+    try:
+        proc.stdin.write(_HANDSHAKE)
+        proc.stdin.write(_rpc("tools/call", 1, name="review",
+                              arguments={"repo": str(repo)}))
+        proc.stdin.flush()
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and not pgid_file.exists():
+            assert proc.poll() is None, "the server exited before reviewing"
+            time.sleep(0.05)
+        assert pgid_file.exists(), "the provider never started"
+        pgid = int(pgid_file.read_text(encoding="utf-8").strip())
+
+        proc.stdin.close()                  # EOF, with a review in flight
+        # `wait` + `read`, never `communicate()`: `communicate` flushes stdin,
+        # which we have deliberately closed. Both streams are tiny (one handshake
+        # reply, one tool result, a few progress lines), so no pipe can fill.
+        rc = proc.wait(timeout=120)
+        out, err = proc.stdout.read(), proc.stderr.read()
+    finally:
+        if proc.poll() is None:             # pragma: no cover - defensive
+            proc.kill()
+            proc.wait(timeout=30)
+        proc.stdout.close()
+        proc.stderr.close()
+
+    assert rc == 0, err.decode()
+
+    assert b"Traceback" not in err, err.decode()
+    # Whatever came back on stdout is still nothing but JSON-RPC.
+    for line in out.decode().splitlines():
+        assert json.loads(line)["jsonrpc"] == "2.0"
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and _group_alive(pgid):
+        time.sleep(0.05)
+    assert not _group_alive(pgid), (
+        "the model CLI outlived the cancelled review, still spending quota")
+
+    with Store.open(Path(env["SKODUN_DB"])) as st:
+        rows = st.list_reviews(None, 10)
+    assert len(rows) == 1, rows
+    assert rows[0]["status"] == "failed", rows[0]
+    assert rows[0]["trustworthy"] is False
+    assert not (git_common_dir(repo) / "grok-reviews-foreground.lock").exists(), \
+        "the cancelled review kept the foreground lock"
+
+
+def test_the_server_joins_the_review_thread_before_exiting(tmp_path):
+    """Skipping the join is a named mutation, and this is the test it dies on.
+
+    Abandoning the thread makes the process exit sooner and leaves the review
+    mid-write: a `running` row, a held lock, and an orphaned provider group. The
+    ORDERING is what is asserted -- the review's own record must be terminal by
+    the time the process is gone, which is only true if the exit waited for it.
+    """
+    from skodun.gitio import git_common_dir
+
+    repo, bindir = _hang_repo(tmp_path)
+    env = _env(tmp_path)
+    env["SKODUN_GROK_BIN"] = str(bindir / "grok")
+    env["SKODUN_ALLOW_MAIN"] = "1"
+    env["SKODUN_LOCK_WAIT_SECONDS"] = "5"
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "skodun", "mcp"], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+        start_new_session=True)
+    try:
+        proc.stdin.write(_HANDSHAKE)
+        proc.stdin.write(_rpc("tools/call", 1, name="review",
+                              arguments={"repo": str(repo)}))
+        proc.stdin.flush()
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and not (bindir / "started.pgid").exists():
+            assert proc.poll() is None
+            time.sleep(0.05)
+        proc.stdin.close()
+        assert proc.wait(timeout=120) == 0, proc.stderr.read().decode()
+    finally:
+        if proc.poll() is None:             # pragma: no cover - defensive
+            proc.kill()
+            proc.wait(timeout=30)
+        proc.stdout.close()
+        proc.stderr.close()
+
+    # THE INSTANT the process is gone, everything the review owned is already
+    # settled. No polling here, deliberately: a wait would hide the race.
+    with Store.open(Path(env["SKODUN_DB"])) as st:
+        rows = st.list_reviews(None, 10)
+    assert rows and rows[0]["status"] == "failed", rows
+    assert not (git_common_dir(repo) / "grok-reviews-foreground.lock").exists()
+
+
+def test_the_review_handler_returns_a_result_for_a_cancellation_never_raises(
+        tmp_path, monkeypatch):
+    """The review thread catches `ReviewCancelled` the way the worker does.
+
+    It does so by delegating: `svc_review` maps it to `(4, banner_failure("review
+    cancelled"))`, so the handler returns an ordinary tool result. That matters
+    because the alternative is a RAISING handler -- which the transport does turn
+    into a status-2 tool error, but as a net, not as an interface: the agent would
+    read "the tool failed: ReviewCancelled(...)" instead of a verdict line, and the
+    status would say "nothing ran" about a review that may have spent three model
+    calls.
+    """
+    repo = _mkrepo(tmp_path)
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    (repo / ".skodun.toml").write_text(CFG, encoding="utf-8")
+    # The primary-checkout refusal fires BEFORE the first cancellation checkpoint
+    # and would report 2 instead, proving nothing about cancellation.
+    monkeypatch.setenv("SKODUN_ALLOW_MAIN", "1")
+
+    spec = _specs()["review"]
+    cancelled = threading.Event()
+    cancelled.set()                     # cancelled before it even starts
+    res = spec.handler(HandlerCall(
+        params={"repo": str(repo)},
+        store_factory=lambda: Store.open(tmp_path / "c.db"),
+        cancel=cancelled))
+
+    assert isinstance(res, HandlerResult)
+    assert res.status == 4, res.text
+    assert res.text == ("SKODUN VERDICT: trustworthy=false "
+                        "reason=review cancelled"), res.text
+    with Store.open(tmp_path / "c.db") as st:
+        assert st.list_reviews(None, 10) == [], (
+            "a review cancelled before it started left a record behind")
+
+
+def test_a_review_of_a_directory_that_is_not_a_repository_is_a_tool_error(
+        tmp_path):
+    """The ordinary misuse an agent will actually commit: a wrong `repo`. It is a
+    readable refusal with the verdict banner the CLI would print, not a
+    traceback and not a protocol error."""
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    db = tmp_path / "r.db"
+    res = _tool("review", db, repo=str(plain))
+    assert res.status == 2, res.text
+    assert res.text.startswith("SKODUN VERDICT: trustworthy=false reason=")
+    assert "no review ran" in res.text
+
+
+def test_the_review_tool_returns_the_verdict_banner_the_cli_prints(tmp_path,
+                                                                  monkeypatch,
+                                                                  capsys):
+    """The banner is `trust.banner(record)` on both surfaces, from the one
+    definition -- the pipeline no longer prints it anywhere."""
+    from tests.test_pipeline import CLEAN, _emit, _fake_grok
+
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _mkrepo(tmp_path)
+    (repo / ".skodun.toml").write_text(CFG, encoding="utf-8")
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    monkeypatch.setenv("SKODUN_GROK_BIN", str(tmp_path / "bin" / "grok"))
+    monkeypatch.setenv("SKODUN_ALLOW_MAIN", "1")
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "0")
+    monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "0")
+    monkeypatch.setenv("SKODUN_LOCK_WAIT_SECONDS", "5")
+    monkeypatch.setenv("SKODUN_LOCK_POLL_SECONDS", "0.05")
+
+    db = tmp_path / "review.db"
+    res = _tool("review", db, repo=str(repo))
+    assert res.status == 0, res.text
+    assert res.text.startswith("SKODUN VERDICT: trustworthy=true findings=0")
+
+    # ...and the CLI, on its own store, prints exactly that shape as its last
+    # stdout line.
+    (repo / "a.txt").write_text("three\n", encoding="utf-8")
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "cli-review.db"))
+    capsys.readouterr()
+    assert main(["review", "--repo", str(repo)]) == 0
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    assert last.startswith("SKODUN VERDICT: trustworthy=true findings=0")
+
+
+def test_a_malformed_repo_is_refused_rather_than_defaulted_to_the_cwd(tmp_path):
+    """The asymmetry is the point, and it is a fail-closed argument.
+
+    An ABSENT `repo` means "here", which for a client-spawned server is the
+    project it was spawned in. A repo of the wrong TYPE is a client that ignored
+    its own schema, and defaulting it would answer a gate question ABOUT A
+    DIFFERENT DIRECTORY than the one that was asked about -- a PASS for content
+    nobody asked about is the one outcome this product exists to make impossible.
+    """
+    db = _seeded(tmp_path, _finding(0))
+    for name in ("gate", "review", "surface"):
+        for bad in (["x"], 7, "", "   "):
+            res = _tool(name, db, repo=bad)
+            assert res.status == 2, (name, bad, res)
+            assert "repo must be a path" in res.text, (name, bad, res.text)
+    # ...while an absent repo really does mean the cwd, on every one of them.
+    assert _tool("gate", db).status == 2      # the cwd is not reviewed either
+    assert "repo must be a path" not in _tool("gate", db).text

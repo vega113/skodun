@@ -91,6 +91,29 @@ def _cancelled(cancel: "threading.Event | None") -> bool:
         return False
 
 
+def _sleep_or_cancelled(cancel: "threading.Event | None", seconds: float) -> bool:
+    """Wait up to `seconds`, returning True if the token became set. Never raises.
+
+    The difference from `time.sleep` is the only reason it exists: a waiter that
+    sleeps on the CLOCK notices a cancellation one whole tick late, and the
+    foreground lock's tick is the poll interval — tens of seconds by default.
+    Waiting on the EVENT returns the instant it is set, so an MCP client's EOF
+    aborts a lock wait in milliseconds rather than at the next poll.
+
+    An Event-shaped-but-not token (a `Mock`, a stale proxy) falls back to a plain
+    sleep and reports NOT cancelled, exactly as `_cancelled` does: an unreadable
+    token must never abort a review nobody asked to stop.
+    """
+    if cancel is None:
+        time.sleep(seconds)
+        return False
+    try:
+        return bool(cancel.wait(seconds))
+    except BaseException:       # pragma: no cover - defensive
+        time.sleep(seconds)
+        return False
+
+
 @dataclass(frozen=True)
 class RunResult:
     rc: int
