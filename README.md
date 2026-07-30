@@ -450,6 +450,30 @@ There is deliberately no `dispatch`, `worker`, `install-hooks`, `import-legacy`,
 `dismiss_all`/`adopt_all`): those are either machinery a human runs, or decisions
 a human makes one finding at a time.
 
+### Upgrading a running server
+
+**A running server keeps serving the build it started with.** Every tool call
+opens its own store connection, so data is always current — but the Python
+modules were loaded once, at startup. Upgrade skodun (or edit it, in a source
+checkout) and the server in your agent's config goes on running the old code
+until the client restarts it, silently: no error, no warning, just an older
+reviewer than you think you have.
+
+So after upgrading, restart the client's MCP connection (in Claude Code, reload
+the session or the server entry; in Codex, start a new `codex` run). To confirm
+which build you actually reached, read `serverInfo.version` from the
+`initialize` response — it is `skodun.__version__`, the same string
+`skodun --version` prints, and a test pins it to the version declared in
+`pyproject.toml` so the three can never disagree:
+
+```
+$ printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"check","version":"0"}}}' | skodun mcp
+{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-06-18",...,"serverInfo":{"name":"skodun","version":"0.3.0"}}}
+```
+
+If that version is not the one you just installed, the client is still holding
+the old process.
+
 ### Claude Code
 
 ```

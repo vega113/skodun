@@ -2579,3 +2579,35 @@ def test_the_hook_format_choices_are_the_delivery_modules_own(tmp_path):
     assert len(formats) == 1, formats
     assert tuple(formats[0].choices) == tuple(delivery.FORMATS)
     assert formats[0].default == delivery.TEXT
+
+
+def test_the_declared_package_version_matches_the_one_the_code_reports():
+    """`pyproject.toml`'s version and `skodun.__version__` are two hand-written
+    literals, and NOTHING else makes them agree.
+
+    They matter separately and are read by different people: `pyproject` is what
+    a wheel is stamped with and what `pip show skodun` reports, while
+    `__version__` is what `skodun --version` prints and -- the reason this is
+    worth a test rather than a convention -- what the MCP server hands a client
+    as `serverInfo.version`. That field is the ONLY way a connected agent can
+    tell which build it is talking to, so a drift here does not fail loudly; it
+    makes every client quietly believe an old build is a new one, or the
+    reverse.
+
+    Pinned rather than derived on purpose: making `pyproject` compute the
+    version from the module (hatchling's `[tool.hatch.version]`) would remove the
+    duplication, but that is a build-system change this suite cannot verify --
+    `hatchling` is a build-time dependency and is not importable here, so a
+    broken `dynamic = ["version"]` would only surface when someone tried to
+    package a release. One literal each plus this equality is the version that
+    fails HERE, immediately, in a checkout with nothing installed.
+    """
+    import tomllib
+
+    root = Path(__file__).resolve().parents[1]
+    with open(root / "pyproject.toml", "rb") as handle:
+        declared = tomllib.load(handle)["project"]["version"]
+    assert declared == skodun.__version__, (
+        f"pyproject.toml declares {declared!r} but skodun.__version__ is "
+        f"{skodun.__version__!r}; a client reading the MCP server's "
+        f"serverInfo.version would be told the wrong build")
