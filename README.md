@@ -23,14 +23,17 @@ semantics:
 ## Status
 
 **Phase 1 is implemented and running in shadow mode; Phase 2 adds multi-provider
-review, quota-fallback chains, and cross-provider refutation on top of it.** Here is
-the honest scope:
+review, quota-fallback chains, and cross-provider refutation on top of it; Phase 3
+adds a pre-push dispatcher with background review, its delivery surface, and an MCP
+server for agent harnesses.** Here is the honest scope:
 
 - What exists: three registered provider adapters (`xai` driving `grok`, `openai`
   driving `codex`, `google` driving `agy`), per-reviewer quota-fallback chains, an
-  annotation-only refuter pass, the seven subcommands below, the SQLite store, the
+  annotation-only refuter pass, the twelve subcommands below, the SQLite store, the
   gate, the triage ledger, a one-shot importer for the archive of the previous
-  implementation, and a shadow comparison used to check the two against each other.
+  implementation, a shadow comparison used to check the two against each other, a
+  pre-push dispatcher with a detached background worker and a delivery ledger
+  (`skodun surface`), and a stdio MCP server (`skodun mcp`).
 - What does not: an `anthropic` adapter is declared nowhere in the registry — it is
   not shipped, so do not configure a reviewer with `provider = "anthropic"` and
   expect it to run (`skodun providers` will report it `FAILED` and exit `1`). This
@@ -38,8 +41,8 @@ the honest scope:
   headlessly bills as API usage rather than drawing on a Claude subscription, and
   the whole premise of skodun is reusing the CLI subscriptions you already pay for.
   An adapter that quietly moves a user onto metered API billing would work against
-  that. See "Why there is no `anthropic` adapter" below. There is also still no MCP
-  server, no scheduling, and no git hooks.
+  that. See "Why there is no `anthropic` adapter" below. There is also still no
+  scheduling.
 - Shadow mode means exactly what it says: `shadow-compare` is observational, always
   exits `0`, and blocks nothing. skodun is being watched against the tool it is
   meant to replace, not yet trusted in its place.
@@ -68,6 +71,11 @@ Background:
 | `skodun log [--branch B] [-n N]` | Recent reviews, newest first, one line each; untrustworthy rows are marked `!`. | `0` / `2` (bad `-n`, or the store could not be read). |
 | `skodun import-legacy [--repo DIR] [--dir ARCHIVE]` | One-shot migration of a legacy `.grok-reviews` archive into the store. Idempotent. Anything it cannot fully verify is imported *demoted* rather than trusted, and every counter is printed. | `0` ok (including "nothing to import") · `2` the importer could not run or a store write failed partway. |
 | `skodun shadow-compare [--dir ARCHIVE] [--diff-hash H] [--since TS]` | Compare skodun's verdicts against that archive's, hash by hash, and print a table plus a summary. `--since` restricts the comparison, on both sides, to rows reviewed at or after a canonical UTC timestamp — exactly `%Y-%m-%dT%H:%M:%SZ` (e.g. `2026-07-28T12:00:00Z`); any other shape is rejected before anything runs. | Observational: always `0`, **except** a malformed `--since`, which is a usage error and exits `2` before any comparison happens. |
+| `skodun install-hooks [--repo DIR] [--force]` | Install (or re-install) the pre-push shim into this repository's real hooks directory, chaining any hook that was already there. See "Pre-push hooks and background review" below for what the shim does and what `--force` means. | `0` installed · `1` refused — a foreign hook is there and needs `--force` (or to be moved aside yourself) · `2` this is not a repository skodun can install into at all. |
+| `skodun dispatch [--repo DIR] [remote-name] [remote-url]` | Reserve and dispatch background reviews for a push. This is what the installed pre-push shim calls; nobody runs it by hand. It decides nothing about the push itself — every failure becomes a stderr warning and a durable `failed` review record, never a blocked push. | Always `0` — dispatching is not a verdict; `skodun gate` is. |
+| `skodun worker --record-id ID --repo DIR --branch B --local-oid OID --base-sha SHA [--base-ref REF]` | The detached background review process `dispatch` spawns for one reservation. Internal: hidden from `--help` because its flags are reservation bookkeeping nobody types by hand, but it stays fully usable (and debuggable) by name. | `0` the reservation reached a terminal state (reviewed, cancelled, or already retired by a newer push) · `2` it could not do its job at all (no store, or no such reservation). Nothing in production reads this code. |
+| `skodun surface [--branch B] [--hook-format text\|claude] [--include-delivered]` | Report background review rounds nobody has been shown yet, and record that they were delivered. Silence is never a verdict: a round that produced nothing usable says so explicitly (`NO REVIEW HAPPENED`) rather than reading as "0 findings". Certifies nothing about the change in the working tree right now — only `skodun gate` does that. See "Pre-push hooks and background review" below. | `0` reported (including "nothing to report") · `2` no store, no branch, an unwritable report, or an unrecordable delivery. |
+| `skodun mcp` | Serve the review loop to agents over stdio (MCP JSON-RPC): the same `gate` / `review` / `log` / `surface` / `triage` decisions the CLI makes, exposed as tools and two prompts. No flags — every tool carries its own arguments. See "MCP server" below. | `0` the session ended (the client closed stdin, or disconnected) · `2` the server could not be loaded or started. |
 
 `skodun` with no subcommand is a usage error, not a `0` — a silent success is
 indistinguishable from a PASS to whatever consumes the exit code. `python -m skodun`
@@ -254,8 +262,170 @@ before the generic "unknown `[defaults]` key" check ever runs.
   security-pass shape, including the one provider (`google`/`agy`) whose CLI has
   sharp edges worth knowing about before you configure it.
 
-Later phases add an MCP server so any agent harness can call skodun, scheduling,
-and pre-push hooks. See the research report for the roadmap.
+Phase 3 adds the pre-push hooks, background dispatcher, and MCP server documented
+below; scheduling is still a later phase. See the research report for the roadmap.
+
+## Pre-push hooks and background review
+
+`skodun install-hooks` installs a small POSIX-sh shim as this repository's
+`pre-push` hook (resolved through `git rev-parse --git-path hooks`, so it lands in
+the right place for a linked worktree or a relocated `core.hooksPath` too, never a
+hard-coded `.git/hooks`). What the shim does, in order:
+
+1. **Buffers stdin once.** Git's pre-push protocol sends the list of updated refs
+   on stdin, and it can only be read once — the shim tees it to a temp file so
+   both the chained hook and skodun read the same bytes.
+2. **Chains any hook that was already there**, with the original argv and the
+   buffered stdin, and **propagates its refusal**: if that hook exits non-zero,
+   the shim exits with the same code and the push fails exactly as it would have
+   without skodun.
+3. **Only then** runs `skodun dispatch` on the same buffered stdin. Nothing about
+   review machinery may block the push at this point: every dispatcher failure —
+   a bad config, a crash, the `skodun` executable being gone entirely — becomes a
+   stderr warning and the shim still exits `0`.
+
+Re-running `skodun install-hooks` replaces only a hook it recognizes as its own
+(marked internally); anything else is a **foreign hook**, and installing over one
+is **refused** unless you pass `--force`. `--force` backs the foreign hook up
+beside the new one (`pre-push.pre-skodun`) and chains it — it is never discarded —
+except that installing refuses even under `--force` if that backup name is already
+holding a *different* hook than the one currently installed, so a second `--force`
+run can never silently destroy the first backup.
+
+### Bypassing review for a push
+
+Two independent switches, either one enough to skip review entirely for a push
+(the chained foreign hook, if any, still runs and can still block the push on its
+own terms):
+
+- **`SKODUN_PREPUSH_SKIP=1 git push`** — skips review for that one push only.
+- **`git config skodun.prepush false`** — a persistent, per-repository opt-out.
+
+Both are checked *before* `.skodun.toml` is even read, so a broken config can
+never make the bypass unavailable.
+
+### `[dispatch]`
+
+A `[dispatch]` table in `.skodun.toml` (or the global config) sizes the
+*background* worker's budget — deliberately separate from `[defaults]`, which
+sizes a *foreground* `skodun review` where a human is waiting:
+
+| Key | Default | What it controls |
+| --- | --- | --- |
+| `enabled` | `true` | Config-level kill switch for background review, parallel to the `git config skodun.prepush false` bypass. `false` discards every pushed ref with one stderr note: no capture, no reservation, no worker, no record. |
+| `timeout_sec` | `240` | The worker's per-attempt timeout, replacing `[defaults] timeout_sec` for background runs only. |
+| `timeout_retries` | `0` | The worker's timeout-retry budget, replacing `[defaults] timeout_retries` for background runs only. |
+| `dedup` | `true` | Whether a push whose diff a trustworthy review already covers may be suppressed without a model ever seeing it. `false` disables that suppression path entirely. |
+| `large_prompt_bytes` | `80000` | Above this per-prompt size, a background attempt's timeout escalates to the *foreground* `[defaults] timeout_sec` — a prompt this large legitimately needs more time than the background budget allows. |
+
+Every other setting a background review uses (diff size caps, checklist routing,
+security-pass triggers, the extra passes) comes from `[defaults]` untouched.
+
+### Reading background results: `skodun surface` and SessionStart hooks
+
+A background review lands after `git push` has already returned, so nobody is
+watching when it finishes — and the dangerous case is not the findings that go
+unread, it is the rounds that *failed*: a timed-out review still records
+`findings_total: 0`, and anything that reads that as "0 findings" turns a review
+that never happened into a clean bill of health. `skodun surface` exists to close
+that gap: it reports every background round on a branch nobody has been shown yet,
+states plainly when a round produced no usable answer at all, and only marks a
+round delivered once its report has actually reached a reader.
+
+```
+skodun surface [--branch B] [--hook-format text|claude] [--include-delivered]
+```
+
+- `--branch` defaults to the checked-out branch.
+- `--hook-format text` (the default) prints plain lines for a shell profile, a
+  tmux hook, or a CI step; `--hook-format claude` prints exactly one JSON object —
+  the Claude Code `SessionStart` hook envelope.
+- `--include-delivered` replays rounds already recorded as delivered too, without
+  affecting the ledger.
+
+Two ready-to-use templates for wiring this into a session start live under
+`examples/hooks/` — **skodun never installs either one into a repository or a
+user's shell config; that is a choice for the person whose session it is, made by
+following the instructions below, not something this tool writes for you.**
+
+- **`examples/hooks/sessionstart-claude.sh`** — copy it somewhere of your own and
+  register it as a Claude Code `SessionStart` hook:
+
+  ```json
+  {"hooks": {"SessionStart": [{"hooks": [
+     {"type": "command", "command": "/path/to/sessionstart-claude.sh"}]}]}}
+  ```
+
+- **`examples/hooks/sessionstart-plain.sh`** — the same delivery in plain text, for
+  any harness that just shows a human whatever a command prints; copy it
+  somewhere of your own and call it from wherever a session begins, e.g. in
+  `~/.bashrc` or `~/.zshrc`:
+
+  ```sh
+  [ -x "$HOME/bin/sessionstart-plain.sh" ] && "$HOME/bin/sessionstart-plain.sh"
+  ```
+
+Both scripts exit `0` on every path, including "skodun is not installed at all",
+and both honor `SKODUN_BIN` to point at a specific binary instead of resolving
+`skodun` on `PATH` or falling back to `python3 -m skodun`.
+
+## MCP server
+
+`skodun mcp` serves the same review loop the CLI does — `gate`, `review`, `log`,
+`surface`, and the `triage` operations — to any MCP client, over stdio, as **8
+tools** and **2 prompts**. A tool's refusal is worded exactly like the CLI's,
+because neither surface owns the words: `services.py` is the one implementation
+both call.
+
+Tools: `gate`, `review`, `log`, `surface`, `triage_list`, `triage_dismiss`,
+`adopt_refuter`, `triage_reopen`. Prompts: `review-now` (run a review and report
+findings without triaging any of them) and `gate-check` (ask whether a trustworthy
+review covers the current change, and explain the verdict).
+
+**`review` is long-running and only one may be in flight per server.** It runs
+the whole foreground review pipeline — minutes, real model calls — on a background
+thread so the server keeps answering other requests; a second `review` call while
+one is running is refused outright (`"review already in flight"`), never queued,
+because a queued review would run against a working tree that has since moved.
+Closing the client session cancels a review still in progress rather than
+abandoning it mid-write.
+
+There is deliberately no `dispatch`, `worker`, `install-hooks`, `import-legacy`,
+`shadow-compare`, or `providers` tool, and no bulk triage tool (no
+`dismiss_all`/`adopt_all`): those are either machinery a human runs, or decisions
+a human makes one finding at a time.
+
+### Claude Code
+
+```
+claude mcp add skodun -- skodun mcp
+```
+
+(use `-- python3 -m skodun mcp` instead if you are running from a source checkout
+rather than an installed console script). Or add it directly to a project's
+`.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "skodun": {
+      "type": "stdio",
+      "command": "skodun",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### Codex CLI
+
+In `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.skodun]
+command = "skodun"
+args = ["mcp"]
+```
 
 ## Requirements
 
