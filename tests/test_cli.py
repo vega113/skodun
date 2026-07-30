@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -2053,3 +2054,358 @@ def test_install_hooks_seam(tmp_path, name, expected, form):
     assert p.returncode == expected, f"stdout={getattr(p, 'stdout', None)!r} " \
                                      f"stderr={p.stderr!r}"
     assert "Traceback" not in p.stderr, p.stderr
+
+
+# ==========================================================================
+# TASK 12: `surface` -- the delivery seam
+# ==========================================================================
+#
+# `surface` is the one command whose STDOUT IS A PAYLOAD: a SessionStart hook
+# feeds it to an agent verbatim, so it carries no verdict banner (a banner would
+# corrupt the JSON envelope) and every diagnostic goes to stderr. And it is the
+# one command whose exit code has to survive a failed WRITE rather than a failed
+# decision: the ack is only allowed to happen after the report actually reached a
+# reader, so a dead stdout must leave the round undelivered AND say so.
+
+
+def _round(**kw) -> dict:
+    rec = dict(
+        id="sk_1", reviewed_at="2026-07-30T10:00:00Z", branch="feat",
+        head="h" * 40, base_ref="origin/main", base_sha="s" * 40,
+        diff_hash="d" * 40, context_hash="", mode="prepush", source="skodun",
+        model="m", adapter="grok", status="clean", parse_ok=True, degraded=False,
+        degraded_reason="", diff_truncated=False, stop_reason="EndTurn",
+        summary="ok", findings=[], findings_total=0,
+        severity={"high": 0, "medium": 0, "low": 0}, failure_reason="",
+        usable_output=True, superseded_by=None)
+    rec.update(kw)
+    return rec
+
+
+def _loud_round(**kw) -> dict:
+    return _round(findings=[_finding(0)], findings_total=1,
+                  severity={"high": 1, "medium": 0, "low": 0},
+                  summary="one real problem", **kw)
+
+
+def _surface_db(tmp_path, *records) -> Path:
+    db = tmp_path / "surface.db"
+    with Store.open(db) as store:
+        for rec in records:
+            store.save_review(rec)
+    return db
+
+
+def _delivery_rows(db: Path) -> list[tuple]:
+    with Store.open(db) as store:
+        return [(r["review_id"], r["channel"]) for r in store._c.execute(
+            "SELECT review_id, channel FROM deliveries ORDER BY review_id")]
+
+
+def test_surface_reports_a_round_and_then_records_the_delivery(tmp_path,
+                                                              monkeypatch, capsys):
+    db = _surface_db(tmp_path, _loud_round())
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["surface", "--branch", "feat"]) == 0
+    out = capsys.readouterr().out
+    assert "NPE 0" in out
+    assert _delivery_rows(db) == [("sk_1", "cli-text")]
+
+
+def test_surface_carries_no_verdict_banner(tmp_path, monkeypatch, capsys):
+    """It gates nothing, and its stdout is consumed verbatim by a hook."""
+    db = _surface_db(tmp_path, _loud_round())
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["surface", "--branch", "feat"]) == 0
+    assert "SKODUN VERDICT" not in capsys.readouterr().out
+
+
+def test_surface_claude_format_is_exactly_one_json_object(tmp_path, monkeypatch,
+                                                          capsys):
+    db = _surface_db(tmp_path, _loud_round())
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["surface", "--branch", "feat", "--hook-format", "claude"]) == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)          # the WHOLE of stdout, nothing else in it
+    assert payload["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "NPE 0" in payload["hookSpecificOutput"]["additionalContext"]
+    assert payload["systemMessage"]
+    assert _delivery_rows(db) == [("sk_1", "cli-claude")]
+
+
+def test_a_failed_emit_leaves_the_round_undelivered(tmp_path, monkeypatch):
+    """THE ack-ordering test, and the mutation target: mark-then-emit passes
+    every other test in this file and fails only this one. A report dropped on
+    the way out must be repeated, not recorded as delivered."""
+    db = _surface_db(tmp_path, _loud_round())
+    monkeypatch.setenv("SKODUN_DB", str(db))
+
+    class DeadStream:
+        encoding = "utf-8"
+
+        def write(self, _data):
+            raise OSError("no space left on device")
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", DeadStream())
+    assert main(["surface", "--branch", "feat"]) == 2
+    assert _delivery_rows(db) == []
+
+
+def test_a_flush_that_fails_leaves_the_round_undelivered(tmp_path, monkeypatch):
+    """Buffering is never "emit success": the bytes are not gone until the flush
+    returns."""
+    db = _surface_db(tmp_path, _loud_round())
+    monkeypatch.setenv("SKODUN_DB", str(db))
+
+    class UnflushableStream:
+        encoding = "utf-8"
+
+        def write(self, _data):
+            return len(_data)
+
+        def flush(self):
+            raise OSError("broken pipe")
+
+    monkeypatch.setattr(sys, "stdout", UnflushableStream())
+    assert main(["surface", "--branch", "feat"]) == 2
+    assert _delivery_rows(db) == []
+
+
+def test_a_quiet_round_is_acknowledged_even_though_nothing_is_printed(
+        tmp_path, monkeypatch, capsys):
+    db = _surface_db(tmp_path, _round())
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["surface", "--branch", "feat"]) == 0
+    assert capsys.readouterr().out == ""
+    assert _delivery_rows(db) == [("sk_1", "quiet")]
+
+
+def test_nothing_undelivered_is_a_silent_stdout_and_a_note_on_stderr(
+        tmp_path, monkeypatch, capsys):
+    """A hook reads stdout; a human reads the terminal. Neither is served by an
+    empty report injected at every session start."""
+    db = _surface_db(tmp_path)
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["surface", "--branch", "feat"]) == 0
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert "feat" in cap.err
+
+
+def test_include_delivered_replays(tmp_path, monkeypatch, capsys):
+    db = _surface_db(tmp_path, _loud_round())
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["surface", "--branch", "feat"]) == 0
+    capsys.readouterr()
+    assert main(["surface", "--branch", "feat"]) == 0
+    assert capsys.readouterr().out == ""
+    assert main(["surface", "--branch", "feat", "--include-delivered"]) == 0
+    replay = capsys.readouterr().out
+    assert "NPE 0" in replay and "cli-text" in replay
+
+
+def test_surface_defaults_to_the_checked_out_branch(tmp_path, monkeypatch, capsys):
+    repo = _tiny_repo(tmp_path)
+    db = _surface_db(tmp_path, _loud_round(branch="main"))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    monkeypatch.chdir(repo)
+    assert main(["surface"]) == 0
+    assert "NPE 0" in capsys.readouterr().out
+
+
+def test_surface_outside_a_repository_says_so_and_never_traces_back(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.chdir(tmp_path)
+    assert main(["surface"]) == 2
+    cap = capsys.readouterr()
+    assert "Traceback" not in cap.out and "Traceback" not in cap.err
+    assert "branch" in cap.err
+    assert cap.out == ""
+
+
+def test_surface_refuses_an_unknown_hook_format(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    assert main(["surface", "--hook-format", "yaml"]) == 2
+    cap = capsys.readouterr()
+    assert "Traceback" not in cap.err
+    assert "usage:" in cap.err
+
+
+def test_surface_reports_an_unopenable_store_on_stderr(tmp_path, monkeypatch,
+                                                       capsys):
+    # A directory where the database file belongs: sqlite cannot open it.
+    (tmp_path / "notadb").mkdir()
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "notadb"))
+    assert main(["surface", "--branch", "feat"]) == 2
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert "store" in cap.err and "Traceback" not in cap.err
+
+
+def test_an_ack_that_cannot_be_written_is_reported_after_a_real_emit(
+        tmp_path, monkeypatch, capsys):
+    """The report DID reach the reader, so it is not repeated silently: the
+    ledger failed, the round will be delivered again, and the exit code says the
+    command did not finish its job."""
+    db = _surface_db(tmp_path, _loud_round())
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    from skodun import delivery
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    monkeypatch.setattr(delivery, "acknowledge", boom)
+    assert main(["surface", "--branch", "feat"]) == 2
+    cap = capsys.readouterr()
+    assert "NPE 0" in cap.out
+    assert "Traceback" not in cap.err
+    assert _delivery_rows(db) == []
+
+
+# --- the seam matrix -------------------------------------------------------
+#
+# Exit code correctness across {normal run, closed stdout, `| head` under
+# pipefail, `python -m skodun`, `python -m skodun.cli`, the console script}, plus
+# the row this task's brief adds: closed stdout MID-EMIT must leave the round
+# undelivered and exit non-zero.
+
+#: `(name, argv, expected)`. Each of these has an empty store behind it, so the
+#: report is empty and the only thing under test is the seam itself.
+_SURFACE_CASES = [
+    ("surface-nothing-to-deliver", ["surface", "--branch", "feat"], 0),
+    ("surface-claude-nothing-to-deliver",
+     ["surface", "--branch", "feat", "--hook-format", "claude"], 0),
+    ("surface-replay-nothing-to-deliver",
+     ["surface", "--branch", "feat", "--include-delivered"], 0),
+    ("surface-bad-format", ["surface", "--hook-format", "yaml"], 2),
+]
+
+
+@pytest.mark.parametrize("name, argv, expected", _SURFACE_CASES,
+                         ids=[c[0] for c in _SURFACE_CASES])
+@pytest.mark.parametrize("form", ["module", "module-cli", "console",
+                                  "closed-stdout", "pipefail", "no-terminal"])
+def test_surface_seam_matrix(tmp_path, name, argv, expected, form):
+    db = tmp_path / form / "s.db"
+    env = _subprocess_env(db)
+    if form == "pipefail":
+        quoted = " ".join(shlex.quote(a) for a in argv)
+        script = (f'set -o pipefail; {shlex.quote(sys.executable)} -m skodun '
+                  f'{quoted} < /dev/null | head -1; '
+                  f'echo "SKODUN_EXIT=${{PIPESTATUS[0]}}"')
+        p = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                           env=env)
+        m = re.search(r"SKODUN_EXIT=(\d+)", p.stdout)
+        assert m and int(m.group(1)) == expected, f"{p.stdout!r} {p.stderr!r}"
+        assert "Traceback" not in p.stderr, p.stderr
+        return
+    if form == "closed-stdout":
+        r_fd, w_fd = os.pipe()
+        os.close(r_fd)
+        try:
+            p = subprocess.run([sys.executable, "-m", "skodun", *argv],
+                               stdout=w_fd, stderr=subprocess.PIPE, text=True,
+                               stdin=subprocess.DEVNULL, env=env)
+        finally:
+            os.close(w_fd)
+    elif form == "console":
+        p = subprocess.run(
+            [sys.executable, "-c", "from skodun.cli import entry; entry()", *argv],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
+    elif form == "no-terminal":
+        p = subprocess.run([sys.executable, "-m", "skodun", *argv],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, text=True, env=env,
+                           start_new_session=True)
+    else:
+        module = "skodun" if form == "module" else "skodun.cli"
+        p = subprocess.run([sys.executable, "-m", module, *argv],
+                           capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, env=env)
+    assert p.returncode == expected, f"stderr={p.stderr!r}"
+    assert "Traceback" not in p.stderr, p.stderr
+
+
+@pytest.mark.parametrize("fmt", ["text", "claude"])
+def test_closed_stdout_mid_emit_leaves_the_round_undelivered(tmp_path, fmt):
+    """The brief's own matrix row, end to end in a real process: the writer is
+    dead, so the round stays undelivered and the exit code is not 0."""
+    db = _surface_db(tmp_path, _loud_round())
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run(
+            [sys.executable, "-m", "skodun", "surface", "--branch", "feat",
+             "--hook-format", fmt],
+            stdout=w_fd, stderr=subprocess.PIPE, text=True,
+            stdin=subprocess.DEVNULL, env=_subprocess_env(db))
+    finally:
+        os.close(w_fd)
+    assert p.returncode != 0, p.stderr
+    assert "Traceback" not in p.stderr, p.stderr
+    assert _delivery_rows(db) == []
+
+
+def test_a_successful_pipe_delivers_and_acknowledges(tmp_path):
+    """The other direction of the same rule, in a real process."""
+    db = _surface_db(tmp_path, _loud_round())
+    p = subprocess.run(
+        [sys.executable, "-m", "skodun", "surface", "--branch", "feat"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        env=_subprocess_env(db))
+    assert p.returncode == 0, p.stderr
+    assert "NPE 0" in p.stdout
+    assert _delivery_rows(db) == [("sk_1", "cli-text")]
+
+
+def test_an_ascii_only_stdout_still_delivers_the_reserved_line(tmp_path):
+    """The reserved line carries an em dash, and an ASCII locale is the most
+    likely place for it to meet a stream that cannot encode it. The delivery must
+    still land -- lossily rendered, every character accounted for -- rather than
+    be repeated forever at every session start."""
+    from skodun import delivery
+
+    db = _surface_db(tmp_path, _round(
+        status="failed", parse_ok=False, usable_output=False,
+        failure_reason="the worker was killed"))
+    env = _subprocess_env(db)
+    env["PYTHONIOENCODING"] = "ascii"
+    p = subprocess.run(
+        [sys.executable, "-m", "skodun", "surface", "--branch", "feat"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
+    assert p.returncode == 0, f"{p.stdout!r} {p.stderr!r}"
+    assert "NO REVIEW HAPPENED" in p.stdout
+    assert delivery.NO_REVIEW_LINE not in p.stdout      # the em dash was escaped
+    assert _delivery_rows(db) == [("sk_1", "cli-text")]
+
+
+def test_surface_appears_in_help_and_names_its_two_formats():
+    from skodun.cli import build_parser
+    out = build_parser().format_help()
+    described = re.findall(r"^\s{4}(\S+)\s{2,}\S", out, re.MULTILINE)
+    assert "surface" in described, out
+
+
+def test_the_hook_format_choices_are_the_delivery_modules_own(tmp_path):
+    """The parser spells the two formats literally (importing `delivery` while
+    building the parser would make every other subcommand pay for it), so the
+    agreement is pinned here instead of left to drift."""
+    from skodun import delivery
+    from skodun.cli import build_parser
+
+    import argparse
+
+    parser = build_parser()
+    subs = [a for a in parser._actions
+            if isinstance(a, argparse._SubParsersAction)]
+    assert len(subs) == 1, subs
+    surface = subs[0].choices["surface"]
+    formats = [a for a in surface._actions if a.dest == "hook_format"]
+    assert len(formats) == 1, formats
+    assert tuple(formats[0].choices) == tuple(delivery.FORMATS)
+    assert formats[0].default == delivery.TEXT
