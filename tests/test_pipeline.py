@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import time
@@ -481,8 +482,11 @@ def test_release_is_a_no_op_when_someone_else_owns_the_lock(tmp_path):
         assert (lock.path / "owner").read_text(encoding="utf-8").startswith(
             f"pid={os.getpid() + 1}\n")
     finally:
-        (lock.path / "owner").unlink()
-        lock.path.rmdir()
+        # `rmtree`, not `unlink(owner) + rmdir`: a held lock also carries the
+        # `budget` sidecar (see `test_batched_review.py`), so removing one named
+        # file no longer empties the directory. Teardown only; every assertion
+        # above is unchanged.
+        shutil.rmtree(lock.path, ignore_errors=True)
 
 
 def test_release_removes_the_lock_when_we_are_still_the_owner(tmp_path):
