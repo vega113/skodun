@@ -22,9 +22,12 @@ are guarded below:
     `--help`, which gate nothing and exit 0; `review` cut short by Ctrl-C,
     which exits 130 with stdout entirely empty -- an operator's own
     interruption, not a refusal this contract owes a banner for (see
-    `main`'s scoped carve-out); and `providers`, a read-only diagnostic
+    `main`'s scoped carve-out); `providers`, a read-only diagnostic
     listing that is never a gate and prints no verdict line on any of its
-    exit codes.
+    exit codes; `dispatch`, which reserves records and starts workers but
+    decides nothing about a push (and whose exit code is 0 on EVERY path
+    for that reason -- a hook must not block on review machinery); and
+    `install-hooks`, which writes a file and reports on it.
 """
 
 import argparse
@@ -122,6 +125,53 @@ def build_parser() -> argparse.ArgumentParser:
     tri.add_argument("--reopen", action="store_true", dest="reopen",
                      help="reopen ONE previously dismissed finding, with an "
                           "audited reason for overturning the dismissal")
+    # --- the pre-push surfaces -------------------------------------------
+    disp = sub.add_parser(
+        "dispatch",
+        help="reserve and dispatch background reviews for a push (pre-push hook)")
+    disp.add_argument("--repo", type=Path, default=Path("."),
+                          help="repository being pushed (default: the current "
+                               "directory)")
+    # Git's standard pre-push argv. Accepted and recorded into failure notes,
+    # otherwise unused -- WITHOUT them argparse would reject the installed shim's
+    # own invocation, which passes `"$@"` through verbatim. `nargs="?"` twice
+    # rather than `nargs="*"` so a third positional is still a usage error.
+    disp.add_argument("remote_name", nargs="?", default="",
+                      help="the remote's name, as git passes it")
+    disp.add_argument("remote_url", nargs="?", default="",
+                      help="the remote's URL, as git passes it")
+
+    # HIDDEN: `skodun worker` is the detached process `dispatch` spawns, not a
+    # command a human runs. Omitting `help=` entirely is what hides it -- argparse
+    # only lists a subcommand's DESCRIPTION when one was given, so there is no
+    # `worker` line among the commands. It stays fully usable (and debuggable) by
+    # name. `help=argparse.SUPPRESS` would NOT work: argparse renders subaction
+    # help verbatim and the literal `==SUPPRESS==` appears in the listing.
+    #
+    # The choices metavar (`{gate,review,...}`) still names it, and deliberately:
+    # argparse builds that from the real command list, and overriding it with a
+    # hand-written `metavar` would be a second list to keep in sync -- one that
+    # would silently start lying the next time a command is added.
+    worker = sub.add_parser("worker")
+    for flag, helptext in (
+            ("--record-id", "the reservation this worker must finalize"),
+            ("--repo", "the repository holding the pushed ref"),
+            ("--branch", "the pushed branch's short name"),
+            ("--local-oid", "the pushed commit"),
+            ("--base-sha", "the base the diff is computed against"),
+            ("--base-ref", "the base's ref name, as recorded")):
+        worker.add_argument(flag, required=flag != "--base-ref", default="",
+                            help=helptext)
+
+    hooks = sub.add_parser(
+        "install-hooks",
+        help="install the pre-push shim, chaining any hook already there")
+    hooks.add_argument("--repo", type=Path, default=Path("."),
+                       help="repository to install into (default: the current "
+                            "directory)")
+    hooks.add_argument("--force", action="store_true",
+                       help="back up a foreign pre-push hook and chain it "
+                            "(never discards it)")
     # Explicit, per-finding, and deliberately WITHOUT a bulk form: a refuter
     # verdict is an annotation, and the only way one may ever dismiss a
     # finding is a human naming that finding. `--adopt-all` would be exactly
@@ -395,6 +445,103 @@ def _cmd_review(args) -> int:
         except (TypeError, ValueError):
             total = 1     # an uncountable findings list is not a clean review
         return 1 if total > 0 else 0
+
+
+def _cmd_dispatch(args) -> int:
+    """Dispatch background reviews for one push. ALWAYS 0.
+
+    A pre-push hook must never block on review machinery, so this seam has no
+    failure exit code at all: every failure is a loud stderr line plus (wherever a
+    store can be reached) a durable `failed` review record, which is what Task
+    12's delivery surfaces. `dispatch`'s only non-zero exits are argparse's usage
+    errors, which never reach here -- and the installed shim absorbs even those
+    into its own warn-and-exit-0, so a human's typo stays loud while a hook's call
+    cannot break a push.
+
+    No verdict banner, deliberately, and it is the second command with that
+    property (`providers` is the first): this gates nothing. It reserves records
+    and starts workers, and the verdict about a push comes from `skodun gate`
+    reading what those workers recorded.
+    """
+    try:
+        from . import dispatch as dispatch_mod
+        # Read stdin ONCE and completely, before anything else can consume it.
+        # `errors="replace"` because a ref line is oids and ref names -- ASCII by
+        # git's own rules -- so undecodable bytes are corruption, and
+        # `parse_ref_lines` classifies the result as malformed rather than
+        # raising here where nothing could be recorded.
+        try:
+            raw = sys.stdin.buffer.read()
+        except BaseException:
+            raw = b""
+        return dispatch_mod.run_dispatch(
+            raw.decode("utf-8", "replace"), Path(args.repo), _store_path(),
+            remote_name=getattr(args, "remote_name", "") or "",
+            remote_url=getattr(args, "remote_url", "") or "")
+    except BaseException as e:
+        # The outermost guard of the exit-0 contract. Even an import failure or a
+        # `MemoryError` here must not fail the push.
+        try:
+            print(f"skodun: the pre-push dispatcher failed ({e!r}); the push is "
+                  f"NOT blocked", file=sys.stderr, flush=True)
+        except BaseException:
+            pass
+        return 0
+
+
+def _cmd_worker(args) -> int:
+    """Run one detached background review. Exit codes:
+
+      0  the reservation reached a terminal state (reviewed, cancelled, or
+         already retired by a newer push)
+      2  the worker could not do its job at all: no store, or no such reservation
+
+    Nothing consumes this code in production -- the dispatcher does not wait --
+    but it is the difference between a log entry that says "nothing to do" and one
+    that says "misconfigured", and the seam matrix pins it.
+    """
+    try:
+        from . import dispatch as dispatch_mod
+    except BaseException as e:
+        from .trust import banner_failure
+        return _emit(banner_failure(
+            f"the review worker could not be loaded: {e!r}"), 2)
+    if not args.record_id:
+        from .trust import banner_failure
+        return _emit(banner_failure("worker: --record-id is required"), 2)
+    try:
+        outcome = dispatch_mod.run_worker(
+            args.record_id, Path(args.repo or "."), args.branch,
+            args.local_oid, args.base_sha, args.base_ref, _store_path())
+    except BaseException as e:
+        # `run_worker` promises never to raise; this is the belt for that braces.
+        from .trust import banner_failure
+        return _emit(banner_failure(f"the review worker crashed: {e!r}"), 2)
+    return _emit(outcome.message, outcome.code)
+
+
+def _cmd_install_hooks(args) -> int:
+    """Install the pre-push shim. 0 installed, 1 refused, 2 could not even look.
+
+    1 and 2 are different answers a script may want to act on: 1 is "there is a
+    hook here that is not mine and you have to decide" (re-runnable with `--force`,
+    or after moving the file), while 2 is "this is not a repository I can install
+    into at all".
+    """
+    try:
+        from . import dispatch as dispatch_mod
+        from .dispatch import HookRefused
+    except BaseException as e:
+        return _emit(f"skodun install-hooks: could not load the installer: {e!r}",
+                     2)
+    try:
+        path, what = dispatch_mod.install_hooks(Path(args.repo),
+                                                force=bool(args.force))
+    except HookRefused as e:
+        return _emit(f"skodun install-hooks: refused -- {e}", 1)
+    except BaseException as e:
+        return _emit(f"skodun install-hooks: {e}", 2)
+    return _emit(f"skodun install-hooks: {path} {what}", 0)
 
 
 def _fmt_binary(binary: str) -> str:
@@ -1099,6 +1246,12 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_log(args)
         if args.command == "triage":
             return _cmd_triage(args)
+        if args.command == "dispatch":
+            return _cmd_dispatch(args)
+        if args.command == "worker":
+            return _cmd_worker(args)
+        if args.command == "install-hooks":
+            return _cmd_install_hooks(args)
         # Unreachable while the subparsers are `required=True`, and kept as
         # defence in depth: if that ever comes off, an unrecognised command
         # must still not certify a push by exiting 0.

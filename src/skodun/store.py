@@ -29,11 +29,22 @@ import re
 import sqlite3
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import ids
 from .trust import is_trustworthy
 
 _TRUST_AXES = ("parse_ok", "degraded", "diff_truncated")
+
+#: The mode/source pair that makes `usable_output` mandatory. See
+#: `_requires_usable_output`.
+PREPUSH_MODE = "prepush"
+SKODUN_SOURCE = "skodun"
+
+#: The record status a reservation writes, and the only status a conditional
+#: transition (finalize, stale recovery, pid attach) will act on.
+RUNNING = "running"
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
@@ -278,9 +289,25 @@ def _apply_atomic(conn: sqlite3.Connection, target: int,
     `BEGIN IMMEDIATE` rather than a deferred `BEGIN`: the write lock is taken
     up front, so two processes opening the same store at once cannot both get
     part-way through the delta and have one of them fail at COMMIT time.
+
+    THE VERSION IS RE-READ UNDER THE LOCK, and that is not belt-and-braces. The
+    caller's version read happens outside any transaction, so two openers of the
+    same store can both see the OLD version and both arrive here for the same
+    delta. The first applies it; the second then waits for the write lock and
+    replays an `ALTER TABLE ADD COLUMN` that now exists -- `duplicate column
+    name`, i.e. `Store.open` RAISES for the loser. Two concurrent pre-push
+    dispatchers on a fresh store is an ordinary case (two worktrees, or one push
+    of two branches), and the loser's failure mode is the worst one available: no
+    store means nowhere to record the failure, so that push gets no record at all.
+    Re-reading here makes a lost race a NO-OP instead.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= target:
+            # A concurrent opener applied this delta while we waited for the
+            # lock. Nothing to do, and nothing to stamp.
+            conn.execute("COMMIT")
+            return
         for sql in statements:
             conn.execute(sql)
         # PRAGMA takes no bound parameters; the value is an int constant.
@@ -296,6 +323,43 @@ def _apply_atomic(conn: sqlite3.Connection, target: int,
             # original exception is the one that matters.
             pass
         raise
+
+
+def _enable_wal(conn: sqlite3.Connection, attempts: int = 20) -> str:
+    """Put the database in WAL mode, tolerating a concurrent opener doing the same.
+
+    `PRAGMA journal_mode=WAL` is the ONE statement SQLite does not route through
+    the busy handler: converting the journal takes a brief exclusive lock and
+    returns `SQLITE_BUSY` IMMEDIATELY if another connection holds any lock,
+    regardless of the connection's `timeout`. So the first-ever concurrent open of
+    a store -- two pre-push dispatchers from two worktrees, or one push of two
+    branches -- can make `Store.open` raise `database is locked` for the loser.
+    That is the worst failure available to the dispatcher: no store means nowhere
+    to record the failure, so that push gets no record at all.
+
+    Retried with a short backoff, and NOT fatal if it still loses: the mode is a
+    concurrency property, not a correctness one. Every writer here uses explicit
+    transactions, so a store left in the rollback-journal mode is slower under
+    concurrent readers and otherwise identical -- vastly better than refusing to
+    open it. Returns the mode actually in force, for the caller that wants to know.
+    """
+    mode = ""
+    for attempt in range(attempts):
+        try:
+            row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            mode = (row[0] if row else "") or ""
+            if mode.lower() == "wal":
+                return mode
+        except sqlite3.OperationalError:
+            pass        # another opener holds a lock; it is converting it too
+        time.sleep(0.02 * (attempt + 1))
+        try:
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+            if row and (row[0] or "").lower() == "wal":
+                return row[0]       # a peer finished the conversion for us
+        except sqlite3.OperationalError:     # pragma: no cover - defensive
+            pass
+    return mode
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -321,7 +385,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if version > SCHEMA_VERSION:
         raise ValueError(f"store schema v{version} is newer than this skodun")
 
-    conn.execute("PRAGMA journal_mode=WAL")
+    _enable_wal(conn)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)         # v1 baseline, idempotent
     for target, delta in _MIGRATIONS:
@@ -334,9 +398,178 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
 
 
+def _requires_usable_output(rec: Mapping) -> bool:
+    """Whether `usable_output` is MANDATORY on this record.
+
+    The predicate is `source == "skodun" and mode == "prepush"`, and both halves
+    are load-bearing. A mode-only rule would reject the shipped legacy import
+    outright: `legacy_import._import_index` merges a foreign index row and
+    artifact VERBATIM, and a legacy archive row carries `mode="prepush"` with
+    `source="legacy"` and no such field -- it predates the concept.
+
+    The field itself is the whole "did this round produce any answer at all"
+    fact, and it is deliberately not derivable from the finding count: a round
+    whose passes all answered "nothing wrong" and a round that failed before any
+    answer both have zero findings, and the difference between them is a clean
+    review versus "NO REVIEW HAPPENED".
+    """
+    return (rec.get("source") == SKODUN_SOURCE
+            and rec.get("mode") == PREPUSH_MODE)
+
+
+def _normalize_record(rec: dict, *, label: str) -> dict:
+    """THE persistence chokepoint's validation, shared by both writers.
+
+    ONE routine behind `save_review` and `finalize_review`, because two copies
+    of it would be two answers to "may this record certify a push". A worker
+    that reached the store through the conditional finalize must be held to
+    exactly the standard the foreground save applies:
+
+    * the three trust axes are EXACT bools -- `bool("false")` is True, and a
+      coerced axis is how a degraded review becomes a trustworthy one;
+    * `trustworthy` is RECOMPUTED and the caller's value overwritten, in both
+      directions (a pessimistic caller does not get to veto trust either);
+    * `usable_output` is validated conditionally (see `_requires_usable_output`)
+      and, whenever present, must be an exact bool.
+
+    Returns a COPY: the caller's dict is never mutated (a shipped guarantee --
+    `test_save_review_does_not_mutate_caller_dict`).
+    """
+    rec = dict(rec)
+    axes = {k: rec.get(k, False) for k in _TRUST_AXES}
+    for k, v in axes.items():
+        if not isinstance(v, bool):   # bool("false") is True — refuse coercion
+            raise ValueError(f"{label}: {k} must be bool, got {type(v).__name__}")
+    rec.update(axes)
+    rec["trustworthy"] = is_trustworthy(**axes)
+    if "usable_output" in rec:
+        if not isinstance(rec["usable_output"], bool):
+            raise ValueError(
+                f"{label}: usable_output must be bool, got "
+                f"{type(rec['usable_output']).__name__}")
+    elif _requires_usable_output(rec):
+        raise ValueError(
+            f"{label}: usable_output is required on a {SKODUN_SOURCE} "
+            f"{PREPUSH_MODE} record (it is the only field that can tell a clean "
+            f"round from a round that produced no answer at all)")
+    return rec
+
+
+#: The `reviews` columns both writers bind, in one order, from a normalized
+#: record. ONE list: an `INSERT` and an `UPDATE` that disagreed about which
+#: columns a record owns would be two records at one id.
+_REVIEW_COLUMNS = (
+    "reviewed_at", "branch", "head", "base_ref", "base_sha", "diff_hash",
+    "context_hash", "mode", "model", "adapter", "status", "parse_ok", "degraded",
+    "diff_truncated", "trustworthy", "stop_reason", "findings_total", "sev_high",
+    "sev_medium", "sev_low", "summary", "source", "artifact_json",
+    "worst_runtime_sec", "pid", "superseded_by",
+)
+
+
+def _review_values(rec: Mapping) -> tuple:
+    """The bind tuple for `_REVIEW_COLUMNS`, from an ALREADY-normalized record.
+
+    `artifact_json` is serialized from the SAME dict the indexed columns are
+    read from, which is what makes an index row that disagrees with its artifact
+    impossible by construction (the Phase 1 rule).
+    """
+    sev = rec.get("severity") or {}
+    return (
+        rec.get("reviewed_at"), rec.get("branch"), rec.get("head"),
+        rec.get("base_ref"), rec.get("base_sha"), rec.get("diff_hash"),
+        rec.get("context_hash", ""), rec.get("mode"), rec.get("model"),
+        rec.get("adapter"), rec.get("status"), int(bool(rec.get("parse_ok"))),
+        int(bool(rec.get("degraded"))), int(bool(rec.get("diff_truncated"))),
+        int(bool(rec.get("trustworthy"))), rec.get("stop_reason"),
+        int(rec.get("findings_total") or 0), int(sev.get("high") or 0),
+        int(sev.get("medium") or 0), int(sev.get("low") or 0),
+        rec.get("summary"), rec.get("source", SKODUN_SOURCE),
+        json.dumps(rec, ensure_ascii=False),
+        _opt_positive_int(rec.get("worst_runtime_sec")),
+        _opt_positive_int(rec.get("pid")), rec.get("superseded_by"),
+    )
+
+
+_INSERT_REVIEW = (
+    "INSERT INTO reviews (id, %s) VALUES (?,%s)\n"
+    "ON CONFLICT(id) DO UPDATE SET %s"
+    % (", ".join(_REVIEW_COLUMNS),
+       ",".join("?" * len(_REVIEW_COLUMNS)),
+       ", ".join(f"{c}=excluded.{c}" for c in _REVIEW_COLUMNS)))
+
+#: The conditional finalize's UPDATE. Identity-pinned by the caller and guarded
+#: on `status='running'` HERE, in the statement itself, so a record that stopped
+#: running between the read and the write changes nothing.
+#:
+#: DELIBERATELY REDUNDANT with `finalize_review`'s own `row["status"] != RUNNING`
+#: early return: both sit inside one `BEGIN IMMEDIATE`, so the row cannot change
+#: between them and either alone suffices today. The pair is kept because they
+#: guard against different future mistakes -- the early return against a caller
+#: reading a stale record, the predicate against a refactor that moves the read
+#: out of the transaction -- and the cost is that neither can be mutation-tested
+#: in isolation. `test_finalize_review_refuses_a_superseded_record_and_changes_
+#: nothing` dies when BOTH are removed, which is the mutation the brief names.
+_FINALIZE_REVIEW = (
+    "UPDATE reviews SET %s WHERE id=? AND status='%s'"
+    % (", ".join(f"{c}=?" for c in _REVIEW_COLUMNS), RUNNING))
+
+#: The reserved identity fields a finalize must agree with the stored row about.
+#: Not `worst_runtime_sec` or `pid`: those are database-owned VALUES, merged
+#: rather than compared (see `finalize_review`). These five are the review's
+#: IDENTITY -- what content it is about -- and a worker that recomputed one of
+#: them differently has reviewed something else.
+_RESERVED_IDENTITY = ("branch", "head", "base_ref", "base_sha", "diff_hash")
+
+#: The atomic FAILURE transition, in ONE statement (a single statement is its own
+#: transaction in autocommit mode). Status and the trust axes move together,
+#: index and artifact together -- because `status='failed'` beside
+#: `trustworthy=1` is a row the gate still honours and dedup still suppresses
+#: against, which is exactly the stale-recovery bug.
+#:
+#: `json('false')` and NOT a bound Python `False`: a bound boolean lands in
+#: `json_set` as the NUMBER 0, which reloads as `int` and makes the artifact
+#: malformed under the strict-bool trust rules -- a demotion that quietly
+#: produced an unreadable artifact instead of an untrustworthy one.
+_FAIL_REVIEW = """
+UPDATE reviews SET status='failed', parse_ok=0, trustworthy=0,
+  artifact_json=json_set(artifact_json,
+    '$.status', 'failed',
+    '$.failure_reason', ?,
+    '$.parse_ok', json('false'),
+    '$.trustworthy', json('false'))
+WHERE id=?"""
+
+
+@dataclass(frozen=True)
+class Reservation:
+    """What one `reserve_prepush` transaction decided.
+
+    Exactly one of the first two fields is set:
+
+    * `record_id` -- the reserved `running` record's id. A worker may now be
+      spawned for it, and nothing else.
+    * `suppressed_by` -- the id of the trustworthy terminal review this push's
+      diff is already covered by. No record was written and no worker may run.
+
+    `superseded` is the set of rows this reservation RETIRED -- `{"id", "pid"}`
+    each -- and it is RETURNED by the transaction rather than re-queried
+    afterwards, because a post-hoc query races: a third dispatcher committing in
+    between would have retired our own row too, and we would signal its worker.
+    A tuple, so a caller cannot append to the audit of what it retired.
+    """
+
+    record_id: str | None = None
+    suppressed_by: str | None = None
+    superseded: tuple[dict, ...] = field(default_factory=tuple)
+
+
 class Store:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, path: Path | None = None):
         self._c = conn
+        #: The file this store lives in, when it was opened from one. Only
+        #: `log_dir` reads it, and it falls back to asking SQLite itself.
+        self._path = None if path is None else Path(path)
 
     @classmethod
     def open(cls, path: Path) -> "Store":
@@ -349,7 +582,7 @@ class Store:
         except BaseException:
             conn.close()        # never leave a refused store open or locked
             raise
-        return cls(conn)
+        return cls(conn, path)
 
     def close(self) -> None:
         """Close the underlying connection. Idempotent.
@@ -372,53 +605,46 @@ class Store:
         # context manager. Closing is the only side effect exiting adds.
         self.close()
 
-    def save_review(self, rec: dict) -> None:
-        rec = dict(rec)   # never mutate the caller's dict
-        axes = {k: rec.get(k, False) for k in _TRUST_AXES}
-        for k, v in axes.items():
-            if not isinstance(v, bool):   # bool("false") is True — refuse coercion
+    def log_dir(self) -> Path:
+        """`<db path>.logs/`, created on first use.
+
+        Where a DETACHED worker's stderr goes. It has to be derivable from the
+        store alone: the dispatcher opens the log file before the worker exists,
+        and the worker itself only ever learns `SKODUN_DB` -- so any other
+        location would need a second piece of configuration that could disagree.
+
+        A sibling of the database rather than a subdirectory of it, so it travels
+        with the store when `SKODUN_DB` is repointed and cannot be mistaken for
+        part of the SQLite file set.
+        """
+        path = self._path
+        if path is None:
+            # A `Store` built straight from a connection (a test, an in-memory
+            # database): ask SQLite where `main` actually lives rather than
+            # inventing a path.
+            row = self._c.execute(
+                "SELECT file FROM pragma_database_list WHERE name='main'").fetchone()
+            raw = (row[0] if row else "") or ""
+            if not raw:
                 raise ValueError(
-                    f"save_review: {k} must be bool, got {type(v).__name__}")
-        rec.update(axes)
-        rec["trustworthy"] = is_trustworthy(**axes)
-        sev = rec.get("severity") or {}
-        self._c.execute(
-            """INSERT INTO reviews (id, reviewed_at, branch, head, base_ref, base_sha,
-                 diff_hash, context_hash, mode, model, adapter, status, parse_ok,
-                 degraded, diff_truncated, trustworthy, stop_reason, findings_total,
-                 sev_high, sev_medium, sev_low, summary, source, artifact_json,
-                 worst_runtime_sec)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(id) DO UPDATE SET
-                 reviewed_at=excluded.reviewed_at, branch=excluded.branch,
-                 head=excluded.head, base_ref=excluded.base_ref,
-                 base_sha=excluded.base_sha, diff_hash=excluded.diff_hash,
-                 context_hash=excluded.context_hash, mode=excluded.mode,
-                 model=excluded.model, adapter=excluded.adapter,
-                 status=excluded.status, parse_ok=excluded.parse_ok,
-                 degraded=excluded.degraded, diff_truncated=excluded.diff_truncated,
-                 trustworthy=excluded.trustworthy, stop_reason=excluded.stop_reason,
-                 findings_total=excluded.findings_total, sev_high=excluded.sev_high,
-                 sev_medium=excluded.sev_medium, sev_low=excluded.sev_low,
-                 summary=excluded.summary, source=excluded.source,
-                 artifact_json=excluded.artifact_json,
-                 -- The v3 runtime-budget column, written from the SAME dict the
-                 -- artifact is serialized from, so the indexed value and the
-                 -- artifact can never disagree (the Phase 1 rule). NULL when the
-                 -- record carries no usable budget, which is every pre-Phase-3
-                 -- row and every unbatched foreground review that predates it.
-                 worst_runtime_sec=excluded.worst_runtime_sec""",
-            (rec["id"], rec.get("reviewed_at"), rec.get("branch"), rec.get("head"),
-             rec.get("base_ref"), rec.get("base_sha"), rec.get("diff_hash"),
-             rec.get("context_hash", ""), rec.get("mode"), rec.get("model"),
-             rec.get("adapter"), rec.get("status"), int(bool(rec.get("parse_ok"))),
-             int(bool(rec.get("degraded"))), int(bool(rec.get("diff_truncated"))),
-             int(bool(rec.get("trustworthy"))), rec.get("stop_reason"),
-             int(rec.get("findings_total") or 0), int(sev.get("high") or 0),
-             int(sev.get("medium") or 0), int(sev.get("low") or 0),
-             rec.get("summary"), rec.get("source", "skodun"),
-             json.dumps(rec, ensure_ascii=False),
-             _opt_positive_int(rec.get("worst_runtime_sec"))))
+                    "this store has no file on disk, so it has no log directory")
+            path = Path(raw)
+        directory = Path(str(path) + ".logs")
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def save_review(self, rec: dict) -> None:
+        self._write_review(_normalize_record(rec, label="save_review"))
+
+    def _write_review(self, rec: Mapping) -> None:
+        """Upsert an ALREADY-normalized record. Never call with a raw dict.
+
+        Private because normalization is not optional: this is the statement
+        behind both `save_review` and `reserve_prepush`, and the only reason it
+        is factored out is that the reservation runs it INSIDE its own
+        transaction while `save_review` runs it in autocommit.
+        """
+        self._c.execute(_INSERT_REVIEW, (rec["id"],) + _review_values(rec))
 
     def get_review(self, review_id: str) -> dict | None:
         row = self._c.execute("SELECT artifact_json FROM reviews WHERE id=?",
@@ -432,11 +658,338 @@ class Store:
                ORDER BY reviewed_at DESC LIMIT 1""", (diff_hash,)).fetchone()
         return json.loads(row["artifact_json"]) if row else None
 
-    def set_status(self, review_id: str, status: str) -> None:
-        self._c.execute(
-            """UPDATE reviews SET status=?,
-                 artifact_json=json_set(artifact_json, '$.status', ?)
-               WHERE id=?""", (status, status, review_id))
+    # --- the two atomic FAILURE transitions --------------------------------
+    #
+    # `set_status` used to live here. It wrote a status and NOTHING else, so
+    # every one of its callers could leave a row saying `status='failed'` beside
+    # `trustworthy=1` -- a row the gate still passes and dedup still suppresses
+    # against. It is retired entirely rather than kept as a deprecated shell:
+    # the two shapes below are the only failure transitions that exist, and each
+    # demotes the trust axes in the same statement as the status.
+
+    def mark_failed(self, review_id: str, reason: str) -> bool:
+        """Demote `review_id` to `failed`, trust axes and all. UNCONDITIONAL.
+
+        Returns whether a row changed. No `status='running'` guard, and that is
+        the point of having it separate from `fail_if_running`: its one call site
+        is the FOREGROUND cleanup, where `_persist` has already autocommitted the
+        final save before its readback. A readback failure therefore has to
+        demote a record that is already `clean` -- and a guard would leave
+        exactly the stale-recovery bug one call site over, a `failed` row still
+        carrying `trustworthy=1`.
+
+        `reason` lands in the artifact's `failure_reason`; nothing else about the
+        artifact is touched.
+        """
+        cur = self._c.execute(_FAIL_REVIEW, (reason, review_id))
+        return cur.rowcount == 1
+
+    def mark_cancelled(self, review_id: str, reason: str) -> bool:
+        """Demote an ALREADY-TERMINAL record because its review was cancelled.
+
+        The worker's POST-COMMIT linearization check, and the only transition that
+        acts on a record that is no longer `running`. It exists because a SIGTERM
+        can land while SQLite holds the write lock for `finalize_review`: the
+        worker's pre-check injects BEFORE that call and cannot see it, so without
+        this a killed review would be committed as a trustworthy one.
+
+        It is `cancellation_transform` expressed as ONE atomic statement, so the
+        record's shape does not depend on which of the three cancellation paths
+        demoted it: `degraded` (not `parse_ok`) is the axis that moves, because
+        the reviewer's output really did parse -- what is untrue is that the round
+        finished. `findings`, `findings_total` and `usable_output` are left ALONE:
+        a round cancelled after two batches answered really did produce those
+        findings, and a surface that dropped them would print "NO REVIEW HAPPENED"
+        over real evidence.
+
+        Guarded on `trustworthy=1`, which makes it self-limiting rather than
+        merely idempotent: a record that is already untrustworthy needs no
+        demotion, and the guard means an unnecessary call cannot rewrite a reason
+        onto a record some other transition already settled. Nothing else can be
+        racing it -- the supersede and the stale sweep both require
+        `status='running'`, which a finalized record no longer has.
+
+        `json('true')`/`json('false')`, never a bound Python bool: a bound boolean
+        lands in `json_set` as the NUMBER 1/0, which reloads as `int` and makes
+        the artifact malformed under the strict-bool trust rules.
+        """
+        cur = self._c.execute(
+            """UPDATE reviews SET status='failed', degraded=1, trustworthy=0,
+                 artifact_json=json_set(artifact_json,
+                   '$.status', 'failed',
+                   '$.degraded', json('true'),
+                   '$.degraded_reason', ?,
+                   '$.failure_reason', ?,
+                   '$.trustworthy', json('false'))
+               WHERE id=? AND trustworthy=1""",
+            (reason, reason, review_id))
+        return cur.rowcount == 1
+
+    def fail_if_running(self, review_id: str, reason: str) -> bool:
+        """`mark_failed`, but only while the record is still `running`.
+
+        Stale recovery's terminal transition. Returns whether it applied.
+
+        CONDITIONAL because this is a janitor, and the two things it races with
+        both have a better answer than it does: a worker finalizing a real
+        review, and a dispatcher superseding this row for a newer push. Whichever
+        terminal transition commits FIRST survives; the loser changes nothing.
+        (The shipped unconditional `set_status` in this path could overwrite a
+        clean, trustworthy record with a guess -- and, worse, could leave
+        `status='failed'` beside `trustworthy=1` when a racing writer had already
+        rewritten the row.)
+        """
+        cur = self._c.execute(
+            _FAIL_REVIEW + f" AND status='{RUNNING}'", (reason, review_id))
+        return cur.rowcount == 1
+
+    # --- the reservation lease ---------------------------------------------
+
+    def reserve_prepush(self, branch: str, head: str, base_ref: str,
+                        base_sha: str, diff_hash: str, worst_runtime_sec: int,
+                        evidence, *, now: str | None = None,
+                        id_prefix: str = "sk_") -> Reservation:
+        """Decide dedup, retire the branch's older runs, and reserve one record.
+
+        ONE `BEGIN IMMEDIATE` transaction, and everything below is inside it
+        because each step is only sound while the write lock is held:
+
+        1. **The AUTHORITATIVE dedup decision.** The dispatcher's `evidence` is
+           evidence, never a verdict: a racing dispatcher may finalize a
+           trustworthy review between the probe and this lease, which is exactly
+           the finalized-during-probe case this closes. The match query, the full
+           artifact validation and the context rules all happen here.
+        2. **The audit row**, in the same transaction as the suppression it
+           records. A suppression that committed without its `dedup_events` row
+           would be a skipped review with no trace of why.
+        3. **The supersede**, with `superseded_by` persisted to the index AND the
+           artifact atomically, and the retired rows RETURNED rather than
+           re-queried afterwards.
+        4. **The insert** of the new `running` row, `pid=NULL`.
+
+        SQLite's write lock serializes racing dispatchers, so whichever
+        transaction commits second supersedes the first's row and exactly one
+        `running` prepush row per branch survives.
+
+        The base identity (`base_ref`, `base_sha`) is reservation-owned: it is
+        written here and `finalize_review` refuses any record that disagrees
+        with it.
+        """
+        at = _iso_now() if now is None else _require_ts("now", now)
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            matched = self._suppression_candidate(diff_hash, base_sha, evidence)
+            if matched is not None:
+                self._c.execute(
+                    "INSERT INTO dedup_events (at, branch, diff_hash,"
+                    " matched_review_id) VALUES (?,?,?,?)",
+                    (at, branch, diff_hash, matched))
+                self._c.execute("COMMIT")
+                return Reservation(suppressed_by=matched)
+
+            record_id = ids.new_review_id(id_prefix)
+            rows = self._c.execute(
+                "SELECT id, pid FROM reviews"
+                " WHERE branch=? AND mode=? AND status=?",
+                (branch, PREPUSH_MODE, RUNNING)).fetchall()
+            retired = tuple({"id": r["id"], "pid": r["pid"]} for r in rows)
+            if retired:
+                self._c.execute(
+                    """UPDATE reviews SET status='superseded', superseded_by=?,
+                         artifact_json=json_set(artifact_json,
+                           '$.status', 'superseded', '$.superseded_by', ?)
+                       WHERE branch=? AND mode=? AND status=?""",
+                    (record_id, record_id, branch, PREPUSH_MODE, RUNNING))
+            # THE reserved record's exact initial shape. Strict bools throughout
+            # (`trustworthy` recomputes False from them at the chokepoint), a
+            # `usable_output` of False because nothing has answered yet, and the
+            # runtime budget already on the row -- that is the only moment at
+            # which stale recovery can learn not to sweep this row at the
+            # single-review ceiling.
+            self._write_review(_normalize_record(dict(
+                id=record_id, reviewed_at=at, branch=branch, head=head,
+                base_ref=base_ref, base_sha=base_sha, diff_hash=diff_hash,
+                mode=PREPUSH_MODE, source=SKODUN_SOURCE, status=RUNNING,
+                parse_ok=False, degraded=False, diff_truncated=False,
+                findings=[], findings_total=0, summary="", failure_reason=None,
+                usable_output=False, worst_runtime_sec=worst_runtime_sec,
+                pid=None, superseded_by=None,
+            ), label="reserve_prepush"))
+            self._c.execute("COMMIT")
+            return Reservation(record_id=record_id, superseded=retired)
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except BaseException:
+                pass    # the original failure is the one the caller must see
+            raise
+
+    def _suppression_candidate(self, diff_hash: str, base_sha: str,
+                               evidence) -> str | None:
+        """The id of a review this push may be suppressed against, or None.
+
+        Called INSIDE the reservation transaction. Every check below is one the
+        GATE itself would apply, because the whole promise of a suppression is
+        "the gate will already pass this content" -- and a suppression that
+        skipped a check the gate makes would leave the push with no record any
+        gate accepts.
+
+        In order:
+
+        * dedup is enabled at all (the `[dispatch] dedup` kill switch; the
+          `valid` half is `dispatch.evidence_permits_suppression`'s, deliberately
+          NOT re-spelled here -- one definition of "may this evidence suppress");
+        * the newest TRUSTWORTHY, TERMINAL record of this `diff_hash`. Terminal,
+          not merely trustworthy: an in-flight review certifies nothing;
+        * `load_valid_artifact` in FULL -- the gate's own validator. A malformed
+          artifact with clean axes must not suppress what the gate would reject;
+        * the trust axes RECOMPUTED from the artifact, strictly. `is_trustworthy`
+          coerces by truthiness, so an artifact carrying `1`/`0` would pass any
+          non-strict read while being malformed to every strict one;
+        * the artifact's own stored `trustworthy` agreeing with that recompute;
+        * the indexed `id`/`diff_hash` agreeing with the artifact's;
+        * `base_sha` equality with THIS reservation's base -- the gate's own
+          mandatory rebase check. A same-patch rebase must never be suppressed:
+          the gate would answer 2 for it;
+        * finally the context rules, with the candidate's context hash.
+
+        Any failure is None, i.e. "review it". There is no path from an
+        uncertainty to a suppression.
+        """
+        # Lazy, and inside the function on purpose: `dispatch` is the
+        # dispatcher's own module and `triage` is the gate's, and neither belongs
+        # in the store's import graph at load time. (The same pattern
+        # `chain.py` uses for its `pipeline` helpers.)
+        from . import dispatch as dispatch_mod
+        from .triage import load_valid_artifact
+
+        if getattr(evidence, "enabled", None) is not True:
+            return None
+        row = self._c.execute(
+            """SELECT id, diff_hash, base_sha, artifact_json FROM reviews
+               WHERE diff_hash=? AND trustworthy=1
+                 AND COALESCE(status, '') <> ?
+               ORDER BY reviewed_at DESC LIMIT 1""",
+            (diff_hash, RUNNING)).fetchone()
+        if row is None:
+            return None
+        try:
+            artifact = json.loads(row["artifact_json"])
+        except (TypeError, ValueError):
+            return None
+        try:
+            load_valid_artifact(artifact)
+        except Exception:
+            return None
+        axes = [artifact.get(k) for k in _TRUST_AXES]
+        if any(not isinstance(v, bool) for v in axes):
+            return None
+        if not is_trustworthy(*axes):
+            return None
+        if artifact.get("trustworthy") is not True:
+            return None
+        if artifact.get("id") != row["id"]:
+            return None
+        if artifact.get("diff_hash") != row["diff_hash"]:
+            return None
+        if artifact.get("diff_hash") != diff_hash:
+            return None
+        if row["base_sha"] != base_sha or artifact.get("base_sha") != base_sha:
+            return None
+        if not dispatch_mod.evidence_permits_suppression(artifact, evidence):
+            return None
+        return row["id"]
+
+    def attach_pid(self, review_id: str, pid: int) -> bool:
+        """Record the worker's pid on a still-`running`, still-pidless record.
+
+        Returns whether it applied. False means a racing dispatch superseded this
+        reservation between the lease and the spawn (or something already
+        attached a pid), and the caller's freshly-spawned child must be
+        terminated -- it would otherwise review content whose record is already
+        terminal, and overlap the replacement review on one inference backend.
+
+        The guard is `status='running' AND pid IS NULL`, which is what makes the
+        answer meaningful rather than advisory.
+        """
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise ValueError(f"attach_pid: pid must be a positive int, got {pid!r}")
+        cur = self._c.execute(
+            """UPDATE reviews SET pid=?,
+                 artifact_json=json_set(artifact_json, '$.pid', ?)
+               WHERE id=? AND status=? AND pid IS NULL""",
+            (pid, pid, review_id, RUNNING))
+        return cur.rowcount == 1
+
+    def finalize_review(self, record_id: str, rec: dict) -> bool:
+        """Apply a worker's completed record to its reservation, CONDITIONALLY.
+
+        Returns True when the record was applied, False when the reservation is
+        no longer `running` -- superseded by a newer push, or already recovered
+        as stale -- in which case NOTHING changes. A late worker can therefore
+        never overwrite a terminal record, which is the whole reason the
+        dispatcher may retire a run it could not signal.
+
+        Raises `ValueError` (and changes nothing) when the record is not the
+        reservation's: a mismatched `id`, or any of the five reserved identity
+        fields disagreeing with the stored row. Those are never silent
+        overwrites, because a worker that recomputed a different `diff_hash` has
+        reviewed different content and would publish it at this record's id.
+
+        The identity read, the database-owned-field merge (`pid`,
+        `superseded_by`), the normalization and the conditional UPDATE all run
+        under ONE `BEGIN IMMEDIATE`. The shipped store is in autocommit, so
+        without it a pid attach committing between the re-read and the update
+        would be erased by the stale merge -- and the record would then look like
+        a worker that never started, which is precisely what stale recovery acts
+        on.
+
+        Normalization is `save_review`'s, exactly (see `_normalize_record`): a
+        worker cannot reach the store by a laxer road than the foreground does.
+        """
+        if not isinstance(record_id, str) or not record_id:
+            raise ValueError(
+                f"finalize_review: record_id must be a non-empty string, got "
+                f"{record_id!r}")
+        if rec.get("id") != record_id:
+            raise ValueError(
+                f"finalize_review: the record's id {rec.get('id')!r} is not the "
+                f"reservation {record_id!r}; refusing to overwrite another record")
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._c.execute(
+                "SELECT status, pid, superseded_by, branch, head, base_ref,"
+                " base_sha, diff_hash FROM reviews WHERE id=?",
+                (record_id,)).fetchone()
+            if row is None:
+                self._c.execute("COMMIT")
+                return False
+            for name in _RESERVED_IDENTITY:
+                if rec.get(name) != row[name]:
+                    raise ValueError(
+                        f"finalize_review: {name} moved under the reservation "
+                        f"{record_id!r}: reserved {row[name]!r}, record "
+                        f"{rec.get(name)!r}")
+            if row["status"] != RUNNING:
+                self._c.execute("COMMIT")
+                return False
+            merged = dict(rec)
+            # DATABASE-owned: the dispatcher wrote them after the worker's dict
+            # was built, so the worker's values are stale by construction.
+            merged["pid"] = row["pid"]
+            merged["superseded_by"] = row["superseded_by"]
+            merged = _normalize_record(merged, label="finalize_review")
+            cur = self._c.execute(
+                _FINALIZE_REVIEW, _review_values(merged) + (record_id,))
+            applied = cur.rowcount == 1
+            self._c.execute("COMMIT")
+            return applied
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except BaseException:
+                pass
+            raise
 
     def log_gate_event(self, rec: dict) -> None:
         self._c.execute(

@@ -16,6 +16,15 @@ are the reason this module exists at all:
    after retries are exhausted would mint a trustworthy "clean review" from a
    run that never finished. On timeout the stdout file is truncated to zero
    bytes, exactly as the oracle discards it (`: > "$_tmp"`).
+
+CANCELLATION lives here too, for property 2's reason. The background worker is
+SIGTERMed when a newer push supersedes it, and its handler cannot take the
+provider down itself -- it does not know the pid, and a signal handler is not
+where a process group should be reaped. So the handler only SETS a token, and
+this module's tick loop is the one place that both holds the pgid and runs
+often enough to notice. A bare SIGTERM death of the worker would leave the model
+CLI alive in its own session, spending quota on a review nobody will read and
+overlapping the replacement review on one inference backend.
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +42,53 @@ _TERM_GRACE_SEC = 3.0
 # Watchdog tick. Finer than the oracle's 1s tick, which only sharpens the
 # timeout edge and the time-to-first-output resolution.
 _POLL_SEC = 0.25
+
+
+class ReviewCancelled(BaseException):
+    """This review was asked to stop; nothing it produced is a verdict.
+
+    `BaseException`, and NOT `Exception`, deliberately. Every layer between this
+    tick loop and the worker catches `Exception` in order to DEMOTE rather than
+    destroy a review -- `pipeline._run_sub`, `pipeline._extra_pass`,
+    `dispatch.build_dedup_evidence`. An `Exception` subclass would therefore be
+    swallowed by the first of them and turned into a degraded *review*: a record
+    with clean-looking axes for a run that was killed mid-flight. Being outside
+    that hierarchy is what makes the cancellation reach the worker's own
+    failed-finalize path instead.
+
+    It lives in this module rather than in `pipeline` because this is the lowest
+    layer that raises it, and `runner` deliberately imports nothing from the
+    package (see the module docstring's no-pipes/no-orphans properties -- it is a
+    leaf on purpose). `pipeline` and `cli` alias the name.
+
+    `partial` is the record built so far, attached by `pipeline`'s pass-boundary
+    checks as the exception travels out: a cancellation that lands after two
+    passes already answered still has findings worth persisting, and the worker
+    finalizes them with `degraded=True` rather than throwing them away. It is
+    `None` when the cancellation happened before any record existed.
+    """
+
+    def __init__(self, *args, partial: dict | None = None):
+        super().__init__(*args)
+        self.partial = partial
+
+
+def _cancelled(cancel: "threading.Event | None") -> bool:
+    """Whether `cancel` is a set token. Total, and never raises.
+
+    `is_set()` is called through a guard because the token crosses a signal
+    handler boundary: a caller that passed something Event-shaped-but-not (a
+    `Mock`, a stale proxy) must not turn a review into a crash inside the
+    watchdog loop. An unreadable token reads as NOT cancelled -- the review
+    continues and its own timeout still bounds it, which is strictly safer than
+    aborting a run that nobody asked to stop.
+    """
+    if cancel is None:
+        return False
+    try:
+        return bool(cancel.is_set())
+    except BaseException:       # pragma: no cover - defensive
+        return False
 
 
 @dataclass(frozen=True)
@@ -49,6 +106,7 @@ def run_with_watchdog(
     stdout_path: Path,
     stderr_path: Path,
     stdin_path: Path | None = None,
+    cancel: "threading.Event | None" = None,
 ) -> RunResult:
     """Run `cmd` with a hard wall-clock timeout, streaming output to files.
 
@@ -72,6 +130,23 @@ def run_with_watchdog(
     caller cannot accumulate open prompt files. `DEVNULL` is deliberately NOT
     routed through the same open: `subprocess` manages that descriptor itself.
 
+    `cancel`, when given, is a `threading.Event` the caller's SIGTERM handler
+    sets. It is checked BEFORE the spawn and on every tick, and a set token
+    takes the process group down exactly as a timeout does and then raises
+    `ReviewCancelled`. Three details are deliberate:
+
+      * **Checked before `Popen`.** A token set while the previous attempt was
+        being written up must not buy one more model call.
+      * **`raise`, not a `RunResult`.** A cancelled run has no exit code worth
+        reporting and its stdout is evidence of nothing (property 3 above,
+        arrived at by a different road) -- returning a result would invite the
+        chain to classify and parse a killed attempt's partial envelope. The
+        stdout file is deliberately NOT truncated: nothing will read it, because
+        nothing between here and the worker's failed finalize looks at it.
+      * **The group dies first, and is waited for.** `_terminate_group` reaps the
+        leader and SIGKILLs the group, so by the time the exception propagates
+        the provider is gone rather than racing the worker's exit.
+
     Note: if `cmd[0]` does not exist, `subprocess.Popen` raises
     `FileNotFoundError` before the watchdog loop starts. That exception
     propagates uncaught out of this function -- `stdout_path`/`stderr_path`
@@ -80,6 +155,10 @@ def run_with_watchdog(
     loop around this function needs to decide deliberately whether that case
     is retryable.
     """
+    if _cancelled(cancel):
+        # Before ANY file is opened or process started: this call is not going
+        # to happen at all, so it should leave nothing behind either.
+        raise ReviewCancelled("the review was cancelled before this attempt started")
     t0 = time.monotonic()
     first_out: float | None = None
     timed_out = False
@@ -107,6 +186,15 @@ def run_with_watchdog(
 
             try:
                 while True:
+                    if _cancelled(cancel):
+                        # The whole reason this loop owns the cancellation: it
+                        # holds `pg`. The worker's signal handler only set the
+                        # token; the provider (and any helper it spawned into
+                        # the same group) is taken down HERE, before the
+                        # exception unwinds, so nothing outlives the worker.
+                        _terminate_group(proc, pg)
+                        raise ReviewCancelled(
+                            "the review was cancelled while a reviewer was running")
                     status = proc.poll()
                     if first_out is None and _size(stdout_path) > 0:
                         # `_size` swallows OSError and reports 0 on a stat failure,
