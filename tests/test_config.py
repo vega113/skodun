@@ -4,8 +4,9 @@ from pathlib import Path
 import pytest
 
 from skodun.config import (
-    _DEFAULTS_MINIMUMS, SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOT_NAMES,
-    SECURITY_PROMPT_SLOTS, Defaults, Reviewer, load_config,
+    _DEFAULTS_MINIMUMS, _DISPATCH_FLAGS, _DISPATCH_MINIMUMS,
+    SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOT_NAMES, SECURITY_PROMPT_SLOTS,
+    Defaults, Dispatch, Reviewer, load_config,
 )
 
 
@@ -963,3 +964,125 @@ max_cost_usd = {literal}
     with pytest.raises(ValueError, match=r"reviewer 'sec': max_cost_usd") as e:
         load_config(None, global_path=p)
     assert "max_cost_usd" in str(e.value), why
+
+
+# ---------------------------------------------------------------------------
+# `[dispatch]`: the background dispatcher's own table
+# ---------------------------------------------------------------------------
+#
+# A separate table rather than more `[defaults]` keys, because the two describe
+# different runs: `[defaults]` is what a FOREGROUND review may spend, and
+# `[dispatch]` is what a background pre-push worker may spend (a much tighter
+# timeout, because the push is already over and nothing is waiting on it).
+# Validated exactly like `[defaults]` -- these are the user's own numbers, and a
+# typo in them must be loud and early rather than a quietly useless review.
+
+
+def test_dispatch_defaults_are_the_documented_ones():
+    cfg = load_config(None, global_path=None)
+    assert cfg.dispatch == Dispatch()
+    assert (cfg.dispatch.enabled, cfg.dispatch.timeout_sec,
+            cfg.dispatch.timeout_retries, cfg.dispatch.dedup,
+            cfg.dispatch.large_prompt_bytes) == (True, 240, 0, True, 80_000)
+
+
+def test_dispatch_values_load_and_the_project_layer_wins(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[dispatch]
+timeout_sec = 300
+dedup = false
+""")
+    repo = tmp_path / "repo"; repo.mkdir()
+    _write(repo / ".skodun.toml", """
+[dispatch]
+timeout_sec = 120
+enabled = false
+large_prompt_bytes = 1
+timeout_retries = 2
+""")
+    d = load_config(repo, global_path=g).dispatch
+    assert d.timeout_sec == 120          # project layer wins per key
+    assert d.dedup is False              # ...and the global key survives
+    assert d.enabled is False
+    assert d.large_prompt_bytes == 1
+    assert d.timeout_retries == 2
+
+
+def test_unknown_dispatch_key_rejected(tmp_path):
+    g = _write(tmp_path / "g.toml", "[dispatch]\nlarge_prompt_escalation = 10\n")
+    with pytest.raises(ValueError, match=r"unknown \[dispatch\] keys: "
+                                         r"\['large_prompt_escalation'\]"):
+        load_config(None, global_path=g)
+
+
+def test_every_integer_dispatch_field_has_a_declared_minimum():
+    numeric = {f.name for f in fields(Dispatch) if f.type in ("int", int)}
+    assert numeric, "expected Dispatch to have integer fields"
+    assert numeric == set(_DISPATCH_MINIMUMS)
+
+
+def test_every_bool_dispatch_field_is_declared_as_one():
+    flags = {f.name for f in fields(Dispatch) if f.type in ("bool", bool)}
+    assert flags == set(_DISPATCH_FLAGS)
+
+
+@pytest.mark.parametrize("key", sorted(_DISPATCH_MINIMUMS))
+def test_dispatch_numeric_accepts_its_minimum(tmp_path, key):
+    g = _write(tmp_path / "g.toml",
+               f"[dispatch]\n{key} = {_DISPATCH_MINIMUMS[key]}\n")
+    assert getattr(load_config(None, global_path=g).dispatch, key) \
+        == _DISPATCH_MINIMUMS[key]
+
+
+@pytest.mark.parametrize("key", sorted(_DISPATCH_MINIMUMS))
+def test_dispatch_numeric_rejects_below_minimum(tmp_path, key):
+    below = _DISPATCH_MINIMUMS[key] - 1
+    g = _write(tmp_path / "g.toml", f"[dispatch]\n{key} = {below}\n")
+    with pytest.raises(ValueError, match=rf"\[dispatch\] {key}: must be >= "
+                                         rf"{_DISPATCH_MINIMUMS[key]}, got {below}"):
+        load_config(None, global_path=g)
+
+
+@pytest.mark.parametrize("literal, shown", [('"420"', "str"), ("1.5", "float"),
+                                            ("true", "bool")])
+@pytest.mark.parametrize("key", sorted(_DISPATCH_MINIMUMS))
+def test_dispatch_numeric_rejects_a_non_integer(tmp_path, key, literal, shown):
+    g = _write(tmp_path / "g.toml", f"[dispatch]\n{key} = {literal}\n")
+    with pytest.raises(
+            ValueError,
+            match=rf"\[dispatch\] {key}: expected an integer, got {shown}"):
+        load_config(None, global_path=g)
+
+
+@pytest.mark.parametrize("literal, shown", [('"false"', "str"), ("0", "int"),
+                                            ("1", "int"), ("1.0", "float")])
+@pytest.mark.parametrize("key", sorted(_DISPATCH_FLAGS))
+def test_dispatch_flag_rejects_anything_but_a_bool(tmp_path, key, literal, shown):
+    """`bool("false")` is True, and `enabled = "false"` must not enable dispatch.
+
+    This is the same refusal-to-coerce the store applies to the trust axes: a
+    kill switch that reads "false" as "yes" is the exact bug class Phase 1 had
+    to fix once already.
+    """
+    g = _write(tmp_path / "g.toml", f"[dispatch]\n{key} = {literal}\n")
+    with pytest.raises(
+            ValueError,
+            match=rf"\[dispatch\] {key}: expected true or false, got {shown}"):
+        load_config(None, global_path=g)
+
+
+def test_a_dispatch_table_does_not_disturb_defaults_or_reviewers(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[defaults]
+timeout_sec = 411
+[dispatch]
+timeout_sec = 7
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+""")
+    cfg = load_config(None, global_path=g)
+    assert cfg.defaults.timeout_sec == 411      # the two tables are separate
+    assert cfg.dispatch.timeout_sec == 7
+    assert [r.name for r in cfg.reviewers] == ["finder"]

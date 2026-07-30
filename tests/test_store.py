@@ -47,6 +47,11 @@ REC = dict(id="r1", reviewed_at="2026-07-27T10:00:00Z", branch="b", head="h"*20,
            severity={"high": 0, "medium": 0, "low": 0}, findings=[])
 
 
+def _a_finding() -> dict:
+    return dict(file="a.py", line=3, severity="high", category="bug",
+                title="NPE", detail="why")
+
+
 def _raw_row(path, review_id="r1"):
     """Read a review row straight from the file, bypassing the Store API."""
     conn = sqlite3.connect(path)
@@ -117,13 +122,6 @@ def test_non_bool_trust_axis_rejected(tmp_path):
     st = Store.open(tmp_path / "s.db")
     with pytest.raises(ValueError):                       # bool("false") is True
         st.save_review({**REC, "parse_ok": "false"})
-
-
-def test_set_status_updates_artifact_json_too(tmp_path):
-    st = Store.open(tmp_path / "s.db")
-    st.save_review({**REC, "status": "running"})
-    st.set_status("r1", "failed")
-    assert st.get_review("r1")["status"] == "failed"
 
 
 # --- contract points the brief's list leaves uncovered ----------------------
@@ -197,16 +195,6 @@ def test_every_trust_axis_rejects_non_bool(tmp_path, axis, value):
     with pytest.raises(ValueError):
         st.save_review({**REC, axis: value})
     assert st.get_review("r1") is None      # nothing was written
-
-
-def test_set_status_updates_indexed_column_too(tmp_path):
-    db = tmp_path / "s.db"
-    st = Store.open(db)
-    st.save_review({**REC, "status": "running"})
-    st.set_status("r1", "superseded")
-    assert _raw_row(db)["status"] == "superseded"
-    assert st.get_review("r1")["status"] == "superseded"
-    assert st.get_review("r1")["summary"] == "ok"   # rest of the artifact intact
 
 
 def test_latest_trustworthy_picks_newest(tmp_path):
@@ -1110,16 +1098,111 @@ def test_a_crashed_v3_migration_never_leaves_the_store_open(tmp_path, monkeypatc
 
 def test_the_v3_delta_is_not_replay_idempotent_which_is_why_it_is_atomic(tmp_path):
     """Pins the premise of the transaction rather than restating it in prose: a
-    second application of the same statements really does raise."""
-    from skodun.store import _MIGRATION_V3, _apply_atomic
+    second application of the same STATEMENTS really does raise.
+
+    Driven against the raw statements rather than through `_apply_atomic`, which
+    now (correctly) refuses to replay a delta at all -- it re-reads
+    `user_version` under the write lock, so a concurrent opener that lost the race
+    is a no-op instead of a `duplicate column name` failure. The premise the
+    transaction rests on is unchanged, and this is where it is pinned.
+    """
+    from skodun.store import _MIGRATION_V3
 
     db = _v2_db(tmp_path / "s.db")
     st = Store.open(db)
     with pytest.raises(sqlite3.OperationalError, match="duplicate column"):
-        _apply_atomic(st._c, 3, _MIGRATION_V3)
-    # ... and the failed replay rolled back, so the store is still usable.
+        for sql in _MIGRATION_V3:
+            st._c.execute(sql)
+    st.close()
+
+
+def test_apply_atomic_is_a_no_op_when_a_peer_already_applied_the_delta(tmp_path):
+    """The migration race, at the statement that closes it.
+
+    The caller's `user_version` read happens OUTSIDE any transaction, so two
+    openers of the same store can both see the old version and both arrive at the
+    same delta. The loser must find the version already stamped and do nothing --
+    otherwise `Store.open` RAISES for it, and no store means a pre-push dispatch
+    has nowhere to record its failure, so that push gets no record at all.
+    """
+    from skodun.store import _MIGRATION_V3, _apply_atomic
+
+    db = _v2_db(tmp_path / "s.db")
+    st = Store.open(db)                     # migrates it to v3
     assert _user_version(db) == 3
-    assert [e["event"] for e in _events(st)] == ["dismiss"]
+    _apply_atomic(st._c, 3, _MIGRATION_V3)  # the loser's call: a no-op
+    assert _user_version(db) == 3
+    assert [e["event"] for e in _events(st)] == ["dismiss"], (
+        "the no-op re-seeded the triage stream")
+    st.close()
+
+
+def test_wal_mode_survives_a_peer_holding_the_lock(tmp_path):
+    """`PRAGMA journal_mode=WAL` is the one statement SQLite does not route
+    through the busy handler: it returns `SQLITE_BUSY` immediately, whatever the
+    connection's `timeout`. Refusing to open the store over that would be the
+    dispatcher's worst failure -- nowhere to record anything.
+
+    A wrapper rather than a monkeypatch: `sqlite3.Connection.execute` is
+    read-only.
+    """
+    import sqlite3 as _sqlite3
+
+    from skodun.store import _enable_wal
+
+    db = tmp_path / "s.db"
+    conn = _sqlite3.connect(db, isolation_level=None)
+    calls = []
+
+    class _Busy:
+        """A connection whose WAL pragma always reports the lock as held."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *a, **kw):
+            if "journal_mode=WAL" in sql:
+                calls.append(sql)
+                raise _sqlite3.OperationalError("database is locked")
+            return self._inner.execute(sql, *a, **kw)
+
+    try:
+        # It gives up rather than refusing to open: the mode is a concurrency
+        # property, not a correctness one -- every writer uses explicit
+        # transactions, so a rollback-journal store is slower and nothing else.
+        assert _enable_wal(_Busy(conn), attempts=2).lower() != "wal"
+        assert len(calls) == 2, "the pragma was not retried"
+    finally:
+        conn.close()
+
+
+def test_wal_mode_stops_retrying_once_a_peer_has_converted_the_database(tmp_path):
+    """The other half: the loser must NOTICE the conversion rather than burning
+    its whole retry budget on a pragma that will keep failing."""
+    import sqlite3 as _sqlite3
+
+    from skodun.store import _enable_wal
+
+    db = tmp_path / "s.db"
+    conn = _sqlite3.connect(db, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")     # a "peer" already did it
+    calls = []
+
+    class _Busy:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *a, **kw):
+            if "journal_mode=WAL" in sql:
+                calls.append(sql)
+                raise _sqlite3.OperationalError("database is locked")
+            return self._inner.execute(sql, *a, **kw)
+
+    try:
+        assert _enable_wal(_Busy(conn), attempts=20).lower() == "wal"
+        assert len(calls) == 1, "it kept retrying a conversion already done"
+    finally:
+        conn.close()
 
 
 def test_no_non_transactional_delta_carries_a_non_idempotent_statement():
@@ -1457,6 +1540,7 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_batched_review.py",
     "tests/test_legacy_import.py",
     "tests/test_shadow.py",
+    "tests/test_dispatch.py",
     "tests/test_refuter.py",
     "tests/test_triage.py",
 )
@@ -1522,3 +1606,985 @@ def test_store_touching_modules_run_clean_under_resourcewarning_error(tmp_path):
     assert proc.returncode == 0, (
         f"store-touching subset failed under -W error::ResourceWarning "
         f"(exit {proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
+
+
+# ===========================================================================
+# Phase 3 Task 10: the reservation lease, conditional finalize, atomic failure
+# ===========================================================================
+#
+# `set_status` is GONE, and its two tests above went with it. It wrote a status
+# and nothing else, so every caller of it left a row whose status said `failed`
+# beside `trustworthy=1` -- a row the gate still honours and dedup still
+# suppresses against. The replacements below are the two shapes that actually
+# exist: an atomic FAILURE transition that demotes the trust axes with it
+# (`mark_failed`, and its conditional sibling `fail_if_running`), and the
+# reservation transaction's own supersede.
+
+#: The reserved record's exact initial shape, as `reserve_prepush` writes it.
+RESERVED_KEYS = {
+    "id", "reviewed_at", "branch", "head", "base_ref", "base_sha", "diff_hash",
+    "mode", "source", "status", "parse_ok", "degraded", "diff_truncated",
+    "findings", "findings_total", "summary", "failure_reason", "usable_output",
+    "worst_runtime_sec", "pid", "superseded_by",
+    # Computed at the chokepoint from the three axes, never caller-supplied.
+    "trustworthy",
+}
+
+PREPUSH = dict(REC, mode="prepush", source="skodun", usable_output=True)
+
+
+def _evidence(enabled=True, valid=True, candidate=None):
+    from skodun.dispatch import DedupEvidence
+    return DedupEvidence(enabled=enabled, valid=valid,
+                         candidate_context_hash=candidate)
+
+
+def _reserve(st, **kw):
+    args = dict(branch="b", head="h" * 40, base_ref="origin/main",
+                base_sha="s" * 40, diff_hash="d" * 40, worst_runtime_sec=1234,
+                evidence=_evidence(enabled=False))
+    args.update(kw)
+    return st.reserve_prepush(**args)
+
+
+def _dedup_events(path):
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM dedup_events")]
+    finally:
+        conn.close()
+
+
+# --- the reserved record's shape -------------------------------------------
+
+
+def test_reserve_prepush_writes_the_documented_running_shape(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+
+    res = _reserve(st)
+
+    assert res.suppressed_by is None
+    assert res.superseded == ()
+    rec = st.get_review(res.record_id)
+    assert set(rec) == RESERVED_KEYS, set(rec) ^ RESERVED_KEYS
+    assert rec["id"] == res.record_id
+    assert (rec["branch"], rec["head"], rec["base_ref"], rec["base_sha"],
+            rec["diff_hash"]) == ("b", "h" * 40, "origin/main", "s" * 40, "d" * 40)
+    assert rec["mode"] == "prepush" and rec["source"] == "skodun"
+    assert rec["status"] == "running"
+    # STRICT bools, every one of them: a trustworthy computation over ints would
+    # be a different function, and the artifact would be malformed under the
+    # strict-bool trust rules every reader applies.
+    for field in ("parse_ok", "degraded", "diff_truncated", "usable_output"):
+        assert rec[field] is False, field
+        assert type(rec[field]) is bool, field
+    assert rec["findings"] == [] and rec["findings_total"] == 0
+    assert rec["summary"] == "" and rec["failure_reason"] is None
+    assert rec["worst_runtime_sec"] == 1234
+    assert rec["pid"] is None and rec["superseded_by"] is None
+    row = _raw_row(db, res.record_id)
+    assert row["status"] == "running" and row["trustworthy"] == 0
+    assert row["worst_runtime_sec"] == 1234
+    assert row["pid"] is None and row["superseded_by"] is None
+    assert row["mode"] == "prepush" and row["source"] == "skodun"
+
+
+def test_a_reserved_record_is_never_a_dedup_candidate_or_a_gate_pass(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    res = _reserve(st)
+    assert st.latest_trustworthy_for("d" * 40) is None
+    from skodun.triage import load_valid_artifact
+    assert load_valid_artifact(st.get_review(res.record_id)) is not None
+
+
+def test_reserve_prepush_mints_a_fresh_id_per_call(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    first = _reserve(st).record_id
+    second = _reserve(st).record_id
+    assert first != second
+    assert first.startswith("sk_") and second.startswith("sk_")
+
+
+def test_the_reservation_time_is_the_stores_canonical_timestamp(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    rec = st.get_review(_reserve(st).record_id)
+    from skodun.store import _is_canonical_ts
+    assert _is_canonical_ts(rec["reviewed_at"]), rec["reviewed_at"]
+
+
+# --- supersede is reservation-owned, and RETURNED ---------------------------
+
+
+def test_reserving_retires_every_running_prepush_row_of_the_branch(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    first = _reserve(st, diff_hash="1" * 40).record_id
+    st.attach_pid(first, 4242)
+    # A SECOND concurrent running prepush row on the same branch, written
+    # directly: a second reservation would have retired the first one itself
+    # (which `test_two_serialized_reservations_leave_exactly_one_running_row`
+    # pins), and this test is about retiring MORE THAN ONE row in one lease --
+    # the state a store left behind by a killed dispatcher can hold.
+    second = "hand-written-running"
+    st.save_review({**PREPUSH, "id": second, "branch": "b", "status": "running",
+                    "parse_ok": False, "usable_output": False,
+                    "diff_hash": "2" * 40, "pid": None})
+
+    third = _reserve(st, diff_hash="3" * 40)
+
+    assert third.record_id not in (first, second)
+    # RETURNED by the transaction, never re-queried: a post-hoc query races.
+    assert sorted(r["id"] for r in third.superseded) == sorted([first, second])
+    assert {r["id"]: r["pid"] for r in third.superseded} == {first: 4242, second: None}
+    for retired in (first, second):
+        assert _raw_row(db, retired)["status"] == "superseded"
+        assert _raw_row(db, retired)["superseded_by"] == third.record_id
+        art = st.get_review(retired)
+        assert art["status"] == "superseded"
+        # Written to the ARTIFACT in the same statement -- Task 12 renders it
+        # from there, and an index row that disagrees with its artifact is the
+        # one thing this store exists to make impossible.
+        assert art["superseded_by"] == third.record_id
+
+
+def test_supersede_never_touches_another_branch_or_a_foreground_run(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    other = _reserve(st, branch="other").record_id
+    st.save_review({**REC, "id": "fg", "branch": "b", "mode": "now",
+                    "status": "running", "parse_ok": False})
+
+    res = _reserve(st, branch="b")
+
+    assert [r["id"] for r in res.superseded] == []
+    assert _raw_row(db, other)["status"] == "running"
+    assert _raw_row(db, "fg")["status"] == "running"
+    assert _raw_row(db, "fg")["superseded_by"] is None
+
+
+def test_supersede_leaves_terminal_rows_of_the_same_branch_alone(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    st.save_review({**PREPUSH, "id": "done", "branch": "b", "status": "clean"})
+
+    res = _reserve(st, branch="b")
+
+    assert [r["id"] for r in res.superseded] == []
+    assert _raw_row(db, "done")["status"] == "clean"
+    assert _raw_row(db, "done")["trustworthy"] == 1
+
+
+def test_two_serialized_reservations_leave_exactly_one_running_row(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    a = _reserve(st, diff_hash="1" * 40).record_id
+    b = _reserve(st, diff_hash="2" * 40).record_id
+    running = [r["id"] for r in _all_rows(db) if r["status"] == "running"]
+    assert running == [b]
+    assert _raw_row(db, a)["superseded_by"] == b
+
+
+def _all_rows(path):
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM reviews")]
+    finally:
+        conn.close()
+
+
+# --- the authoritative dedup decision, inside the lease --------------------
+
+
+def _candidate(st, **kw):
+    """A trustworthy TERMINAL record of `d*40` that a lease may suppress against.
+
+    `context_hash` is REMOVED unless a test supplies one: the shipped `""` is the
+    AMBIGUOUS state and never suppresses, so a candidate carrying it would make
+    every suppression assertion below vacuous. An ABSENT key is the legacy state,
+    which suppresses on the diff hash alone.
+    """
+    rec = {**PREPUSH, "id": "cand", "status": "clean", "base_sha": "s" * 40,
+           "diff_hash": "d" * 40}
+    rec.pop("context_hash")
+    rec.update(kw)
+    st.save_review(rec)
+    return rec
+
+
+def test_a_matching_trustworthy_terminal_record_suppresses_with_an_audit_row(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    _candidate(st)          # no context_hash key: the legacy state
+
+    res = _reserve(st, evidence=_evidence())
+
+    assert res.record_id is None
+    assert res.suppressed_by == "cand"
+    assert res.superseded == ()
+    assert [r["id"] for r in _all_rows(db)] == ["cand"]     # nothing reserved
+    events = _dedup_events(db)
+    assert len(events) == 1
+    assert events[0]["branch"] == "b"
+    assert events[0]["diff_hash"] == "d" * 40
+    assert events[0]["matched_review_id"] == "cand"
+    from skodun.store import _is_canonical_ts
+    assert _is_canonical_ts(events[0]["at"])
+
+
+def test_a_suppression_can_never_commit_without_its_audit_row(tmp_path, monkeypatch):
+    """The audit INSERT is inside the same transaction as the decision.
+
+    Fault-injected at the audit step: the whole transaction must roll back, so
+    there is neither a suppression nor a reservation nor an event.
+    """
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    _candidate(st)
+    real = st._c.execute
+
+    def boom(sql, *a, **kw):
+        if "dedup_events" in sql:
+            raise sqlite3.OperationalError("disk full at the audit insert")
+        return real(sql, *a, **kw)
+
+    monkeypatch.setattr(st, "_c", _Proxy(st._c, boom))
+    with pytest.raises(sqlite3.OperationalError):
+        _reserve(st, evidence=_evidence())
+
+    st2 = Store.open(db)
+    assert _dedup_events(db) == []
+    assert [r["id"] for r in _all_rows(db)] == ["cand"]
+    # ...and the store is usable afterwards: the transaction was rolled back,
+    # not left open holding the write lock.
+    assert _reserve(st2).record_id is not None
+
+
+def test_the_audit_row_is_inserted_INSIDE_the_lease_not_after_it(tmp_path,
+                                                                 monkeypatch):
+    """The named mutation is "move the audit insert after COMMIT".
+
+    The fault-injection test above cannot see that mutation, and the reason is
+    worth stating: a suppression writes NOTHING durable except its audit row, so
+    "the suppression rolled back" and "the audit row was never written" are the
+    same observation. What DOES distinguish them is whether the write lock is
+    still held when the row is inserted -- `in_transaction` answers exactly that,
+    and it is False the moment a `COMMIT` has run.
+
+    If the row is inserted after the commit, then a crash in between (or a disk
+    error on that one statement) leaves a review skipped with no trace of why: the
+    push looks reviewed and the audit stream disagrees.
+    """
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    _candidate(st)
+    real = st._c.execute
+    seen = []
+
+    def watch(sql, *a, **kw):
+        if "dedup_events" in sql:
+            seen.append(st._c.in_transaction)
+        return real(sql, *a, **kw)
+
+    monkeypatch.setattr(st, "_c", _Proxy(st._c, watch))
+    assert _reserve(st, evidence=_evidence()).suppressed_by == "cand"
+    assert seen == [True], (
+        "the audit row was inserted outside the reservation lease")
+    assert len(_dedup_events(db)) == 1
+
+
+class _Proxy:
+    """A connection stand-in whose `execute` is replaced. Everything else passes."""
+
+    def __init__(self, conn, execute):
+        self._conn = conn
+        self.execute = execute
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_disabled_dedup_never_suppresses_and_never_audits(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    _candidate(st)
+
+    res = _reserve(st, evidence=_evidence(enabled=False))
+
+    assert res.record_id is not None and res.suppressed_by is None
+    assert _dedup_events(db) == []
+
+
+def test_invalid_evidence_never_suppresses_even_a_legacy_candidate(tmp_path):
+    """THE mutation-killer for dropping the `evidence.valid` check in the lease.
+
+    A legacy-context candidate needs no hash comparison at all, so a lease that
+    asked only the CONTEXT rule (`context_permits_suppression`) instead of the
+    evidence gate would suppress here -- certifying a push whose context nobody
+    could establish.
+    """
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    _candidate(st)
+
+    res = _reserve(st, evidence=_evidence(valid=False))
+
+    assert res.suppressed_by is None and res.record_id is not None
+    assert _dedup_events(db) == []
+
+
+def test_a_same_diff_different_base_is_never_suppressed(tmp_path):
+    """The gate's own mandatory rebase check, inside the lease.
+
+    A rebased branch pushes the same patch against a different base. The gate
+    would answer 2 for it (its `base_sha` no longer matches), so dedup must not
+    skip the review that would produce the record the gate needs.
+    """
+    st = Store.open(tmp_path / "s.db")
+    _candidate(st, base_sha="OTHER" + "s" * 35)
+
+    res = _reserve(st, evidence=_evidence(), base_sha="s" * 40)
+
+    assert res.suppressed_by is None and res.record_id is not None
+
+
+def test_a_running_record_of_the_same_diff_never_suppresses(tmp_path):
+    """TERMINAL, not merely trustworthy: an in-flight review certifies nothing."""
+    st = Store.open(tmp_path / "s.db")
+    # A running row cannot be trustworthy through `save_review` (its axes are
+    # recomputed), so this is written with clean axes AND a running status --
+    # the shape only a hand-edited store could hold, which is exactly what the
+    # terminal filter is for.
+    st.save_review({**PREPUSH, "id": "live", "status": "running"})
+    assert _raw_row(tmp_path / "s.db", "live")["trustworthy"] == 1
+
+    res = _reserve(st, evidence=_evidence())
+
+    assert res.suppressed_by is None and res.record_id is not None
+
+
+@pytest.mark.parametrize("axis, value", [("parse_ok", False), ("degraded", True),
+                                         ("diff_truncated", True)])
+def test_an_untrustworthy_candidate_never_suppresses(tmp_path, axis, value):
+    st = Store.open(tmp_path / "s.db")
+    _candidate(st, **{axis: value, "status": "failed"})
+    res = _reserve(st, evidence=_evidence())
+    assert res.suppressed_by is None
+    assert res.record_id is not None
+
+
+@pytest.mark.parametrize("mutation, why", [
+    ({"findings_total": 3}, "findings_total disagrees with findings"),
+    ({"findings": [1]}, "a non-object finding"),
+    ({"branch": 7}, "branch is not a string"),
+    ({"id": None}, "id is missing"),
+])
+def test_a_malformed_artifact_never_suppresses_what_the_gate_would_reject(
+        tmp_path, mutation, why):
+    """`load_valid_artifact`, in full, inside the lease.
+
+    THE mutation-killer for skipping it: each artifact below has CLEAN trust
+    axes and a `trustworthy=1` index row, so nothing about the axes would stop
+    a suppression -- and every one of them is an artifact the gate itself
+    refuses. Suppressing against one would leave the push with no record any
+    gate accepts.
+    """
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    _candidate(st)
+    _hand_edit_artifact(db, "cand", mutation)
+
+    res = _reserve(st, evidence=_evidence())
+
+    assert res.suppressed_by is None, why
+    assert res.record_id is not None
+
+
+@pytest.mark.parametrize("mutation", [
+    {"parse_ok": 1}, {"degraded": 0}, {"diff_truncated": "false"},
+    {"trustworthy": 1}, {"trustworthy": False},
+])
+def test_a_candidate_whose_artifact_axes_are_not_strict_bools_never_suppresses(
+        tmp_path, mutation):
+    """The axes are RECOMPUTED from the artifact, strictly.
+
+    `is_trustworthy(1, 0, "")` is True by truthiness, and the index column says
+    1 -- so an artifact carrying ints would suppress under any coercing read.
+    """
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    _candidate(st)
+    _hand_edit_artifact(db, "cand", mutation)
+
+    assert _reserve(st, evidence=_evidence()).suppressed_by is None
+
+
+@pytest.mark.parametrize("mutation", [{"id": "somebody-else"},
+                                      {"diff_hash": "z" * 40}])
+def test_an_index_row_disagreeing_with_its_artifact_never_suppresses(tmp_path,
+                                                                    mutation):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    _candidate(st)
+    _hand_edit_artifact(db, "cand", mutation)
+
+    assert _reserve(st, evidence=_evidence()).suppressed_by is None
+
+
+def test_the_context_rules_are_applied_with_the_evidence_hash(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    _candidate(st, context_hash="c" * 64)
+
+    assert _reserve(st, evidence=_evidence(candidate="c" * 64)).suppressed_by == "cand"
+    assert _reserve(st, evidence=_evidence(candidate="x" * 64)).suppressed_by is None
+    assert _reserve(st, evidence=_evidence(candidate=None)).suppressed_by is None
+
+
+def test_an_empty_string_context_hash_never_suppresses(tmp_path):
+    """The `""`-never-suppresses rule, reaching all the way into the lease."""
+    st = Store.open(tmp_path / "s.db")
+    _candidate(st, context_hash="")
+    for candidate in ("c" * 64, None):
+        assert _reserve(st, evidence=_evidence(candidate=candidate)).suppressed_by is None
+
+
+def test_the_newest_matching_candidate_is_the_one_considered(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    _candidate(st, id="old", reviewed_at="2026-07-27T09:00:00Z",
+               context_hash="c" * 64)
+    _candidate(st, id="new", reviewed_at="2026-07-27T12:00:00Z",
+               context_hash="n" * 64)
+
+    assert _reserve(st, evidence=_evidence(candidate="n" * 64)).suppressed_by == "new"
+    # The OLDER row's hash does not get a second chance: exactly one candidate
+    # is considered, the newest terminal one.
+    assert _reserve(st, evidence=_evidence(candidate="c" * 64)).suppressed_by is None
+
+
+def test_a_suppression_never_supersedes_an_in_flight_review(tmp_path):
+    """A skip must not TERM a live worker reviewing DIFFERENT content.
+
+    Oracle-parity in structure: the dedup decision is made before the supersede,
+    so a suppressed push leaves the branch's running row exactly as it was.
+    """
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    live = _reserve(st, diff_hash="1" * 40).record_id
+    _candidate(st, diff_hash="2" * 40)
+
+    res = _reserve(st, diff_hash="2" * 40, evidence=_evidence())
+
+    assert res.suppressed_by == "cand"
+    assert res.superseded == ()
+    assert _raw_row(db, live)["status"] == "running"
+
+
+def _hand_edit_artifact(path, review_id, mutation):
+    """Rewrite one row's artifact_json only -- the index row keeps its values."""
+    conn = sqlite3.connect(path)
+    try:
+        raw = conn.execute("SELECT artifact_json FROM reviews WHERE id=?",
+                           (review_id,)).fetchone()[0]
+        art = json.loads(raw)
+        for k, v in mutation.items():
+            if v is None:
+                art.pop(k, None)
+            else:
+                art[k] = v
+        conn.execute("UPDATE reviews SET artifact_json=? WHERE id=?",
+                     (json.dumps(art), review_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# --- attach_pid ------------------------------------------------------------
+
+
+def test_attach_pid_writes_the_column_and_the_artifact(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    rid = _reserve(st).record_id
+
+    assert st.attach_pid(rid, 31337) is True
+
+    assert _raw_row(db, rid)["pid"] == 31337
+    assert st.get_review(rid)["pid"] == 31337
+
+
+def test_attach_pid_refuses_a_record_that_is_no_longer_running(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    first = _reserve(st, diff_hash="1" * 40).record_id
+    _reserve(st, diff_hash="2" * 40)              # supersedes `first`
+
+    assert st.attach_pid(first, 999) is False
+
+    assert _raw_row(db, first)["pid"] is None
+    assert st.get_review(first)["pid"] is None
+
+
+def test_attach_pid_refuses_a_record_that_already_has_one(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    rid = _reserve(st).record_id
+    assert st.attach_pid(rid, 11) is True
+    assert st.attach_pid(rid, 22) is False
+    assert st.get_review(rid)["pid"] == 11
+
+
+@pytest.mark.parametrize("pid", [0, -1, True, 1.5, "12", None])
+def test_attach_pid_refuses_anything_that_is_not_a_real_pid(tmp_path, pid):
+    st = Store.open(tmp_path / "s.db")
+    rid = _reserve(st).record_id
+    with pytest.raises(ValueError):
+        st.attach_pid(rid, pid)
+    assert st.get_review(rid)["pid"] is None
+
+
+# --- conditional finalization ---------------------------------------------
+
+
+def _final(rec, **kw):
+    """A completed record built from a reserved one: clean, parsed, terminal."""
+    out = dict(rec)
+    out.update(status="clean", parse_ok=True, degraded=False, diff_truncated=False,
+               summary="ok", findings=[], findings_total=0, usable_output=True,
+               severity={"high": 0, "medium": 0, "low": 0})
+    out.update(kw)
+    return out
+
+
+def test_finalize_review_applies_the_record_and_reports_true(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    rid = _reserve(st).record_id
+    reserved = st.get_review(rid)
+
+    assert st.finalize_review(rid, _final(reserved, summary="done")) is True
+
+    rec = st.get_review(rid)
+    assert rec["status"] == "clean" and rec["trustworthy"] is True
+    assert rec["summary"] == "done"
+    assert _raw_row(db, rid)["status"] == "clean"
+    assert _raw_row(db, rid)["trustworthy"] == 1
+    assert st.latest_trustworthy_for("d" * 40)["id"] == rid
+    # Reservation-owned fields survive the finalize untouched.
+    assert rec["worst_runtime_sec"] == 1234
+    assert _raw_row(db, rid)["worst_runtime_sec"] == 1234
+
+
+def test_finalize_review_refuses_a_superseded_record_and_changes_nothing(tmp_path):
+    """THE mutation-killer for making `finalize_review` unconditional."""
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    rid = _reserve(st, diff_hash="1" * 40).record_id
+    reserved = st.get_review(rid)
+    newer = _reserve(st, diff_hash="2" * 40).record_id
+
+    assert st.finalize_review(rid, _final(reserved, summary="too late")) is False
+
+    rec = st.get_review(rid)
+    assert rec["status"] == "superseded"
+    assert rec["superseded_by"] == newer
+    assert rec["summary"] == "" and rec["trustworthy"] is False
+    assert _raw_row(db, rid)["trustworthy"] == 0
+    assert st.latest_trustworthy_for("1" * 40) is None
+
+
+def test_finalize_review_refuses_a_stale_recovered_record(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    rid = _reserve(st).record_id
+    reserved = st.get_review(rid)
+    assert st.fail_if_running(rid, "stale recovery: worker exceeded its budget") is True
+
+    assert st.finalize_review(rid, _final(reserved)) is False
+
+    rec = st.get_review(rid)
+    assert rec["status"] == "failed" and rec["trustworthy"] is False
+
+
+def test_finalize_review_refuses_a_record_that_does_not_exist(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    assert st.finalize_review("nope", _final({**PREPUSH, "id": "nope"})) is False
+    assert st.get_review("nope") is None
+
+
+def test_finalize_review_recomputes_trust_and_overwrites_a_lie(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    rid = _reserve(st).record_id
+    reserved = st.get_review(rid)
+
+    assert st.finalize_review(rid, _final(reserved, degraded=True,
+                                          trustworthy=True)) is True
+
+    assert st.get_review(rid)["trustworthy"] is False
+
+
+@pytest.mark.parametrize("axis", ["parse_ok", "degraded", "diff_truncated"])
+def test_finalize_review_refuses_a_non_bool_axis(tmp_path, axis):
+    st = Store.open(tmp_path / "s.db")
+    rid = _reserve(st).record_id
+    reserved = st.get_review(rid)
+    with pytest.raises(ValueError):
+        st.finalize_review(rid, _final(reserved, **{axis: "false"}))
+    assert st.get_review(rid)["status"] == "running"
+
+
+@pytest.mark.parametrize("field", ["branch", "head", "base_ref", "base_sha",
+                                   "diff_hash"])
+def test_finalize_review_refuses_an_identity_that_moved(tmp_path, field):
+    """Reservation-owned identity is DATABASE-owned at finalization.
+
+    A worker that recomputed one of these and got a different answer has
+    reviewed something else; overwriting the row silently would publish a
+    record about content nobody asked for, at the reservation's own id.
+    """
+    st = Store.open(tmp_path / "s.db")
+    rid = _reserve(st).record_id
+    reserved = st.get_review(rid)
+    with pytest.raises(ValueError, match=field):
+        st.finalize_review(rid, _final(reserved, **{field: "moved"}))
+    assert st.get_review(rid)["status"] == "running"
+
+
+def test_finalize_review_refuses_a_record_whose_id_is_not_the_one_asked_for(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    rid = _reserve(st).record_id
+    reserved = st.get_review(rid)
+    with pytest.raises(ValueError, match="id"):
+        st.finalize_review(rid, _final(reserved, id="somebody-else"))
+    assert st.get_review(rid)["status"] == "running"
+
+
+def test_finalize_review_merges_the_database_owned_pid_and_supersede(tmp_path):
+    """`pid` and `superseded_by` are the DATABASE's, not the worker's.
+
+    The worker's dict predates the pid attach, so a finalize that wrote the
+    worker's value back would erase it -- and `recover_stale`'s liveness check
+    reads exactly that column.
+    """
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    rid = _reserve(st).record_id
+    reserved = st.get_review(rid)
+    st.attach_pid(rid, 5150)
+
+    assert st.finalize_review(rid, _final(reserved)) is True
+
+    assert _raw_row(db, rid)["pid"] == 5150
+    assert st.get_review(rid)["pid"] == 5150
+
+
+def test_a_pid_attach_between_reread_and_update_is_not_erased(tmp_path):
+    """The barrier the explicit `BEGIN IMMEDIATE` exists for.
+
+    The shipped store runs in autocommit. Without one transaction around the
+    identity read, the merge and the UPDATE, a pid attach committing in that
+    window would be overwritten by the stale merge -- and the record would then
+    look like a worker that never started.
+    """
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    rid = _reserve(st).record_id
+    reserved = st.get_review(rid)
+    attacher = Store.open(db)
+    fired = []
+
+    real = st._c.execute
+
+    def hook(sql, *a, **kw):
+        if sql.lstrip().upper().startswith("UPDATE REVIEWS") and not fired:
+            fired.append(True)
+            # A SECOND connection attaching a pid right now. Under one
+            # `BEGIN IMMEDIATE` it cannot get the write lock, so it fails --
+            # which is the serialization working. Without the transaction it
+            # would succeed and then be clobbered.
+            try:
+                attacher.attach_pid(rid, 6060)
+            except sqlite3.OperationalError:
+                fired.append("locked")
+        return real(sql, *a, **kw)
+
+    monkey = _Proxy(st._c, hook)
+    st._c, saved = monkey, st._c
+    try:
+        assert st.finalize_review(rid, _final(reserved)) is True
+    finally:
+        st._c = saved
+    assert fired and fired[-1] == "locked", (
+        "the finalize did not hold the write lock across its read and update")
+    attacher.close()
+
+
+def test_finalize_review_requires_usable_output_on_a_skodun_prepush_record(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    rid = _reserve(st).record_id
+    reserved = st.get_review(rid)
+    bare = {k: v for k, v in _final(reserved).items() if k != "usable_output"}
+    with pytest.raises(ValueError, match="usable_output"):
+        st.finalize_review(rid, bare)
+    assert st.get_review(rid)["status"] == "running"
+
+
+# --- the `usable_output` production contract, at the chokepoint ------------
+
+
+def test_usable_output_is_required_on_a_skodun_prepush_record(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(ValueError, match="usable_output"):
+        st.save_review({k: v for k, v in PREPUSH.items() if k != "usable_output"})
+    assert st.get_review("r1") is None
+
+
+@pytest.mark.parametrize("value", [1, 0, "true", "", None, []])
+def test_usable_output_must_be_an_exact_bool_wherever_it_appears(tmp_path, value):
+    """Not just on the prepush records: a present field must be a real bool.
+
+    `usable_output: 1` reads as True under truthiness and as "not a bool" under
+    the strict rules every other axis is read by; a surface that mixed the two
+    would print "NO REVIEW HAPPENED" over a round that answered.
+    """
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(ValueError, match="usable_output"):
+        st.save_review({**REC, "usable_output": value})
+    with pytest.raises(ValueError, match="usable_output"):
+        st.save_review({**PREPUSH, "usable_output": value})
+    assert st.get_review("r1") is None
+
+
+def test_a_legacy_imported_prepush_row_may_omit_usable_output(tmp_path):
+    """THE post-v3 legacy-import regression.
+
+    A legacy archive row carries `mode="prepush"` with `source="legacy"` and no
+    `usable_output` at all, so a MODE-ONLY requirement would reject the shipped
+    import outright.
+    """
+    st = Store.open(tmp_path / "s.db")
+    st.save_review({**REC, "id": "legacy1", "mode": "prepush", "source": "legacy"})
+    assert st.get_review("legacy1")["mode"] == "prepush"
+    assert "usable_output" not in st.get_review("legacy1")
+
+
+def test_a_foreground_now_record_may_omit_usable_output(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.save_review(REC)                       # mode="now", source="skodun"
+    assert st.get_review("r1")["trustworthy"] is True
+
+
+def test_usable_output_is_never_derived_from_the_finding_count(tmp_path):
+    """THE mutation-killer for deriving it.
+
+    A prepush round whose passes all answered "nothing wrong" has zero findings
+    and `usable_output=True`; one that failed before any answer has zero
+    findings and `usable_output=False`. A derivation from `findings_total`
+    cannot tell them apart, and the difference is "NO REVIEW HAPPENED" versus a
+    clean review.
+    """
+    st = Store.open(tmp_path / "s.db")
+    st.save_review({**PREPUSH, "id": "answered", "findings": [],
+                    "findings_total": 0, "usable_output": True})
+    st.save_review({**PREPUSH, "id": "silent", "findings": [], "findings_total": 0,
+                    "usable_output": False, "parse_ok": False, "status": "failed"})
+    assert st.get_review("answered")["usable_output"] is True
+    assert st.get_review("silent")["usable_output"] is False
+
+
+# --- mark_failed: the atomic failure transition ---------------------------
+
+
+def test_mark_cancelled_demotes_the_DEGRADED_axis_with_strict_bools(tmp_path):
+    """The worker's POST-COMMIT linearization check.
+
+    A SIGTERM can land while SQLite holds the write lock for `finalize_review`, so
+    the worker's pre-check cannot see it -- and without this the killed review is
+    committed TRUSTWORTHY. `degraded`, not `parse_ok`: the reviewer's output really
+    did parse; what is untrue is that the round finished.
+    """
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    st.save_review({**REC, "findings": [_a_finding()], "findings_total": 1,
+                    "usable_output": True})
+    assert _raw_row(db)["trustworthy"] == 1
+
+    assert st.mark_cancelled("r1", "cancelled during finalization") is True
+
+    row = _raw_row(db)
+    assert row["status"] == "failed" and row["degraded"] == 1
+    assert row["trustworthy"] == 0
+    rec = st.get_review("r1")
+    assert rec["degraded_reason"] == "cancelled during finalization"
+    assert rec["failure_reason"] == "cancelled during finalization"
+    # THE STRICT-JSON-BOOLEAN HAZARD, same as `mark_failed`: a bound Python bool
+    # lands in `json_set` as the NUMBER 1/0, which reloads as `int` and makes the
+    # artifact malformed under the strict-bool trust rules.
+    assert rec["degraded"] is True and type(rec["degraded"]) is bool
+    assert rec["trustworthy"] is False and type(rec["trustworthy"]) is bool
+    assert st.latest_trustworthy_for(REC["diff_hash"]) is None
+
+
+def test_mark_cancelled_preserves_the_findings_the_round_did_produce(tmp_path):
+    """A round cancelled after two batches answered really did produce those
+    findings, and a surface that dropped them would print "NO REVIEW HAPPENED"
+    over real evidence."""
+    st = Store.open(tmp_path / "s.db")
+    st.save_review({**REC, "findings": [_a_finding()], "findings_total": 1,
+                    "usable_output": True, "summary": "found one"})
+    st.mark_cancelled("r1", "cancelled")
+    rec = st.get_review("r1")
+    assert rec["findings_total"] == 1 and len(rec["findings"]) == 1
+    assert rec["usable_output"] is True and rec["summary"] == "found one"
+    assert rec["parse_ok"] is True, "parse_ok is a fact about the OUTPUT"
+
+
+def test_mark_cancelled_is_self_limiting_on_an_untrustworthy_record(tmp_path):
+    """Guarded on `trustworthy=1`, so a record some other transition already
+    settled keeps its own answer -- a superseded row stays superseded."""
+    st = Store.open(tmp_path / "s.db")
+    st.save_review({**REC, "status": "superseded", "parse_ok": False})
+    assert st.mark_cancelled("r1", "cancelled") is False
+    assert st.get_review("r1")["status"] == "superseded"
+
+
+def test_mark_cancelled_on_a_missing_record_reports_false(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    assert st.mark_cancelled("nope", "cancelled") is False
+
+
+
+def test_mark_failed_demotes_status_and_the_trust_axes_together(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    st.save_review(REC)                      # clean, trustworthy=1
+    assert _raw_row(db)["trustworthy"] == 1
+
+    assert st.mark_failed("r1", "the review could not be read back") is True
+
+    row = _raw_row(db)
+    assert row["status"] == "failed"
+    assert row["parse_ok"] == 0 and row["trustworthy"] == 0
+    rec = st.get_review("r1")
+    assert rec["status"] == "failed"
+    assert rec["failure_reason"] == "the review could not be read back"
+    # THE STRICT-JSON-BOOLEAN HAZARD: a bound Python `False` lands in `json_set`
+    # as the NUMBER 0, which reloads as `int` and makes the artifact malformed
+    # under the strict-bool trust rules -- so a `failed` row would still look
+    # trustworthy to every strict reader.
+    for field in ("parse_ok", "trustworthy"):
+        assert rec[field] is False, field
+        assert type(rec[field]) is bool, field
+    # ...and the demotion is visible to the two readers that matter.
+    assert st.latest_trustworthy_for("d" * 40) is None
+
+
+def test_mark_failed_needs_no_running_guard(tmp_path):
+    """The one call site is the foreground cleanup, and it must not need one.
+
+    `_persist` autocommits the final save BEFORE its readback, so a readback
+    failure has to demote a record that is already `clean` -- a `running` guard
+    would leave exactly the stale-recovery bug one call site over.
+    """
+    st = Store.open(tmp_path / "s.db")
+    st.save_review({**REC, "status": "clean"})
+    assert st.mark_failed("r1", "readback failed") is True
+    assert st.get_review("r1")["status"] == "failed"
+    assert st.get_review("r1")["trustworthy"] is False
+
+
+def test_mark_failed_on_a_missing_record_reports_false_and_writes_nothing(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    assert st.mark_failed("nope", "reason") is False
+    assert st.get_review("nope") is None
+
+
+def test_mark_failed_leaves_the_rest_of_the_artifact_intact(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.save_review({**REC, "summary": "keep me"})
+    st.mark_failed("r1", "reason")
+    assert st.get_review("r1")["summary"] == "keep me"
+    assert st.get_review("r1")["id"] == "r1"
+
+
+# --- fail_if_running: stale recovery's conditional terminal transition -----
+
+
+def test_fail_if_running_demotes_a_running_record_with_strict_bools(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    rid = _reserve(st).record_id
+
+    reason = "stale recovery: worker exceeded its runtime budget"
+    assert st.fail_if_running(rid, reason) is True
+
+    row = _raw_row(db, rid)
+    assert row["status"] == "failed"
+    assert row["parse_ok"] == 0 and row["trustworthy"] == 0
+    rec = st.get_review(rid)
+    assert rec["failure_reason"] == reason
+    for field in ("parse_ok", "trustworthy"):
+        assert rec[field] is False and type(rec[field]) is bool, field
+
+
+def test_fail_if_running_loses_to_a_worker_that_already_finalized(tmp_path):
+    """Whichever terminal transition commits FIRST survives.
+
+    A worker finalizing clean between the stale scan and this update must win:
+    the record it wrote is a real review, and overwriting it would replace a
+    trustworthy answer with a janitor's guess.
+    """
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    rid = _reserve(st).record_id
+    reserved = st.get_review(rid)
+    assert st.finalize_review(rid, _final(reserved)) is True
+
+    assert st.fail_if_running(rid, "stale recovery") is False
+
+    assert st.get_review(rid)["status"] == "clean"
+    assert st.get_review(rid)["trustworthy"] is True
+    assert _raw_row(db, rid)["trustworthy"] == 1
+
+
+def test_fail_if_running_loses_to_a_dispatcher_that_already_superseded(tmp_path):
+    db = tmp_path / "s.db"
+    st = Store.open(db)
+    rid = _reserve(st, diff_hash="1" * 40).record_id
+    newer = _reserve(st, diff_hash="2" * 40).record_id
+
+    assert st.fail_if_running(rid, "stale recovery") is False
+
+    assert st.get_review(rid)["status"] == "superseded"
+    assert st.get_review(rid)["superseded_by"] == newer
+
+
+def test_fail_if_running_on_a_missing_record_reports_false(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    assert st.fail_if_running("nope", "stale recovery") is False
+
+
+# --- log_dir --------------------------------------------------------------
+
+
+def test_log_dir_is_the_db_path_plus_logs_and_is_created_lazily(tmp_path):
+    db = tmp_path / "nested" / "s.db"
+    st = Store.open(db)
+    expected = tmp_path / "nested" / "s.db.logs"
+    assert not expected.exists()
+
+    got = st.log_dir()
+
+    assert got == expected
+    assert got.is_dir()
+    assert st.log_dir() == expected          # idempotent
+
+
+def test_set_status_is_gone(tmp_path):
+    """The unsafe status-only API does not survive as a deprecated shell.
+
+    It wrote a status and nothing else, so every one of its callers could leave
+    `status='failed'` beside `trustworthy=1` -- a row the gate honours and dedup
+    suppresses against. `mark_failed`/`fail_if_running` replace it.
+    """
+    st = Store.open(tmp_path / "s.db")
+    assert not hasattr(st, "set_status")

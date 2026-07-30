@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import re
@@ -1779,3 +1780,276 @@ def test_every_cli_subcommand_closes_its_store(tmp_path, monkeypatch):
     # triage --adopt-refuter and a plain dismissal share `_cmd_triage`'s
     # single store-opening path with `--list`, already covered above; no
     # separate assertion needed for the same code path.
+
+
+# ==========================================================================
+# TASK 10: seam matrices for `dispatch`, `worker` and `install-hooks`
+# ==========================================================================
+#
+# Exit code correctness across {normal run, closed stdout, `| head` under
+# pipefail, `python -m skodun`, `python -m skodun.cli`, the console script}.
+# The dangerous coincidence these exist for is the same one the reopen matrix
+# above exists for: a `BrokenPipeError` escaping `_emit` hands the shell the
+# interpreter's own exit code of 1, and for `dispatch` ANY non-zero is a blocked
+# push. The two extra rows -- no controlling tty, dead reader on stdout -- are
+# this task's own: `dispatch` runs from a hook and `worker` runs detached, so
+# neither has a terminal, a live stdin, or anyone reading its stdout.
+
+
+def _hooks_env(db: Path, tmp_path: Path) -> dict:
+    """`_subprocess_env` plus a hermetic git.
+
+    This machine's global git config may carry `core.hooksPath`, and
+    `install-hooks` correctly honours it -- which would write a real pre-push hook
+    into a real hooks directory outside `tmp_path`.
+    """
+    env = _subprocess_env(db)
+    env["GIT_CONFIG_GLOBAL"] = str(tmp_path / "gitconfig")
+    env["GIT_CONFIG_SYSTEM"] = str(tmp_path / "gitsystem")
+    (tmp_path / "gitconfig").write_text("", encoding="utf-8")
+    (tmp_path / "gitsystem").write_text("", encoding="utf-8")
+    env.pop("SKODUN_PREPUSH_SKIP", None)
+    return env
+
+
+def _tiny_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["GIT_CONFIG_GLOBAL"] = str(tmp_path / "gitconfig")
+    env["GIT_CONFIG_SYSTEM"] = str(tmp_path / "gitsystem")
+    (tmp_path / "gitconfig").write_text("", encoding="utf-8")
+    (tmp_path / "gitsystem").write_text("", encoding="utf-8")
+    for args in (["init", "-b", "main"], ["config", "user.email", "t@t"],
+                 ["config", "user.name", "t"]):
+        subprocess.run(["git", "-C", str(repo), *args], check=True,
+                       capture_output=True, env=env)
+    (repo / "a.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True,
+                   capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "c0"], check=True,
+                   capture_output=True, env=env)
+    return repo
+
+
+#: `(name, argv, expected)`. Every one of these is a REFUSAL or a no-op that must
+#: not be mistaken for something else by its exit code.
+_PREPUSH_CASES = [
+    # `dispatch` is 0 on every path, including the ones where nothing happened:
+    # a hook must never block a push on review machinery.
+    ("dispatch-no-refs", ["dispatch"], 0),
+    ("dispatch-with-git-argv", ["dispatch", "github", "git@example:x/y.git"], 0),
+    ("dispatch-outside-a-repo", ["dispatch", "--repo", "/", "o", "u"], 0),
+    # `worker` refuses a reservation that is not there, and says so with a 2.
+    ("worker-no-such-record",
+     ["worker", "--record-id", "sk_absent", "--repo", ".", "--branch", "b",
+      "--local-oid", "a" * 40, "--base-sha", "b" * 40, "--base-ref", "main"], 2),
+]
+
+
+@pytest.mark.parametrize("name, argv, expected", _PREPUSH_CASES,
+                         ids=[c[0] for c in _PREPUSH_CASES])
+def test_prepush_seam_normal_run(tmp_path, monkeypatch, capsys, name, argv,
+                                 expected):
+    db = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "absent.toml"))
+    monkeypatch.delenv("SKODUN_PREPUSH_SKIP", raising=False)
+    monkeypatch.chdir(_tiny_repo(tmp_path))
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"")))
+    assert main(argv) == expected
+    cap = capsys.readouterr()
+    assert "Traceback" not in cap.out and "Traceback" not in cap.err
+
+
+@pytest.mark.parametrize("name, argv, expected", _PREPUSH_CASES,
+                         ids=[c[0] for c in _PREPUSH_CASES])
+def test_prepush_seam_closed_stdout(tmp_path, name, argv, expected):
+    """Every write raises, and the exit code must still be the decision's."""
+    db = tmp_path / "sub" / "s.db"
+    repo = _tiny_repo(tmp_path)
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run([sys.executable, "-m", "skodun", *argv], stdout=w_fd,
+                           stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                           text=True, cwd=str(repo),
+                           env=_hooks_env(db, tmp_path))
+    finally:
+        os.close(w_fd)
+    assert p.returncode == expected, f"stderr={p.stderr!r}"
+    assert "Traceback" not in p.stderr, p.stderr
+
+
+@pytest.mark.parametrize("name, argv, expected", _PREPUSH_CASES,
+                         ids=[c[0] for c in _PREPUSH_CASES])
+def test_prepush_seam_through_head_under_pipefail(tmp_path, name, argv, expected):
+    db = tmp_path / "sub" / "s.db"
+    repo = _tiny_repo(tmp_path)
+    quoted = " ".join(shlex.quote(a) for a in argv)
+    script = (f'set -o pipefail; {shlex.quote(sys.executable)} -m skodun {quoted} '
+              f'< /dev/null | head -1; echo "SKODUN_EXIT=${{PIPESTATUS[0]}}"')
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                       cwd=str(repo), env=_hooks_env(db, tmp_path))
+    m = re.search(r"SKODUN_EXIT=(\d+)", p.stdout)
+    assert m, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert int(m.group(1)) == expected, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert "Traceback" not in p.stderr, p.stderr
+
+
+@pytest.mark.parametrize("module", ["skodun", "skodun.cli"])
+@pytest.mark.parametrize("name, argv, expected", _PREPUSH_CASES,
+                         ids=[c[0] for c in _PREPUSH_CASES])
+def test_prepush_seam_module_invocation(tmp_path, module, name, argv, expected):
+    db = tmp_path / module / "s.db"
+    repo = _tiny_repo(tmp_path)
+    p = subprocess.run([sys.executable, "-m", module, *argv],
+                       capture_output=True, text=True, cwd=str(repo),
+                       stdin=subprocess.DEVNULL, env=_hooks_env(db, tmp_path))
+    assert p.returncode == expected, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert "Traceback" not in p.stderr, p.stderr
+
+
+@pytest.mark.parametrize("name, argv, expected", _PREPUSH_CASES,
+                         ids=[c[0] for c in _PREPUSH_CASES])
+def test_prepush_seam_console_script_entry_point(tmp_path, name, argv, expected):
+    db = tmp_path / "sub" / "s.db"
+    repo = _tiny_repo(tmp_path)
+    p = subprocess.run(
+        [sys.executable, "-c", "from skodun.cli import entry; entry()", *argv],
+        capture_output=True, text=True, cwd=str(repo),
+        stdin=subprocess.DEVNULL, env=_hooks_env(db, tmp_path))
+    assert p.returncode == expected, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert "Traceback" not in p.stderr, p.stderr
+
+
+@pytest.mark.parametrize("name, argv, expected", _PREPUSH_CASES,
+                         ids=[c[0] for c in _PREPUSH_CASES])
+def test_prepush_seam_with_no_terminal_at_all(tmp_path, name, argv, expected):
+    """The row that is specific to these two commands.
+
+    `dispatch` runs from a pre-push hook and `worker` runs detached with
+    `start_new_session=True`: neither has a controlling tty, a live stdin, or
+    anyone reading its stdout. A library that probes for a terminal (argparse asks
+    stdout about colour support while building its formatter) must not turn that
+    into an exception -- which would be a non-zero exit, i.e. a blocked push.
+    """
+    db = tmp_path / "sub" / "s.db"
+    repo = _tiny_repo(tmp_path)
+    p = subprocess.run(
+        [sys.executable, "-m", "skodun", *argv], stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        cwd=str(repo), env=_hooks_env(db, tmp_path), start_new_session=True)
+    assert p.returncode == expected, f"stderr={p.stderr!r}"
+    assert "Traceback" not in p.stderr, p.stderr
+
+
+def test_dispatch_with_a_dead_reader_on_stdout_still_exits_0(tmp_path):
+    """`head -1` closes its end while skodun may still be writing. For `dispatch`
+    a `BrokenPipeError` escaping would be exit 1 -- a BLOCKED PUSH from a broken
+    pipe."""
+    db = tmp_path / "sub" / "s.db"
+    repo = _tiny_repo(tmp_path)
+    script = (f'{shlex.quote(sys.executable)} -m skodun dispatch github url '
+              f'< /dev/null | true; echo "SKODUN_EXIT=${{PIPESTATUS[0]}}"')
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                       cwd=str(repo), env=_hooks_env(db, tmp_path))
+    assert re.search(r"SKODUN_EXIT=0", p.stdout), f"{p.stdout!r} {p.stderr!r}"
+
+
+@pytest.mark.parametrize("argv, expected", [
+    (["dispatch", "one", "two", "three"], 2),        # a THIRD positional
+    (["dispatch", "--no-such-flag"], 2),
+    (["worker"], 2),                                 # --record-id is required
+    (["worker", "--record-id"], 2),                  # a flag with no value
+    (["install-hooks", "--no-such-flag"], 2),
+])
+def test_direct_misuse_is_loud_and_never_a_traceback(tmp_path, monkeypatch,
+                                                     capsys, argv, expected):
+    """DIRECT misuse exits non-zero -- usage errors stay loud for humans -- while
+    the installed shim absorbs any dispatcher non-zero into its own warn-and-exit-0.
+    Never a traceback either way: an argparse usage message is an answer, a stack
+    trace is a crash."""
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    monkeypatch.chdir(tmp_path)
+    assert main(argv) == expected
+    cap = capsys.readouterr()
+    assert "Traceback" not in cap.out and "Traceback" not in cap.err
+    assert "usage:" in cap.err or "usage:" in cap.out
+
+
+def test_the_worker_subcommand_is_hidden_from_help():
+    """`worker` is the detached process `dispatch` spawns, not a command a human
+    runs -- but it stays fully usable (and debuggable) by name."""
+    from skodun.cli import build_parser
+    out = build_parser().format_help()
+    assert "dispatch" in out and "install-hooks" in out
+    # No DESCRIPTION line for it, which is the part a human reads. (The choices
+    # metavar still names it: argparse builds that from the real command list, and
+    # a hand-written metavar would be a second list that could drift.)
+    described = re.findall(r"^\s{4}(\S+)\s{2,}\S", out, re.MULTILINE)
+    assert "worker" not in described, out
+    assert "dispatch" in described and "install-hooks" in described
+    assert "SUPPRESS" not in out
+
+
+#: `(name, argv, expected)` for `install-hooks`: 0 installed, 1 refused.
+_HOOKS_CASES = [
+    ("install-fresh", 0),
+    ("install-refused", 1),
+]
+
+
+@pytest.mark.parametrize("name, expected", _HOOKS_CASES,
+                         ids=[c[0] for c in _HOOKS_CASES])
+@pytest.mark.parametrize("form", ["module", "module-cli", "console", "closed-stdout",
+                                  "pipefail", "no-terminal"])
+def test_install_hooks_seam(tmp_path, name, expected, form):
+    """One matrix, both outcomes, every invocation form.
+
+    1 (refused) and 0 (installed) are the two answers a setup script acts on, and
+    a `BrokenPipeError` escaping `_emit` would turn either into the interpreter's
+    exit code of 1 -- silently converting "installed" into "refused".
+    """
+    db = tmp_path / "s.db"
+    repo = _tiny_repo(tmp_path)
+    env = _hooks_env(db, tmp_path)
+    if expected == 1:
+        hooks = repo / ".git" / "hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        (hooks / "pre-push").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    argv = ["install-hooks", "--repo", str(repo)]
+    if form == "pipefail":
+        quoted = " ".join(shlex.quote(a) for a in argv)
+        script = (f'set -o pipefail; {shlex.quote(sys.executable)} -m skodun '
+                  f'{quoted} | head -1; echo "SKODUN_EXIT=${{PIPESTATUS[0]}}"')
+        p = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                           env=env)
+        m = re.search(r"SKODUN_EXIT=(\d+)", p.stdout)
+        assert m and int(m.group(1)) == expected, f"{p.stdout!r} {p.stderr!r}"
+        return
+    if form == "closed-stdout":
+        r_fd, w_fd = os.pipe()
+        os.close(r_fd)
+        try:
+            p = subprocess.run([sys.executable, "-m", "skodun", *argv],
+                               stdout=w_fd, stderr=subprocess.PIPE, text=True,
+                               env=env)
+        finally:
+            os.close(w_fd)
+    elif form == "console":
+        p = subprocess.run(
+            [sys.executable, "-c", "from skodun.cli import entry; entry()", *argv],
+            capture_output=True, text=True, env=env)
+    elif form == "no-terminal":
+        p = subprocess.run([sys.executable, "-m", "skodun", *argv],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, text=True, env=env,
+                           start_new_session=True)
+    else:
+        module = "skodun" if form == "module" else "skodun.cli"
+        p = subprocess.run([sys.executable, "-m", module, *argv],
+                           capture_output=True, text=True, env=env)
+    assert p.returncode == expected, f"stdout={getattr(p, 'stdout', None)!r} " \
+                                     f"stderr={p.stderr!r}"
+    assert "Traceback" not in p.stderr, p.stderr

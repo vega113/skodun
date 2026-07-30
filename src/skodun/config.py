@@ -264,6 +264,94 @@ class Reviewer:
     fallbacks: tuple[str, ...] = ()
 
 @dataclass(frozen=True)
+class Dispatch:
+    """The `[dispatch]` table of `.skodun.toml`: the BACKGROUND worker's budget.
+
+    A table of its own rather than five more `[defaults]` keys, because the two
+    describe different runs. `[defaults]` is what a FOREGROUND `skodun review`
+    may spend -- a human is waiting, and the whole diff is in one prompt.
+    `[dispatch]` is what a detached pre-push worker may spend: the push is
+    already over, nothing is blocked on the answer, and a much tighter timeout
+    is the right default (the oracle's own background cap is 240s against a 420s
+    foreground one).
+
+    * `enabled` -- the CONFIG-level kill switch, parallel to the per-repo
+      `git config skodun.prepush false` bypass. False means the dispatcher
+      notes it once on stderr and discards every ref: no capture, no
+      reservation, no worker, no record.
+    * `timeout_sec` / `timeout_retries` -- the worker's effective `Defaults`
+      are `replace(defaults, timeout_sec=..., timeout_retries=...)` from these
+      two; every other key comes from `[defaults]` untouched.
+    * `dedup` -- whether a push whose diff a trustworthy review already covers
+      may be suppressed at all. False disables the whole suppression path,
+      evidence included.
+    * `large_prompt_bytes` -- the per-prompt size above which a background
+      attempt's cap escalates to the FOREGROUND `defaults.timeout_sec` (oracle
+      A14.7). A whole-diff prompt this large legitimately needs longer than a
+      background cap allows, and timing it out would spend the budget and
+      record nothing. (The spec's `large_prompt_escalation` name is superseded
+      by this one; a config still using it is rejected as an unknown key.)
+    """
+
+    enabled: bool = True
+    timeout_sec: int = 240
+    timeout_retries: int = 0
+    dedup: bool = True
+    large_prompt_bytes: int = 80_000
+
+
+# key -> minimum accepted value, exactly as `_DEFAULTS_MINIMUMS` above and for
+# the same reason. `test_config.py` pins that every integer field of `Dispatch`
+# appears here, so a new numeric key cannot arrive unguarded.
+#   >= 1  a capacity: zero seconds is a worker that cannot review, and a zero
+#         `large_prompt_bytes` would escalate every prompt (which is a coherent
+#         wish, spelled by setting it to 1 -- but a zero would read as "off"
+#         while doing the opposite, so it is refused).
+#   >= 0  zero is a coherent opt-out: do not retry a timeout.
+_DISPATCH_MINIMUMS = {
+    "timeout_sec": 1,
+    "timeout_retries": 0,
+    "large_prompt_bytes": 1,
+}
+
+#: The `bool` fields, validated as EXACT bools. `bool("false")` is True and
+#: `enabled = "false"` must never enable dispatch -- the same refusal to coerce
+#: the store applies to the trust axes.
+_DISPATCH_FLAGS = ("dedup", "enabled")
+
+
+def _strict_bool(key: str, value: object) -> bool:
+    """Validate a `[dispatch]` flag, or raise naming `key`.
+
+    No truthiness anywhere near this. TOML has real `true`/`false` literals, so
+    anything else in a boolean key is a typo -- and the two typos that matter
+    (`"false"`, `0`) would both be read the WRONG way by a truthiness coercion:
+    `bool("false")` is True, and `enabled = 0` reading as False is only
+    accidentally right while `dedup = 1` reading as True is accidentally wrong.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"[dispatch] {key}: expected true or false, got "
+            f"{type(value).__name__}")
+    return value
+
+
+def _bounded_dispatch_int(key: str, value: object, minimum: int) -> int:
+    """`_bounded_int` for `[dispatch]`, naming that table in the message.
+
+    A separate function only because the message names the table: a user whose
+    `[dispatch] timeout_sec` is wrong must not be sent to `[defaults]`.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"[dispatch] {key}: expected an integer, got {type(value).__name__}")
+    if value < minimum:
+        raise ValueError(
+            f"[dispatch] {key}: must be >= {minimum}, got {value}")
+    return value
+
+
+@dataclass(frozen=True)
 class Config:
     # Reviewers are selected by ROLE, never by name: `pipeline._reviewer_for`
     # takes the first enabled reviewer whose `role` matches. A lookup-by-name
@@ -271,6 +359,11 @@ class Config:
     # rather than kept as a second, unused selection rule.
     defaults: Defaults
     reviewers: tuple[Reviewer, ...]
+    #: The `[dispatch]` table. Defaulted so that every shipped construction of
+    #: `Config(defaults=..., reviewers=...)` -- in this module and in the tests
+    #: that build one by hand -- keeps working unchanged, and so a config file
+    #: with no `[dispatch]` table gets the documented defaults rather than None.
+    dispatch: Dispatch = Dispatch()
 
 def _read(path: Path | None) -> dict:
     if path is None or not path.exists():
@@ -427,10 +520,14 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
         layers.append(_read(Path(repo_root) / ".skodun.toml"))
 
     dvals: dict = {}
+    pvals: dict = {}
     rmap: dict[str, dict] = {}
     order: list[str] = []
     for layer in layers:
         dvals.update(layer.get("defaults", {}))
+        # Per-KEY merge, exactly like `[defaults]`: a project file that sets one
+        # dispatch key keeps the global file's answer for the others.
+        pvals.update(layer.get("dispatch", {}))
         for entry in layer.get("reviewers", []):
             if "name" not in entry:
                 raise ValueError("reviewer entry is missing its required 'name' key")
@@ -452,6 +549,16 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     for key, minimum in _DEFAULTS_MINIMUMS.items():
         if key in dvals:
             dvals[key] = _bounded_int(key, dvals[key], minimum)
+    pknown = {f.name for f in fields(Dispatch)}
+    punknown = set(pvals) - pknown
+    if punknown:
+        raise ValueError(f"unknown [dispatch] keys: {sorted(punknown)}")
+    for key in _DISPATCH_FLAGS:
+        if key in pvals:
+            pvals[key] = _strict_bool(key, pvals[key])
+    for key, minimum in _DISPATCH_MINIMUMS.items():
+        if key in pvals:
+            pvals[key] = _bounded_dispatch_int(key, pvals[key], minimum)
     rknown = {f.name for f in fields(Reviewer)}
     reviewers = []
     for name in order:
@@ -466,4 +573,5 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
         reviewers.append(_validate(Reviewer(**e)))
     reviewers = tuple(reviewers)
     _validate_fallbacks(reviewers)
-    return Config(defaults=Defaults(**dvals), reviewers=reviewers)
+    return Config(defaults=Defaults(**dvals), reviewers=reviewers,
+                  dispatch=Dispatch(**pvals))

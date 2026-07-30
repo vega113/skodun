@@ -147,13 +147,13 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
-import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import (batching, budget, chain, checklist, contextpack, gitio, passes,
-               promptbuild)
+from . import (batching, budget, chain, checklist, contextpack, gitio, ids,
+               passes, promptbuild, runner)
 from .adapters import REFUTER_CONTRACT, get_adapter
 from .config import Config, Defaults, Reviewer
 from .store import Store, _TS_FORMAT
@@ -191,6 +191,14 @@ _MAX_PASSES_UNDER_LOCK = budget.MAX_PASSES_UNDER_LOCK
 #: clean are the last ones it would reach, and any finite cap would skip
 #: exactly them on a busy store.
 _SCAN_ALL = -1
+
+#: The `failure_reason` a swept `running` record carries. Task 12 renders it, so
+#: it is a constant here rather than a literal at the call site.
+STALE_RECOVERY_REASON = "stale recovery: worker exceeded its runtime budget"
+
+#: The `failure_reason` the foreground cleanup writes when a run left a
+#: persisted `running`/committed record behind without finalizing it.
+UNFINISHED_REASON = ("the review did not finish; its record was never finalized")
 
 
 class PipelineError(RuntimeError):
@@ -242,16 +250,11 @@ def _iso_now() -> str:
     return time.strftime(_TS_FORMAT, time.gmtime())
 
 
-def _new_id(prefix: str = "sk_") -> str:
-    """`sk_<utcstamp>_<pid>_<uuid8>`.
-
-    The uuid component is mandatory. Second-resolution time plus pid collides
-    for two runs in the same process-second — which the review loop does
-    routinely — and `Store.save_review` upserts by id, so the second run would
-    silently overwrite the first.
-    """
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    return f"{prefix}{stamp}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+#: `sk_<utcstamp>_<pid>_<uuid8>`, now `ids.new_review_id`. An IMPORT, not a
+#: wrapper: `store.reserve_prepush` mints the reserved record's id and the store
+#: cannot import this module, so the definition had to move somewhere both can
+#: reach. Two copies would drift on the one property that matters (see `ids`).
+_new_id = ids.new_review_id
 
 
 def _env_seconds(name: str, default: float) -> float:
@@ -384,7 +387,16 @@ def recover_stale(store: Store, cfg: Config) -> int:
         if now - started <= ceiling:
             continue
         try:
-            store.set_status(rid, "failed")
+            # CONDITIONAL: a worker finalizing a real review, or a dispatcher
+            # superseding this row for a newer push, may have committed between
+            # the scan above and this line -- and either answer is better than a
+            # janitor's. Whichever terminal transition commits first survives.
+            # (The shipped unconditional `set_status` also left the trust axes
+            # alone, so a swept row could read `status='failed'` beside
+            # `trustworthy=1` -- which the gate honours and dedup suppresses
+            # against. `fail_if_running` demotes both in one statement.)
+            if not store.fail_if_running(rid, STALE_RECOVERY_REASON):
+                continue
         except Exception as e:      # pragma: no cover - defensive
             _note(f"could not recover stale review {rid}: {e!r}")
             continue
@@ -1303,10 +1315,348 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
         # --- 12. never leave a `running` record or a held lock behind -----
         if persisted and not finalized:
             try:
-                store.set_status(rid, "failed")
+                # UNCONDITIONAL, and it has to be: `_persist` autocommits the
+                # final save BEFORE its readback, so a readback failure lands
+                # here with a record that is already `clean` and
+                # `trustworthy=1`. A `running`-guarded transition would leave
+                # that row certifying a review nobody could read back -- the
+                # stale-recovery bug, one call site over. `mark_failed` demotes
+                # the status AND the trust axes in one statement.
+                store.mark_failed(rid, UNFINISHED_REASON)
             except Exception:
                 pass   # the crash that got us here is the story, not this
         _release_fg_lock(lock)
+
+
+#: `runner.ReviewCancelled`, aliased under this module's name. Defined in
+#: `runner` because that is the lowest layer that raises it (its watchdog tick
+#: loop is the only place holding the provider's pgid); aliased here because
+#: every OTHER raiser and the only catcher are pipeline-level. NOT a subclass of
+#: `PipelineError`: it must stay outside `Exception` so the `except Exception`
+#: demote-don't-destroy guards cannot turn a killed run into a degraded review.
+ReviewCancelled = runner.ReviewCancelled
+
+
+def _checkpoint(cancel: "threading.Event | None", partial: dict | None,
+                where: str) -> None:
+    """Raise `ReviewCancelled` if the token is set. THE pass-boundary check.
+
+    `partial` is the record as it stands, attached to the exception so the worker
+    can finalize the findings that were already produced rather than throwing
+    them away. `None` is honest for a boundary with no record yet.
+    """
+    if runner._cancelled(cancel):
+        raise ReviewCancelled(
+            f"the review was cancelled {where}", partial=partial)
+
+
+def cancellation_transform(rec: dict, boundary: str) -> dict:
+    """A cancelled review's record, DEMOTED. The one definition of that.
+
+    Called by the worker on all three of its cancellation paths (a partial that
+    came out of `run_prepush_review`, a token set between its return and the
+    finalize, and the post-commit linearization check) and by Task 14's
+    foreground persist path. It is one function because the transform is not
+    obvious and getting it wrong is silent:
+
+    * `findings` and `usable_output` are PRESERVED. A round cancelled after two
+      batches answered really did produce those findings, and a surface that
+      threw them away would print "NO REVIEW HAPPENED" over real evidence.
+    * `degraded=True` with a `degraded_reason` naming the boundary is what makes
+      the record untrustworthy. Setting only `status`/`failure_reason` would
+      NOT: `finalize_review` recomputes `trustworthy` from the three axes alone,
+      so a cancelled round with clean axes would be stored as a trustworthy one
+      and would satisfy both the gate and dedup.
+    * `parse_ok` is left ALONE. It says whether the reviewer's output parsed,
+      which is a fact about the output and not about the cancellation; the
+      demotion belongs on the axis that means "this round is incomplete".
+
+    Returns a copy; the caller's dict is not mutated.
+    """
+    out = dict(rec)
+    reason = f"cancelled: {boundary}"
+    out["degraded"] = True
+    existing = str(out.get("degraded_reason") or "")
+    out["degraded_reason"] = f"{existing}; {reason}" if existing else reason
+    out["status"] = "failed"
+    prior = str(out.get("failure_reason") or "")
+    out["failure_reason"] = f"{prior}; {reason}" if prior else reason
+    out["trustworthy"] = is_trustworthy(
+        out.get("parse_ok"), True, out.get("diff_truncated"))
+    return out
+
+
+def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
+                       local_oid: str, base, diff, d: Defaults, cfg: Config,
+                       *, cancel: "threading.Event | None" = None) -> dict:
+    """Review a PUSHED ref for an already-reserved record. Persists NOTHING.
+
+    The background half of `run_review`, and the list of what it does NOT do is
+    the interface: no foreground lock (the reservation lease already serialised
+    this branch, and a detached worker must not block on a human's review), no
+    primary-checkout refusal (the pushed commit is read from the object database,
+    so the checkout is irrelevant — that refusal exists to stop a model session
+    bound to the main checkout from reviewing the wrong tree), no id generation
+    (`store.reserve_prepush` minted it), and no persistence at all. The caller —
+    the worker, and only the worker — performs the single conditional
+    `store.finalize_review`, which is what lets a superseded reservation refuse
+    a late worker's answer.
+
+    `d` is the EFFECTIVE defaults the worker built
+    (`replace(cfg.defaults, timeout_sec=dispatch.timeout_sec,
+    timeout_retries=dispatch.timeout_retries)`); `cfg.defaults` is still read for
+    the FOREGROUND cap that a large prompt escalates to (see `_escalated`).
+
+    Reservation-owned fields are carried through untouched — `id`, `branch`,
+    `head`, `base_ref`, `base_sha`, `diff_hash`, `mode`, `worst_runtime_sec`,
+    `pid` — because `finalize_review` refuses a record whose identity disagrees
+    with the stored row rather than overwriting it. `worst_runtime_sec` and `pid`
+    are read back off the reserved row rather than taken as parameters: they are
+    DATABASE-owned, so the database is where their values come from.
+
+    `reviewed_at` is likewise the RESERVATION's timestamp, not this function's.
+    It answers "when was this content pushed", which is what orders the dedup
+    candidate query and the log; letting it jump forward by the review's own
+    duration would reorder a record relative to the supersede that retired its
+    predecessor.
+
+    Cancellation: the token is checked at every pass boundary and immediately
+    before returning, and `ReviewCancelled` carries the record as it stands.
+    This function CANNOT do the final check itself — it persists nothing, so
+    there is nothing for a check here to protect; the worker holds the last one,
+    immediately before `finalize_review`.
+    """
+    repo = Path(repo)
+    # The same normalisation `run_review` applies, and for the same reason: the
+    # checklist directory, the rules registry and the context packer are all
+    # resolved against the worktree root, and a hook invoked from a subdirectory
+    # would otherwise select a different checklist than a foreground review of
+    # the same change.
+    root = gitio._worktree_root(repo)
+
+    finder = _reviewer_for(cfg, "finder")
+    if finder is None:
+        raise PreflightRefused(
+            "no enabled reviewer with role 'finder' is configured; no review ran")
+    adapter = _adapter_for(finder)
+    # Every reviewer this run may reach for, resolved before any model call. Only
+    # the integration pass can run in `prepush` mode (`should_run_security`,
+    # `should_run_skeptic` and `refuter_decision` are all gated on `mode ==
+    # "now"`), so the graph is the finder's chain plus the integrator's.
+    for reviewer in (finder, _pass_reviewer(cfg, passes.INTEGRATION_PASS, finder)):
+        for entry in _chain_for(cfg, reviewer):
+            _adapter_for(entry)
+
+    reserved = store.get_review(record_id) or {}
+    diff_hash = gitio.diff_identity(diff.data)
+    common = dict(
+        id=record_id, reviewed_at=reserved.get("reviewed_at") or _iso_now(),
+        source="skodun", branch=branch, head=local_oid, base_ref=base.ref,
+        base_sha=base.sha, diff_hash=diff_hash, mode="prepush",
+        model=finder.model, adapter=adapter.name, timeout_seconds=d.timeout_sec,
+        max_turns=d.max_turns,
+        worst_runtime_sec=reserved.get("worst_runtime_sec"),
+        pid=reserved.get("pid"),
+    )
+    #: `(threshold, foreground cap)`, or None when the two caps coincide.
+    large_prompt = (cfg.dispatch.large_prompt_bytes, cfg.defaults.timeout_sec)
+
+    rec: dict | None = None
+    try:
+        if diff.data.rstrip(b"\n") == b"":
+            # FAIL-CLOSED, unlike `--now`'s clean verdict for an empty diff. The
+            # dispatcher never reserves an empty ref diff (it skips those with a
+            # note and no record), so reaching here means the ref moved between
+            # the capture and the worker in a way the identity check did not
+            # catch — and an empty prompt could mint a clean verdict for content
+            # nobody looked at.
+            return _prepush_record(
+                common, status="failed", parse_ok=False, usable_output=False,
+                trustworthy=False,
+                failure_reason="the pushed ref has no outgoing changes to review")
+
+        plan = batch_plan(diff.data, d)
+        planned = 0 if plan is None else len(plan)
+        if plan is not None:
+            _note(f"diff is {len(diff.data)} bytes (> {d.max_diff_bytes}); "
+                  f"reviewing {len(diff.files)} file(s) in {planned} "
+                  f"deterministic batch(es) + "
+                  f"{int(passes.should_run_integration(planned))} "
+                  f"integration pass")
+        if plan is not None and not plan:
+            # Task 6's terminal rule: `batching.split` returns nothing only for
+            # an EMPTY diff, so this is the shape that should not happen — and a
+            # clean verdict for a diff nothing looked at is the alternative.
+            _note("diff batching produced no batches; failing closed")
+            return _prepush_record(
+                common, status="failed", parse_ok=False,
+                files_changed=list(diff.files), diff_bytes=len(diff.data),
+                batched=True, batch_count=0, batches=[], usable_output=False,
+                trustworthy=False,
+                failure_reason="diff batching produced no batches")
+
+        with tempfile.TemporaryDirectory(prefix="skodun-bg-") as tmp:
+            scratch = Path(tmp)
+            if plan is not None:
+                rec = _prepush_record(
+                    common, status="running", parse_ok=False,
+                    files_changed=list(diff.files), diff_bytes=len(diff.data),
+                    batched=True, batch_count=planned, batches=[],
+                    usable_output=False)
+                _note(f"reviewing {len(diff.files)} file(s) vs {base.ref} as "
+                      f"{record_id} in {planned} batch(es) ...")
+                rec = _orchestrate(
+                    rec, diff, batches=plan, cfg=cfg, d=d, root=root,
+                    store=store, scratch=scratch, finder=finder, branch=branch,
+                    base_ref=base.ref, base_sha=base.sha, head_label=local_oid,
+                    context_source="oid", context_oid=local_oid,
+                    large_prompt=large_prompt, cancel=cancel)
+            else:
+                rec = _single_shot(
+                    common, diff, cfg=cfg, d=d, root=root, store=store,
+                    scratch=scratch, finder=finder, branch=branch, base=base,
+                    local_oid=local_oid, large_prompt=large_prompt,
+                    cancel=cancel, record_id=record_id)
+
+        rec["trustworthy"] = is_trustworthy(
+            rec["parse_ok"], rec["degraded"], rec["diff_truncated"])
+        rec["status"] = _status_for(rec)
+        # The LAST boundary this function owns. A token set during the write-up
+        # above must not produce a record that looks complete: the worker's own
+        # pre-finalize check is the barrier that catches a signal landing after
+        # this one, and the two together are what make the window closed.
+        _checkpoint(cancel, rec, "after the review, before returning it")
+        return rec
+    except ReviewCancelled as exc:
+        # A cancellation raised DEEPER than this function (the watchdog tick
+        # loop, a chain entry boundary, a batch boundary) carries no partial: the
+        # layers below do not know what record is being built. Attach the best
+        # one we have so the worker's transform has findings to preserve.
+        if exc.partial is None and rec is not None:
+            exc.partial = rec
+        raise
+
+
+def _prepush_record(common: dict, **overrides) -> dict:
+    """`common` + the empty shell + `overrides`, in that precedence order.
+
+    A helper rather than `dict(common, **_empty_shell(), foo=...)` because that
+    form raises `TypeError` the moment an override names a key the shell also
+    carries -- which is most of them, and which is a crash inside a DETACHED
+    worker whose only trace is a log file. Three layers, applied in order, so an
+    override always simply wins.
+    """
+    rec = dict(common)
+    rec.update(_empty_shell())
+    rec.update(overrides)
+    return rec
+
+
+def _empty_shell() -> dict:
+    """The fields every prepush record carries with nothing in them yet.
+
+    A FUNCTION, not a module constant, because half of these values are mutable
+    containers: a shared `findings=[]` or `severity={...}` would be the same
+    object on every record this module builds, and one caller appending to it
+    would edit records that were already returned.
+
+    Shared at all because a record that OMITS one of these is a record whose
+    readers — the banner, the gate, Task 12's delivery — have to guess, and the
+    four construction sites would otherwise each omit a different subset.
+    """
+    return dict(
+        degraded=False, degraded_reason="", stop_reason=None,
+        diff_truncated=False, context_hash="", files_changed=[], diff_bytes=0,
+        prompt_bytes=0, checklist_sections=[], checklist_bytes=0,
+        checklist_note="", checklist_degraded=False, context_bytes=0,
+        context_files=[], context_omitted_files=[], attempts=[], summary="",
+        findings=[], findings_total=0,
+        severity={"high": 0, "medium": 0, "low": 0}, rule_ids=[],
+        extra_passes={}, failure_reason="",
+    )
+
+
+def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
+                 store: Store, scratch: Path, finder: Reviewer, branch: str,
+                 base, local_oid: str, large_prompt: tuple[int, int] | None,
+                 cancel: "threading.Event | None", record_id: str) -> dict:
+    """One prompt, one chain, one record: the UNBATCHED background review.
+
+    Deliberately mirrors `run_review`'s 6b branch, with the two differences a
+    pushed ref forces:
+
+    * the context pack reads the PUSHED COMMIT's tree (`source="oid"`), never
+      the working tree — the checkout may be somewhere else entirely, and
+      packing it would certify content nobody pushed;
+    * the head LABEL is the pushed oid, where the foreground says
+      `"<sha> (working tree)"`. The oracle passes `$LOCAL_OID` here for the same
+      reason.
+
+    `usable_output` is the accepted attempt's existence, which is exactly "did
+    this round produce a parseable answer" — never the finding count, because a
+    clean round and a round that produced nothing both have zero findings.
+    """
+    selection = checklist.select(
+        diff.files, "full", _under(root, d.checklist_dir),
+        _under(root, d.rules_json), d.checklist_map, d.test_path_patterns)
+    if selection.note:
+        kind = ("cross-file rules unavailable" if selection.degraded
+                else "path-scoped rules dropped")
+        _note(f"checklist: {kind} -- {selection.note}")
+    if selection.dropped:
+        _note(f"checklist: dropped {', '.join(selection.dropped)} to fit the "
+              f"{checklist.BUDGET}-byte injection budget")
+    if selection.over_budget:
+        _note(f"checklist: {selection.bytes_total} bytes still exceeds the "
+              f"{checklist.BUDGET}-byte budget after eviction; only undroppable "
+              f"sections remain")
+
+    pack = None
+    pack_body = None
+    if d.context_pack:
+        headroom = promptbuild.context_headroom(
+            d.max_diff_bytes, len(diff.data), packing=True)
+        # `pack_large_added=False`: the single-shot diff already carries every
+        # added file whole. This is the SAME call `dispatch.build_dedup_evidence`
+        # makes for its candidate hash, and it has to stay that way — a different
+        # headroom or a different large-added rule would be a different identity
+        # for the same commit, so nothing would ever dedup-match again.
+        pack = contextpack.pack(root, list(diff.files), dict(diff.statuses),
+                                headroom, source="oid", oid=local_oid,
+                                pack_large_added=False)
+        pack_body = pack.body
+
+    prompt = promptbuild.build(branch, base.ref, base.sha, local_oid, diff.data,
+                              d.max_diff_bytes, selection, pack_body)
+    if prompt.diff_truncated:
+        _note(f"diff is {len(diff.data)} bytes (> {d.max_diff_bytes}); the "
+              f"prompt is truncated and this review cannot be trustworthy")
+
+    rec = _prepush_record(
+        common, status="running", parse_ok=False,
+        context_hash=pack.sha256 if pack is not None else "",
+        diff_truncated=prompt.diff_truncated,
+        files_changed=list(diff.files), diff_bytes=len(diff.data),
+        prompt_bytes=prompt.prompt_bytes,
+        checklist_sections=list(selection.sections),
+        checklist_bytes=selection.bytes_total,
+        checklist_note=selection.note, checklist_degraded=selection.degraded,
+        context_bytes=pack.bytes_total if pack is not None else 0,
+        context_files=list(pack.included) if pack is not None else [],
+        context_omitted_files=[f"{p} ({r})" for p, r in pack.omitted]
+                              if pack is not None else [],
+        usable_output=False,
+    )
+    _checkpoint(cancel, rec, "before the reviewer was invoked")
+    _note(f"reviewing {len(diff.files)} file(s) vs {base.ref} as {record_id} ...")
+    outcome = _run_chain(finder, cfg,
+                         _escalated(d, prompt.prompt_bytes, large_prompt),
+                         prompt.text, root, store, scratch, "primary",
+                         cancel=cancel)
+    rec["attempts"] = outcome.attempts
+    _apply(rec, outcome)
+    rec["usable_output"] = outcome.accepted is not None
+    return rec
 
 
 def _under(root: Path, relative: str) -> Path:
@@ -1546,8 +1896,40 @@ class _Sub:
     accepted: dict | None
 
 
+def _escalated(d: Defaults, prompt_bytes: int,
+               large_prompt: tuple[int, int] | None) -> Defaults:
+    """`d`, with the timeout raised for a prompt that is over the threshold.
+
+    ORACLE A14.7, and a BACKGROUND-only rule: `large_prompt` is
+    `(threshold_bytes, foreground_timeout_sec)` and is None for the foreground,
+    whose cap is already the wider of the two. A whole-diff prompt this large
+    legitimately needs longer than a background cap allows, and timing it out
+    would spend the entire budget and record nothing.
+
+    Measured PER PROMPT, so in a batched run each batch prompt is judged on its
+    own size -- one oversized batch escalates that batch's attempts and nothing
+    else.
+
+    Never a REDUCTION. A config may set `[dispatch] timeout_sec` ABOVE
+    `[defaults] timeout_sec` (the reservation budget takes the max of the two for
+    exactly that reason), and applying the foreground figure literally would then
+    give the LARGEST prompts the SHORTEST cap -- the opposite of what an
+    escalation means. Deviation from the brief's literal "escalates to
+    defaults.timeout_sec", recorded in the plan.
+    """
+    if large_prompt is None:
+        return d
+    threshold, escalated = large_prompt
+    if prompt_bytes <= threshold or escalated <= d.timeout_sec:
+        return d
+    _note(f"prompt is {prompt_bytes} bytes (> {threshold}); raising this "
+          f"attempt's cap from {d.timeout_sec}s to {escalated}s")
+    return replace(d, timeout_sec=escalated)
+
+
 def _run_sub(reviewer: Reviewer, cfg: Config, d: Defaults, prompt, root: Path,
-             store: Store, scratch: Path, tag: str, label: str) -> _Sub:
+             store: Store, scratch: Path, tag: str, label: str,
+             cancel: "threading.Event | None" = None) -> _Sub:
     """Run one sub-review chain and normalise the outcome into a `_Sub`.
 
     Anything the chain raises DEMOTES the aggregate rather than destroying it,
@@ -1565,8 +1947,11 @@ def _run_sub(reviewer: Reviewer, cfg: Config, d: Defaults, prompt, root: Path,
     trunc = bool(prompt.diff_truncated)
     try:
         outcome = _run_chain(reviewer, cfg, d, prompt.text, root, store,
-                             scratch, tag)
+                             scratch, tag, cancel=cancel)
     except Exception as e:
+        # `Exception`, so `ReviewCancelled` (a `BaseException`) passes straight
+        # through: a cancelled sub-review must not be recorded as a sub-review
+        # that answered badly.
         _note(f"{label} failed; the aggregate cannot be trustworthy: {e!r}")
         reason = f"{label} failed: {e!r}"
         return _Sub(False, False, "", None, trunc, "", [], reason, [],
@@ -1620,7 +2005,10 @@ def _batch_labels(branch: str, head_label: str, index: int, count: int,
 def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                  root: Path, store: Store, scratch: Path, finder: Reviewer,
                  branch: str, base_ref: str, base_sha: str, head_label: str,
-                 tag: str = "primary") -> dict:
+                 tag: str = "primary", context_source: str = "wt",
+                 context_oid: str | None = None,
+                 large_prompt: tuple[int, int] | None = None,
+                 cancel: "threading.Event | None" = None) -> dict:
     """Review `batches` as sub-reviews plus one cross-file pass; AGGREGATE.
 
     Returns a new record: `rec` with every aggregate field filled in. `rec` is
@@ -1636,6 +2024,24 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
     axes, checklist selection) that makes the merged findings attributable —
     they are merged in batch order, then the integration pass's, and only the
     latter are tagged.
+
+    Four keyword-only parameters exist for the BACKGROUND dispatcher, and all
+    four default to the foreground's shipped behaviour:
+
+    * `context_source`/`context_oid` — where each batch's file context is READ
+      FROM. The foreground packs the working tree (`"wt"`); a pre-push worker
+      packs the PUSHED COMMIT's tree (`"oid"`, the pushed oid), because the
+      developer's checkout may already be somewhere else entirely and reading it
+      would certify content nobody pushed. This is the one Task-8 seam Task 10
+      threads: the per-batch pack call used to be hard-wired to the working tree.
+    * `large_prompt` — the per-prompt timeout escalation (see `_escalated`),
+      measured on each batch prompt individually.
+    * `cancel` — the worker's cancellation token, forwarded to every sub-review
+      and checked at each batch boundary. `ReviewCancelled` propagates out
+      UNCAUGHT: a cancelled orchestration has no aggregate, and building one
+      from the batches that happened to finish would publish a partial review as
+      a whole one. (The worker's own transform is what preserves the partial,
+      and it marks it `degraded`.)
     """
     count = len(batches)
     mode = passes.batch_checklist_mode(count)
@@ -1671,6 +2077,11 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         checklist_degraded = checklist_degraded or selection.degraded is True
 
     for index, batch in enumerate(batches, 1):
+        # A BATCH BOUNDARY. The checklist selection, the context pack and the
+        # prompt build below all happen outside any watchdog, so a token set
+        # while the previous batch was being written up would otherwise buy a
+        # whole further pack + model call.
+        _checkpoint(cancel, None, f"before batch {index} of {count}")
         # Per batch: never a cross-file rule (`mode`), and context for exactly
         # the files this batch shows. A file split across two batches has its
         # context packed into both -- accepted, because the batches are reviewed
@@ -1693,7 +2104,8 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 root, list(batch.files),
                 {f: diff.statuses[f] for f in batch.files
                  if f in diff.statuses},
-                headroom, pack_large_added=not sole)
+                headroom, source=context_source, oid=context_oid,
+                pack_large_added=not sole)
             ctx_bytes += pack.bytes_total
             for name in pack.included:
                 if name not in ctx_files:
@@ -1715,8 +2127,10 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             _note(f"batch {index}/{count} is {len(batch.data)} bytes "
                   f"(> {d.max_diff_bytes}); its prompt is truncated and this "
                   f"review cannot be trustworthy")
-        sub = _run_sub(finder, cfg, d, prompt, root, store, scratch,
-                       f"{tag}.b{index}", f"batch {index}")
+        sub = _run_sub(finder, cfg,
+                       _escalated(d, prompt.prompt_bytes, large_prompt),
+                       prompt, root, store, scratch,
+                       f"{tag}.b{index}", f"batch {index}", cancel=cancel)
         subs.append(sub)
         findings.extend(sub.findings)
         metas.append({
@@ -1748,6 +2162,9 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
     integration: dict | None = None
     integration_sub: _Sub | None = None
     if passes.should_run_integration(count):
+        # The last pass boundary in an orchestration: the integration prompt is
+        # built from every batch's diff and findings, which is real work.
+        _checkpoint(cancel, None, "before the integration pass")
         selection = checklist.select(
             diff.files, passes.INTEGRATION_CHECKLIST_MODE,
             _under(root, d.checklist_dir), _under(root, d.rules_json),
@@ -1782,8 +2199,10 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 _note(f"NOTE integration context capped at {d.max_diff_bytes} "
                       f"bytes; some cross-file relationships were not shown")
             integration_sub = _run_sub(
-                reviewer, cfg, d, prompt, root, store, scratch,
-                passes.INTEGRATION_PASS, "the integration pass")
+                reviewer, cfg,
+                _escalated(d, prompt.prompt_bytes, large_prompt),
+                prompt, root, store, scratch,
+                passes.INTEGRATION_PASS, "the integration pass", cancel=cancel)
             # Tagged BEFORE they are merged: nothing downstream can tell a
             # cross-file finding from a within-batch one afterwards.
             tagged = passes.tag_integration_findings(integration_sub.findings)

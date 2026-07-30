@@ -398,3 +398,83 @@ def test_finishing_just_before_the_deadline_is_not_a_timeout(tmp_path):
     assert r.timed_out is False
     assert (tmp_path / "out").read_text(encoding="utf-8").strip() == "done"
     assert r.duration_sec >= 0.9
+
+
+# --------------------------------------------------------------------------
+# the cancellation token (Task 10)
+#
+# The BACKGROUND worker's SIGTERM has to reach the provider, which runs in its
+# OWN process group precisely so this watchdog can signal it -- a bare SIGTERM
+# death of the worker would orphan a live model call and let it overlap the
+# replacement review. The signal handler cannot kill the group itself (it does
+# not know the pid), so it sets a token this loop checks.
+# --------------------------------------------------------------------------
+
+
+def test_review_cancelled_is_a_base_exception_that_carries_a_partial():
+    """`BaseException`, not `Exception`, and that is load-bearing.
+
+    Every layer between the tick loop and the worker catches `Exception` to
+    demote rather than destroy a review (`pipeline._run_sub`,
+    `pipeline._extra_pass`, `dispatch.build_dedup_evidence`). A cancellation
+    caught by one of those would be turned into a degraded REVIEW -- a
+    trustworthy-shaped record for a run that was killed -- instead of reaching
+    the worker's failed finalize.
+    """
+    from skodun.runner import ReviewCancelled
+    assert issubclass(ReviewCancelled, BaseException)
+    assert not issubclass(ReviewCancelled, Exception)
+    assert ReviewCancelled("x").partial is None
+    assert ReviewCancelled("x", partial={"id": "r1"}).partial == {"id": "r1"}
+
+
+def test_an_already_set_token_spawns_nothing_at_all(tmp_path):
+    """Checked BEFORE `Popen`, so a token set while the previous attempt was
+    being written up does not start one more model call."""
+    marker = tmp_path / "ran"
+    cancel = threading.Event()
+    cancel.set()
+    from skodun.runner import ReviewCancelled
+    with pytest.raises(ReviewCancelled):
+        run_with_watchdog(
+            [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('x')"],
+            10, tmp_path, tmp_path / "out", tmp_path / "err", cancel=cancel)
+    assert not marker.exists(), "a cancelled run must not spawn a process"
+
+
+def test_a_token_set_mid_run_kills_the_whole_group_and_raises(tmp_path):
+    """The provider group dies, exactly as it does on a timeout.
+
+    The child below leaks a grandchild that ignores SIGTERM into its own group,
+    which is the shape the group SIGKILL exists for -- a model CLI that spawns
+    a helper.
+    """
+    from skodun.runner import ReviewCancelled
+    pidfile = tmp_path / "pgid"
+    code = (
+        "import os, signal, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"open({str(pidfile)!r}, 'w').write(str(os.getpgid(0)))\n"
+        "sys.stdout.write('x'); sys.stdout.flush()\n"
+        "time.sleep(60)\n")
+    cancel = threading.Event()
+    t = threading.Timer(0.6, cancel.set)
+    t.start()
+    try:
+        with pytest.raises(ReviewCancelled):
+            run_with_watchdog([sys.executable, "-c", code], 60, tmp_path,
+                              tmp_path / "out", tmp_path / "err", cancel=cancel)
+    finally:
+        t.cancel()
+    pgid = int(pidfile.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and _group_exists(pgid):
+        time.sleep(0.05)
+    assert not _group_exists(pgid), "the provider's process group outlived the cancel"
+
+
+def test_no_token_is_the_shipped_behaviour_exactly(tmp_path):
+    """`cancel=None` is the foreground/legacy path and changes nothing."""
+    r = run_with_watchdog([sys.executable, "-c", "print('hi')"], 10, tmp_path,
+                          tmp_path / "out", tmp_path / "err", cancel=None)
+    assert r.rc == 0 and not r.timed_out

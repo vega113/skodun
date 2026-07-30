@@ -22,6 +22,7 @@ other at module load time.
 from __future__ import annotations
 
 import shutil
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -181,7 +182,8 @@ def _remember_unavailable(store: Store, provider: str, verdict) -> None:
 
 def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
               cwd: Path, store: Store, scratch: Path, tag: str,
-              contract: OutputContract = REVIEW_CONTRACT) -> _Outcome:
+              contract: OutputContract = REVIEW_CONTRACT,
+              cancel: "threading.Event | None" = None) -> _Outcome:
     """Run a reviewer chain to a verdict: entry by entry, retry by retry.
 
     Every retry is a FRESH run of the same prompt — never a resumed session —
@@ -225,6 +227,17 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
     `--output-schema` beside it and always overwrites), so two attempts sharing
     one prompt path would swap each other's requested response shape between
     `build_cmd` and `exec`.
+
+    `cancel` is the background worker's cancellation token (Task 10). It is
+    forwarded to EVERY `run_with_watchdog` call — a supersede landing during
+    attempt 3 of a fallback entry must not wait for the chain to exhaust itself
+    — and it is checked at each ENTRY boundary as well, because the work between
+    two attempts (a provider-availability lookup, a binary probe, a prompt
+    write) is not inside the watchdog and can otherwise buy a whole further
+    model call after the token was set. `None` is the foreground path and
+    changes nothing. `ReviewCancelled` propagates out of here uncaught, by
+    design: it is a `BaseException` precisely so the `except Exception` guards
+    between here and the worker cannot turn a killed run into a degraded review.
     """
     from .pipeline import _chain_for, _note
     chain = _chain_for(cfg, head)
@@ -236,6 +249,12 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
     n = 0
 
     for i, entry in enumerate(chain):
+        if runner._cancelled(cancel):
+            # The ENTRY boundary. Nothing has spawned for this entry yet, so
+            # there is no group to take down -- `run_with_watchdog` owns that
+            # for an attempt already in flight.
+            raise runner.ReviewCancelled(
+                f"the review was cancelled before reviewer {entry.name!r} ran")
         adapter = get_adapter(entry.provider)
 
         cached = _cached_unavailable(store, entry.provider)
@@ -298,7 +317,7 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
             try:
                 result = runner.run_with_watchdog(
                     cmd, d.timeout_sec, cwd, out_path, err_path,
-                    stdin_path=stdin_path)
+                    stdin_path=stdin_path, cancel=cancel)
             except FileNotFoundError:
                 # The binary existed when we looked and does not now, or the
                 # adapter's argv names something else that is missing. Same
