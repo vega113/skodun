@@ -12,13 +12,15 @@ semantics:
 - **Adversarial passes** — a skeptic pass that attacks clean results, a security pass for
   risky paths, and an optional refuter pass where a *different* provider re-examines the
   finder's findings.
-- **A gate you can trust** — exit `0` (clean or every finding dismissed with an audited reason),
+- **A gate you can trust** — exit `0` (clean or every finding triaged with an audited reason),
   `1` (findings open), `2` (no trustworthy review); every unexpected error is `2`, and every
   bypass is a recorded decision.
-- **Triage ledger** — dismissing a finding requires a ≥20-character reason; placeholder excuses
-  ("false positive", "wontfix", …) are rejected; dismissals survive review rounds but not rebases.
-  A refuter's annotation can be adopted as that reason with `triage --adopt-refuter`, one finding
-  at a time — there is no bulk form.
+- **Triage ledger** — clearing a finding requires a ≥20-character reason; placeholder excuses
+  ("false positive", "wontfix", …) are rejected; decisions survive review rounds but not rebases.
+  There are three verbs: `dismiss` ("not a defect"), `defer` ("real, not for this change, filed
+  as X" — with a **mandatory** tracking reference), and `reopen`, which overturns either. A
+  refuter's annotation can be adopted as a dismissal reason with `triage --adopt-refuter`, one
+  finding at a time — there is no bulk form.
 
 ## Status
 
@@ -29,7 +31,7 @@ server for agent harnesses.** Here is the honest scope:
 
 - What exists: three registered provider adapters (`xai` driving `grok`, `openai`
   driving `codex`, `google` driving `agy`), per-reviewer quota-fallback chains, an
-  annotation-only refuter pass, the twelve subcommands below, the SQLite store, the
+  annotation-only refuter pass, the thirteen subcommands below, the SQLite store, the
   gate, the triage ledger, a one-shot importer for the archive of the previous
   implementation, a shadow comparison used to check the two against each other, a
   pre-push dispatcher with a detached background worker and a delivery ledger
@@ -64,11 +66,13 @@ Background:
 | `skodun review [--repo DIR] [--reviewer NAME]` | Run one review of the outgoing change now, in the foreground, and record it. `--reviewer` heads this run's chain with a named `[[reviewers]]` entry instead of the config's `finder` — see "Choosing the reviewer for one review" below. | `0` trustworthy and clean · `1` trustworthy, findings open · `2` preflight refusal (nothing ran) · `3` gave up waiting for the lock · `4` no trustworthy review was recorded · `130` interrupted with Ctrl-C (stdout is left empty on purpose — an operator's own interruption, not a refusal). |
 | `skodun gate [--repo DIR]` | Fail closed unless a trustworthy review already covers this exact diff; every decision is written to the audit log. Wire it into pre-push or CI. | `0` clean or every finding triaged · `1` findings open · `2` no trustworthy review covers this diff. Every unexpected exception maps to `2`, never `1`. |
 | `skodun providers [--repo DIR]` | List every registered provider adapter, whether its CLI binary is resolvable and executable right now, and its cached availability state. Read-only; never gates anything. | `0` always, even with missing binaries — that is exactly what this command exists to report · `1` a reviewer in the loaded config (enabled or not) names a `provider` with no registered adapter · `2` `--repo`/config/store could not be read at all. |
-| `skodun triage <review-id> <finding-index> "<reason>"` | Dismiss one finding with an audited reason. Reasons under 20 characters and known placeholders are rejected. | `0` dismissed · `2` rejected (bad review id, bad index, reason too short or a placeholder). |
-| `skodun triage --list <review-id>` | List a review's findings, each marked `OPEN`, `DISMISSED <when>` or `REOPENED <when>, dismissed <when>`, with any refuter annotation shown alongside. | `0` / `2` (store or artifact could not be read). |
-| `skodun triage --reopen <review-id> <finding-index> "<reason>"` | Overturn one finding's dismissal, with an audited reason of its own — it clears the same 20-character, no-placeholder floor a dismissal does, because it takes the gate from `0` back to `1`. Append-only: the dismissal and its reason stay in the ledger, and the whole history of a finding (dismiss → reopen → dismiss) is preserved. | `0` recorded · `1` REFUSED (reason fails the audit floor, or the finding is not dismissed and there is nothing to overturn) · `2` NOT FOUND (no such review/finding, invalid artifact, or misuse). |
+| `skodun triage <review-id> <finding-index> "<reason>"` | Dismiss one finding with an audited reason — *this is not a defect*. Reasons under 20 characters and known placeholders are rejected. | `0` dismissed · `2` rejected (bad review id, bad index, reason too short or a placeholder). |
+| `skodun triage --defer <review-id> <finding-index> <tracking-ref> "<reason>"` | Defer one finding to a **filed** tracking reference — *this is real, it is not blast-radius for this change, and the work is filed as X*. The reference is **mandatory** and validated (an issue number, a tracker key, or a URL — one token, not prose); the reason clears the same audit floor a dismissal's does. It clears the gate exactly as a dismissal does, and `skodun deferrals` is how the backlog it creates stays visible. | `0` recorded · `1` REFUSED (no usable tracking reference, or a reason that fails the audit floor) · `2` NOT FOUND (no such review/finding, invalid artifact, or misuse). |
+| `skodun triage --list <review-id>` | List a review's findings, each marked `OPEN`, `DISMISSED <when>`, `DEFERRED -> <ref> <when>` or `REOPENED <when>, dismissed <when>`, with any refuter annotation shown alongside. | `0` / `2` (store or artifact could not be read). |
+| `skodun triage --reopen <review-id> <finding-index> "<reason>"` | Overturn one finding's dismissal **or deferral**, with an audited reason of its own — it clears the same 20-character, no-placeholder floor a dismissal does, because it takes the gate from `0` back to `1`. Append-only: the decision it overturns and its reason (and, for a deferral, its filed reference) stay in the ledger, and the whole history of a finding (dismiss → reopen → defer → …) is preserved. | `0` recorded · `1` REFUSED (reason fails the audit floor, or the finding is neither dismissed nor deferred and there is nothing to overturn) · `2` NOT FOUND (no such review/finding, invalid artifact, or misuse). |
 | `skodun triage --adopt-refuter <review-id> <finding-index>` | Dismiss ONE finding by adopting its refuter annotation as the audited reason. See "The refuter" below. | `0` recorded · `1` REFUSED (wrong verdict, thin reasoning, or reasoning that fails the audit floor) · `2` NOT FOUND (no such review/finding, invalid artifact, or misuse). |
 | `skodun log [--branch B] [-n N]` | Recent reviews, newest first, one line each; untrustworthy rows are marked `!`. | `0` / `2` (bad `-n`, or the store could not be read). |
+| `skodun deferrals [-n N]` | Every finding still standing as DEFERRED, across **all** reviews and branches, newest first: `<ref> \| <branch> \| <file>:<line> \| <severity> <title> \| deferred <when> \| review <id>`. Deliberately unscoped — a deferral filed on a branch nobody is looking at is exactly the one that rots. Nothing on stdout and a note on stderr when there are none. | `0` / `2` (bad `-n`, or the ledger could not be read). |
 | `skodun import-legacy [--repo DIR] [--dir ARCHIVE]` | One-shot migration of a legacy `.grok-reviews` archive into the store. Idempotent. Anything it cannot fully verify is imported *demoted* rather than trusted, and every counter is printed. | `0` ok (including "nothing to import") · `2` the importer could not run or a store write failed partway. |
 | `skodun shadow-compare [--dir ARCHIVE] [--diff-hash H] [--since TS]` | Compare skodun's verdicts against that archive's, hash by hash, and print a table plus a summary. `--since` restricts the comparison, on both sides, to rows reviewed at or after a canonical UTC timestamp — exactly `%Y-%m-%dT%H:%M:%SZ` (e.g. `2026-07-28T12:00:00Z`); any other shape is rejected before anything runs. | Observational: always `0`, **except** a malformed `--since`, which is a usage error and exits `2` before any comparison happens. |
 | `skodun install-hooks [--repo DIR] [--force]` | Install (or re-install) the pre-push shim into this repository's real hooks directory, chaining any hook that was already there. See "Pre-push hooks and background review" below for what the shim does and what `--force` means. | `0` installed · `1` refused — a foreign hook is there and needs `--force` (or to be moved aside yourself) · `2` this is not a repository skodun can install into at all. |
@@ -511,18 +515,47 @@ that an agent never dismisses a finding by itself.
 The reasoning, the outside evidence and the recommendations for skodun itself
 are in `docs/superpowers/specs/2026-07-31-review-round-cutoff-design.md`.
 
+### Deferring a finding honestly
+
+The gate passes on **clean OR every finding triaged**, and `defer` is the verb
+that makes "triaged" mean something other than "dismissed". Recording
+
+```bash
+skodun triage --defer sk_20260731_ab12 3 GH-412 \
+  "in-bounds for this surface; the hot path is the batcher, filed for next sprint"
+```
+
+clears the finding for the gate while keeping it in the ledger as **outstanding
+debt** rather than a rejected finding, so `skodun deferrals` can still list it
+next month. The tracking reference is mandatory and validated; a deferral with
+none is refused with the same force a placeholder reason is, because an unfiled
+deferral and an ignored finding are the same artifact. File the issue first,
+then record its reference.
+
+This is a liability transfer, not a fix. A project that defers everything ships
+the same code as a project with no review, and only the filed references make
+the difference visible — whether the backlog is actually worked is a human
+discipline no gate can enforce. What skodun guarantees is that the debt is
+written down, attributable, and reversible on the record with `triage --reopen`.
+
 ## MCP server
 
 `skodun mcp` serves the same review loop the CLI does — `gate`, `review`, `log`,
-`surface`, and the `triage` operations — to any MCP client, over stdio, as **8
+`surface`, and the `triage` operations — to any MCP client, over stdio, as **9
 tools** and **2 prompts**. A tool's refusal is worded exactly like the CLI's,
 because neither surface owns the words: `services.py` is the one implementation
 both call.
 
 Tools: `gate`, `review`, `log`, `surface`, `triage_list`, `triage_dismiss`,
-`adopt_refuter`, `triage_reopen`. Prompts: `review-now` (run a review and report
-findings without triaging any of them) and `gate-check` (ask whether a trustworthy
-review covers the current change, and explain the verdict).
+`adopt_refuter`, `triage_reopen`, `triage_defer`. Prompts: `review-now` (run a
+review and report findings without triaging any of them) and `gate-check` (ask
+whether a trustworthy review covers the current change, and explain the verdict).
+
+`triage_defer` takes a mandatory `tracking_ref` and refuses without a usable one,
+in the CLI's words. There is deliberately no `deferrals` tool: reviewing the
+deferral backlog is a human's periodic job, not a step in the loop an agent
+drives, and an agent that could both file deferrals and mark them handled would be
+holding both ends of the audit trail.
 
 `review` takes an optional `reviewer` argument — the name of a configured
 `[[reviewers]]` entry to head that one review's chain, exactly as the CLI's
@@ -608,9 +641,10 @@ property everything here is arranged around — but each is a real rough edge.
 - **Background rounds have no repo dimension.** `reviews` is keyed by branch, so
   two repositories sharing one store collide on common branch names. The fix is a
   `repo` column (the git common dir) scoping the supersede query, the undelivered
-  query, and `log --branch`; it is a schema change, so it waits for the next store
-  version. Until then, use one store per repository — see "One store per
-  repository" above.
+  query, and `log --branch`; it is a schema change and still unwritten. Store v4
+  (the `defer` verb) rebuilt `triage_events` only, so the column is an ordinary
+  additive `ALTER TABLE reviews ADD COLUMN` in a v5 delta whenever it lands. Until
+  then, use one store per repository — see "One store per repository" above.
 - **Stale-review recovery JSON-parses the whole `reviews` table on every push.**
   The cleanup pass that reclaims abandoned `running` rows loads and decodes every
   stored artifact to find rows whose status is an indexed column. It is fast on a
@@ -626,13 +660,6 @@ property everything here is arranged around — but each is a real rough edge.
   empty ref list rather than the live stdin. Only the "no temp file at all" case
   is currently handled — that one correctly skips skodun and hands the chained
   hook the original stdin.
-- **A triage decision has only two verbs.** `dismiss` means "not a defect", and
-  there is no way to say "real, but not for this change, filed as X" — so a
-  deferral has to masquerade as a dismissal and the ledger stops distinguishing
-  outstanding debt from rejected findings. A `defer` verb with a mandatory
-  tracking reference is the main recommendation of
-  `docs/superpowers/specs/2026-07-31-review-round-cutoff-design.md`; it needs a
-  store version, so it waits with the `repo` column above.
 - **A review round carries no context about the rounds before it.** skodun
   cannot say "this is review 3 of this branch, and 6 findings were already
   triaged", nor mark a finding as landing in code the previous round's fix

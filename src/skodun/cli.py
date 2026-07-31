@@ -150,15 +150,42 @@ def build_parser() -> argparse.ArgumentParser:
     log.add_argument("-n", type=int, default=20, dest="limit",
                      help="maximum rows to show (default: 20)")
 
+    dfr = sub.add_parser(
+        "deferrals",
+        help="list every finding still standing as DEFERRED, across all reviews")
+    dfr.add_argument("-n", type=int, default=50, dest="limit",
+                     help="maximum rows to show, newest first (default: 50)")
+
     tri = sub.add_parser(
         "triage",
-        help="dismiss or reopen a finding with an audited reason, or list a "
-             "review's findings")
+        help="dismiss, defer or reopen a finding with an audited reason, or "
+             "list a review's findings")
     tri.add_argument("review_id")
     tri.add_argument("finding_index", nargs="?", type=int, default=None)
     tri.add_argument("reason", nargs="?", default=None)
+    # THE FOURTH POSITIONAL, and it exists only for `--defer`, whose argv is
+    # `<review-id> <finding-index> <tracking-ref> "<reason>"`. argparse fills
+    # optional positionals left to right, so under `--defer` the third slot
+    # (`reason`) carries the TRACKING REFERENCE and this one carries the reason
+    # -- see `_cmd_triage`, which is the only place that mapping is applied.
+    # Naming it after its one use rather than after its position keeps every
+    # other mode's `args.reason` meaning exactly what it always meant, and
+    # `_cmd_triage` refuses a fourth positional on any other mode rather than
+    # discarding it.
+    tri.add_argument("defer_reason", nargs="?", default=None,
+                     help="with --defer ONLY: the audited reason, which follows "
+                          "the tracking reference")
     tri.add_argument("--list", action="store_true", dest="list_only",
                      help="list a review's findings instead of dismissing one")
+    # The third verb. It CLEARS the gate exactly as a dismissal does, and the
+    # only thing that keeps that honest is the mandatory tracking reference --
+    # a deferral nobody filed and an ignored finding are the same artifact, so
+    # the reference is validated at the same door the reason's audit floor is.
+    tri.add_argument("--defer", action="store_true", dest="defer",
+                     help="defer ONE finding to a MANDATORY tracking reference "
+                          "(an issue number, a tracker key or a URL) with an "
+                          "audited reason: the finding is real, it is not "
+                          "blast-radius for this change, and the work is filed")
     # The audited un-dismissal. It takes a reason of its own -- and the same
     # reason floor a dismissal clears -- because it moves the gate from 0 back
     # to 1, and nothing may do that silently. Append-only: the dismissal it
@@ -1203,8 +1230,39 @@ def _cmd_log(args) -> int:
     return _emit(text, code) if text else code
 
 
+def _cmd_deferrals(args) -> int:
+    """Print every finding still standing as DEFERRED. `2` if unreadable.
+
+    Its own subcommand rather than a flag on `log` or `triage`, for a reason
+    about SHAPE: `log` lists reviews one row each and a deferral is a finding
+    inside one, while `triage` takes a review id as a required positional --
+    and the question this answers ("what has this project deferred, and where
+    is it filed") is precisely the one whose subject is not a review anybody
+    already has in mind. A deferral filed three branches ago is the one that
+    rots, so the listing has no scope at all.
+
+    An empty ledger prints NOTHING on stdout and says so on stderr, exit 0 --
+    `surface`'s convention, and for its reason: stdout here is a listing
+    something may count or pipe, and a note injected into it would be a row.
+    """
+    from .services import svc_deferrals
+
+    try:
+        from .store import Store
+        store = Store.open(_store_path())
+    except BaseException as e:
+        return _emit(f"skodun deferrals: could not read the store: {e!r}", 2)
+    with store:
+        code, text = svc_deferrals(store, args.limit)
+    if text:
+        return _emit(text, code)
+    # `_warn`, not `_emit`: an empty listing is an answer, and a note printed
+    # onto stdout would be a row in something a caller may be counting.
+    return _warn("skodun deferrals: no open deferrals", code) if code == 0 else code
+
+
 def _cmd_triage(args) -> int:
-    """Dismiss or reopen one finding with an audited reason, or list a review's.
+    """Dismiss, defer or reopen one finding with an audited reason, or list.
 
     A rejected reason or a missing/invalid review is reported as a clear
     message and a nonzero exit -- never a traceback -- because both are the
@@ -1215,15 +1273,17 @@ def _cmd_triage(args) -> int:
     interpreter's own exit code of 1 -- indistinguishable from a real error
     about a decision that in fact was never even reached.
 
-    `--adopt-refuter` and `--reopen` share one exit contract, and the split is
-    the point:
+    `--adopt-refuter`, `--reopen` and `--defer` share one exit contract, and the
+    split is the point:
 
       0  the decision was recorded
       1  REFUSED -- the finding is right there and the decision was declined
          (for `--adopt-refuter`: a wrong verdict, thin reasoning, a reasoning
          that fails the audit floor, an annotation that cannot say who
          answered; for `--reopen`: a reason that fails the audit floor, or a
-         finding that is not dismissed and so has nothing to overturn)
+         finding that is not dismissed or deferred and so has nothing to
+         overturn; for `--defer`: a reason that fails the audit floor, or a
+         tracking reference nobody could look up)
       2  NOT FOUND -- no such review, no such finding, an artifact that does
          not validate, a store that will not open, or plain misuse
 
@@ -1237,8 +1297,9 @@ def _cmd_triage(args) -> int:
     shipped contract that pre-push hooks and humans already read, and this task
     is not the place to change what `skodun triage <id> <n> "<reason>"` returns.
     """
-    from .services import (TRIAGE_ADOPT_USAGE, TRIAGE_REOPEN_USAGE,
-                           svc_adopt_refuter, svc_triage_dismiss,
+    from .services import (TRIAGE_ADOPT_USAGE, TRIAGE_DEFER_USAGE,
+                           TRIAGE_REOPEN_USAGE, svc_adopt_refuter,
+                           svc_triage_defer, svc_triage_dismiss,
                            svc_triage_list, svc_triage_reopen)
     from .store import Store
 
@@ -1256,17 +1317,35 @@ def _cmd_triage(args) -> int:
     # the same words, from the `services` constants imported above.
     modes = [name for name, on in (("--list", args.list_only),
                                    ("--adopt-refuter", args.adopt_refuter),
-                                   ("--reopen", args.reopen)) if on]
+                                   ("--reopen", args.reopen),
+                                   ("--defer", args.defer)) if on]
     if len(modes) > 1:
         return _emit(
             f"skodun triage: {modes[0]} and {modes[1]} are two different "
             "commands; pick one", 2)
+    # THE FOURTH POSITIONAL BELONGS TO `--defer` ALONE. Only that mode's argv
+    # has four, so anywhere else it is an argument argparse would silently throw
+    # away -- and its author, having typed a reference before their reason,
+    # would have every right to believe a deferral was recorded. Refused before
+    # the store opens, with the flag that WOULD have accepted it named.
+    if not args.defer and args.defer_reason is not None:
+        return _emit(
+            "skodun triage: that is one argument too many. Only --defer takes a "
+            "tracking reference before the reason: skodun triage --defer "
+            "<review-id> <finding-index> <tracking-ref> \"<reason>\"", 2)
     if args.list_only and not (args.finding_index is None and args.reason is None):
         return _emit(
             "skodun triage: --list takes only a review id; drop the finding "
             "index and the reason to list, or drop --list to dismiss", 2)
     if args.reopen and (args.finding_index is None or args.reason is None):
         return _emit(TRIAGE_REOPEN_USAGE, 2)
+    if args.defer and (args.finding_index is None or args.reason is None
+                       or args.defer_reason is None):
+        # All three, and the reference is the one most likely to be left
+        # out: it is the argument a plain dismissal does not take.
+        # `TRIAGE_DEFER_USAGE` says so, and the MCP tool refuses the same
+        # absence with the same words -- the service owns them.
+        return _emit(TRIAGE_DEFER_USAGE, 2)
     if args.adopt_refuter:
         # Same class of mixture, and the same refusal to guess. The reason is
         # SYNTHESIZED from the annotation, so a reason typed alongside the flag
@@ -1293,6 +1372,16 @@ def _cmd_triage(args) -> int:
         elif args.reopen:
             code, text = svc_triage_reopen(store, args.review_id,
                                            args.finding_index, args.reason)
+        elif args.defer:
+            # THE POSITIONAL REMAPPING, in the one place it happens: under
+            # `--defer` the third positional is the TRACKING REFERENCE and the
+            # fourth is the reason (see `build_parser`). Spelled out at the call
+            # rather than by renaming the attributes, so nothing else in this
+            # function has to know that `args.reason` ever means anything else.
+            code, text = svc_triage_defer(store, args.review_id,
+                                          args.finding_index,
+                                          args.reason,        # <tracking-ref>
+                                          args.defer_reason)  # "<reason>"
         elif args.adopt_refuter:
             code, text = svc_adopt_refuter(store, args.review_id,
                                            args.finding_index)
@@ -1366,6 +1455,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_log(args)
         if args.command == "triage":
             return _cmd_triage(args)
+        if args.command == "deferrals":
+            return _cmd_deferrals(args)
         if args.command == "surface":
             return _cmd_surface(args)
         if args.command == "dispatch":

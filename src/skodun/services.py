@@ -70,6 +70,12 @@ TRIAGE_ADOPT_USAGE = (
     "<review-id> <finding-index>  (one finding at a time, on "
     "purpose)")
 
+TRIAGE_DEFER_USAGE = (
+    "skodun triage: usage: skodun triage --defer <review-id> "
+    "<finding-index> <tracking-ref> \"<reason>\"  (the tracking reference "
+    "is mandatory: an unfiled deferral and an ignored finding are the same "
+    "artifact)")
+
 #: What a cancelled foreground review reports. Status 4 in both surfaces: the
 #: content has no trustworthy review covering it, which is exactly what 4 says,
 #: and a cancelled run must never be able to report anything gentler.
@@ -593,3 +599,110 @@ def svc_triage_reopen(store, review_id, index, reason) -> tuple[int, str]:
         return 2, f"skodun triage: could not record the reopen: {e!r}"
     return 0, (f"skodun triage: reopened finding {index} on review "
                f"{review_id}; it counts as open again")
+
+
+def svc_triage_defer(store, review_id, index, tracking_ref,
+                     reason) -> tuple[int, str]:
+    """Defer ONE finding to a FILED tracking reference, with an audited reason.
+
+    `svc_triage_reopen`'s exit contract, exactly (0 recorded, 1 refused, 2 not
+    found), because it is the same shape of decision: the finding is right there
+    and either the ledger took the decision or it declined it.
+
+    What makes this verb different from `svc_triage_dismiss` is what a 1 can
+    mean here: a MISSING OR UNUSABLE TRACKING REFERENCE is refused on exactly
+    the terms a placeholder reason is. A deferral clears the gate, so one that
+    names nowhere the work is filed is an auto-dismissal with better manners --
+    "an unfiled deferral and an ignored finding are the same artifact" is a
+    mechanical fact only because this refusal exists.
+
+    An ABSENT reference (`None`) is a 2 and the usage string, not a 1: that is a
+    caller who has not made a deferral yet, which is misuse rather than a
+    declined decision -- and it is the refusal both surfaces have to share, so
+    it comes from `TRIAGE_DEFER_USAGE` and neither of them owns the words.
+    """
+    import time
+
+    from .store import _TS_FORMAT
+    from .triage import ArtifactError, FindingNotFound, TriageError, defer
+
+    if index is None or reason is None or tracking_ref is None:
+        # All three are mandatory: one finding at a time, never without a stated
+        # reason, and never without the filing that distinguishes a deferral
+        # from a dismissal. Before the load, matching the CLI's own order.
+        return 2, TRIAGE_DEFER_USAGE
+    review, refusal = _load_review(store, review_id)
+    if refusal is not None:
+        return refusal
+
+    try:
+        rec = defer(store, review, index, tracking_ref, reason,
+                    now=time.strftime(_TS_FORMAT, time.gmtime()))
+    except (FindingNotFound, ArtifactError) as e:
+        # The finding or the review does not exist: nothing was decided.
+        return 2, f"skodun triage: {e}"
+    except TriageError as e:
+        # The finding exists and the deferral was declined -- an unauditable
+        # reason, or a reference nobody could look up.
+        return 1, f"skodun triage: refused: {e}"
+    except KeyboardInterrupt:
+        raise           # 130's; the guard below is for a store that broke
+    except BaseException as e:
+        return 2, f"skodun triage: could not record the deferral: {e!r}"
+    # The CANONICAL reference (`triage.defer` returns what it stored), never the
+    # caller's raw string: what is echoed has to be what a later `skodun
+    # deferrals` will print, or the two disagree about the same filing.
+    return 0, (f"skodun triage: deferred finding {index} on review {review_id}, "
+               f"filed as {rec['tracking_ref']}; it no longer blocks the gate")
+
+
+def svc_deferrals(store, limit=50) -> tuple[int, str]:
+    """Every finding still standing as DEFERRED, across every review. One line
+    each, newest first. `(0, text)`, or `(2, why-not)`.
+
+    THE ANTI-ROT SURFACE, and the reason it is its own command rather than a
+    flag on an existing one. `log` lists REVIEWS, one row per stored review; a
+    deferral is a FINDING inside one, and `log --deferred` would have to render
+    a different row shape under the same command. `triage` takes a review id as
+    a required positional and answers about that review -- but a deferral filed
+    three branches ago is exactly the one that rots, and it is unreachable from
+    any surface scoped to a review a human already has in mind. So: a listing
+    with no scope at all, which is the only honest shape for the question "what
+    has this project deferred, and where is it filed".
+
+    `2` for a non-positive or non-integer `-n` and for a store that cannot be
+    read; `0` otherwise, including for a store with no deferrals at all -- an
+    empty listing is an answer, and `text` is then `""`.
+    """
+    from .triage import shown_field
+
+    try:
+        rows_wanted = int(limit)
+    except (TypeError, ValueError):
+        return 2, (f"skodun deferrals: -n must be a positive row count, got "
+                   f"{limit!r}")
+    if rows_wanted < 1:
+        # `-n` becomes SQLite's LIMIT, where a NEGATIVE value means "no limit",
+        # so `-n -1` would dump the whole ledger while reading like a request
+        # for fewer rows. Exactly `svc_log`'s rule.
+        return 2, (f"skodun deferrals: -n must be a positive row count, got "
+                   f"{rows_wanted}")
+    try:
+        rows = store.open_deferrals(rows_wanted)
+    except KeyboardInterrupt:
+        raise           # a cancelled listing is 130's, not "the store is broken"
+    except BaseException as e:
+        return 2, f"skodun deferrals: could not read the ledger: {e!r}"
+
+    # EVERY field below except the separators is finder-authored model text or a
+    # stored string, reaching a terminal on a one-line-per-item listing -- the
+    # same exposure `triage --list` has, so it goes through the same
+    # `shown_field`: flattened, control characters stripped, length bounded. A
+    # title carrying a raw newline must not be able to forge a second deferral.
+    return 0, "\n".join(
+        f"{shown_field(r.get('tracking_ref'))} | {shown_field(r.get('branch'))} | "
+        f"{shown_field(r.get('file'))}:{shown_field(r.get('line'))} | "
+        f"{shown_field(r.get('severity'))} {shown_field(r.get('title'))} | "
+        f"deferred {shown_field(r.get('at'))} | review "
+        f"{shown_field(r.get('review_id'))}"
+        for r in rows)

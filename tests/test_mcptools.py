@@ -8,9 +8,10 @@ the tool work" but "does it answer EXACTLY what the CLI answers".
 
 Three properties are worth more than the rest and each has its own section:
 
-  * **The list is curated.** A snapshot pins the eight tool names and their
-    order. A ninth tool is a new agent-facing surface on a fail-closed gate, and
-    it should cost a failing test to add.
+  * **The list is curated.** A snapshot pins the tool names and their order.
+    Another tool is a new agent-facing surface on a fail-closed gate, and it
+    should cost a failing test to add -- `triage_defer` (issue #5) cost exactly
+    that, deliberately.
   * **Refusals are word-for-word identical across surfaces.** A human reading an
     agent's transcript, or the other way round, must not be looking at two
     products. Every refusal below is produced twice -- once through
@@ -52,8 +53,15 @@ from tests.test_gitio import _git, _mkrepo
 _SRC = str(Path(skodun.__file__).resolve().parents[1])
 
 #: The tools `skodun mcp` serves, in `tools/list` order. THE SNAPSHOT.
+#: `triage_defer` is APPENDED rather than slotted beside `triage_dismiss`: the
+#: order is the order tools were added, a client's tool picker renders it, and
+#: reordering the shipped eight would move every one of them for no reason.
 EXPECTED_TOOLS = ["gate", "review", "log", "surface", "triage_list",
-                  "triage_dismiss", "adopt_refuter", "triage_reopen"]
+                  "triage_dismiss", "adopt_refuter", "triage_reopen",
+                  "triage_defer"]
+
+TRACKING_REF = "GH-412"
+DEFER_REASON = "in-bounds for this surface; the hot path is the batcher upstream"
 
 EXPECTED_PROMPTS = ["review-now", "gate-check"]
 
@@ -141,7 +149,7 @@ def _both(db: Path, argv: list[str], tool: str, capsys,
 # ==========================================================================
 
 def test_the_tool_list_is_exactly_the_review_loop_and_nothing_more():
-    """THE SNAPSHOT. A ninth tool must cost a failing test.
+    """THE SNAPSHOT. Another tool must cost a failing test.
 
     Every name here is a `skodun` subcommand's service. What is NOT here is the
     point of the test: no bulk dismissal (a dismissal is a human naming ONE
@@ -201,6 +209,11 @@ def test_the_required_arguments_are_the_ones_without_a_default():
     assert required["triage_dismiss"] == {"review_id", "index", "reason"}
     assert required["adopt_refuter"] == {"review_id", "index"}
     assert required["triage_reopen"] == {"review_id", "index", "reason"}
+    # The tracking reference is REQUIRED, and that is the whole verb: a
+    # `triage_defer` an agent could call without one would be `triage_dismiss`
+    # with a friendlier name and no audit trail of what was actually filed.
+    assert required["triage_defer"] == {"review_id", "index", "tracking_ref",
+                                        "reason"}
 
 
 def test_the_prompts_are_the_two_static_ones():
@@ -273,7 +286,8 @@ def test_every_tool_handler_goes_through_the_services_module():
     # RENDERER for a diagnostic listing that is no part of the review loop, so the
     # rule names the decisions rather than the module.)
     decisions = ("run_gate", "run_review", "load_valid_artifact", "adopt_refuter",
-                 "dismiss", "reopen", "triage_state")
+                 "dismiss", "reopen", "defer", "triage_state",
+                 "validate_tracking_ref")
     for name in decisions:
         pattern = rf"(?<![\w.]){name}\s*\("
         assert not re.search(pattern, cli_src), f"cli.py calls {name}()"
@@ -454,6 +468,80 @@ def test_reopening_a_finding_that_is_not_dismissed_is_refused_identically(
     assert cli[0] == 1
 
 
+def test_an_unfiled_deferral_is_refused_with_the_same_words_on_both_surfaces(
+        tmp_path, monkeypatch, capsys):
+    """THE refusal issue #5 exists for, and the one an agent is most likely to
+    hit: a deferral clears the gate, so one that names nowhere the work is filed
+    is an auto-dismissal with better manners. An agent must not be able to get
+    past it by asking a different door."""
+    db = _seeded(tmp_path, _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--defer", "rev1", "0", "", DEFER_REASON],
+                      "triage_defer", capsys, review_id="rev1", index=0,
+                      tracking_ref="", reason=DEFER_REASON)
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 1, "a refusal about the ledger is a 1, not a 2"
+    with Store.open(db) as st:
+        assert st.triage_for("feat", "s" * 40) == {}, "a refusal recorded something"
+
+
+@pytest.mark.parametrize("ref", ["I will file it later", "GH 412", "#"])
+def test_a_reference_nobody_can_look_up_is_refused_identically(
+        tmp_path, monkeypatch, capsys, ref):
+    db = _seeded(tmp_path, _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--defer", "rev1", "0", ref, DEFER_REASON],
+                      "triage_defer", capsys, review_id="rev1", index=0,
+                      tracking_ref=ref, reason=DEFER_REASON)
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 1
+
+
+@pytest.mark.parametrize("reason", ["fp", "false positive", "wontfix"])
+def test_a_placeholder_defer_reason_is_refused_identically(tmp_path, monkeypatch,
+                                                           capsys, reason):
+    """A filed reference buys no way past the reason floor: "filed as GH-412,
+    wontfix" is a dismissal wearing a ticket number, through either door."""
+    db = _seeded(tmp_path, _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--defer", "rev1", "0", TRACKING_REF, reason],
+                      "triage_defer", capsys, review_id="rev1", index=0,
+                      tracking_ref=TRACKING_REF, reason=reason)
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 1
+
+
+def test_an_out_of_range_defer_index_is_refused_identically(tmp_path, monkeypatch,
+                                                            capsys):
+    db = _seeded(tmp_path, _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--defer", "rev1", "99", TRACKING_REF,
+                           DEFER_REASON],
+                      "triage_defer", capsys, review_id="rev1", index=99,
+                      tracking_ref=TRACKING_REF, reason=DEFER_REASON)
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 2, "no such finding: the command never had an opinion"
+
+
+def test_a_missing_tracking_ref_is_refused_with_the_services_usage_string(
+        tmp_path, monkeypatch, capsys):
+    """The two surfaces reach this by different roads -- argparse's missing
+    positional for the CLI, the handler's absent argument for the tool -- and
+    land on the SAME string, because it lives in `services`.
+
+    ABSENT is a 2 and not the 1 an unusable reference gets: a caller who has not
+    supplied a reference has not made a deferral yet, which is misuse rather
+    than a declined decision.
+    """
+    db = _seeded(tmp_path, _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli_code, cli_text = _cli(["triage", "--defer", "rev1", "0"], capsys)
+    res = _tool("triage_defer", db, review_id="rev1", index=0,
+                reason=DEFER_REASON)
+    assert cli_code == 2 and cli_text == services.TRIAGE_DEFER_USAGE
+    assert res.status == 2 and res.text == services.TRIAGE_DEFER_USAGE, res.text
+
+
 def test_a_missing_index_is_refused_with_the_services_usage_string(tmp_path,
                                                                   monkeypatch,
                                                                   capsys):
@@ -504,6 +592,13 @@ def test_a_tool_argument_of_the_wrong_type_is_a_message_never_a_traceback(
             ("triage_dismiss", {"review_id": "rev1", "index": 0,
                                 "reason": ["a", "b"]}),
             ("triage_reopen", {"review_id": "rev1", "index": 0, "reason": 7}),
+            ("triage_defer", {"review_id": "rev1", "index": 0,
+                              "tracking_ref": ["GH-1"], "reason": DEFER_REASON}),
+            ("triage_defer", {"review_id": "rev1", "index": 0,
+                              "tracking_ref": 412, "reason": DEFER_REASON}),
+            ("triage_defer", {"review_id": "rev1", "index": "zero",
+                              "tracking_ref": TRACKING_REF,
+                              "reason": DEFER_REASON}),
     ]:
         res = _tool(name, db, **params)
         assert res.status == 2, (name, params, res)
@@ -693,6 +788,48 @@ def test_adopting_through_the_tool_stores_the_refuters_own_words(tmp_path):
         assert len(st.triage_for("feat", "s" * 40)) == 1
         reason = st.triage_history(_lkey())[-1]["reason"]
     assert "refuter" in reason and "model-x" in reason, reason
+
+
+def test_a_deferral_through_the_tool_records_and_moves_the_gate_as_the_cli_does(
+        tmp_path, monkeypatch, capsys):
+    """Parity where it costs something: the same ledger row and the same filed
+    reference, from either door.
+
+    Two identical stores rather than two calls against one, because a second
+    deferral of the same finding is a different question.
+    """
+    cli_db = _seeded(tmp_path / "a", _finding(0))
+    tool_db = _seeded(tmp_path / "b", _finding(0))
+    monkeypatch.setenv("SKODUN_DB", str(cli_db))
+
+    cli_code, cli_text = _cli(
+        ["triage", "--defer", "rev1", "0", TRACKING_REF, DEFER_REASON], capsys)
+    res = _tool("triage_defer", tool_db, review_id="rev1", index=0,
+                tracking_ref=TRACKING_REF, reason=DEFER_REASON)
+
+    assert (res.status, res.text) == (cli_code, cli_text)
+    assert cli_code == 0
+    for db in (cli_db, tool_db):
+        with Store.open(db) as st:
+            # The gate's view: cleared, exactly as a dismissal clears it.
+            assert len(st.triage_for("feat", "s" * 40)) == 1, db
+            history = st.triage_history(_lkey())
+            assert [h["event"] for h in history] == ["defer"], db
+            assert history[-1]["tracking_ref"] == TRACKING_REF, db
+            assert history[-1]["reason"] == DEFER_REASON, "stored verbatim"
+            # ... and it is outstanding debt, not a rejected finding.
+            assert [r["tracking_ref"] for r in st.open_deferrals()] == [TRACKING_REF]
+
+
+def test_the_defer_tool_publishes_the_reference_as_a_required_string(tmp_path):
+    """An agent can only pass what the schema publishes, and the description is
+    what tells it the reference must be real rather than plausible."""
+    schema = _specs()["triage_defer"].input_schema
+    assert schema["properties"]["tracking_ref"]["type"] == "string"
+    assert "tracking_ref" in schema["required"]
+    described = (schema["properties"]["tracking_ref"]["description"]
+                 + _specs()["triage_defer"].description).lower()
+    assert "issue" in described or "url" in described
 
 
 def test_a_reopen_through_the_tool_is_append_only(tmp_path):

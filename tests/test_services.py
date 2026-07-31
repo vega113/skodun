@@ -36,10 +36,17 @@ from tests.test_cli import _annotation, _artifact, _finding, _loud_round, _round
 from tests.test_gitio import _git, _mkrepo
 
 #: Every store-backed service, by name. The list itself is part of the contract:
-#: these are the eight the MCP surface mirrors.
+#: the first nine are what the MCP surface mirrors; `svc_deferrals` is
+#: deliberately CLI-only (see its docstring -- it is a human's backlog review,
+#: not a step in the loop an agent drives).
 STORE_BACKED = ["svc_gate", "svc_review", "svc_log", "svc_surface",
                 "svc_triage_list", "svc_triage_dismiss", "svc_adopt_refuter",
-                "svc_triage_reopen"]
+                "svc_triage_reopen", "svc_triage_defer", "svc_deferrals"]
+
+#: A deferral needs a filed reference and a reason that clears the same audit
+#: floor a dismissal's does -- both, or the service refuses.
+TRACKING_REF = "GH-412"
+DEFER_REASON = "in-bounds for this surface; the hot path is the batcher upstream"
 
 GOOD_REASON = "the guard at line 12 already rejects a None handler before this"
 
@@ -145,6 +152,11 @@ def test_no_service_writes_to_stdout_on_any_path(tmp_path, capsys, monkeypatch):
             services.svc_triage_dismiss(store, "rev1", 0, "fp"),   # refused
             services.svc_adopt_refuter(store, "rev1", 0),
             services.svc_triage_reopen(store, "rev1", 0, GOOD_REASON),
+            services.svc_triage_defer(store, "rev1", 0, TRACKING_REF,
+                                      DEFER_REASON),
+            services.svc_triage_defer(store, "rev1", 0, "", DEFER_REASON),
+            services.svc_deferrals(store, 20),
+            services.svc_deferrals(store, 0),             # the refusal path
             services.svc_surface(store, "feat")[:2],
             services.svc_review(store, tmp_path / "not-a-repo"),
         ]
@@ -384,6 +396,12 @@ def test_an_ordinary_gate_setup_failure_is_still_a_recorded_fail_2(monkeypatch,
     pytest.param(
         lambda st, repo: services.svc_triage_dismiss(st, "r1", 0, GOOD_REASON),
         id="svc_triage_dismiss"),
+    pytest.param(
+        lambda st, repo: services.svc_triage_defer(st, "r1", 0, TRACKING_REF,
+                                                   DEFER_REASON),
+        id="svc_triage_defer"),
+    pytest.param(lambda st, repo: services.svc_deferrals(st, 20),
+                 id="svc_deferrals"),
 ])
 def test_no_service_guard_turns_a_ctrl_c_into_a_synthetic_failure(
         monkeypatch, tmp_path, call):
@@ -403,13 +421,15 @@ def test_no_service_guard_turns_a_ctrl_c_into_a_synthetic_failure(
 
     for module, name in ((config, "load_config"), (gitio, "current_branch"),
                          (delivery, "surface"), (triage, "adopt_refuter"),
-                         (triage, "reopen"), (triage, "dismiss")):
+                         (triage, "reopen"), (triage, "dismiss"),
+                         (triage, "defer")):
         monkeypatch.setattr(module, name, boom)
     repo = _mkrepo(tmp_path)
     db = _db(tmp_path, _round(id="r1", findings=[_finding(0)], findings_total=1,
                               artifact=_artifact(_finding(0))))
     with Store.open(db) as store:
         monkeypatch.setattr(store, "list_reviews", boom)
+        monkeypatch.setattr(store, "open_deferrals", boom)
         with pytest.raises(KeyboardInterrupt):
             call(store, repo)
 
@@ -421,6 +441,9 @@ def test_no_service_guard_turns_a_ctrl_c_into_a_synthetic_failure(
     pytest.param(lambda st: services.svc_triage_reopen(st, "r1", 0,
                                                        GOOD_REASON),
                  "reopen", id="svc_triage_reopen"),
+    pytest.param(lambda st: services.svc_triage_defer(st, "r1", 0, TRACKING_REF,
+                                                      DEFER_REASON),
+                 "deferral", id="svc_triage_defer"),
 ])
 def test_a_store_that_stopped_accepting_writes_is_a_refusal_not_a_traceback(
         monkeypatch, tmp_path, service, verb):
@@ -440,6 +463,7 @@ def test_a_store_that_stopped_accepting_writes_is_a_refusal_not_a_traceback(
 
     monkeypatch.setattr(triage, "dismiss", boom)
     monkeypatch.setattr(triage, "reopen", boom)
+    monkeypatch.setattr(triage, "defer", boom)
     db = _db(tmp_path, _round(id="r1", findings=[_finding(0)], findings_total=1,
                               artifact=_artifact(_finding(0))))
     with Store.open(db) as store:
@@ -458,7 +482,8 @@ def test_the_usage_strings_are_module_constants_not_literals():
     absence check -- so a literal at either site would be a second definition that
     drifts the first time one is reworded."""
     cli_src = (Path(skodun.__file__).parent / "cli.py").read_text(encoding="utf-8")
-    for name in ("TRIAGE_REOPEN_USAGE", "TRIAGE_ADOPT_USAGE"):
+    for name in ("TRIAGE_REOPEN_USAGE", "TRIAGE_ADOPT_USAGE",
+                 "TRIAGE_DEFER_USAGE"):
         constant = getattr(services, name)
         assert constant.startswith("skodun triage: usage:")
         assert name in cli_src, f"the CLI does not use services.{name}"
@@ -468,6 +493,117 @@ def test_the_usage_strings_are_module_constants_not_literals():
     # argparse cannot produce that shape on the CLI -- so it is a constant for
     # symmetry, and the test says so rather than pretending otherwise.
     assert services.TRIAGE_DISMISS_USAGE.startswith("skodun triage: usage:")
+
+
+# ==========================================================================
+# svc_deferrals: the listing that keeps a deferral from rotting
+# ==========================================================================
+
+def _deferred(tmp_path: Path, *, ref=TRACKING_REF) -> Path:
+    from skodun import triage
+
+    db = _db(tmp_path, _artifact([_finding(0), _finding(1)]))
+    with Store.open(db) as st:
+        triage.defer(st, st.get_review("rev1"), 0, ref, DEFER_REASON,
+                     now="2026-07-27T11:00:00Z")
+    return db
+
+
+def test_svc_deferrals_renders_one_line_per_open_deferral(tmp_path):
+    db = _deferred(tmp_path)
+    with Store.open(db) as st:
+        status, text = services.svc_deferrals(st, 20)
+    assert status == 0
+    lines = text.splitlines()
+    assert len(lines) == 1, lines
+    # Everything a human needs to chase it: the filing, where the finding is,
+    # what it was, when it was deferred, and which review it came from.
+    for needle in (TRACKING_REF, "feat", "a0.py", "NPE 0", "2026-07-27T11:00:00Z",
+                   "rev1"):
+        assert needle in lines[0], (needle, lines[0])
+
+
+def test_svc_deferrals_is_empty_text_when_nothing_is_deferred(tmp_path):
+    """An empty listing is an ANSWER: `(0, "")`, and each transport says so its
+    own way -- the CLI with a note on stderr, so `| wc -l` stays honest."""
+    db = _db(tmp_path, _artifact([_finding(0)]))
+    with Store.open(db) as st:
+        assert services.svc_deferrals(st, 20) == (0, "")
+
+
+@pytest.mark.parametrize("limit", [0, -1, "lots", None])
+def test_svc_deferrals_refuses_a_non_positive_limit(tmp_path, limit):
+    """`-n` becomes SQLite's LIMIT, where a NEGATIVE value means "no limit" --
+    exactly `svc_log`'s reason, and the same refusal."""
+    db = _deferred(tmp_path)
+    with Store.open(db) as st:
+        status, text = services.svc_deferrals(st, limit)
+    assert status == 2 and "positive" in text
+
+
+def test_svc_deferrals_bounds_every_untrusted_field_it_prints(tmp_path):
+    """The title is finder-authored model text and reaches a terminal on a
+    one-line-per-item listing, exactly as in `triage --list`. Same rule, same
+    helper: no forged row, no rewritten line, no 10,000-character field."""
+    hostile = dict(_finding(0), title="a\x1b[2K\nGH-9 forged " + "z" * 4000)
+    db = _db(tmp_path, _artifact([hostile]))
+    with Store.open(db) as st:
+        from skodun import triage
+        triage.defer(st, st.get_review("rev1"), 0, TRACKING_REF, DEFER_REASON,
+                     now="2026-07-27T11:00:00Z")
+        status, text = services.svc_deferrals(st, 20)
+    assert status == 0
+    assert len(text.splitlines()) == 1, text
+    assert "\x1b" not in text
+    assert len(text) < 600, len(text)
+
+
+# ==========================================================================
+# svc_triage_defer: the exit contract `--reopen` already uses
+# ==========================================================================
+
+def test_svc_triage_defer_records_and_names_the_filing(tmp_path):
+    """The success line names the reference, because "deferred" without it is
+    the very ambiguity this verb exists to remove."""
+    from skodun.textnorm import finding_key
+
+    db = _db(tmp_path, _artifact([_finding(0)]))
+    with Store.open(db) as st:
+        status, text = services.svc_triage_defer(st, "rev1", 0, "  GH-412 ",
+                                                 DEFER_REASON)
+        assert status == 0, text
+        assert "GH-412" in text and "rev1" in text
+        assert set(st.triage_for("feat", "s" * 40)) == {
+            finding_key("a0.py", "NPE 0")}
+
+
+@pytest.mark.parametrize("ref, reason, status", [
+    (TRACKING_REF, "fp", 1),                        # placeholder reason
+    ("", DEFER_REASON, 1),                          # no filing
+    ("I will file it later", DEFER_REASON, 1),      # prose, not a filing
+    (None, DEFER_REASON, 2),                        # absent: misuse
+    (TRACKING_REF, None, 2),                        # absent: misuse
+])
+def test_svc_triage_defer_splits_refused_from_never_had_an_opinion(
+        tmp_path, ref, reason, status):
+    """1 is "the finding is right there and the deferral was declined"; 2 is
+    "this never got as far as having an opinion". Collapsing them would make
+    "your reference is prose" indistinguishable from "you typed no reference"."""
+    db = _db(tmp_path, _artifact([_finding(0)]))
+    with Store.open(db) as st:
+        got, text = services.svc_triage_defer(st, "rev1", 0, ref, reason)
+        assert got == status, text
+        assert st.triage_for("feat", "s" * 40) == {}, "a refusal recorded something"
+
+
+@pytest.mark.parametrize("review_id, index", [("nope", 0), ("rev1", 99)])
+def test_svc_triage_defer_reports_a_thing_that_does_not_exist_as_a_2(
+        tmp_path, review_id, index):
+    db = _db(tmp_path, _artifact([_finding(0)]))
+    with Store.open(db) as st:
+        status, text = services.svc_triage_defer(st, review_id, index,
+                                                 TRACKING_REF, DEFER_REASON)
+    assert status == 2 and text
 
 
 def test_the_cancellation_reason_is_one_constant():

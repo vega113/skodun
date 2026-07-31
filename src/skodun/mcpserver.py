@@ -251,6 +251,20 @@ _REASON_PROPERTY = {
                               "specific about this finding"},
 }
 
+#: The deferral's filed reference. MANDATORY, and the description says why in
+#: the schema itself: this is the argument an agent is most likely to want to
+#: leave out, and `inputSchema` is the only documentation it reads.
+_TRACKING_REF_PROPERTY = {
+    "tracking_ref": {
+        "type": "string",
+        "description": "where the deferred work is FILED: an issue number "
+                       "(#412), a tracker key (SKO-7), a repo-qualified issue "
+                       "(owner/repo#5), or a URL. One token, not prose, and "
+                       "not optional -- an unfiled deferral and an ignored "
+                       "finding are the same artifact. File the issue FIRST, "
+                       "then record its reference here"},
+}
+
 
 def _schema(properties: dict, required: tuple[str, ...] = ()) -> dict:
     """One JSON Schema shape for every tool: an object, closed, explicit.
@@ -555,6 +569,34 @@ def _handle_triage_reopen(call: "HandlerCall") -> "HandlerResult":
     return HandlerResult(status=status, text=text)
 
 
+def _handle_triage_defer(call: "HandlerCall") -> "HandlerResult":
+    from . import services
+    review_id, refusal = _string_arg(call.params, "review_id", "triage_defer")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    index, refusal = _int_arg(call.params, "index", "triage_defer")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    # `_opt_string_arg`, not `_string_arg`, and the asymmetry is the parity
+    # rule: an ABSENT reference is the SERVICE's refusal (`TRIAGE_DEFER_USAGE`,
+    # the string argparse's missing positional produces for the CLI), while an
+    # EMPTY one is a real deferral attempt that `triage.validate_tracking_ref`
+    # declines with the words a human sees. Refusing `""` here instead would
+    # hand the agent a different sentence for the same mistake. Only the TYPE is
+    # this transport's business, because argparse cannot produce a non-string.
+    tracking_ref, refusal = _opt_string_arg(call.params, "tracking_ref",
+                                            "triage_defer")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    reason, refusal = _reason_arg(call.params, "triage_defer")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    with call.store_factory() as store:
+        status, text = services.svc_triage_defer(store, review_id, index,
+                                                 tracking_ref, reason)
+    return HandlerResult(status=status, text=text)
+
+
 def default_registry() -> tuple[HandlerSpec, ...]:
     """The tools `skodun mcp` serves: the CLI's review loop, mirrored exactly.
 
@@ -680,11 +722,30 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                 {**_REVIEW_ID_PROPERTY, **_INDEX_PROPERTY, **_REASON_PROPERTY},
                 ("review_id", "index", "reason")),
             handler=_handle_triage_reopen,
-            description="Reopen ONE previously dismissed finding, with an "
-                        "audited reason for overturning the dismissal. It moves "
-                        "the gate from 0 back to 1, so the reason clears the "
-                        "same audit floor a dismissal does. Append-only: the "
-                        "dismissal it overturns stays in the ledger."),
+            description="Reopen ONE previously dismissed or deferred finding, "
+                        "with an audited reason for overturning that decision. "
+                        "It moves the gate from 0 back to 1, so the reason "
+                        "clears the same audit floor a dismissal does. "
+                        "Append-only: the decision it overturns stays in the "
+                        "ledger."),
+        HandlerSpec(
+            name="triage_defer", long_running=False,
+            input_schema=_schema(
+                {**_REVIEW_ID_PROPERTY, **_INDEX_PROPERTY,
+                 **_TRACKING_REF_PROPERTY, **_REASON_PROPERTY},
+                ("review_id", "index", "tracking_ref", "reason")),
+            handler=_handle_triage_defer,
+            description="Defer ONE finding to a FILED tracking reference: the "
+                        "finding is REAL, it is not blast-radius for this "
+                        "change, and the work is filed as `tracking_ref`. This "
+                        "is not `triage_dismiss` -- use it when the finding "
+                        "stands but the fix belongs in other work, and file the "
+                        "issue BEFORE calling. It clears the gate, so the "
+                        "reference is mandatory and a deferral with none is "
+                        "REFUSED. Status 1 = REFUSED (no usable reference, or a "
+                        "reason that fails the audit floor); 2 = no such review "
+                        "or finding. Like every triage tool, it carries out a "
+                        "decision a human already made."),
     )
 
 
