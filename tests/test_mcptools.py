@@ -1083,6 +1083,38 @@ def test_the_surface_tool_refuses_a_repo_git_cannot_read(tmp_path):
     assert _delivered(db) == [], "a refused pass acknowledged a round"
 
 
+def test_the_scoped_log_renders_identically_on_both_surfaces(tmp_path,
+                                                             monkeypatch,
+                                                             capsys):
+    """The parity that acceptance criterion 7 is actually about.
+
+    `test_the_log_tool_and_the_log_command_render_the_same_lines` compares the
+    two surfaces with NO branch, so it never touches the repository scope --
+    every scoped path could diverge while it stayed green. This runs the
+    scoped form on both: same store, same branch, same repository, byte-equal
+    output and equal status.
+    """
+    a, scope_a = _round_repo(tmp_path / "a")
+    b, scope_b = _round_repo(tmp_path / "b")
+    db = tmp_path / "parity.db"
+    with Store.open(db) as store:
+        store.save_review(dict(_round(id="in_a", branch="main",
+                                      summary="the a repository"), repo=scope_a))
+        store.save_review(dict(_round(id="in_b", branch="main",
+                                      summary="the b repository"), repo=scope_b))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+
+    cli_code, cli_text = _cli(["log", "--branch", "main", "--repo", str(a)],
+                              capsys)
+    res = _tool("log", db, branch="main", repo=str(a))
+
+    assert (res.status, res.text) == (cli_code, cli_text), (
+        "the scoped log diverged between the CLI and the MCP tool")
+    assert "the a repository" in cli_text
+    assert "the b repository" not in cli_text, (
+        "the scope leaked on BOTH surfaces, so parity alone would not catch it")
+
+
 def test_the_log_tool_scopes_a_branch_and_stays_lazy_without_one(tmp_path):
     """The `log` tool's half of the parity decision. `repo` narrows `branch`
     and is resolved ONLY with one -- `git_common_dir` shells out to git, and an
