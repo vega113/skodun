@@ -575,3 +575,33 @@ def test_a_stale_running_row_from_another_repository_is_still_swept(
     assert status[world.null_running] == "failed", (
         "the sweep skipped a stale PRE-V5 row -- the rows no scoped query can "
         "reach are exactly the ones an unscoped sweep exists to reclaim")
+
+
+def test_a_dispatch_failure_record_is_surfaceable_by_its_own_repository(tmp_path):
+    """Phase 3 promised that a push whose review machinery broke is visible --
+    "a push whose review machinery broke silently is indistinguishable from a
+    push that was reviewed and found clean". Phase 4 scoped `surface` by
+    repository, and a failure record written without one is invisible to EVERY
+    repository: the guarantee inverted, silently, which is the failure mode this
+    project exists to remove.
+
+    Caught by the review of PR #22, reproduced before the fix, and pinned here.
+    """
+    from skodun import delivery
+    from skodun.store import Store
+
+    repo = _build_repo(tmp_path / "a")
+    scope = str(gitio.git_common_dir(repo))
+    db = tmp_path / "s.db"
+    with Store.open(db) as st:
+        dispatch._record_failure(
+            st, "feat", "the skodun config could not be loaded, so no review ran",
+            head="abc123", repo=dispatch._repo_scope(repo))
+
+        rounds = delivery.undelivered(st, "feat", scope)
+        assert [r["id"] for r in rounds], (
+            "a dispatch failure is invisible to its own repository's surface")
+        assert rounds[0]["status"] == "failed"
+
+        assert delivery.undelivered(st, "feat", str(tmp_path / "b" / ".git")) == [], (
+            "another repository can see this one's failure record")
