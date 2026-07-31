@@ -364,28 +364,50 @@ except that installing refuses even under `--force` if that backup name is alrea
 holding a *different* hook than the one currently installed, so a second `--force`
 run can never silently destroy the first backup.
 
-### One store per repository (required if you use skodun in more than one)
+### One store per repository, or one store for all of them (both work)
 
-**Background review rounds are keyed by BRANCH NAME, and the store defaults to one
-global file** (`~/.local/share/skodun/skodun.db`). Two repositories sharing one
-store therefore share a namespace: if both have a branch called `main`, they can
-supersede and deliver *each other's* rounds. Concretely —
+**Background review rounds carry the repository that recorded them.** `reviews`
+has had a `repo` column since store v5, holding the repository's *git common
+directory* — the same expression the foreground lock scopes by, so "the same
+repository" has exactly one definition and a linked worktree is correctly the
+same repository as its main checkout. The three queries that act on a
+repository's behalf consult it:
 
-- Pushing repo A's `main` looks like a newer push of the same branch to repo B's
-  in-flight round, so the dispatcher retires that round and **signals its live
-  background worker to stop**.
-- `skodun surface` on `main` in repo A renders repo B's round too, and marks it
-  delivered — so repo B's next session shows nothing, for a report nobody there
-  ever saw.
+- the supersede a push performs, so pushing repo A's `main` no longer retires
+  repo B's in-flight round on the strength of a shared branch name — and no
+  longer **signals repo B's live background worker to stop**;
+- the undelivered-rounds query behind `skodun surface` (and its
+  `--include-delivered` replay), so surfacing `main` in repo A no longer renders
+  repo B's round, and no longer marks it delivered on repo B's behalf;
+- `skodun log --branch`, which grew a `--repo` of its own to aim it. An
+  *unscoped* `skodun log` still crosses repositories on purpose: a branch name is
+  the ambiguous key, "show me everything" is not.
 
-The gate itself is unaffected either way: `skodun gate` is content-addressed
-(`diff_hash` + `base_sha`), so it can never answer `0` for another repository's
-change. The damage is confined to background review — killed workers and reports
-consumed by the wrong session.
+Two repositories can therefore share the default global store
+(`~/.local/share/skodun/skodun.db`), which is what they do unless you say
+otherwise.
 
-**The supported setup is one store per repository**, via `SKODUN_DB`. Point it at a
-path inside (or named after) each repository, from wherever that repository's
-environment is set up — a shell profile:
+**One caveat, and it is permanent: rows recorded before the upgrade have no
+repository.** The v5 migration adds the column and backfills nothing, and
+`repo = ?` never matches NULL — deliberately, because the alternative to an
+invisible old row is guessing which tree it belonged to and killing that tree's
+worker. What you can see: **background rounds recorded before the upgrade are
+never delivered by `skodun surface`.** They are not lost — an unscoped `skodun
+log` still lists them, `skodun triage` still reads them, and the gate still
+matches them by content — they simply never appear in a session report again.
+Everything recorded after the upgrade is unaffected.
+
+The gate was never affected either way, and still is not: `skodun gate` is
+content-addressed (`diff_hash` + `base_sha`) and consults no repository at all,
+so it can never answer `0` for a change no trustworthy review covers. That it
+*does* still match a review of the same content taken in a different checkout is
+a decision, not an oversight — identical diff bytes at the same base are the same
+change, which is the whole property diff-identity exists to express.
+
+**You may still want one store per repository**, via `SKODUN_DB` — to keep one
+project's review history off another's disk, or simply to keep `skodun log`
+short. Point it at a path inside (or named after) each repository, from wherever
+that repository's environment is set up — a shell profile:
 
 ```sh
 # ~/.zshrc or ~/.bashrc
@@ -404,11 +426,9 @@ something a future `git add -A` will happily commit).
 
 Whatever sets it must be in effect for `git push` as well as for your editor and
 shell: the pre-push shim, the background worker, and `skodun surface` all read the
-same variable, and they must all land on the same file. A single-repository user
-needs none of this — the default global store is correct for them.
-
-Scoping this properly needs a `repo` column on the `reviews` table, which is a
-schema change deferred to a later phase; see "Known limitations" below.
+same variable, and they must all land on the same file. A half-configured split
+is the failure to watch for: a worker writing rounds to one store while `skodun
+surface` reads another reports nothing, and says nothing about why.
 
 ### Bypassing review for a push
 
@@ -634,24 +654,20 @@ command = "skodun"
 args = ["mcp"]
 ```
 
-## Known limitations (Phase 4 candidates)
+## Known limitations
 
 Recorded so each is a decision rather than a surprise. None of them can make the
 gate answer `0` for a change no trustworthy review covers — that is the one
 property everything here is arranged around — but each is a real rough edge.
 
-- **Background rounds have no repo dimension.** `reviews` is keyed by branch, so
-  two repositories sharing one store collide on common branch names. The fix is a
-  `repo` column (the git common dir) scoping the supersede query, the undelivered
-  query, and `log --branch`; it is a schema change and still unwritten. Store v4
-  (the `defer` verb) rebuilt `triage_events` only, so the column is an ordinary
-  additive `ALTER TABLE reviews ADD COLUMN` in a v5 delta whenever it lands. Until
-  then, use one store per repository — see "One store per repository" above.
-- **Stale-review recovery JSON-parses the whole `reviews` table on every push.**
-  The cleanup pass that reclaims abandoned `running` rows loads and decodes every
-  stored artifact to find rows whose status is an indexed column. It is fast on a
-  small store and grows linearly with review history, on the synchronous `git
-  push` path. It only needs the indexed columns.
+- **Background rounds recorded before store v5 are never delivered.** v5 added
+  the `repo` column and backfilled nothing, so every row written by an earlier
+  build has `repo IS NULL` — and `repo = ?` matches NULL in no repository. Those
+  rounds stay readable by an unscoped `skodun log` and by `skodun triage`, and the
+  gate still matches them by content; they will simply never be reported by
+  `skodun surface`. The alternative was to guess which tree an old row belonged
+  to, and a wrong guess retires that tree's round and kills its worker. See "One
+  store per repository, or one store for all of them" above.
 - **Worker logs are never pruned.** Every background review gets its own log file
   beside the store (`<db>.logs/<record-id>.log`) and nothing deletes them. They
   are small, but they accumulate for as long as you use skodun. Retention is a
