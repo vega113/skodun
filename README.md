@@ -424,6 +424,25 @@ Both scripts exit `0` on every path, including "skodun is not installed at all",
 and both honor `SKODUN_BIN` to point at a specific binary instead of resolving
 `skodun` on `PATH` or falling back to `python3 -m skodun`.
 
+## Telling your coding agents how to use skodun
+
+An agent that can run `skodun` will use it, and — without being told otherwise —
+will keep fixing and re-reviewing until the reviewer goes quiet. That does not
+converge: every round of fixes is new code for the next round to find fault
+with. Measured on skodun's own Phase 3 branch, a second round repeated **none**
+of the first round's eleven findings and put four of its six new ones in code
+the fix commit had just written.
+
+**`examples/AGENTS.md`** is a template to paste into your repository's own
+`AGENTS.md` / `CLAUDE.md`. It covers the loop (freeze the diff, one review per
+head, stop when `gate` exits 0 — not when findings reach zero), a fix-now vs
+defer table judged on consequence rather than severity label, the conditions
+that mean "escalate to a human instead of running another round", and the rule
+that an agent never dismisses a finding by itself.
+
+The reasoning, the outside evidence and the recommendations for skodun itself
+are in `docs/superpowers/specs/2026-07-31-review-round-cutoff-design.md`.
+
 ## MCP server
 
 `skodun mcp` serves the same review loop the CLI does — `gate`, `review`, `log`,
@@ -533,6 +552,35 @@ property everything here is arranged around — but each is a real rough edge.
   empty ref list rather than the live stdin. Only the "no temp file at all" case
   is currently handled — that one correctly skips skodun and hands the chained
   hook the original stdin.
+- **The shim does not shell-escape the chained hook's path.** It embeds it as
+  `SKODUN_SHIM_CHAIN='<path>'`, so a repository under a path containing a single
+  quote gets a syntactically invalid hook.
+- **A triage decision has only two verbs.** `dismiss` means "not a defect", and
+  there is no way to say "real, but not for this change, filed as X" — so a
+  deferral has to masquerade as a dismissal and the ledger stops distinguishing
+  outstanding debt from rejected findings. A `defer` verb with a mandatory
+  tracking reference is the main recommendation of
+  `docs/superpowers/specs/2026-07-31-review-round-cutoff-design.md`; it needs a
+  store version, so it waits with the `repo` column above.
+- **A review round carries no context about the rounds before it.** skodun
+  cannot say "this is review 3 of this branch, and 6 findings were already
+  triaged", nor mark a finding as landing in code the previous round's fix
+  wrote — the signal that most reliably says a review loop is chasing its own
+  tail. Both are computable from what the store and git already hold.
+- **`contextpack.pack()`'s parameters after `headroom` are positional.** `oid`
+  was inserted before `per_file_cap`, so a positional caller written against the
+  older signature would silently bind the wrong arguments. Every caller in this
+  repository uses keywords; making them keyword-only would close it for good.
+- **The pid-reuse guard is not bound to a record.** Before signalling a
+  superseded worker, the dispatcher confirms the pid still names a skodun worker
+  — but not *which* one, so a reused pid belonging to a different in-flight
+  review could be signalled. Checking `--record-id` in the argv would tighten it.
+- **`svc_triage_dismiss` does not guard store I/O** the way `svc_adopt_refuter`
+  and `svc_triage_reopen` do, so a SQLite failure escapes as an exception rather
+  than the `(status, text)` refusal both surfaces promise.
+- **`runner._sleep_or_cancelled` catches `BaseException`** around its token wait,
+  which swallows a `Ctrl-C` arriving during a foreground lock wait and keeps
+  polling instead of aborting.
 
 ## Requirements
 
