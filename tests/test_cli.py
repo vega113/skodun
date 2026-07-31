@@ -2501,12 +2501,56 @@ def _loud_round(**kw) -> dict:
                   summary="one real problem", **kw)
 
 
-def _surface_db(tmp_path, *records) -> Path:
+def _surface_db(tmp_path, *records, repo: str | None = None) -> Path:
+    """A store holding `records`, each stamped with `repo` if one is given.
+
+    The stamp is not decoration: `delivery`'s query is scoped by `repo`, and an
+    unstamped row is invisible to every `surface` below. `repo` has to be the
+    `gitio.git_common_dir` of a REAL repository the test built, because that is
+    what the transport computes at run time -- see `_surface_scope`.
+    """
     db = tmp_path / "surface.db"
     with Store.open(db) as store:
         for rec in records:
-            store.save_review(rec)
+            store.save_review(dict(rec, repo=repo) if repo is not None else rec)
     return db
+
+
+def _surface_scope(tmp_path, monkeypatch, repo: Path | None = None) -> str:
+    """Make `repo` (a fresh `_tiny_repo` by default) the cwd, and return the git
+    common dir `surface` will scope its rows by from there.
+
+    `surface` now refuses (2) when it cannot identify a repository -- there is
+    nothing to scope the rounds to -- so the surface tests that used to run from
+    an arbitrary cwd need a real one.
+    """
+    from skodun import gitio
+
+    if repo is None:
+        repo = _tiny_repo(tmp_path)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "gitsystem"))
+    monkeypatch.chdir(repo)
+    return str(gitio.git_common_dir(repo))
+
+
+def _surface_subprocess_repo(tmp_path) -> tuple[Path, str]:
+    """`_surface_scope`'s form for a REAL PROCESS: a repository to run `skodun`
+    in (there is no `monkeypatch.chdir` for a subprocess) and the git common dir
+    its rows must carry."""
+    from skodun import gitio
+
+    repo = _tiny_repo(tmp_path)
+    return repo, str(gitio.git_common_dir(repo))
+
+
+def _surface_subprocess_env(tmp_path, db: Path) -> dict:
+    """`_subprocess_env` plus `_tiny_repo`'s hermetic git config, which the
+    child needs now that it runs git for itself."""
+    env = _subprocess_env(db)
+    env["GIT_CONFIG_GLOBAL"] = str(tmp_path / "gitconfig")
+    env["GIT_CONFIG_SYSTEM"] = str(tmp_path / "gitsystem")
+    return env
 
 
 def _delivery_rows(db: Path) -> list[tuple]:
@@ -2517,7 +2561,8 @@ def _delivery_rows(db: Path) -> list[tuple]:
 
 def test_surface_reports_a_round_and_then_records_the_delivery(tmp_path,
                                                               monkeypatch, capsys):
-    db = _surface_db(tmp_path, _loud_round())
+    scope = _surface_scope(tmp_path, monkeypatch)
+    db = _surface_db(tmp_path, _loud_round(), repo=scope)
     monkeypatch.setenv("SKODUN_DB", str(db))
     assert main(["surface", "--branch", "feat"]) == 0
     out = capsys.readouterr().out
@@ -2527,7 +2572,8 @@ def test_surface_reports_a_round_and_then_records_the_delivery(tmp_path,
 
 def test_surface_carries_no_verdict_banner(tmp_path, monkeypatch, capsys):
     """It gates nothing, and its stdout is consumed verbatim by a hook."""
-    db = _surface_db(tmp_path, _loud_round())
+    scope = _surface_scope(tmp_path, monkeypatch)
+    db = _surface_db(tmp_path, _loud_round(), repo=scope)
     monkeypatch.setenv("SKODUN_DB", str(db))
     assert main(["surface", "--branch", "feat"]) == 0
     assert "SKODUN VERDICT" not in capsys.readouterr().out
@@ -2535,7 +2581,8 @@ def test_surface_carries_no_verdict_banner(tmp_path, monkeypatch, capsys):
 
 def test_surface_claude_format_is_exactly_one_json_object(tmp_path, monkeypatch,
                                                           capsys):
-    db = _surface_db(tmp_path, _loud_round())
+    scope = _surface_scope(tmp_path, monkeypatch)
+    db = _surface_db(tmp_path, _loud_round(), repo=scope)
     monkeypatch.setenv("SKODUN_DB", str(db))
     assert main(["surface", "--branch", "feat", "--hook-format", "claude"]) == 0
     out = capsys.readouterr().out
@@ -2550,7 +2597,8 @@ def test_a_failed_emit_leaves_the_round_undelivered(tmp_path, monkeypatch):
     """THE ack-ordering test, and the mutation target: mark-then-emit passes
     every other test in this file and fails only this one. A report dropped on
     the way out must be repeated, not recorded as delivered."""
-    db = _surface_db(tmp_path, _loud_round())
+    scope = _surface_scope(tmp_path, monkeypatch)
+    db = _surface_db(tmp_path, _loud_round(), repo=scope)
     monkeypatch.setenv("SKODUN_DB", str(db))
 
     class DeadStream:
@@ -2570,7 +2618,8 @@ def test_a_failed_emit_leaves_the_round_undelivered(tmp_path, monkeypatch):
 def test_a_flush_that_fails_leaves_the_round_undelivered(tmp_path, monkeypatch):
     """Buffering is never "emit success": the bytes are not gone until the flush
     returns."""
-    db = _surface_db(tmp_path, _loud_round())
+    scope = _surface_scope(tmp_path, monkeypatch)
+    db = _surface_db(tmp_path, _loud_round(), repo=scope)
     monkeypatch.setenv("SKODUN_DB", str(db))
 
     class UnflushableStream:
@@ -2589,7 +2638,8 @@ def test_a_flush_that_fails_leaves_the_round_undelivered(tmp_path, monkeypatch):
 
 def test_a_quiet_round_is_acknowledged_even_though_nothing_is_printed(
         tmp_path, monkeypatch, capsys):
-    db = _surface_db(tmp_path, _round())
+    scope = _surface_scope(tmp_path, monkeypatch)
+    db = _surface_db(tmp_path, _round(), repo=scope)
     monkeypatch.setenv("SKODUN_DB", str(db))
     assert main(["surface", "--branch", "feat"]) == 0
     assert capsys.readouterr().out == ""
@@ -2600,6 +2650,7 @@ def test_nothing_undelivered_is_a_silent_stdout_and_a_note_on_stderr(
         tmp_path, monkeypatch, capsys):
     """A hook reads stdout; a human reads the terminal. Neither is served by an
     empty report injected at every session start."""
+    _surface_scope(tmp_path, monkeypatch)
     db = _surface_db(tmp_path)
     monkeypatch.setenv("SKODUN_DB", str(db))
     assert main(["surface", "--branch", "feat"]) == 0
@@ -2622,6 +2673,7 @@ def test_nothing_undelivered_is_SILENT_on_both_streams_for_a_hook(
     Suppressed for a hook, kept for a human (the test above). Only the NOTE:
     every real failure still goes to stderr in both cases, pinned below.
     """
+    _surface_scope(tmp_path, monkeypatch)
     db = _surface_db(tmp_path)
     monkeypatch.setenv("SKODUN_DB", str(db))
     assert main(["surface", "--branch", "feat", "--hook-format", fmt]) == 0
@@ -2642,6 +2694,7 @@ def test_a_real_surface_failure_still_reaches_stderr_with_a_hook_format(
     def unopenable(*_a, **_k):
         raise RuntimeError("disk gone")
 
+    _surface_scope(tmp_path, monkeypatch)
     monkeypatch.setenv("SKODUN_DB", str(tmp_path / "nope" / "dir" / "s.db"))
     monkeypatch.setattr(Store, "open", unopenable)
     assert main(["surface", "--branch", "feat", *fmt_argv]) == 2
@@ -2651,7 +2704,8 @@ def test_a_real_surface_failure_still_reaches_stderr_with_a_hook_format(
 
 
 def test_include_delivered_replays(tmp_path, monkeypatch, capsys):
-    db = _surface_db(tmp_path, _loud_round())
+    scope = _surface_scope(tmp_path, monkeypatch)
+    db = _surface_db(tmp_path, _loud_round(), repo=scope)
     monkeypatch.setenv("SKODUN_DB", str(db))
     assert main(["surface", "--branch", "feat"]) == 0
     capsys.readouterr()
@@ -2663,10 +2717,9 @@ def test_include_delivered_replays(tmp_path, monkeypatch, capsys):
 
 
 def test_surface_defaults_to_the_checked_out_branch(tmp_path, monkeypatch, capsys):
-    repo = _tiny_repo(tmp_path)
-    db = _surface_db(tmp_path, _loud_round(branch="main"))
+    scope = _surface_scope(tmp_path, monkeypatch)
+    db = _surface_db(tmp_path, _loud_round(branch="main"), repo=scope)
     monkeypatch.setenv("SKODUN_DB", str(db))
-    monkeypatch.chdir(repo)
     assert main(["surface"]) == 0
     assert "NPE 0" in capsys.readouterr().out
 
@@ -2715,9 +2768,12 @@ def test_surface_repo_reports_the_named_repositorys_branch_from_any_cwd(
         tmp_path, monkeypatch, capsys):
     """The cwd is not a repository at all, so the branch can only have come from
     `--repo` -- and the round it matches is on a branch nothing else names."""
+    from skodun import gitio
+
     repo = _tiny_repo(tmp_path)
     _renamed_branch(repo, tmp_path, "feat-elsewhere")
-    db = _surface_db(tmp_path, _loud_round(branch="feat-elsewhere"))
+    db = _surface_db(tmp_path, _loud_round(branch="feat-elsewhere"),
+                     repo=str(gitio.git_common_dir(repo)))
     monkeypatch.setenv("SKODUN_DB", str(db))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "gitsystem"))
@@ -2732,9 +2788,12 @@ def test_surface_repo_reports_the_named_repositorys_branch_from_any_cwd(
 def test_surface_branch_beats_repo(tmp_path, monkeypatch, capsys):
     """`--branch` overrides everything, `--repo` included: the round on the
     repository's OWN branch stays undelivered."""
+    from skodun import gitio
+
     repo = _tiny_repo(tmp_path)                      # on `main`
     db = _surface_db(tmp_path, _loud_round(branch="main"),
-                     _loud_round(id="sk_2", branch="explicit"))
+                     _loud_round(id="sk_2", branch="explicit"),
+                     repo=str(gitio.git_common_dir(repo)))
     monkeypatch.setenv("SKODUN_DB", str(db))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "gitsystem"))
@@ -2750,8 +2809,11 @@ def test_surface_with_a_repo_that_is_no_repository_exits_2_never_traces_back(
     with an undelivered round, and that round must stay undelivered. Reporting
     somebody else's branch because the named one could not be read is the one
     answer this command may not give."""
+    from skodun import gitio
+
     repo = _tiny_repo(tmp_path)                      # on `main`, and the cwd
-    db = _surface_db(tmp_path, _loud_round(branch="main"))
+    db = _surface_db(tmp_path, _loud_round(branch="main"),
+                     repo=str(gitio.git_common_dir(repo)))
     monkeypatch.setenv("SKODUN_DB", str(db))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "gitsystem"))
@@ -2785,9 +2847,140 @@ def test_surface_repo_defaults_to_none_and_the_mcp_tool_takes_the_same_argument(
     assert "repo" in tool[0].input_schema["properties"]
 
 
+def _two_repos(tmp_path, monkeypatch) -> tuple[Path, Path, str, str]:
+    """Repositories A and B, both on `main`, and their two scopes.
+
+    One store, two repositories, the same branch name: the collision the whole
+    scope exists for. A's hermetic git config is the one exported, because A is
+    the cwd in every caller below.
+    """
+    from skodun import gitio
+
+    a = _tiny_repo(tmp_path / "a")
+    b = _tiny_repo(tmp_path / "b")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "a" / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "a" / "gitsystem"))
+    monkeypatch.chdir(a)
+    return a, b, str(gitio.git_common_dir(a)), str(gitio.git_common_dir(b))
+
+
+def test_surface_repo_scopes_the_rows_it_delivers_never_the_cwd(
+        tmp_path, monkeypatch, capsys):
+    """THE `--repo` mutation target. `_cmd_surface` resolving `Path(".")`
+    instead of `args.repo` passes every other test in this file: the cwd is
+    repository A, which has its own undelivered round on the SAME branch name,
+    and the command names repository B. Under the mutation A's round is
+    delivered and PERMANENTLY acknowledged -- a fresh instance of the defect
+    this phase closes, committed by the fix for it."""
+    a, b, scope_a, scope_b = _two_repos(tmp_path, monkeypatch)
+    loud = dict(findings_total=1, severity={"high": 1, "medium": 0, "low": 0})
+    db = tmp_path / "two.db"
+    with Store.open(db) as store:
+        store.save_review(dict(_round(id="in_a", branch="main",
+                                      findings=[_finding(0)], **loud),
+                               repo=scope_a))
+        store.save_review(dict(_round(id="in_b", branch="main",
+                                      findings=[_finding(1)], **loud),
+                               repo=scope_b))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+
+    assert main(["surface", "--repo", str(b)]) == 0
+    out = capsys.readouterr().out
+    assert "NPE 1" in out
+    assert "NPE 0" not in out, "the cwd repository's round was rendered"
+    assert _delivery_rows(db) == [("in_b", "cli-text")], (
+        "the cwd repository's round was permanently acknowledged by a "
+        "`surface` aimed at another repository")
+
+
+def test_log_branch_is_scoped_to_its_repository_and_repo_aims_it(
+        tmp_path, monkeypatch, capsys):
+    """`--branch` is the ambiguous key: two repositories with a `main` each
+    collide in one store. `--repo` aims the scope, and an unscoped `log` stays a
+    human's "show me everything"."""
+    a, b, scope_a, scope_b = _two_repos(tmp_path, monkeypatch)
+    db = tmp_path / "s.db"
+    with Store.open(db) as store:
+        store.save_review(dict(_round(id="in_a", branch="main",
+                                      summary="the a repository"), repo=scope_a))
+        store.save_review(dict(_round(id="in_b", branch="main",
+                                      summary="the b repository"), repo=scope_b))
+    monkeypatch.setenv("SKODUN_DB", str(db))
+
+    assert main(["log", "--branch", "main"]) == 0
+    out = capsys.readouterr().out
+    assert "the a repository" in out and "the b repository" not in out
+
+    assert main(["log", "--branch", "main", "--repo", str(b)]) == 0
+    out = capsys.readouterr().out
+    assert "the b repository" in out and "the a repository" not in out
+
+    assert main(["log"]) == 0
+    out = capsys.readouterr().out
+    assert "the a repository" in out and "the b repository" in out, (
+        "an unscoped listing must keep crossing repositories")
+
+
+def test_log_without_a_branch_still_runs_outside_a_repository(tmp_path,
+                                                              monkeypatch,
+                                                              capsys):
+    """`--repo` is resolved only for `--branch`. An unscoped `log` never shells
+    out to git, and exiting 1 with a GitError traceback from a directory that
+    is not a repository is not in this command's contract."""
+    db = tmp_path / "s.db"
+    Store.open(db).close()
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    assert main(["log"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_log_with_a_branch_outside_a_repository_refuses_with_a_message(
+        tmp_path, monkeypatch, capsys):
+    """The other side of the laziness: once a branch is named there IS a
+    repository to resolve, and one git cannot read is a refusal (2) with a
+    message -- never the interpreter's own 1 and a `GitError` traceback."""
+    db = tmp_path / "s.db"
+    Store.open(db).close()
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "gitsystem"))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    assert main(["log", "--branch", "main"]) == 2
+    cap = capsys.readouterr()
+    assert "could not resolve the repository" in cap.out + cap.err
+    assert "Traceback" not in cap.out and "Traceback" not in cap.err
+
+
+def test_log_repo_defaults_to_none_and_the_mcp_tool_takes_the_same_argument():
+    """Neither surface may grow a repo argument the other lacks: a `log` that
+    is repo-scoped on one and global on the other makes "whose history is
+    this" depend on which client you asked."""
+    import argparse
+
+    from skodun.cli import build_parser
+    from skodun.mcpserver import default_registry
+
+    subs = [a for a in build_parser()._actions
+            if isinstance(a, argparse._SubParsersAction)]
+    repos = [a for a in subs[0].choices["log"]._actions if a.dest == "repo"]
+    assert len(repos) == 1, repos
+    assert repos[0].default is None
+    assert repos[0].type is Path
+
+    tool = [t for t in default_registry() if t.name == "log"]
+    assert len(tool) == 1, tool
+    assert "repo" in tool[0].input_schema["properties"]
+
+
 def test_surface_reports_an_unopenable_store_on_stderr(tmp_path, monkeypatch,
                                                        capsys):
     # A directory where the database file belongs: sqlite cannot open it.
+    _surface_scope(tmp_path, monkeypatch)
     (tmp_path / "notadb").mkdir()
     monkeypatch.setenv("SKODUN_DB", str(tmp_path / "notadb"))
     assert main(["surface", "--branch", "feat"]) == 2
@@ -2801,7 +2994,8 @@ def test_an_ack_that_cannot_be_written_is_reported_after_a_real_emit(
     """The report DID reach the reader, so it is not repeated silently: the
     ledger failed, the round will be delivered again, and the exit code says the
     command did not finish its job."""
-    db = _surface_db(tmp_path, _loud_round())
+    scope = _surface_scope(tmp_path, monkeypatch)
+    db = _surface_db(tmp_path, _loud_round(), repo=scope)
     monkeypatch.setenv("SKODUN_DB", str(db))
     from skodun import delivery
 
@@ -2848,14 +3042,21 @@ _SURFACE_CASES = [
                                   "closed-stdout", "pipefail", "no-terminal"])
 def test_surface_seam_matrix(tmp_path, name, argv, expected, form):
     db = tmp_path / form / "s.db"
+    # A REAL repository to run in, in every form: `surface` scopes its rows by
+    # the repository it resolves and refuses when it cannot identify one, so a
+    # cwd that happened not to be a repository would turn every 0 below into a
+    # 2 for a reason that has nothing to do with the seam under test.
+    cwd = str(_tiny_repo(tmp_path))
     env = _subprocess_env(db)
+    env["GIT_CONFIG_GLOBAL"] = str(tmp_path / "gitconfig")
+    env["GIT_CONFIG_SYSTEM"] = str(tmp_path / "gitsystem")
     if form == "pipefail":
         quoted = " ".join(shlex.quote(a) for a in argv)
         script = (f'set -o pipefail; {shlex.quote(sys.executable)} -m skodun '
                   f'{quoted} < /dev/null | head -1; '
                   f'echo "SKODUN_EXIT=${{PIPESTATUS[0]}}"')
         p = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
-                           env=env)
+                           cwd=cwd, env=env)
         m = re.search(r"SKODUN_EXIT=(\d+)", p.stdout)
         assert m and int(m.group(1)) == expected, f"{p.stdout!r} {p.stderr!r}"
         assert "Traceback" not in p.stderr, p.stderr
@@ -2866,23 +3067,24 @@ def test_surface_seam_matrix(tmp_path, name, argv, expected, form):
         try:
             p = subprocess.run([sys.executable, "-m", "skodun", *argv],
                                stdout=w_fd, stderr=subprocess.PIPE, text=True,
-                               stdin=subprocess.DEVNULL, env=env)
+                               stdin=subprocess.DEVNULL, cwd=cwd, env=env)
         finally:
             os.close(w_fd)
     elif form == "console":
         p = subprocess.run(
             [sys.executable, "-c", "from skodun.cli import entry; entry()", *argv],
-            capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=cwd,
+            env=env)
     elif form == "no-terminal":
         p = subprocess.run([sys.executable, "-m", "skodun", *argv],
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.PIPE, text=True, env=env,
+                           stderr=subprocess.PIPE, text=True, cwd=cwd, env=env,
                            start_new_session=True)
     else:
         module = "skodun" if form == "module" else "skodun.cli"
         p = subprocess.run([sys.executable, "-m", module, *argv],
                            capture_output=True, text=True,
-                           stdin=subprocess.DEVNULL, env=env)
+                           stdin=subprocess.DEVNULL, cwd=cwd, env=env)
     assert p.returncode == expected, f"stderr={p.stderr!r}"
     assert "Traceback" not in p.stderr, p.stderr
 
@@ -2891,7 +3093,8 @@ def test_surface_seam_matrix(tmp_path, name, argv, expected, form):
 def test_closed_stdout_mid_emit_leaves_the_round_undelivered(tmp_path, fmt):
     """The brief's own matrix row, end to end in a real process: the writer is
     dead, so the round stays undelivered and the exit code is not 0."""
-    db = _surface_db(tmp_path, _loud_round())
+    repo, scope = _surface_subprocess_repo(tmp_path)
+    db = _surface_db(tmp_path, _loud_round(), repo=scope)
     r_fd, w_fd = os.pipe()
     os.close(r_fd)
     try:
@@ -2899,7 +3102,8 @@ def test_closed_stdout_mid_emit_leaves_the_round_undelivered(tmp_path, fmt):
             [sys.executable, "-m", "skodun", "surface", "--branch", "feat",
              "--hook-format", fmt],
             stdout=w_fd, stderr=subprocess.PIPE, text=True,
-            stdin=subprocess.DEVNULL, env=_subprocess_env(db))
+            stdin=subprocess.DEVNULL, cwd=str(repo),
+            env=_surface_subprocess_env(tmp_path, db))
     finally:
         os.close(w_fd)
     assert p.returncode != 0, p.stderr
@@ -2909,11 +3113,12 @@ def test_closed_stdout_mid_emit_leaves_the_round_undelivered(tmp_path, fmt):
 
 def test_a_successful_pipe_delivers_and_acknowledges(tmp_path):
     """The other direction of the same rule, in a real process."""
-    db = _surface_db(tmp_path, _loud_round())
+    repo, scope = _surface_subprocess_repo(tmp_path)
+    db = _surface_db(tmp_path, _loud_round(), repo=scope)
     p = subprocess.run(
         [sys.executable, "-m", "skodun", "surface", "--branch", "feat"],
-        capture_output=True, text=True, stdin=subprocess.DEVNULL,
-        env=_subprocess_env(db))
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=str(repo),
+        env=_surface_subprocess_env(tmp_path, db))
     assert p.returncode == 0, p.stderr
     assert "NPE 0" in p.stdout
     assert _delivery_rows(db) == [("sk_1", "cli-text")]
@@ -2926,14 +3131,16 @@ def test_an_ascii_only_stdout_still_delivers_the_reserved_line(tmp_path):
     be repeated forever at every session start."""
     from skodun import delivery
 
+    repo, scope = _surface_subprocess_repo(tmp_path)
     db = _surface_db(tmp_path, _round(
         status="failed", parse_ok=False, usable_output=False,
-        failure_reason="the worker was killed"))
-    env = _subprocess_env(db)
+        failure_reason="the worker was killed"), repo=scope)
+    env = _surface_subprocess_env(tmp_path, db)
     env["PYTHONIOENCODING"] = "ascii"
     p = subprocess.run(
         [sys.executable, "-m", "skodun", "surface", "--branch", "feat"],
-        capture_output=True, text=True, stdin=subprocess.DEVNULL, env=env)
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=str(repo),
+        env=env)
     assert p.returncode == 0, f"{p.stdout!r} {p.stderr!r}"
     assert "NO REVIEW HAPPENED" in p.stdout
     assert delivery.NO_REVIEW_LINE not in p.stdout      # the em dash was escaped

@@ -877,13 +877,30 @@ def test_a_reopen_through_the_tool_is_append_only(tmp_path):
 # surface: the acknowledgement is the transport's, after its own write
 # ==========================================================================
 
-def _round_db(tmp_path: Path, *records) -> Path:
+def _round_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A real repository to hand the `surface` tool as its `repo`, and the git
+    common dir the rows must be stamped with.
+
+    The two are DIFFERENT values, which is the whole point of this task's MCP
+    half: `_repo_arg` returns a CHECKOUT PATH (what `resolve_surface_branch`
+    wants) and the column stores `gitio.git_common_dir` of it. `_handle_surface`
+    performs that conversion; if it stopped, every assertion below would be
+    about an empty report.
+    """
+    from skodun import gitio
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    repo = _mkrepo(tmp_path)
+    return repo, str(gitio.git_common_dir(repo))
+
+
+def _round_db(tmp_path: Path, *records, repo: str | None = None) -> Path:
     """A store holding undelivered background rounds. `_loud_round` and
     `_surface_db` are `test_cli.py`'s own fixtures, imported rather than
     re-spelled: a round shaped differently from the one the CLI's surface tests
     use would make the parity assertions below prove nothing."""
     tmp_path.mkdir(parents=True, exist_ok=True)
-    return _surface_db(tmp_path, *(records or (_loud_round(),)))
+    return _surface_db(tmp_path, *(records or (_loud_round(),)), repo=repo)
 
 
 def _rpc(method: str, id_=None, **params) -> bytes:
@@ -948,10 +965,12 @@ _delivered = _delivery_rows
 
 
 def test_the_surface_tool_delivers_a_round_and_acknowledges_it_as_mcp(tmp_path):
-    db = _round_db(tmp_path)
+    repo, scope = _round_repo(tmp_path / "scope")
+    db = _round_db(tmp_path, repo=scope)
     out = _Recorder()
-    code = _serve(db, _HANDSHAKE + _rpc("tools/call", 1, name="surface",
-                                        arguments={"branch": "feat"}), out)
+    code = _serve(db, _HANDSHAKE + _rpc(
+        "tools/call", 1, name="surface",
+        arguments={"branch": "feat", "repo": str(repo)}), out)
     assert code == 0
     body = json.loads(out.data.decode().splitlines()[1])
     assert body["result"]["isError"] is False
@@ -970,12 +989,14 @@ def test_a_flush_that_raises_leaves_the_round_undelivered(tmp_path):
     write that "succeeded" is exactly the mistake: bytes in a buffer have not
     reached a reader.
     """
-    db = _round_db(tmp_path)
+    repo, scope = _round_repo(tmp_path / "scope")
+    db = _round_db(tmp_path, repo=scope)
     # The handshake's flush succeeds; the TOOL RESULT's flush raises. Anything
     # simpler loses the handshake and never reaches the tool.
     out = _Recorder(fail_flush_from=2)
-    code = _serve(db, _HANDSHAKE + _rpc("tools/call", 1, name="surface",
-                                        arguments={"branch": "feat"}), out)
+    code = _serve(db, _HANDSHAKE + _rpc(
+        "tools/call", 1, name="surface",
+        arguments={"branch": "feat", "repo": str(repo)}), out)
     assert code == 0
     assert out.flushes >= 2, "the tool result was never even attempted"
     assert _delivered(db) == [], (
@@ -983,10 +1004,12 @@ def test_a_flush_that_raises_leaves_the_round_undelivered(tmp_path):
 
 
 def test_a_write_that_raises_leaves_the_round_undelivered(tmp_path):
-    db = _round_db(tmp_path)
+    repo, scope = _round_repo(tmp_path / "scope")
+    db = _round_db(tmp_path, repo=scope)
     out = _Recorder(fail_write_from=2)      # the handshake lands; the report does not
-    _serve(db, _HANDSHAKE + _rpc("tools/call", 1, name="surface",
-                                 arguments={"branch": "feat"}), out)
+    _serve(db, _HANDSHAKE + _rpc(
+        "tools/call", 1, name="surface",
+        arguments={"branch": "feat", "repo": str(repo)}), out)
     assert out.writes >= 2, "the tool result was never even attempted"
     assert _delivered(db) == []
 
@@ -997,20 +1020,98 @@ def test_a_quiet_round_is_acknowledged_by_the_service_not_by_the_transport(
     a write could lose: `delivery.surface` acknowledges it immediately under the
     `quiet` channel, and it never appears in `pending_acks`. That is why an
     empty report is still progress rather than a round re-scanned forever."""
-    db = _round_db(tmp_path / "quiet", _round())     # clean, zero findings
-    res = _tool("surface", db, branch="feat")
+    repo, scope = _round_repo(tmp_path / "scope")
+    db = _round_db(tmp_path / "quiet", _round(),     # clean, zero findings
+                   repo=scope)
+    res = _tool("surface", db, branch="feat", repo=str(repo))
     assert res.pending_acks == []
     assert _delivered(db) == [("sk_1", "quiet")]
     assert "no undelivered" in res.text
 
 
 def test_the_surface_tool_reports_nothing_to_report_in_words(tmp_path):
+    repo, _scope = _round_repo(tmp_path / "scope")
     db = tmp_path / "none.db"
     Store.open(db).close()
-    res = _tool("surface", db, branch="feat")
+    res = _tool("surface", db, branch="feat", repo=str(repo))
     assert res.status == 0
     assert res.text == services.surface_no_rounds_note("feat")
     assert res.pending_acks == []
+
+
+def test_the_surface_tool_scopes_its_rows_to_the_repo_it_was_given(tmp_path):
+    """`_repo_arg` hands the handler a CHECKOUT PATH and the column holds
+    `git_common_dir`; a handler that skipped the conversion, or converted the
+    wrong argument, would deliver another repository's rounds -- and
+    permanently acknowledge them."""
+    a, scope_a = _round_repo(tmp_path / "a")
+    b, scope_b = _round_repo(tmp_path / "b")
+    db = tmp_path / "two.db"
+    with Store.open(db) as store:
+        store.save_review(dict(_loud_round(id="in_a", branch="feat"),
+                               repo=scope_a))
+        store.save_review(dict(_round(id="in_b", branch="feat",
+                                      summary="the b repository"),
+                               repo=scope_b))
+
+    res = _tool("surface", db, branch="feat", repo=str(b))
+    assert res.pending_acks == []
+    assert "NPE 0" not in res.text, "repository A's round was rendered"
+    # B's own round is quiet, so B's pass acknowledges exactly that one.
+    assert _delivered(db) == [("in_b", "quiet")]
+
+    res = _tool("surface", db, branch="feat", repo=str(a))
+    assert res.pending_acks == ["in_a"]
+    assert "NPE 0" in res.text
+
+
+def test_the_surface_tool_refuses_a_repo_git_cannot_read(tmp_path):
+    """The conversion can FAIL, and a failure is a refusal rather than a fall
+    back to the server's cwd: reporting and permanently acknowledging some other
+    repository's rounds because the named one could not be read is the damage
+    this scope removes."""
+    repo, scope = _round_repo(tmp_path / "scope")
+    db = _round_db(tmp_path / "d", repo=scope)
+    # A directory that exists and is not a repository, so the BRANCH resolves
+    # (it is given) and the repository is the only thing that cannot.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    res = _tool("surface", db, branch="feat", repo=str(plain))
+    assert res.status == 2
+    assert "could not resolve the repository" in res.text
+    assert res.pending_acks == []
+    assert _delivered(db) == [], "a refused pass acknowledged a round"
+
+
+def test_the_log_tool_scopes_a_branch_and_stays_lazy_without_one(tmp_path):
+    """The `log` tool's half of the parity decision. `repo` narrows `branch`
+    and is resolved ONLY with one -- `git_common_dir` shells out to git, and an
+    unscoped `log` from a server spawned outside a repository is this tool's
+    contract, not an accident."""
+    a, scope_a = _round_repo(tmp_path / "a")
+    b, scope_b = _round_repo(tmp_path / "b")
+    db = tmp_path / "log.db"
+    with Store.open(db) as store:
+        store.save_review(dict(_round(id="in_a", branch="main",
+                                      summary="the a repository"), repo=scope_a))
+        store.save_review(dict(_round(id="in_b", branch="main",
+                                      summary="the b repository"), repo=scope_b))
+
+    scoped = _tool("log", db, branch="main", repo=str(a))
+    assert scoped.status == 0
+    assert "the a repository" in scoped.text
+    assert "the b repository" not in scoped.text
+
+    everything = _tool("log", db, repo=str(tmp_path / "not-a-repository"))
+    assert everything.status == 0, (
+        "an unscoped `log` resolved a repository it never needed")
+    assert "the a repository" in everything.text
+    assert "the b repository" in everything.text
+
+    refused = _tool("log", db, branch="main",
+                    repo=str(tmp_path / "not-a-repository"))
+    assert refused.status == 2
+    assert "could not resolve the repository" in refused.text
 
 
 def test_all_four_delivery_channels_are_reachable_and_persisted(tmp_path,
@@ -1018,22 +1119,25 @@ def test_all_four_delivery_channels_are_reachable_and_persisted(tmp_path,
                                                                capsys):
     """`cli-text`, `cli-claude`, `mcp`, `quiet` -- every value in
     `delivery.CHANNELS`, each written by the surface that owns it."""
+    repo, scope = _round_repo(tmp_path / "scope")
     seen = {}
     for fmt, channel in (("text", "cli-text"), ("claude", "cli-claude")):
-        db = _round_db(tmp_path / f"cli-{fmt}")
+        db = _round_db(tmp_path / f"cli-{fmt}", repo=scope)
         monkeypatch.setenv("SKODUN_DB", str(db))
-        assert main(["surface", "--branch", "feat", "--hook-format", fmt]) == 0
+        assert main(["surface", "--repo", str(repo), "--branch", "feat",
+                     "--hook-format", fmt]) == 0
         capsys.readouterr()
         seen[channel] = _delivered(db)
 
-    db = _round_db(tmp_path / "mcp")
+    db = _round_db(tmp_path / "mcp", repo=scope)
     out = _Recorder()
-    _serve(db, _HANDSHAKE + _rpc("tools/call", 1, name="surface",
-                                 arguments={"branch": "feat"}), out)
+    _serve(db, _HANDSHAKE + _rpc(
+        "tools/call", 1, name="surface",
+        arguments={"branch": "feat", "repo": str(repo)}), out)
     seen["mcp"] = _delivered(db)
 
-    quiet_db = _round_db(tmp_path / "quiet2", _round())
-    _tool("surface", quiet_db, branch="feat")
+    quiet_db = _round_db(tmp_path / "quiet2", _round(), repo=scope)
+    _tool("surface", quiet_db, branch="feat", repo=str(repo))
     seen["quiet"] = _delivered(quiet_db)
 
     assert {c: rows[0][1] for c, rows in seen.items()} == {
@@ -1044,13 +1148,14 @@ def test_all_four_delivery_channels_are_reachable_and_persisted(tmp_path,
 
 def test_the_surface_tool_and_the_surface_command_render_the_same_report(
         tmp_path, monkeypatch, capsys):
-    cli_db = _round_db(tmp_path / "a")
-    tool_db = _round_db(tmp_path / "b")
+    repo, scope = _round_repo(tmp_path / "scope")
+    cli_db = _round_db(tmp_path / "a", repo=scope)
+    tool_db = _round_db(tmp_path / "b", repo=scope)
     monkeypatch.setenv("SKODUN_DB", str(cli_db))
     capsys.readouterr()
-    assert main(["surface", "--branch", "feat"]) == 0
+    assert main(["surface", "--repo", str(repo), "--branch", "feat"]) == 0
     cli_text = capsys.readouterr().out
-    res = _tool("surface", tool_db, branch="feat")
+    res = _tool("surface", tool_db, branch="feat", repo=str(repo))
     assert res.text == cli_text
     assert res.pending_acks == ["sk_1"]
 
@@ -1059,20 +1164,23 @@ def test_include_delivered_takes_real_booleans_and_defaults_to_false(tmp_path):
     """The other half of the refusal above: rejecting `"false"` must not have
     been done by rejecting everything. A JSON `true` replays a round the ledger
     already holds; `false` and an absent argument do not."""
-    db = _round_db(tmp_path / "d")
-    first = _tool("surface", db, branch="feat", include_delivered=False)
+    repo, scope = _round_repo(tmp_path / "scope")
+    db = _round_db(tmp_path / "d", repo=scope)
+    first = _tool("surface", db, branch="feat", repo=str(repo),
+                  include_delivered=False)
     assert first.status == 0 and first.pending_acks == ["sk_1"]
     with Store.open(db) as st:
         delivery.acknowledge(st, ["sk_1"], "mcp")
 
     # Delivered now, so the default and an explicit False both report nothing.
     for params in ({}, {"include_delivered": False}):
-        again = _tool("surface", db, branch="feat", **params)
+        again = _tool("surface", db, branch="feat", repo=str(repo), **params)
         assert again.status == 0, (params, again)
         assert again.pending_acks == [], (params, again)
         assert "no undelivered" in again.text, (params, again)
 
-    replay = _tool("surface", db, branch="feat", include_delivered=True)
+    replay = _tool("surface", db, branch="feat", repo=str(repo),
+                   include_delivered=True)
     assert replay.status == 0
     assert "NPE 0" in replay.text
 
@@ -1406,7 +1514,10 @@ def test_a_malformed_repo_is_refused_rather_than_defaulted_to_the_cwd(tmp_path):
     nobody asked about is the one outcome this product exists to make impossible.
     """
     db = _seeded(tmp_path, _finding(0))
-    for name in ("gate", "review", "surface"):
+    # `log` joined this list when it grew a `repo` of its own: the refusal is
+    # `_repo_arg`'s and must fire on every tool that reads one, including the
+    # one whose repo is only ever used to narrow a branch.
+    for name in ("gate", "review", "surface", "log"):
         for bad in (["x"], 7, "", "   "):
             res = _tool(name, db, repo=bad)
             assert res.status == 2, (name, bad, res)

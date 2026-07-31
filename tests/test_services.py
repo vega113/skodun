@@ -50,6 +50,13 @@ DEFER_REASON = "in-bounds for this surface; the hot path is the batcher upstream
 
 GOOD_REASON = "the guard at line 12 already rejects a None handler before this"
 
+#: The repository every record in this file is stamped with, and the scope every
+#: `svc_surface` call passes. A LITERAL on purpose: the services take an already
+#: resolved git common dir, and turning a checkout path into one is the
+#: TRANSPORTS' job (`cli._cmd_surface`, `mcpserver._handle_surface`), tested
+#: with real repositories where it happens.
+REPO = "/repos/services"
+
 
 @pytest.fixture(autouse=True)
 def _never_the_real_store(tmp_path, monkeypatch):
@@ -64,11 +71,14 @@ def _never_the_real_store(tmp_path, monkeypatch):
     monkeypatch.setenv("SKODUN_CODEX_BIN", str(tmp_path / "no-bin" / "codex"))
 
 
-def _db(tmp_path: Path, *records) -> Path:
+def _db(tmp_path: Path, *records, repo: str | None = REPO) -> Path:
     db = tmp_path / "s.db"
     with Store.open(db) as st:
         for rec in records:
-            st.save_review(rec)
+            # Stamped here rather than at each call site: `delivery`'s query is
+            # scoped by `repo` and an unstamped row is invisible to every
+            # `svc_surface` below -- the whole file would pass vacuously.
+            st.save_review(dict(rec, repo=repo) if repo is not None else rec)
     return db
 
 
@@ -157,7 +167,7 @@ def test_no_service_writes_to_stdout_on_any_path(tmp_path, capsys, monkeypatch):
             services.svc_triage_defer(store, "rev1", 0, "", DEFER_REASON),
             services.svc_deferrals(store, 20),
             services.svc_deferrals(store, 0),             # the refusal path
-            services.svc_surface(store, "feat")[:2],
+            services.svc_surface(store, "feat", REPO)[:2],
             services.svc_review(store, tmp_path / "not-a-repo"),
         ]
     cap = capsys.readouterr()
@@ -196,7 +206,7 @@ def test_a_service_never_writes_to_stdout_even_when_stdout_is_the_only_stream_le
 def test_svc_surface_returns_a_payload_and_the_content_bearing_ids(tmp_path):
     db = _db(tmp_path, _loud_round())
     with Store.open(db) as store:
-        status, text, pending = services.svc_surface(store, "feat")
+        status, text, pending = services.svc_surface(store, "feat", REPO)
     assert status == 0
     assert "NPE 0" in text and text.endswith("\n")
     assert pending == ["sk_1"], (
@@ -211,7 +221,7 @@ def test_svc_surface_returns_nothing_to_report_as_an_empty_payload(tmp_path):
     one definition in `surface_no_rounds_note`."""
     db = _db(tmp_path)
     with Store.open(db) as store:
-        assert services.svc_surface(store, "feat") == (0, "", [])
+        assert services.svc_surface(store, "feat", REPO) == (0, "", [])
     assert "feat" in services.surface_no_rounds_note("feat")
 
 
@@ -222,7 +232,7 @@ def test_svc_surface_acknowledges_quiet_rounds_itself_and_never_returns_them(
     Leaving it unacknowledged would re-scan it at every session start forever."""
     db = _db(tmp_path, _round())              # clean, zero findings: quiet
     with Store.open(db) as store:
-        status, text, pending = services.svc_surface(store, "feat")
+        status, text, pending = services.svc_surface(store, "feat", REPO)
         rows = [(r["review_id"], r["channel"]) for r in
                 store._c.execute("SELECT review_id, channel FROM deliveries")]
     assert (status, text, pending) == (0, "", [])
@@ -241,7 +251,7 @@ def test_svc_surface_reports_a_broken_ledger_as_a_diagnostic_not_a_payload(
     monkeypatch.setattr(delivery, "surface", boom)
     db = _db(tmp_path, _loud_round())
     with Store.open(db) as store:
-        status, text, pending = services.svc_surface(store, "feat")
+        status, text, pending = services.svc_surface(store, "feat", REPO)
     assert status == 2 and pending == []
     assert "could not read the delivery ledger" in text
 
@@ -252,7 +262,7 @@ def test_svc_surface_refuses_an_unknown_format_before_touching_the_ledger(
     format FIRST, and the service lets that refusal through as a diagnostic."""
     db = _db(tmp_path, _loud_round())
     with Store.open(db) as store:
-        status, text, _ = services.svc_surface(store, "feat", "yaml")
+        status, text, _ = services.svc_surface(store, "feat", REPO, "yaml")
         rows = list(store._c.execute("SELECT review_id FROM deliveries"))
     assert status == 2 and "yaml" in text
     assert rows == [], "a rejected format acknowledged a round"
@@ -284,6 +294,27 @@ def test_svc_log_renders_an_empty_store_as_an_empty_string(tmp_path):
     db = _db(tmp_path)
     with Store.open(db) as store:
         assert services.svc_log(store, None, 20) == (0, "")
+
+
+def test_svc_log_hands_the_repo_to_the_store_and_only_with_a_branch(tmp_path):
+    """The threading itself, pinned: a `svc_log` that accepted `repo` and never
+    passed it on would leave `log --repo` a flag that does nothing, and every
+    other test in this file would stay green."""
+    db = tmp_path / "log.db"
+    with Store.open(db) as st:
+        # The listing renders the SUMMARY, not the id, so that is what each
+        # row is recognised by here.
+        st.save_review(dict(_round(id="in_a", branch="main", summary="mine"),
+                            repo=REPO))
+        st.save_review(dict(_round(id="in_b", branch="main", summary="theirs"),
+                            repo="/repos/other"))
+    with Store.open(db) as store:
+        scoped = services.svc_log(store, "main", 20, REPO)[1]
+        assert "mine" in scoped and "theirs" not in scoped
+        # ...and the same repo without a branch narrows nothing: that is
+        # `list_reviews`'s contract and what `--repo`'s help text promises.
+        everything = services.svc_log(store, None, 20, REPO)[1]
+        assert "mine" in everything and "theirs" in everything
 
 
 def test_svc_review_is_keyword_only_for_its_two_new_parameters():
@@ -384,8 +415,9 @@ def test_an_ordinary_gate_setup_failure_is_still_a_recorded_fail_2(monkeypatch,
 @pytest.mark.parametrize("call", [
     pytest.param(lambda st, repo: services.svc_gate(st, repo), id="svc_gate"),
     pytest.param(lambda st, repo: services.svc_log(st, None, 10), id="svc_log"),
-    pytest.param(lambda st, repo: services.svc_surface(st, "feat", "text", False),
-                 id="svc_surface"),
+    pytest.param(
+        lambda st, repo: services.svc_surface(st, "feat", REPO, "text", False),
+        id="svc_surface"),
     pytest.param(lambda st, repo: services.resolve_surface_branch(None, repo),
                  id="resolve_surface_branch"),
     pytest.param(lambda st, repo: services.svc_adopt_refuter(st, "r1", 0),

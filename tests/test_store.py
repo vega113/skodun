@@ -223,6 +223,21 @@ def test_list_reviews_orders_and_limits(tmp_path):
     assert len(st.list_reviews("b", 30)) == 5
 
 
+def test_list_reviews_scopes_by_repo_only_when_a_branch_is_given(tmp_path):
+    """`--branch` is the ambiguous key and the only thing `repo` narrows. An
+    unscoped listing is a human's "show me everything" and must keep crossing
+    repositories -- including the pre-v5 rows no scoped query can reach."""
+    with Store.open(tmp_path / "s.db") as st:
+        st.save_review(dict(REC, id="in_a", branch="main", repo="/repos/a"))
+        st.save_review(dict(REC, id="in_b", branch="main", repo="/repos/b"))
+        st.save_review(dict(REC, id="pre_v5", branch="main"))
+
+        assert [r["id"] for r in st.list_reviews("main", 30, "/repos/a")] == ["in_a"]
+        assert sorted(r["id"] for r in st.list_reviews(None, 30, "/repos/a")) == [
+            "in_a", "in_b", "pre_v5"], "an unscoped listing must not be filtered"
+        assert st.list_reviews("main", 30, "/repos/nowhere") == []
+
+
 def test_triage_roundtrip_scoped_by_branch_and_base(tmp_path):
     st = Store.open(tmp_path / "s.db")
     base = dict(review_id="r1", file="a.py", line=7, severity="high",

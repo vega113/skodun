@@ -447,7 +447,7 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
 
 
 def _handle_log(call: "HandlerCall") -> "HandlerResult":
-    from . import services
+    from . import gitio, services
     branch = call.params.get("branch")
     limit = 20                          # the CLI's own `-n` default
     if call.params.get("limit") is not None:
@@ -460,9 +460,26 @@ def _handle_log(call: "HandlerCall") -> "HandlerResult":
         limit, refusal = _int_arg(call.params, "limit", "log")
         if refusal:
             return HandlerResult(status=2, text=refusal)
+    repo_path, refusal = _repo_arg(call.params, "log")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    branch = branch if isinstance(branch, str) and branch else None
+    # `_repo_arg` hands back a CHECKOUT PATH; the column stores
+    # `gitio.git_common_dir` of it, so this transport converts -- and only when
+    # there is a branch to narrow, because `git_common_dir` shells out to git
+    # and an unscoped `log` from a server spawned outside a repository is this
+    # tool's contract. A conversion that fails is a refusal, never a fall back.
+    scope = None
+    if branch is not None:
+        try:
+            scope = str(gitio.git_common_dir(repo_path))
+        except Exception as e:
+            return HandlerResult(
+                status=2,
+                text=f"skodun log: could not resolve the repository for "
+                     f"branch: {e!r}")
     with call.store_factory() as store:
-        status, text = services.svc_log(
-            store, branch if isinstance(branch, str) and branch else None, limit)
+        status, text = services.svc_log(store, branch, limit, scope)
     # An empty listing is an answer, and an empty tool result is not readable as
     # one: an agent cannot tell "no reviews" from "the tool broke".
     return HandlerResult(status=status,
@@ -480,7 +497,7 @@ def _handle_surface(call: "HandlerCall") -> "HandlerResult":
     fix. A crash between the flush and the ack re-delivers, which is the designed
     direction.
     """
-    from . import delivery, services
+    from . import delivery, gitio, services
     params = call.params
     repo, refusal = _repo_arg(params, "surface")
     if refusal:
@@ -498,9 +515,21 @@ def _handle_surface(call: "HandlerCall") -> "HandlerResult":
     branch, why_not = services.resolve_surface_branch(params.get("branch"), repo)
     if not branch:
         return HandlerResult(status=2, text=why_not)
+    # `_repo_arg` returns a CHECKOUT PATH -- what `resolve_surface_branch`
+    # wants, and not what the column stores. The conversion happens here, per
+    # transport, and a conversion that fails is a refusal: reporting (and
+    # permanently acknowledging) some other repository's rounds because the
+    # named one could not be read is the damage this scope exists to remove.
+    try:
+        scope = str(gitio.git_common_dir(repo))
+    except Exception as e:
+        return HandlerResult(
+            status=2,
+            text=f"skodun surface: could not resolve the repository to report "
+                 f"on: {e!r}")
     with call.store_factory() as store:
         status, text, pending = services.svc_surface(
-            store, branch, fmt, include_delivered)
+            store, branch, scope, fmt, include_delivered)
     if status != 0 or not text:
         # A diagnostic, or nothing to report. Either way there is nothing
         # delivered, so nothing to acknowledge.
@@ -650,6 +679,7 @@ def default_registry() -> tuple[HandlerSpec, ...]:
         HandlerSpec(
             name="log", long_running=False,
             input_schema=_schema({
+                **_REPO_PROPERTY,
                 "branch": {"type": "string",
                            "description": "restrict to one branch; defaults to "
                                           "every branch"},

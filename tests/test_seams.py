@@ -286,7 +286,13 @@ def _worker_setup(tmp_path: Path, overrides: dict):
 
 def _surface_setup(tmp_path: Path, overrides: dict):
     _empty_store(Path(overrides["SKODUN_DB"]))
-    return (["surface", "--branch", "feat"], tmp_path)
+    # A REAL repository as the cwd: `surface` scopes its rows by the repository
+    # it resolves and refuses (2) when it cannot identify one, so a cwd that is
+    # not a repository would make this row's expected 0 unreachable for a
+    # reason that has nothing to do with the seam. The store is still empty --
+    # the seam, not the report, is what this matrix asserts.
+    return (["surface", "--branch", "feat"],
+            _tiny_repo(tmp_path, _subprocess_env(overrides)))
 
 
 def _mcp_setup(tmp_path: Path, overrides: dict):
@@ -316,7 +322,7 @@ SURFACES = [
             misuse_needle="usage:", no_terminal=True),
     Surface("worker", _ov_git, _worker_setup, expected=2,
             misuse_argv=["worker"], misuse_needle="usage:", no_terminal=True),
-    Surface("surface", _ov_plain, _surface_setup, expected=0,
+    Surface("surface", _ov_git, _surface_setup, expected=0,
             misuse_argv=["surface", "--hook-format", "yaml"],
             misuse_needle="usage:"),
     Surface("mcp", _ov_plain, _mcp_setup, expected=0,

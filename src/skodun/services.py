@@ -259,12 +259,18 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
 # --- log --------------------------------------------------------------------
 
 
-def svc_log(store, branch, limit) -> tuple[int, str]:
+def svc_log(store, branch, limit, repo=None) -> tuple[int, str]:
     """Recent reviews, newest first, one line each. `(code, text)`.
 
     `2` for a non-positive `-n` and for a store that cannot be read; `0`
     otherwise, including for a store with no rows at all (an empty listing is an
     answer, and `text` is then `""`).
+
+    `repo` narrows `branch` and is IGNORED without one -- `list_reviews`'s own
+    contract, and what the `--repo` flag's help text says. It is optional here
+    and required on `svc_surface` for one reason: a listing that crossed
+    repositories shows a reader too much, while a `surface` that did would
+    deliver and permanently acknowledge rounds that were never theirs.
     """
     from .trust import coerce_count, one_line
 
@@ -280,7 +286,7 @@ def svc_log(store, branch, limit) -> tuple[int, str]:
         return 2, (f"skodun log: -n must be a positive row count, got "
                    f"{rows_wanted}")
     try:
-        rows = store.list_reviews(branch, rows_wanted)
+        rows = store.list_reviews(branch, rows_wanted, repo)
     except KeyboardInterrupt:
         raise           # a cancelled listing is 130's, not "the store is broken"
     except BaseException as e:
@@ -350,7 +356,7 @@ def resolve_surface_branch(branch, repo=".") -> tuple[str, str]:
     return branch, ""
 
 
-def svc_surface(store, branch, fmt="text",
+def svc_surface(store, branch, repo, fmt="text",
                 include_delivered=False) -> tuple[int, str, list]:
     """One delivery pass. `(status, text, pending_acks)`, and the three shapes it
     returns are distinguishable on purpose:
@@ -369,11 +375,16 @@ def svc_surface(store, branch, fmt="text",
     lost by marking them now. `pending_acks` therefore holds only the
     content-bearing rounds — the ones whose delivery depends on a write this
     module cannot perform and must not claim.
+
+    `repo` is POSITIONAL AND REQUIRED, unlike `svc_log`'s: it is the git common
+    dir the rows are scoped by, every transport must resolve it for itself, and
+    a `surface` that guessed would deliver AND permanently acknowledge another
+    repository's rounds. There is no safe default for that.
     """
     from . import delivery
 
     try:
-        status, text, pending = delivery.surface(store, branch, fmt,
+        status, text, pending = delivery.surface(store, branch, repo, fmt,
                                                  bool(include_delivered))
     except KeyboardInterrupt:
         raise           # 130's, not "the ledger is unreadable"
