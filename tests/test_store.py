@@ -2248,6 +2248,7 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_mcpserver.py",
     "tests/test_seams.py",
     "tests/test_services.py",
+    "tests/test_repo_scoping.py",
 )
 
 #: Store-touching modules deliberately kept OUT of the subprocess sweep, with
