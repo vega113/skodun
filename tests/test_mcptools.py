@@ -234,6 +234,31 @@ def test_the_review_now_prompt_tells_the_agent_not_to_triage_anything():
     assert "triage_list" in text
 
 
+def test_the_review_now_prompt_carries_the_stopping_rule(tmp_path):
+    """An agent that can review will keep fixing and re-reviewing until the
+    reviewer goes quiet, and that does not converge: every round of fixes is
+    new code for the next round to find fault with. Measured on skodun's own
+    Phase 3 branch, a second round repeated NONE of the first round's eleven
+    findings and put four of its six new ones in code the fix commit had just
+    written.
+
+    So the prompt has to answer the question it provokes -- when do I stop? --
+    at the moment it provokes it. Three things have to be in there: the
+    terminating condition (the GATE, not an empty finding list), the basis for
+    triage (consequence, not the severity label), and the escalation trigger
+    that the measurement above is about."""
+    text = {p.name: p.text for p in mcpserver.default_prompts()}["review-now"]
+    # The terminating condition is the gate, not "no findings".
+    assert "gate" in text.lower()
+    # Triage is by consequence; severity labels are not the criterion.
+    assert "severity" in text.lower() and "consequence" in text.lower()
+    # The verb for "real, but filed" exists now, and the prompt must name it
+    # rather than leaving an agent to overload a dismissal.
+    assert "triage_defer" in text
+    # The escalation trigger, in the agent's own words rather than a doc link.
+    assert "escalat" in text.lower()
+
+
 def test_the_tool_list_reaches_a_client_over_the_wire(tmp_path):
     """The snapshot again, through a real `skodun mcp` process, because
     `default_registry()` being right is not the same as it being SERVED."""

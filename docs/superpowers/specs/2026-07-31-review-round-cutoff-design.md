@@ -1,8 +1,19 @@
 # Bounding review rounds — where skodun should stop, and how clients should
 
-Date: 2026-07-31. Status: proposal, not yet owner-approved.
-R1 has since been implemented (issue #5, store v4) — see its section for what
-shipped and where it differs from the recommendation below.
+Date: 2026-07-31. Status: proposal; R1 and R4 approved and shipped, R2/R3
+tracked, R5 standing.
+  * **R1 — the `defer` verb: IMPLEMENTED** (issue #5, store v4). See its section
+    for what shipped and where it differs from the recommendation below.
+  * **R4 — blast-radius guidance in the MCP prompts: IMPLEMENTED.** The
+    `review-now` prompt now carries the terminating condition (the gate, not an
+    empty finding list), triage by consequence rather than severity label,
+    `triage_defer` as the verb for "real but filed", and the escalate-don't-
+    iterate triggers. It could only be written once R1 gave the agent a verb for
+    a deferral; before that the prompt would have had to describe a workaround.
+  * **R2 (churn attribution) and R3 (round context)** remain unimplemented and
+    are tracked in the Phase 4 epic (#13).
+  * **R5 — no round cap** stands as a recommendation against a change, so there
+    is nothing to implement; it is a decision to keep not doing something.
 Prerequisite reading: `README.md` (the gate contract and the triage ledger),
 `docs/phase3-acceptance.md`.
 Supporting research: `sdd/review-cutoff-research.md` (sourced brief, with

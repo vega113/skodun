@@ -766,10 +766,29 @@ not cover this change and nothing may be concluded from it.
 3. If it reports findings, call `triage_list` with the review id from the \
 verdict line and summarise each finding for me: file, line, severity, title, \
 and whether a refuter annotation disagrees with it.
-4. Then STOP and wait for me. Do NOT dismiss anything. A dismissal is my \
-decision and it is recorded with my reason in an audit ledger; `triage_dismiss` \
-and `adopt_refuter` are tools for carrying out a decision I have already made, \
-not for tidying up a report.
+4. Then STOP and wait for me. Do NOT dismiss, defer or adopt anything. Each of \
+those moves the gate and each is my decision, recorded with my reason in an \
+audit ledger; `triage_dismiss`, `triage_defer` and `adopt_refuter` carry out a \
+decision I have already made, they are not ways to tidy up a report.
+
+When I ask you what to do about the findings, judge each one by its \
+CONSEQUENCE, never by its severity label -- labels are wrong in both \
+directions. Fixing is for a finding that makes the change not work as \
+described, falsifies a safety property the change or its docs promise, states \
+something wrong to a user, corrupts data, or would need a migration to undo \
+after merge. Everything else -- performance within bounds, style, naming, \
+documentation drift, message precision where the outcome is already right -- \
+is a candidate for `triage_defer`, which records that a finding is real and \
+FILED under a tracking reference rather than rejected. The reference is \
+mandatory; a deferral without one is refused.
+
+Stop when the `gate` tool answers 0, which means clean OR every finding \
+triaged. It does NOT mean the reviewer found nothing: for a real change that \
+may never happen, because each round of fixes is new code the next round will \
+review. Tell me to decide rather than starting another round when a round \
+raises a must-fix finding in code the previous round's fix wrote, when fixing \
+a finding would touch more code than the change under review, or when you \
+think a finding is wrong -- escalate, do not iterate.
 """
 
 _GATE_CHECK_TEXT = """\
