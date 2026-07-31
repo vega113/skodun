@@ -1444,7 +1444,15 @@ def test_the_worker_preserves_every_reservation_owned_field(tmp_path):
     with Store.open(db) as st:
         final = st.get_review(rid)
     for key in ("id", "branch", "head", "base_ref", "base_sha", "diff_hash",
-                "mode", "worst_runtime_sec"):
+                "mode", "worst_runtime_sec", "repo"):
+        # `repo` is here for a reason worth stating: `finalize_review` merges
+        # only `pid` and `superseded_by` back from the stored row and binds
+        # every other column from the WORKER's dict, so a worker record that
+        # omits the repo writes NULL over the value the reservation persisted
+        # -- at the exact moment the round becomes deliverable, and background
+        # rounds are the only kind `surface` delivers. Dropping
+        # `repo=reserved.get("repo")` from `run_prepush_review`'s record left
+        # every other test in this file green.
         assert final[key] == reserved[key], key
     assert final["pid"] == os.getpid(), "the DATABASE-owned pid was erased"
     assert final["reviewed_at"] == reserved["reviewed_at"], (
