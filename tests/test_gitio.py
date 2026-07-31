@@ -1084,7 +1084,14 @@ def test_a_submodule_path_is_not_a_blob_on_either_read_form(tmp_path):
          str(inner), "mod")
     _git(repo, "commit", "-m", "add submodule")
     oid = _git(repo, "rev-parse", "HEAD")
-    _git(repo, "fetch", str(inner), "HEAD")  # see docstring: put HEAD:mod in this ODB
+    # See docstring: this is what puts HEAD:mod in THIS repo's ODB. The
+    # `protocol.file.allow` pin is for the same reason as the one above, but
+    # not for the same default: a direct fetch from a local path is allowed
+    # under git's default `user` policy (only submodule-spawned child
+    # processes are refused there, which is what forces the pin on `submodule
+    # add`). Pinned anyway so an ambient `never` — the one setting that does
+    # refuse this fetch — cannot make the test a property of the machine.
+    _git(repo, "-c", "protocol.file.allow=always", "fetch", str(inner), "HEAD")
     assert _git(repo, "cat-file", "-t", f"{oid}:mod") == "commit"
 
     assert blob_size(repo, oid, "mod") is not None
