@@ -367,6 +367,7 @@ def pack(
     files: list[str],
     statuses: dict[str, str],
     headroom: int,
+    *,
     source: str = "wt",
     oid: str | None = None,
     per_file_cap: int | None = None,
@@ -392,6 +393,15 @@ def pack(
     Passing an `oid` with `source="wt"` is refused rather than ignored: it is the
     one caller mistake whose consequence is silent (a working-tree pack that
     every downstream field labels as the commit's).
+
+    Everything after `headroom` is KEYWORD-ONLY, and that is the enforcement of
+    the same rule one level up. `oid` was INSERTED between `source` and
+    `per_file_cap` when Task 8 added the object-store source, so a positional
+    caller written against the older signature would bind `per_file_cap` to `oid`
+    and `pack_large_added` to `per_file_cap`. That mistake is now a `TypeError`
+    at the call site rather than a pack whose provenance is wrong. Every caller
+    in this package already passed these by name; the `*` is what stops the next
+    one from not.
 
     Everything else is the same on both sources: binary detection, the caps,
     selection order, the section format and the omission vocabulary, all pinned

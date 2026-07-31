@@ -167,7 +167,7 @@ from pathlib import Path
 
 from . import (batching, budget, chain, checklist, contextpack, gitio, ids,
                passes, promptbuild, runner)
-from .adapters import REFUTER_CONTRACT, get_adapter
+from .adapters import NORMAL_STOP_REASONS, REFUTER_CONTRACT, get_adapter
 from .config import Config, Defaults, Reviewer
 from .store import Store, _TS_FORMAT
 from .trust import is_trustworthy
@@ -2378,6 +2378,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                                    None)
             integration = passes.integration_meta(
                 "failed", ran=False, checklist=meta_checklist, note=reason,
+                stop_reason=integration_sub.stop_reason,
                 provenance=integration_sub.provenance)
         else:
             prompt_bytes += prompt.prompt_bytes
@@ -2401,6 +2402,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 degraded=integration_sub.degraded,
                 diff_truncated=integration_sub.diff_truncated,
                 findings_total=len(tagged), attempts=integration_sub.attempts,
+                stop_reason=integration_sub.stop_reason,
                 provenance=integration_sub.provenance,
                 checklist=meta_checklist,
                 note=integration_sub.failure_reason)
@@ -2498,16 +2500,45 @@ def _aggregate_stop_reason(subs: list) -> object:
     Batch order, then the integration pass. ORACLE, and its reasoning is the
     point: reporting the last one, or the most common one, would let a single
     truncated batch hide behind its healthy siblings — the exact false all-clear
-    this field exists to expose. `EndTurn` only when every sub-review that
-    reported one completed normally, and None when none reported at all (the
-    shipped record's own "nothing to say" value).
+    this field exists to expose. `None` when nothing reported at all (the shipped
+    record's own "nothing to say" value).
+
+    Two things about "abnormal" that the shipped rule got wrong, both REPORTING
+    only — no trust axis is computed here, and `parse_ok`/`degraded`/
+    `diff_truncated` are unchanged by either:
+
+    * **Abnormal is measured against `adapters.NORMAL_STOP_REASONS`, not against
+      the literal `"EndTurn"`.** That literal is grok's word. A batched review
+      can be answered by several adapters (a fallback chain, or a cross-file pass
+      configured on a second provider), and agy's normal terminal status —
+      `SUCCESS` — was therefore promoted as the round's first ABNORMAL value.
+
+    * **A normal word is only reported for a round in which something actually
+      produced a review.** Observed live: nine batches whose chains were
+      exhausted, plus a cross-file pass that came back `SUCCESS` with nothing in
+      it, published `stop_reason=SUCCESS` in the verdict banner of a round that
+      reviewed nothing at all. `usable_output` is the field that draws that line
+      (see `usable_output`, whose rule this mirrors on the `_Sub`s), and a
+      terminal word from a sub-review that produced no review describes the
+      process, not the round.
+
+      An ABNORMAL value is NOT suppressed that way, deliberately. `Cancelled` or
+      `MaxOutputTokens` is a diagnostic, and it is worth most precisely when
+      there is no review to read instead.
+
+    When every reporting sub-review ended normally, the answer is the FIRST word
+    they reported — theirs, not a translation of it into some other adapter's
+    vocabulary. For the single-provider grok runs the oracle pins, that is
+    `EndTurn`, exactly as before.
     """
     reported = [s.stop_reason for s in subs
                 if isinstance(s.stop_reason, str) and s.stop_reason]
     for value in reported:
-        if value != "EndTurn":
+        if value not in NORMAL_STOP_REASONS:
             return value
-    return "EndTurn" if reported else None
+    if not reported or not any(s.parse_ok for s in subs):
+        return None
+    return reported[0]
 
 
 def _aggregate_summary(count: int, integration: bool, findings: int,

@@ -478,3 +478,80 @@ def test_no_token_is_the_shipped_behaviour_exactly(tmp_path):
     r = run_with_watchdog([sys.executable, "-c", "print('hi')"], 10, tmp_path,
                           tmp_path / "out", tmp_path / "err", cancel=None)
     assert r.rc == 0 and not r.timed_out
+
+
+# --------------------------------------------------------------------------
+# reading the token: a Ctrl-C is not an unreadable token
+#
+# Both readers guard the token because it crosses a signal-handler boundary and
+# an Event-shaped-but-not value (a `Mock`, a stale proxy) must not turn a review
+# into a crash. `KeyboardInterrupt` is the one thing that guard may not eat: in
+# the FOREGROUND, `_sleep_or_cancelled` is what a lock wait blocks in, so a
+# swallowed Ctrl-C there means the poll loop keeps going and the operator's
+# interrupt does nothing. `SystemExit` is deliberately NOT re-raised -- the same
+# distinction `svc_gate` makes (commit d204c6f): an arbitrary exit code, 0
+# included, escaping a fail-closed path is worse than the bug.
+# --------------------------------------------------------------------------
+
+
+class _RaisingToken:
+    """An Event-shaped token whose every read raises. Counts its reads."""
+
+    def __init__(self, exc: BaseException):
+        self._exc = exc
+        self.reads = 0
+
+    def is_set(self):
+        self.reads += 1
+        raise self._exc
+
+    def wait(self, timeout=None):
+        self.reads += 1
+        raise self._exc
+
+
+def _no_sleep(monkeypatch):
+    """Spy on `runner.time.sleep` and never actually sleep."""
+    import skodun.runner as runner_mod
+    slept = []
+    monkeypatch.setattr(runner_mod.time, "sleep", slept.append)
+    return slept
+
+
+def test_a_ctrl_c_during_a_token_wait_aborts_the_wait(monkeypatch):
+    """A foreground lock wait blocks in `cancel.wait(seconds)`. Swallowing the
+    Ctrl-C raised there left the caller polling for the rest of the window."""
+    from skodun.runner import _sleep_or_cancelled
+    slept = _no_sleep(monkeypatch)
+    token = _RaisingToken(KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        _sleep_or_cancelled(token, 30.0)
+    assert token.reads == 1
+    assert slept == [], "an interrupted wait must not fall back to sleeping"
+
+
+def test_a_ctrl_c_while_reading_the_token_aborts_the_check(monkeypatch):
+    """`_cancelled` has the same guard and the same rule."""
+    from skodun.runner import _cancelled
+    with pytest.raises(KeyboardInterrupt):
+        _cancelled(_RaisingToken(KeyboardInterrupt()))
+
+
+def test_a_system_exit_from_the_token_is_still_swallowed(monkeypatch):
+    """NOT re-raised, deliberately. `SystemExit` carries an arbitrary code --
+    including 0 -- and letting one out of the tick loop would turn a review
+    that could not read its token into a clean exit."""
+    from skodun.runner import _cancelled, _sleep_or_cancelled
+    slept = _no_sleep(monkeypatch)
+    assert _cancelled(_RaisingToken(SystemExit(0))) is False
+    assert _sleep_or_cancelled(_RaisingToken(SystemExit(0)), 2.5) is False
+    assert slept == [2.5], "the fallback sleep still bounds the wait"
+
+
+def test_an_ordinary_unreadable_token_is_unchanged(monkeypatch):
+    """The shipped behaviour for the case the guard exists for."""
+    from skodun.runner import _cancelled, _sleep_or_cancelled
+    slept = _no_sleep(monkeypatch)
+    assert _cancelled(_RaisingToken(RuntimeError("stale proxy"))) is False
+    assert _sleep_or_cancelled(_RaisingToken(RuntimeError("x")), 1.5) is False
+    assert slept == [1.5]

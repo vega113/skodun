@@ -1185,6 +1185,7 @@ def integration_meta(
     degraded: bool = False,
     diff_truncated: bool = False,
     findings_total: int = 0,
+    stop_reason: Any = None,
     attempts: Sequence[Any] = (),
     provenance: Mapping[str, Any] | None = None,
     checklist: Mapping[str, Any] | None = None,
@@ -1206,6 +1207,15 @@ def integration_meta(
     deliberately drops it (see `pipeline._extra_pass`): there the attempt list
     was telemetry about an optional opinion, here the pass is a trust axis of
     the aggregate and its attempts are the audit trail for that verdict.
+
+    `stop_reason` is carried for a narrower but equally concrete reason: this
+    pass is one of the terms `pipeline._aggregate_stop_reason` reads, and it was
+    the only one whose value the artifact did not record. `batches[]` has carried
+    a `stop_reason` per sub-review since Task 6, so a word at the top of the
+    record could be traced to the batch that reported it — but a word this pass
+    reported appeared at the top attributable to nothing, which is exactly how a
+    `SUCCESS` nobody could find the source of was read as a verdict. `None` on
+    every path where nothing answered, like the batch entries.
 
     `provenance` is `{provider, model, effort}` for the attempt that answered,
     exactly as `pipeline._provenance` builds it. Explicit `None`s when nothing
@@ -1230,6 +1240,7 @@ def integration_meta(
         "degraded": bool(degraded),
         "diff_truncated": bool(diff_truncated),
         "findings_total": int(findings_total),
+        "stop_reason": stop_reason,
         "attempts": list(attempts or ()),
         "provider": prov.pop("provider", None),
         "model": prov.pop("model", None),

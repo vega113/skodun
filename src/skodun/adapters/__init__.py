@@ -24,8 +24,11 @@ from .base import (
     OutputContract,
     ParseResult,
 )
+from .agy import _STATUS_OK as _AGY_NORMAL_STOP
 from .agy import AgyAdapter
+from .codex import _TURN_COMPLETED as _CODEX_NORMAL_STOP
 from .codex import CodexAdapter
+from .grok import _STOP_REASON_OK as _GROK_NORMAL_STOP
 from .grok import GrokAdapter
 
 __all__ = [
@@ -34,6 +37,7 @@ __all__ = [
     "ClassifyResult",
     "CodexAdapter",
     "GrokAdapter",
+    "NORMAL_STOP_REASONS",
     "OutputContract",
     "ParseResult",
     "REFUTER_CONTRACT",
@@ -42,6 +46,23 @@ __all__ = [
     "UNAVAILABLE_RC",
     "get_adapter",
 ]
+
+#: Every value a `ParseResult.stop_reason` can carry for a run that ENDED
+#: NORMALLY, across all three adapters — grok's `EndTurn`, agy's `SUCCESS`,
+#: codex's `turn.completed`.
+#:
+#: Assembled from each adapter's OWN constant rather than re-spelled, because a
+#: second list of these words is a list that drifts — and it already had. The
+#: batched aggregate measured "abnormal" as `!= "EndTurn"`, one adapter's
+#: vocabulary applied to all of them, so agy's normal terminal status was
+#: promoted to the top of a record as though it were a truncation signal (and
+#: read, in the verdict banner, as a success). This is a REPORTING vocabulary
+#: only: no trust axis is computed from it. An adapter still judges its OWN
+#: run's health itself, on its own terms, in `parse`/`classify` — this is the
+#: one place that has to compare terminal words ACROSS adapters, because a
+#: single batched review can be answered by several of them.
+NORMAL_STOP_REASONS: frozenset[str] = frozenset(
+    {_GROK_NORMAL_STOP, _AGY_NORMAL_STOP, _CODEX_NORMAL_STOP})
 
 
 # Keyed by PROVIDER, not by adapter name: config names a provider, and one

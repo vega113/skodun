@@ -612,6 +612,11 @@ def reserved_budget(cfg: "Config", diff_bytes: bytes) -> int:
 #: `skodun worker`, `<venv>/bin/skodun worker`).
 WORKER_ARGV_TOKENS: Final = ("skodun", "worker")
 
+#: The flag `worker_argv` writes the record id behind, and the flag the pid-reuse
+#: guard reads it back out of. ONE definition for the same reason the tokens above
+#: are one: the spawn and the guard must not be able to drift apart.
+WORKER_RECORD_FLAG: Final = "--record-id"
+
 #: The environment variables a detached worker inherits, beyond `SKODUN_*`.
 #: An ALLOWLIST rather than a filter, because a pre-push hook inherits whatever
 #: the developer's shell had -- a `GIT_INDEX_FILE` or `GIT_DIR` left over from the
@@ -659,9 +664,9 @@ def worker_argv(record_id: str, repo: Path, branch: str, local_oid: str,
     """The worker's exact argv. ONE definition, so the pid-reuse guard's tokens
     and the spawn cannot drift apart."""
     return [sys.executable, "-m", "skodun", "worker",
-            "--record-id", record_id, "--repo", str(repo), "--branch", branch,
-            "--local-oid", local_oid, "--base-sha", base_sha,
-            "--base-ref", base_ref]
+            WORKER_RECORD_FLAG, record_id, "--repo", str(repo),
+            "--branch", branch, "--local-oid", local_oid,
+            "--base-sha", base_sha, "--base-ref", base_ref]
 
 
 def spawn_worker(store: "Store", record_id: str, repo: Path, branch: str,
@@ -727,24 +732,40 @@ def _terminate(proc: subprocess.Popen) -> None:
         pass
 
 
-def pid_is_skodun_worker(pid: object) -> bool:
-    """Whether `pid` is demonstrably still a skodun worker (ORACLE A14.4).
+def pid_is_skodun_worker(pid: object, record_id: object) -> bool:
+    """Whether `pid` is demonstrably still THE worker of `record_id` (ORACLE A14.4).
 
     The pid-reuse guard. `kill -0` only proves SOME process owns the pid, and a
     `running` marker can be minutes old -- long enough for the kernel to have
     recycled it onto an unrelated same-user process. Signalling on liveness alone
     would eventually SIGTERM a developer's editor.
 
+    `record_id` is what BINDS the answer to the reservation being retired, and it
+    is not optional. The argv tokens alone say "this is a skodun worker" and not
+    WHICH one -- so the one process class the guard still let through was another
+    skodun worker: a pid recycled onto a live review of a different branch was
+    confirmed and signalled, killing a run nothing had superseded. The argv must
+    now also carry `--record-id <record_id>` as `worker_argv` writes it, which is
+    a fact about this row and no other.
+
+    Matched as the FLAG AND THE VALUE, and with the value's end pinned: `sk_x`
+    must not confirm a worker running `sk_x2`. Ids share a branch-and-oid stem,
+    so being a prefix of one another is ordinary rather than exotic.
+
     An UNCONFIRMABLE pid gets no signal at all, and that is safe rather than
     lax precisely because finalization is conditional: the reservation transaction
     has already marked the row `superseded`, so if that worker really is alive it
     will finish, call `finalize_review`, be told the record is no longer running,
-    and change nothing.
+    and change nothing. Binding to the record only ever REMOVES signals, so it
+    cannot weaken that posture -- it lands more rows in the same safe case.
 
-    Total: a `ps` that cannot be run, a non-integer pid, a pid of 0 or below all
-    answer False. There is no path from "we could not tell" to "signal it".
+    Total: a `ps` that cannot be run, a non-integer pid, a pid of 0 or below, a
+    `record_id` that is not a non-empty string, all answer False. There is no path
+    from "we could not tell" to "signal it".
     """
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    if not isinstance(record_id, str) or not record_id:
         return False
     try:
         cp = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
@@ -754,7 +775,29 @@ def pid_is_skodun_worker(pid: object) -> bool:
     if cp.returncode != 0:
         return False
     args = cp.stdout.decode("utf-8", "replace")
-    return all(token in args for token in WORKER_ARGV_TOKENS)
+    if not all(token in args for token in WORKER_ARGV_TOKENS):
+        return False
+    return _argv_names_record(args, record_id)
+
+
+def _argv_names_record(args: str, record_id: str) -> bool:
+    """Whether `args` (one `ps -o args=` line) carries `--record-id <record_id>`.
+
+    A plain `in` test would match a longer id that merely STARTS with this one,
+    which is why the character after the value is checked: the value must end the
+    argv or be followed by whitespace, exactly as `worker_argv`'s list-form spawn
+    leaves it.
+    """
+    needle = f"{WORKER_RECORD_FLAG} {record_id}"
+    start = 0
+    while True:
+        at = args.find(needle, start)
+        if at < 0:
+            return False
+        end = at + len(needle)
+        if end == len(args) or args[end].isspace():
+            return True
+        start = at + 1
 
 
 def signal_superseded(retired) -> int:
@@ -766,14 +809,15 @@ def signal_superseded(retired) -> int:
 
     A row with a NULL pid is a reservation whose worker never attached one (it may
     not even have been spawned), so there is nothing to signal; a row whose pid
-    cannot be confirmed as a live skodun worker is left alone (see
-    `pid_is_skodun_worker`). Returns how many signals were actually sent, which is
-    what the tests count.
+    cannot be confirmed as the live worker OF THAT ROW is left alone (see
+    `pid_is_skodun_worker`, which takes the row's own id for exactly this reason).
+    Returns how many signals were actually sent, which is what the tests count.
     """
     sent = 0
     for row in retired or ():
         pid = row.get("pid") if isinstance(row, Mapping) else None
-        if not pid_is_skodun_worker(pid):
+        record_id = row.get("id") if isinstance(row, Mapping) else None
+        if not pid_is_skodun_worker(pid, record_id):
             continue
         try:
             os.kill(int(pid), signal.SIGTERM)
@@ -1297,7 +1341,53 @@ BACKUP_SUFFIX: Final = ".pre-skodun"
 #: The shim records its chaining target inside itself, on this line, so a
 #: re-install can recover the chain without re-deriving it -- and so a human
 #: reading the hook can see what else runs.
-_CHAIN_LINE = re.compile(r"^SKODUN_SHIM_CHAIN='(?P<path>.*)'$", re.MULTILINE)
+#:
+#: The value is captured RAW and handed to `_sh_unquote`, rather than matched
+#: with `'(?P<path>.*)'`: a path containing a single quote is written as several
+#: quoted runs spliced together (see `_sh_quote`), and a pattern that assumes one
+#: unbroken run would recover a truncated prefix -- which the re-install would
+#: then write back as the chain, silently dropping the rest of a foreign hook's
+#: path.
+_CHAIN_LINE = re.compile(r"^SKODUN_SHIM_CHAIN=(?P<value>.*)$", re.MULTILINE)
+
+
+def _sh_quote(value: str) -> str:
+    """`value` as ONE POSIX sh word, always single-quoted.
+
+    The standard `'\\''` idiom: close the quoted run, emit an escaped quote,
+    reopen. `shlex.quote` would do the same job but leaves a "safe" string
+    UNQUOTED, and the shipped shim (and `_CHAIN_LINE`, and every hook already
+    installed) is written around the value being quoted -- so this always quotes,
+    including the empty string, which becomes `''` exactly as it always has.
+    """
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _sh_unquote(text: str) -> str | None:
+    """The inverse of `_sh_quote`, or None for anything this module did not write.
+
+    A concatenation of single-quoted runs and `\\'` escapes, which is precisely
+    what `_sh_quote` emits and precisely what every shim installed by an earlier
+    build emits too (a path with no quote in it is one unbroken run). `None`
+    rather than a best guess: a chain line that cannot be read is not a chain
+    target, and guessing at one would point the next push at the wrong file.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "'":
+            end = text.find("'", i + 1)
+            if end < 0:
+                return None
+            out.append(text[i + 1:end])
+            i = end + 1
+        elif text.startswith("\\'", i):
+            out.append("'")
+            i += 2
+        else:
+            return None
+    return "".join(out)
+
 
 #: The shim's dispatcher command, as an overridable default. `:` `${VAR:=...}`
 #: rather than a hard-coded line so an operator (or a test) can point the shim at
@@ -1320,7 +1410,7 @@ _SHIM_TEMPLATE = """\
 # block the push at that point: every dispatcher failure becomes a warning and an
 # exit 0.
 set -u
-SKODUN_SHIM_CHAIN='{chain}'
+SKODUN_SHIM_CHAIN={chain}
 : "${{{py_env}:={python}}}"
 
 _sk_tmp=""
@@ -1358,9 +1448,15 @@ def shim_text(chain: str = "", python: str | None = None) -> str:
     the hook can see what else runs -- deriving it again from the filesystem would
     be a second answer to "what am I chaining", and the two could disagree once a
     backup file was moved.
+
+    It is SHELL-QUOTED on the way in (`_sh_quote`). It is a filesystem path, and
+    a repository checked out under a directory whose name contains a single quote
+    -- an ordinary thing on a case-preserving filesystem -- otherwise produced a
+    hook that would not even parse, i.e. a pre-push that fails for every push in
+    that repository.
     """
     return _SHIM_TEMPLATE.format(
-        marker=SHIM_MARKER, chain=chain, py_env=_SHIM_PY_ENV,
+        marker=SHIM_MARKER, chain=_sh_quote(chain), py_env=_SHIM_PY_ENV,
         python=python or sys.executable)
 
 
@@ -1429,7 +1525,19 @@ def install_hooks(repo: Path, *, force: bool = False,
     existing = _read_text(hook)
     if SHIM_MARKER in existing:
         match = _CHAIN_LINE.search(existing)
-        chain = match.group("path") if match else ""
+        chain = ""
+        if match is not None:
+            chain = _sh_unquote(match.group("value"))
+            if chain is None:
+                # OUR marker, and a chain line we cannot read. Writing `""` here
+                # would drop whatever foreign hook it named -- exactly the
+                # silent loss `--force`'s backup exists to prevent -- and
+                # guessing at a prefix would chain the wrong file.
+                raise HookRefused(
+                    f"{hook} carries skodun's marker but a chain line this "
+                    f"build cannot read ({match.group(0)}); it may name a hook "
+                    f"that would be dropped. Fix or delete that line, then "
+                    f"re-run")
         _write_shim(hook, chain, python)
         return hook, ("reinstalled, still chaining " + chain if chain
                       else "reinstalled")

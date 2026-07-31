@@ -381,6 +381,9 @@ def test_an_ordinary_gate_setup_failure_is_still_a_recorded_fail_2(monkeypatch,
     pytest.param(
         lambda st, repo: services.svc_triage_reopen(st, "r1", 0, GOOD_REASON),
         id="svc_triage_reopen"),
+    pytest.param(
+        lambda st, repo: services.svc_triage_dismiss(st, "r1", 0, GOOD_REASON),
+        id="svc_triage_dismiss"),
 ])
 def test_no_service_guard_turns_a_ctrl_c_into_a_synthetic_failure(
         monkeypatch, tmp_path, call):
@@ -400,7 +403,7 @@ def test_no_service_guard_turns_a_ctrl_c_into_a_synthetic_failure(
 
     for module, name in ((config, "load_config"), (gitio, "current_branch"),
                          (delivery, "surface"), (triage, "adopt_refuter"),
-                         (triage, "reopen")):
+                         (triage, "reopen"), (triage, "dismiss")):
         monkeypatch.setattr(module, name, boom)
     repo = _mkrepo(tmp_path)
     db = _db(tmp_path, _round(id="r1", findings=[_finding(0)], findings_total=1,
@@ -409,6 +412,41 @@ def test_no_service_guard_turns_a_ctrl_c_into_a_synthetic_failure(
         monkeypatch.setattr(store, "list_reviews", boom)
         with pytest.raises(KeyboardInterrupt):
             call(store, repo)
+
+
+@pytest.mark.parametrize("service, verb", [
+    pytest.param(lambda st: services.svc_triage_dismiss(st, "r1", 0,
+                                                        GOOD_REASON),
+                 "dismissal", id="svc_triage_dismiss"),
+    pytest.param(lambda st: services.svc_triage_reopen(st, "r1", 0,
+                                                       GOOD_REASON),
+                 "reopen", id="svc_triage_reopen"),
+])
+def test_a_store_that_stopped_accepting_writes_is_a_refusal_not_a_traceback(
+        monkeypatch, tmp_path, service, verb):
+    """The `(status, text)` contract is what BOTH surfaces are built on: the CLI
+    turns it into an exit code and a line, and the MCP transport into a tool
+    result. A `sqlite3.OperationalError` out of the write escaped both.
+
+    `svc_triage_dismiss` was the one triage service without this guard -- it
+    caught only the validation errors -- while its two siblings had it.
+    """
+    import sqlite3
+
+    from skodun import triage
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(triage, "dismiss", boom)
+    monkeypatch.setattr(triage, "reopen", boom)
+    db = _db(tmp_path, _round(id="r1", findings=[_finding(0)], findings_total=1,
+                              artifact=_artifact(_finding(0))))
+    with Store.open(db) as store:
+        status, text = service(store)
+    assert status == 2
+    assert f"could not record the {verb}" in text
+    assert "database is locked" in text
 
 
 # ==========================================================================

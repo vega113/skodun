@@ -29,6 +29,7 @@ pinned rather than asserted in prose.
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -1775,7 +1776,8 @@ def _pgroup_alive(pgid: int) -> bool:
 # --------------------------------------------------------------------------
 
 
-def _fake_worker_process(tmp_path: Path, name: str = "skodun") -> subprocess.Popen:
+def _fake_worker_process(tmp_path: Path, name: str = "skodun",
+                         record_id: str = "sk_x") -> subprocess.Popen:
     """A live process whose `ps -o args=` NAMES the skodun worker entrypoint.
 
     A script file called `skodun` invoked with `worker ...`, so the guard is tested
@@ -1785,7 +1787,7 @@ def _fake_worker_process(tmp_path: Path, name: str = "skodun") -> subprocess.Pop
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_text("#!/bin/sh\ntrap '' TERM\nsleep 120\n", encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    return subprocess.Popen([str(script), "worker", "--record-id", "sk_x"],
+    return subprocess.Popen([str(script), "worker", "--record-id", record_id],
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
 
@@ -1793,7 +1795,39 @@ def _fake_worker_process(tmp_path: Path, name: str = "skodun") -> subprocess.Pop
 def test_a_pid_that_ps_confirms_as_a_worker_is_signalled(tmp_path):
     proc = _fake_worker_process(tmp_path)
     try:
-        assert pid_is_skodun_worker(proc.pid) is True
+        assert pid_is_skodun_worker(proc.pid, "sk_x") is True
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+
+def test_a_worker_for_a_DIFFERENT_record_is_never_signalled(tmp_path):
+    """The pid-reuse guard is bound to the RESERVATION, not just to "a skodun
+    worker".
+
+    Confirming the argv names *a* worker leaves the reuse window open on the one
+    class of process most likely to be in it: another in-flight skodun worker.
+    A recycled pid that happens to belong to a review of a different branch would
+    otherwise be SIGTERMed by the row this dispatcher is retiring.
+    """
+    proc = _fake_worker_process(tmp_path, record_id="sk_someone_else")
+    try:
+        assert pid_is_skodun_worker(proc.pid, "sk_x") is False
+        assert signal_superseded([{"id": "sk_x", "pid": proc.pid}]) == 0
+        assert proc.poll() is None, "we signalled another review's worker"
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+
+def test_a_record_id_that_is_only_a_PREFIX_of_the_argv_one_is_not_a_match(
+        tmp_path):
+    """`sk_x` must not confirm a worker running `sk_x2`: ids are minted with a
+    shared branch-and-oid stem, so prefixes of one another are the ordinary
+    case, not a corner one."""
+    proc = _fake_worker_process(tmp_path, record_id="sk_x2")
+    try:
+        assert pid_is_skodun_worker(proc.pid, "sk_x") is False
     finally:
         proc.kill()
         proc.wait(timeout=30)
@@ -1806,7 +1840,7 @@ def test_a_pid_that_is_something_else_entirely_is_never_signalled(tmp_path):
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
                             stdout=subprocess.DEVNULL)
     try:
-        assert pid_is_skodun_worker(proc.pid) is False
+        assert pid_is_skodun_worker(proc.pid, "sk_x") is False
     finally:
         proc.kill()
         proc.wait(timeout=30)
@@ -1817,17 +1851,30 @@ def test_anything_that_is_not_a_real_pid_is_never_signalled(pid):
     """Total, and fail-closed: there is no path from "we could not tell" to
     "signal it". `True` is caught explicitly -- it is an `int` subclass, and
     `os.kill(True, SIGTERM)` would signal pid 1."""
-    assert pid_is_skodun_worker(pid) is False
+    assert pid_is_skodun_worker(pid, "sk_x") is False
+
+
+@pytest.mark.parametrize("record_id", [None, "", 123, b"sk_x"])
+def test_a_record_id_that_is_not_an_id_is_never_confirmable(tmp_path, record_id):
+    """Same fail-closed direction on the other argument: a row whose `id` is
+    missing or the wrong shape cannot be bound to any argv, so nothing is
+    signalled for it."""
+    proc = _fake_worker_process(tmp_path)
+    try:
+        assert pid_is_skodun_worker(proc.pid, record_id) is False
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
 
 
 def test_a_reaped_pid_is_never_signalled(tmp_path):
     proc = subprocess.Popen(["sh", "-c", "exit 0"])
     proc.wait(timeout=30)
-    assert pid_is_skodun_worker(proc.pid) is False
+    assert pid_is_skodun_worker(proc.pid, "sk_x") is False
 
 
 def test_signalling_only_touches_confirmed_workers(tmp_path):
-    worker = _fake_worker_process(tmp_path)
+    worker = _fake_worker_process(tmp_path, record_id="a")
     other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
                              stdout=subprocess.DEVNULL)
     try:
@@ -1861,7 +1908,7 @@ def test_a_live_but_unconfirmABLE_worker_cannot_resurrect_its_record(tmp_path):
         assert st.attach_pid(rid, os.getpid())
         newer = st.reserve_prepush("feat", "f" * 40, "main", "b" * 40, "h2",
                                    100, _evidence(valid=False))
-    assert not pid_is_skodun_worker(os.getpid())
+    assert not pid_is_skodun_worker(os.getpid(), rid)
     assert signal_superseded(newer.superseded) == 0, "we signalled a stranger"
     # The unconfirmed worker finishes anyway. Its answer is refused.
     out = run_worker(rid, repo, "feat", ident["head"], ident["base_sha"],
@@ -2132,6 +2179,87 @@ def test_reinstalling_after_a_forced_install_keeps_the_chain(tmp_path,
     backup = hook.parent / f"pre-push{BACKUP_SUFFIX}"
     assert f"SKODUN_SHIM_CHAIN='{backup}'" in path.read_text(encoding="utf-8")
     assert "still chaining" in what
+
+
+def _quoted_repo(tmp_path: Path) -> Path:
+    """A git repository whose PATH contains a single quote."""
+    repo = tmp_path / "re'po"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("one\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "c0")
+    return repo
+
+
+def test_a_chained_path_with_a_quote_installs_runs_and_reads_back(
+        tmp_path, hermetic_git):
+    """END TO END for a repository under a path containing a single quote.
+
+    The chain target used to be pasted between bare quotes, so this hook was
+    not even syntactically valid `sh` -- and `_CHAIN_LINE` read the truncated
+    prefix back as the chain on the next install, which would have dropped a
+    foreign hook. Install, RUN (the chained hook must be reached at the exact
+    path), re-install, run again.
+    """
+    repo = _quoted_repo(tmp_path)
+    directory = hooks_dir(repo)
+    directory.mkdir(parents=True, exist_ok=True)
+    ran = tmp_path / "chained-argv0.txt"
+    # The chained hook records its OWN path, so the assertion below is about the
+    # exact bytes the shim resolved -- not merely "something ran".
+    (directory / "pre-push").write_text(
+        "#!/bin/sh\n"
+        f"printf '%s' \"$0\" > {shlex.quote(str(ran))}\n"
+        "exit 0\n", encoding="utf-8")
+    (directory / "pre-push").chmod(0o755)
+    fake_py = tmp_path / "fake-python"
+    fake_py.write_text("#!/bin/sh\ncat >/dev/null\nexit 0\n", encoding="utf-8")
+    fake_py.chmod(0o755)
+
+    hook, what = install_hooks(repo, force=True, python=str(fake_py))
+    backup = directory / f"pre-push{BACKUP_SUFFIX}"
+    assert "'" in str(backup), "the fixture must actually exercise the quote"
+
+    def _check(where: str) -> None:
+        syntax = subprocess.run(["sh", "-n", str(hook)], capture_output=True)
+        assert syntax.returncode == 0, (
+            f"{where}: the generated hook is not valid sh: "
+            f"{syntax.stderr.decode('utf-8', 'replace')}")
+        ran.unlink(missing_ok=True)
+        cp = subprocess.run(["sh", str(hook), "origin", "git@example:x"],
+                            input=b"refs/heads/main a refs/heads/main b\n",
+                            capture_output=True)
+        assert cp.returncode == 0, cp.stderr.decode("utf-8", "replace")
+        assert ran.read_text(encoding="utf-8") == str(backup), (
+            f"{where}: the shim did not reach the chained hook's exact path")
+
+    _check("first install")
+    assert str(backup) in what
+
+    # The RE-INSTALL path reads the target back out of the marker line.
+    hook, what = install_hooks(repo, python=str(fake_py))
+    assert what == f"reinstalled, still chaining {backup}"
+    _check("re-install")
+
+
+def test_an_unreadable_chain_line_is_refused_rather_than_dropped(
+        tmp_path, hermetic_git):
+    """Our marker, a chain line this build cannot parse. Rewriting it as "no
+    chain" would discard whatever foreign hook it named, with no trace -- the
+    same loss `--force`'s backup exists to prevent."""
+    repo = _mkrepo(tmp_path)
+    hook = hooks_dir(repo) / "pre-push"
+    install_hooks(repo)
+    hook.write_text(
+        hook.read_text(encoding="utf-8").replace(
+            "SKODUN_SHIM_CHAIN=''", "SKODUN_SHIM_CHAIN=$SOMETHING_ELSE"),
+        encoding="utf-8")
+    with pytest.raises(HookRefused) as e:
+        install_hooks(repo)
+    assert "SKODUN_SHIM_CHAIN=$SOMETHING_ELSE" in str(e.value)
 
 
 def test_a_second_DIFFERENT_foreign_hook_is_refused_even_under_force(
