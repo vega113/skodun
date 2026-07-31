@@ -2531,14 +2531,24 @@ def _aggregate_stop_reason(subs: list) -> object:
     vocabulary. For the single-provider grok runs the oracle pins, that is
     `EndTurn`, exactly as before.
     """
-    reported = [s.stop_reason for s in subs
+    def said(candidates):
+        return [s.stop_reason for s in candidates
                 if isinstance(s.stop_reason, str) and s.stop_reason]
-    for value in reported:
+
+    # Abnormality is judged across EVERY sub-review, answered or not: a
+    # `Cancelled` from a run that produced nothing is exactly when the word
+    # matters most.
+    for value in said(subs):
         if value not in NORMAL_STOP_REASONS:
             return value
-    if not reported or not any(s.parse_ok for s in subs):
-        return None
-    return reported[0]
+    # A NORMAL word, though, has to come from a sub-review that actually
+    # produced a review. A failed one can still report its adapter's normal
+    # terminal status -- an exhausted chain whose last attempt exited cleanly
+    # with nothing usable in it -- and that word describes the process, not the
+    # round. Reporting it would let a batch that answered nothing speak for a
+    # batch that did.
+    answered = said([s for s in subs if s.parse_ok])
+    return answered[0] if answered else None
 
 
 def _aggregate_summary(count: int, integration: bool, findings: int,
