@@ -221,6 +221,34 @@ disable the respective pass (any other value, or leaving the variable unset,
 leaves it enabled — only the exact string `"0"`, after stripping whitespace,
 turns a pass off).
 
+### Prompt budgets are per provider
+
+`[defaults] max_diff_bytes` is the prompt *envelope*: the diff plus whatever
+packed file context fits after it. It is one number for the whole config, but it
+is not the only thing that bounds a prompt — a CLI that carries its prompt in an
+argv element rather than a file has a hard ceiling of its own (`agy`: ~120 KB,
+the kernel's per-argument cap), and each adapter **declares** that ceiling.
+
+The budget for one reviewer is therefore `min(that reviewer's own
+max_diff_bytes or the global, its adapter's declared ceiling)`, and every prompt
+build and batch plan is sized with it. Two consequences worth knowing:
+
+* You do **not** have to shrink the global to fit the least capable provider in
+  your config. An `agy` entry is budgeted to what it can carry while a `codex`
+  or `grok` entry beside it keeps the whole envelope.
+* A reviewer entry may carry its own `max_diff_bytes` (validated exactly like
+  the `[defaults]` key: an integer, not a bool, at least 1). It *replaces* the
+  global for that entry, in either direction, and is still capped by the
+  adapter's ceiling — a ceiling is what the CLI can physically accept, and no
+  configuration raises it.
+
+A prompt that still exceeds an adapter's ceiling — a chain can span providers,
+and one sized for a file-fed head may reach an argv-bound fallback — is
+classified `unavailable` for that entry and **the chain advances** to the next
+one, exactly as a quota outage would. This is still fail-closed: an exhausted
+chain is a `failed`, untrustworthy record naming the prompt size and the
+ceiling, and nothing becomes trustworthy that was not reviewed.
+
 ### `max_cost_usd`
 
 A reviewer may set `max_cost_usd` (a finite, strictly positive number — `true`,

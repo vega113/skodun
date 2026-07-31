@@ -2,15 +2,22 @@
 # because it is the provider that is reliably available here; codex remains in
 # the chain so a quota outage on either one costs an attempt, not the review.
 #
-# `agy` passes its prompt on the command line and refuses above ~120 KB. The
-# prompt is much bigger than the diff -- context packing adds the full text of
-# every changed file, so a 53 KB diff built a 338 KB prompt -- and
-# `max_diff_bytes` is what bounds the whole envelope, not just the diff. 100 KB
-# keeps an ordinary change inside agy's ceiling; a larger change simply splits
-# into more, smaller batches, which is the documented cost of this provider.
+# `agy` passes its prompt on the command line and refuses above ~120 KB, and
+# the prompt is much bigger than the diff -- context packing adds the full text
+# of every changed file, so a 53 KB diff once built a 338 KB prompt.
+# `max_diff_bytes` is what bounds that whole envelope, not just the diff.
+#
+# This file used to carry `max_diff_bytes = 100000` for exactly that reason,
+# which shrank the review for `codex` too -- its prompt travels as a file and
+# has no such ceiling. It no longer has to: the planner takes the SMALLER of
+# this number and the head adapter's own declared limit, per reviewer
+# (`budget.prompt_budget`), so `agy` is budgeted to what it can carry and
+# `codex` gets the whole envelope. A change too big for agy simply splits into
+# more, smaller batches; one too big even after that is `unavailable` for agy
+# and the codex fallback reviews it.
 
 [defaults]
-max_diff_bytes = 100000
+max_diff_bytes = 400000
 
 [[reviewers]]
 name      = "finder"

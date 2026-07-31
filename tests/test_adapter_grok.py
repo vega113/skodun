@@ -129,6 +129,17 @@ def test_cmd_has_explicit_model_and_denies_tools(tmp_path):
     assert "--json-schema" in s and "--max-turns 40" in s
 
 
+def test_no_prompt_ceiling_because_the_prompt_travels_as_a_file(tmp_path):
+    """`--prompt-file` means no argv-element cap, so the planner gets None.
+
+    Answering with a number instead would shrink every batch this provider
+    reviews to fit a limit it does not have.
+    """
+    assert GrokAdapter().prompt_limit() is None
+    assert "--prompt-file" in GrokAdapter().build_cmd(
+        tmp_path / "p.txt", R, D, tmp_path)
+
+
 def test_cmd_never_uses_legacy_prompt_arg(tmp_path):
     """No `-p` re-shell fallback exists (global constraint); always --prompt-file."""
     cmd = GrokAdapter().build_cmd(tmp_path / "p.txt", R, D, tmp_path)

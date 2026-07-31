@@ -31,8 +31,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import runner
-from .adapters import (REVIEW_CONTRACT, UNAVAILABLE_RC, OutputContract,
-                       ParseResult, get_adapter)
+from .adapters import (PROMPT_TOO_LARGE_CATEGORY, REVIEW_CONTRACT,
+                       UNAVAILABLE_RC, ClassifyResult, OutputContract,
+                       ParseResult, PromptTooLarge, get_adapter)
 from .config import Config, Defaults, Reviewer
 from .store import Store, _TS_FORMAT
 
@@ -214,12 +215,25 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
        silent false all-clear.
 
     Advancing the chain is reserved for `unavailable`. An entry that answered
-    BADLY — degraded, unparseable, timed out, or one whose invocation could not
-    even be built — STOPS the chain and returns its failure: that is a harness
-    or config problem, and hopping providers on it would spend someone else's
-    quota to hide a bug. An exhausted chain is an explicit failure with
-    `parsed=None`, which the record machinery turns into an untrustworthy
-    `failed` record. It is never a pass.
+    BADLY — degraded, unparseable, timed out — STOPS the chain and returns its
+    failure: that is a harness or config problem, and hopping providers on it
+    would spend someone else's quota to hide a bug. An exhausted chain is an
+    explicit failure with `parsed=None`, which the record machinery turns into
+    an untrustworthy `failed` record. It is never a pass.
+
+    An invocation that could not be BUILT splits along exactly that line, and
+    the split is the whole safety argument of the per-provider budgets (#15):
+
+    * `PromptTooLarge` — this CLI cannot physically carry this prompt (`agy`
+      has no prompt-file flag and ignores stdin, so its prompt must fit one
+      argv word). That is a statement about the PROVIDER's capacity, i.e.
+      `unavailable`, so it takes the `unavailable` path: an attempt row, a
+      note, and the next entry. The planner already sizes for the head
+      (`budget.prompt_budget`), so this is mostly the CHAIN-SPANNING case —
+      a prompt sized for a file-fed head reaching an argv-bound fallback.
+    * everything else — an effort the CLI cannot express, an unwritable
+      sidecar, a prompt that is not decodable text. Config or repo errors, and
+      the same bytes would fail identically at every other entry. Fatal.
 
     Scratch filenames extend `tag` with the chain ORDINAL and the attempt
     number (`<tag>.e<i>.a<n>`), never with the reviewer's name: names come
@@ -297,12 +311,43 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
             try:
                 prompt_file.write_bytes(prompt)
                 cmd = adapter.build_cmd(prompt_file, entry, d, cwd, contract)
+            except PromptTooLarge as e:
+                # THIS PROVIDER cannot carry THIS PROMPT — which is what
+                # `unavailable` means, and what a fallback chain is for. So it
+                # takes the `unavailable` path below rather than the fatal one:
+                # an `agy`-headed chain with a `codex` fallback reviews a large
+                # change instead of dying on it.
+                #
+                # Fail-closed is untouched. Nothing becomes trustworthy that
+                # was not reviewed: this appends an attempt and BREAKS to the
+                # next entry, and a chain that runs out still returns
+                # `parsed=None` with a reason that names the size and the
+                # ceiling (both are in `e`'s message, and on `e.size`/`e.limit`
+                # for a caller that would rather not read prose).
+                #
+                # NOT cached against the provider: `_remember_unavailable` is
+                # not called, and the category is deliberately not `quota` —
+                # the only provider-wide-cacheable one. The next, smaller
+                # prompt will be accepted by the very same CLI.
+                verdict = ClassifyResult(
+                    "unavailable", PROMPT_TOO_LARGE_CATEGORY, str(e))
+                next_step = ("trying the next entry" if i + 1 < len(chain)
+                             else "no entries remain")
+                _note(f"{entry.name} ({entry.provider}) cannot take this "
+                      f"prompt ({e.size} bytes > {e.limit}); {next_step}")
+                attempts.append(_attempt(
+                    n, entry, skipped=f"prompt too large for this provider: {e}",
+                    classification=_classification(verdict)))
+                exhausted.append(f"{entry.name}/{entry.provider}: {e}")
+                break
             except Exception as e:
                 # An effort this CLI cannot express, an unwritable schema
-                # sidecar: a LOCAL failure, not an unavailable provider. It
-                # stops the chain rather than routing around it — silently
-                # reviewing somewhere else at some other default is exactly the
-                # unnoticed downgrade `build_cmd` raises to prevent.
+                # sidecar, a prompt that is not decodable text: a LOCAL failure,
+                # not an unavailable provider. It stops the chain rather than
+                # routing around it — silently reviewing somewhere else at some
+                # other default is exactly the unnoticed downgrade `build_cmd`
+                # raises to prevent, and the same bytes would fail the same way
+                # at every other entry anyway.
                 attempts.append(_attempt(
                     n, entry,
                     skipped=f"could not build the invocation: {e!r}"))

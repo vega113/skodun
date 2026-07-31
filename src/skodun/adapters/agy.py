@@ -18,11 +18,17 @@ global rule rather than a detail:
   must decode as UTF-8 (a `str` is what argv needs), it must carry no embedded
   NUL (`subprocess.Popen` rejects one anywhere in argv), and it must fit under
   the kernel's per-argument cap. All three are guarded in `build_cmd`, in that
-  order, and all three fail the SAME way: a loud `ValueError`, which
-  `pipeline._run_chain` already turns into "could not build the invocation"
-  and a stopped chain — never a `UnicodeDecodeError` or an unguarded `Popen`
-  `ValueError` escaping as an unexpected exception. The size guard is
-  `MAX_PROMPT_ARG_BYTES` below. (b) is a real, stated cost of this provider
+  order, and all three fail loudly with a `ValueError` rather than a
+  `UnicodeDecodeError` or an unguarded `Popen` `ValueError` escaping as an
+  unexpected exception. The first two STOP the chain (`chain.run_chain`:
+  "could not build the invocation") because they are facts about the repo,
+  which no other provider would fix. The THIRD raises `base.PromptTooLarge`
+  and ADVANCES the chain instead: a prompt that does not fit is a statement
+  about this provider's capacity, which is what a fallback chain is for, and
+  an exhausted chain is still a failure. The size guard is
+  `MAX_PROMPT_ARG_BYTES` below, and `prompt_limit()` is the same number
+  declared upward so the planner sizes for it rather than discovering it here.
+  (b) is a real, stated cost of this provider
   regardless of the guards: a reviewer's prompt contains the diff under
   review, and on a shared machine `ps` will show it for the life of the
   attempt. Providers whose CLI accepts a file (grok) or stdin (codex) do not
@@ -97,6 +103,7 @@ from .base import (
     ClassifyResult,
     OutputContract,
     ParseResult,
+    PromptTooLarge,
     _ask,
     _DECODE_FAILURES,
     _first_eligible_object,
@@ -112,12 +119,20 @@ from .base import (
 #: on CI is worse than one that refuses the same prompt on both. The slack
 #: leaves room for the flags and the inline schema that share the vector.
 #:
-#: `config.Defaults.max_diff_bytes` is 400_000, so a large diff CAN exceed this.
-#: That is a real limitation of this provider and it fails closed: `build_cmd`
-#: raises, `pipeline._run_chain` records "could not build the invocation" and
-#: stops the chain. The alternative is an `OSError` out of `subprocess`, which
-#: reaches the gate as an unexpected exception instead of as a reviewer that
-#: could not be invoked.
+#: `config.Defaults.max_diff_bytes` is 400_000, so a large diff COULD exceed
+#: this -- but the planner no longer lets it: `budget.prompt_budget` reads this
+#: number through `prompt_limit()` and sizes every prompt and batch for the
+#: reviewer that will actually run, so a chain headed by this adapter is
+#: budgeted to what it can carry rather than to the global envelope.
+#:
+#: The guard in `build_cmd` remains, because sizing is an estimate and a chain
+#: can span providers: a prompt sized for a file-fed head may still reach an
+#: argv-bound fallback. It fails closed, and it now fails SIDEWAYS first --
+#: `PromptTooLarge` classifies `unavailable` and `chain.run_chain` advances to
+#: the next entry, and only an exhausted chain is a failure. The alternative it
+#: has always prevented is an `OSError` out of `subprocess`, which reaches the
+#: gate as an unexpected exception instead of as a reviewer that could not
+#: serve.
 MAX_PROMPT_ARG_BYTES = 128 * 1024 - 8 * 1024
 
 # The `status` value that means "the run reached its end normally". An
@@ -303,6 +318,15 @@ class AgyAdapter:
         the table cannot mutate this adapter's behaviour."""
         return dict(_EFFORT_MAP)
 
+    def prompt_limit(self) -> int | None:
+        """This CLI's argv ceiling — the SAME constant `build_cmd` enforces.
+
+        Returned rather than re-spelled: a planner sizing batches against a
+        number that has drifted from the guard's is a planner cutting batches
+        this adapter will refuse (or, worse, needlessly small ones).
+        """
+        return MAX_PROMPT_ARG_BYTES
+
     def build_cmd(self, prompt_file: Path, r: Reviewer, d: Defaults,
                   cwd: Path,
                   contract: OutputContract = REVIEW_CONTRACT) -> list[str]:
@@ -406,12 +430,22 @@ class AgyAdapter:
             # BYTES, not characters: the kernel's per-argument cap counts
             # bytes, so a multibyte prompt that looks short in characters can
             # still be refused by `execve`.
-            raise ValueError(
+            #
+            # `PromptTooLarge`, not a bare `ValueError`, and the difference is
+            # the whole point: this is a statement about THIS PROVIDER's
+            # capacity, so `chain.run_chain` classifies it `unavailable` and
+            # advances to the next entry -- an `agy`-headed chain with a
+            # `codex` fallback reviews the change instead of dying on it. The
+            # refusals ABOVE (an undecodable prompt, an embedded NUL) stay bare
+            # `ValueError`s and stay fatal: those are facts about the repo, and
+            # reviewing the same bytes elsewhere would hide them.
+            raise PromptTooLarge(
                 f"adapter {self.name!r}: prompt is too large to pass on the "
                 f"command line ({size} bytes > {MAX_PROMPT_ARG_BYTES}); this "
                 f"CLI has no prompt-file flag and ignores stdin, so lower "
                 f"`max_diff_bytes` or review this change with another "
-                f"provider")
+                f"provider",
+                size=size, limit=MAX_PROMPT_ARG_BYTES)
 
         cmd = [
             resolve_agy_bin(),

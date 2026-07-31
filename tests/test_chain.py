@@ -134,3 +134,200 @@ def test_a_token_set_between_chain_entries_stops_the_chain(tmp_path, monkeypatch
             chain.run_chain(head, cfg, cfg.defaults, b"p", tmp_path, store,
                             tmp_path, "t", cancel=token)
     assert len(calls) == 1, "the chain advanced past a cancellation"
+
+
+# --------------------------------------------------------------------------
+# a prompt over an adapter's ceiling: `unavailable`, and the chain ADVANCES
+# --------------------------------------------------------------------------
+#
+# A fallback chain exists precisely for "this reviewer cannot do it", and a
+# prompt that does not fit is that case. It used to be FATAL -- `build_cmd`
+# raised, `run_chain` returned, and an `agy`-headed chain with a `codex`
+# fallback died on a large change the fallback could have reviewed.
+#
+# Fail-closed is unchanged and is what these tests pin alongside it: an
+# exhausted chain is still a failure, the reason still names the size and the
+# ceiling, and the OTHER `build_cmd` failures -- an effort the CLI cannot
+# express, an unwritable sidecar -- stay fatal, because those are config errors
+# rather than "this provider cannot take this prompt".
+
+GROK_CLEAN = (b'{"structuredOutput": {"summary": "s", "findings": []},'
+              b' "stopReason": "EndTurn"}')
+
+
+def _too_large_for_agy() -> bytes:
+    from skodun.adapters.agy import MAX_PROMPT_ARG_BYTES
+    return b"x" * (MAX_PROMPT_ARG_BYTES + 1)
+
+
+def _answering(monkeypatch, calls: list):
+    """Patch the watchdog with a fake that answers every spawn cleanly."""
+    from skodun import runner
+
+    def fake(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        calls.append(cmd[0])
+        out.write_bytes(GROK_CLEAN)
+        return runner.RunResult(rc=0, timed_out=False, duration_sec=0.1,
+                                first_output_sec=0.05)
+
+    monkeypatch.setattr(chain.runner, "run_with_watchdog", fake)
+
+
+def _pin_bins(monkeypatch):
+    monkeypatch.setenv("SKODUN_GROK_BIN", "/bin/sh")
+    monkeypatch.setenv("SKODUN_AGY_BIN", "/bin/sh")
+
+
+def test_a_prompt_over_the_ceiling_advances_to_the_fallback(tmp_path, monkeypatch):
+    """THE defect: the head cannot carry this prompt, so the fallback reviews it.
+
+    `agy` has no prompt-file flag and ignores stdin, so its prompt must fit one
+    argv word. That is a statement about this provider, not about the change --
+    exactly what `unavailable` means -- and the entry beside it can answer.
+    """
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.store import Store
+
+    _pin_bins(monkeypatch)
+    calls: list[str] = []
+    _answering(monkeypatch, calls)
+    head = Reviewer(name="f", provider="google", model="m", role="finder",
+                    fallbacks=("backup",))
+    backup = Reviewer(name="backup", provider="xai", model="m2", role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(head, backup))
+    store = Store.open(tmp_path / "s.db")
+    with store:
+        out = chain.run_chain(head, cfg, cfg.defaults, _too_large_for_agy(),
+                              tmp_path, store, tmp_path, "t")
+
+    assert out.parsed is not None and out.parsed.parse_ok is True
+    assert out.accepted["provider"] == "xai"
+    assert len(calls) == 1, "the head must not have spawned anything"
+    head_row, backup_row = out.attempts
+    assert head_row["provider"] == "google"
+    assert head_row["classification"]["kind"] == "unavailable"
+    # NOT `quota`: that is the one category cached provider-wide, and caching
+    # this would take a healthy provider out of every later chain in the run
+    # over a fact about ONE prompt.
+    assert head_row["classification"]["category"] != "quota"
+    assert head_row["rc"] is None and head_row["timed_out"] is None
+    assert "too large" in head_row["skipped"]
+
+
+def test_the_declined_entry_names_the_size_and_the_ceiling(tmp_path, monkeypatch):
+    """A reason that says only "unavailable" sends the operator nowhere.
+
+    Both numbers, on the row and in the exhausted chain's failure reason: the
+    fix is either a smaller envelope or a different provider, and neither is
+    choosable without knowing by how much.
+    """
+    from skodun.adapters.agy import MAX_PROMPT_ARG_BYTES
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.store import Store
+
+    _pin_bins(monkeypatch)
+    calls: list[str] = []
+    _answering(monkeypatch, calls)
+    prompt = _too_large_for_agy()
+    only = Reviewer(name="f", provider="google", model="m", role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(only,))
+    store = Store.open(tmp_path / "s.db")
+    with store:
+        out = chain.run_chain(only, cfg, cfg.defaults, prompt, tmp_path, store,
+                              tmp_path, "t")
+
+    # FAIL-CLOSED: an exhausted chain is still a failure, never a pass.
+    assert out.parsed is None and out.accepted is None
+    assert calls == []
+    assert "all providers unavailable" in out.failure_reason
+    for number in (str(len(prompt)), str(MAX_PROMPT_ARG_BYTES)):
+        assert number in out.failure_reason, out.failure_reason
+        assert number in out.attempts[0]["skipped"]
+
+
+def test_an_effort_the_cli_cannot_express_is_still_FATAL(tmp_path, monkeypatch):
+    """The distinction that keeps the new path from swallowing config errors.
+
+    An unmappable effort is not "this provider cannot take this prompt" -- it
+    is a typo in the user's own config, and routing around it would review at
+    some other provider's default effort and say nothing. It must still stop
+    the chain, with the fallback untouched.
+    """
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.store import Store
+
+    _pin_bins(monkeypatch)
+    calls: list[str] = []
+    _answering(monkeypatch, calls)
+    # `agy` has no `--effort max`: `build_cmd` raises a plain ValueError.
+    head = Reviewer(name="f", provider="google", model="m", role="finder",
+                    effort="max", fallbacks=("backup",))
+    backup = Reviewer(name="backup", provider="xai", model="m2", role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(head, backup))
+    store = Store.open(tmp_path / "s.db")
+    with store:
+        out = chain.run_chain(head, cfg, cfg.defaults, b"small", tmp_path,
+                              store, tmp_path, "t")
+
+    assert out.parsed is None
+    assert calls == [], "nothing may spawn"
+    assert len(out.attempts) == 1, "the chain advanced past a config error"
+    assert "could not be invoked" in out.failure_reason
+    assert out.attempts[0]["classification"] is None
+
+
+def test_a_non_utf8_prompt_is_still_FATAL(tmp_path, monkeypatch):
+    """The other `agy` `build_cmd` refusal, and the same rule.
+
+    A prompt that is not decodable text is a statement about the REPO (a
+    latin-1 source file), not about a provider's capacity, and `agy` refuses it
+    rather than review a lossy re-decode. Hopping providers on it would review
+    the same bytes somewhere else and hide the problem.
+    """
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.store import Store
+
+    _pin_bins(monkeypatch)
+    calls: list[str] = []
+    _answering(monkeypatch, calls)
+    head = Reviewer(name="f", provider="google", model="m", role="finder",
+                    fallbacks=("backup",))
+    backup = Reviewer(name="backup", provider="xai", model="m2", role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(head, backup))
+    store = Store.open(tmp_path / "s.db")
+    with store:
+        out = chain.run_chain(head, cfg, cfg.defaults, b"\xff\xfe not utf-8",
+                              tmp_path, store, tmp_path, "t")
+
+    assert out.parsed is None and calls == []
+    assert len(out.attempts) == 1
+    assert "could not be invoked" in out.failure_reason
+
+
+def test_a_too_large_prompt_is_never_cached_against_the_provider(tmp_path,
+                                                                 monkeypatch):
+    """One oversized prompt must not black-hole a provider for the TTL.
+
+    `quota` is the only provider-wide-cacheable category precisely because it
+    is the only one that is a property of the provider rather than of this
+    attempt. A size refusal is a property of THIS PROMPT, and the same provider
+    will happily take the next, smaller one.
+    """
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.store import Store
+
+    _pin_bins(monkeypatch)
+    calls: list[str] = []
+    _answering(monkeypatch, calls)
+    only = Reviewer(name="f", provider="google", model="m", role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(only,))
+    store = Store.open(tmp_path / "s.db")
+    with store:
+        chain.run_chain(only, cfg, cfg.defaults, _too_large_for_agy(),
+                        tmp_path, store, tmp_path, "t")
+        # A second, small prompt against the SAME provider must run.
+        out = chain.run_chain(only, cfg, cfg.defaults, b"small", tmp_path,
+                              store, tmp_path, "t2")
+
+    assert out.parsed is not None and out.parsed.parse_ok is True
+    assert len(calls) == 1

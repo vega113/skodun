@@ -123,10 +123,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from . import contextpack, promptbuild
+from . import budget, contextpack, promptbuild
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from .config import Config, Defaults, Dispatch
+    from .config import Config, Defaults, Dispatch, Reviewer
     from .gitio import Base, Diff
     from .store import Store
 
@@ -260,7 +260,8 @@ def evidence_permits_suppression(artifact: object,
 
 
 def build_dedup_evidence(store: "Store", repo: Path, diff: "Diff", oid: str,
-                         d: "Defaults", dedup_enabled: bool) -> DedupEvidence:
+                         d: "Defaults", dedup_enabled: bool,
+                         finder: "Reviewer | None" = None) -> DedupEvidence:
     """Pack the pushed commit's context once and report its identity.
 
     `store` is accepted and deliberately unused. The authoritative match query
@@ -279,11 +280,18 @@ def build_dedup_evidence(store: "Store", repo: Path, diff: "Diff", oid: str,
     would certify content nobody pushed.
 
     The settings are the ones a review of this commit would use — the shipped
-    single-shot pipeline's, `pipeline.py:1146-1158`: the prompt's own leftover
+    single-shot pipeline's, `pipeline._single_shot`: the prompt's own leftover
     headroom, and `pack_large_added=False` because the pushed diff already
     carries every added file whole. A different headroom or a different
     large-added rule is a different identity for the same commit, so getting
     this wrong would not fail loudly, it would silently stop ever matching.
+
+    `finder` is that review's HEAD reviewer, and it is part of those settings
+    now that the envelope is per-provider (`budget.prompt_budget`): the worker
+    packs against ITS finder's envelope, so a candidate hash computed from the
+    global would never match again for any reviewer whose envelope differs from
+    it. `None` means "no finder in hand" and answers the global, which is what
+    the pre-change behaviour was.
 
     `d.context_pack` off is a REVIEW SETTING, not a failure: such a review
     records no context hash, so the candidate has none either (`valid=True`,
@@ -312,8 +320,8 @@ def build_dedup_evidence(store: "Store", repo: Path, diff: "Diff", oid: str,
         if not d.context_pack:
             return DedupEvidence(enabled=True, valid=True,
                                  candidate_context_hash=None)
-        headroom = promptbuild.context_headroom(d.max_diff_bytes, len(diff.data),
-                                                packing=True)
+        headroom = promptbuild.context_headroom(
+            budget.prompt_budget(d, finder), len(diff.data), packing=True)
         pack = contextpack.pack(Path(repo), list(diff.files), dict(diff.statuses),
                                 headroom, source="oid", oid=oid,
                                 pack_large_added=False)
@@ -590,12 +598,15 @@ def reserved_budget(cfg: "Config", diff_bytes: bytes) -> int:
     (`pipeline.batch_plan`), because a multi-batch review makes `batch_count + 1`
     sequential reviewer runs and a ceiling sized for one would invite
     `recover_stale` to reclaim a live worker halfway through batch three. The
-    planner only reads `max_diff_bytes`/`context_pack`, which the reservation and
-    effective defaults share, so both agree on the count.
+    planner reads `context_pack` and `budget.prompt_budget` of the FINDER, which
+    the reservation and effective defaults share, so both agree on the count —
+    the finder is passed here for exactly that reason: sizing the reservation
+    from the global while the worker plans from the finder's own envelope would
+    put the two counts out of step on every argv-bound provider.
     """
-    from . import budget, pipeline
+    from . import pipeline
     d = reservation_defaults(cfg.defaults, cfg.dispatch)
-    plan = pipeline.batch_plan(diff_bytes, d)
+    plan = pipeline.batch_plan(diff_bytes, d, pipeline._reviewer_for(cfg, "finder"))
     return budget.worst_runtime(d, pipeline.max_chain_width(cfg),
                                 0 if plan is None else len(plan))
 
@@ -979,7 +990,7 @@ def _dispatch_ref(store: "Store", store_path: Path, repo: Path, cfg,
                   ref: Ref, where: str) -> None:
     """Reserve and dispatch ONE actionable ref. Raises on a failure it cannot
     record itself; `run_dispatch` turns that into a durable `failed` record."""
-    from . import gitio
+    from . import gitio, pipeline
     base = resolve_dispatch_base(repo, ref)
     diff = gitio.capture_ref_diff(repo, base.sha, ref.local_oid)
     if diff.data.rstrip(b"\n") == b"":
@@ -995,7 +1006,8 @@ def _dispatch_ref(store: "Store", store_path: Path, repo: Path, cfg,
     # reservation lease owns the match query, because a racing dispatcher can
     # finalize a trustworthy review between this call and the lease.
     evidence = build_dedup_evidence(store, repo, diff, ref.local_oid,
-                                    cfg.defaults, cfg.dispatch.dedup)
+                                    cfg.defaults, cfg.dispatch.dedup,
+                                    pipeline._reviewer_for(cfg, "finder"))
     reservation = store.reserve_prepush(
         ref.branch, ref.local_oid, base.ref, base.sha, diff_hash,
         reserved_budget(cfg, diff.data), evidence)
