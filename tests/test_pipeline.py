@@ -589,8 +589,10 @@ def test_recover_stale_fails_old_running_records_and_leaves_fresh_ones(tmp_path)
 
 
 def test_recover_stale_scans_past_the_newest_reviews(tmp_path):
-    """The sweep orders by `reviewed_at DESC`, so the records it exists to
-    clean are the LAST ones it sees; a bounded scan would never reach them."""
+    """The sweep is unbounded and unordered: `running_records` has no LIMIT
+    and no ORDER BY, so every `running` row is judged whatever else is stored
+    beside it. A newer-first, capped scan would never reach the old records
+    the sweep exists to clean."""
     repo = _repo(tmp_path, "\n[defaults]\ntimeout_sec = 1\n"
                            "timeout_retries = 0\ndegraded_retries = 0\n")
     st = _store(tmp_path)
@@ -615,6 +617,33 @@ def test_recover_stale_ignores_finished_records_and_bad_timestamps(tmp_path):
     assert pipeline.recover_stale(st, load_config(repo)) == 0
     assert st.get_review("done")["status"] == "clean"
     assert st.get_review("junkts")["status"] == "running"
+
+
+def test_recover_stale_decodes_no_artifacts(tmp_path):
+    """The sweep runs on the synchronous `git push` path and used to decode
+    EVERY stored artifact to read a status that is an indexed column. The
+    unparseable artifact is the proof: `list_reviews` would raise on it before
+    the loop body ever ran.
+
+    The corrupt row is deliberately FRESH, so the sweep reaches its age check
+    and stops -- `fail_if_running` writes through `json_set`, which would
+    itself refuse malformed JSON, and this test is about the read path.
+    """
+    repo = _repo(tmp_path, "\n[defaults]\ntimeout_sec = 1\n"
+                           "timeout_retries = 0\ndegraded_retries = 0\n")
+    cfg = load_config(repo)
+    st = _store(tmp_path)
+    _running(st, "sk_corrupt", 1)
+    _running(st, "sk_old", 600)
+    st._c.execute("UPDATE reviews SET artifact_json='{not json' "
+                  "WHERE id='sk_corrupt'")
+
+    assert pipeline.recover_stale(st, cfg) == 1
+
+    assert st.get_review("sk_old")["status"] == "failed"
+    assert st._c.execute(
+        "SELECT status FROM reviews WHERE id='sk_corrupt'"
+    ).fetchone()["status"] == "running"
 
 
 def test_run_review_sweeps_stale_records_before_reviewing(tmp_path, capsys):

@@ -238,6 +238,23 @@ def test_list_reviews_scopes_by_repo_only_when_a_branch_is_given(tmp_path):
         assert st.list_reviews("main", 30, "/repos/nowhere") == []
 
 
+def test_running_records_returns_the_indexed_columns_and_only_running_rows(
+        tmp_path):
+    with Store.open(tmp_path / "s.db") as st:
+        st.save_review(dict(REC, id="done", status="clean"))
+        res = _reserve(st, branch="main", repo="/repos/a")
+        st.save_review(dict(REC, id="legacy", status="running", parse_ok=False,
+                            trustworthy=False))
+
+        rows = st.running_records()
+
+        assert sorted(r["id"] for r in rows) == ["legacy", res.record_id]
+        assert set(rows[0]) == {"id", "reviewed_at", "worst_runtime_sec"}
+        by_id = {r["id"]: r for r in rows}
+        assert by_id[res.record_id]["worst_runtime_sec"] == 1234
+        assert by_id["legacy"]["worst_runtime_sec"] is None
+
+
 def test_triage_roundtrip_scoped_by_branch_and_base(tmp_path):
     st = Store.open(tmp_path / "s.db")
     base = dict(review_id="r1", file="a.py", line=7, severity="high",
