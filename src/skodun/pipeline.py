@@ -198,13 +198,6 @@ LOCK_BUDGET_MAX_SEC = 365 * 24 * 3600
 STALE_RECORD_GRACE_SEC = budget.GRACE_SEC
 _MAX_PASSES_UNDER_LOCK = budget.MAX_PASSES_UNDER_LOCK
 
-#: `Store.list_reviews` passes this straight to SQLite's `LIMIT`, where a
-#: negative value means "no upper bound". `recover_stale` must see EVERY row:
-#: the query orders by `reviewed_at DESC`, so the stale records it exists to
-#: clean are the last ones it would reach, and any finite cap would skip
-#: exactly them on a busy store.
-_SCAN_ALL = -1
-
 #: The `failure_reason` a swept `running` record carries. Task 12 renders it, so
 #: it is a constant here rather than a literal at the call site.
 STALE_RECOVERY_REASON = "stale recovery: worker exceeded its runtime budget"
@@ -411,13 +404,16 @@ def recover_stale(store: Store, cfg: Config) -> int:
     evidence this function has, and it will not act on evidence it does not
     have. Best-effort per record — one unwritable row must not stop the sweep,
     and must certainly not stop the review that follows.
+
+    Reads `running_records`, not `list_reviews`: everything below is an index
+    row column, so filtering `running` out of DECODED artifacts made every
+    push pay for every review ever stored — on the synchronous `git push`
+    path. Unbounded and unordered on purpose; see that method.
     """
     computed = worst_runtime_sec(cfg.defaults, max_chain_width(cfg))
     now = time.time()
     swept = 0
-    for rec in store.list_reviews(None, _SCAN_ALL):
-        if not isinstance(rec, dict) or rec.get("status") != "running":
-            continue
+    for rec in store.running_records():
         rid = rec.get("id")
         started = _epoch(rec.get("reviewed_at"))
         if not isinstance(rid, str) or started is None:

@@ -1394,3 +1394,27 @@ class Store:
         q += " ORDER BY reviewed_at DESC LIMIT ?"
         rows = self._c.execute(q, args + (limit,)).fetchall()
         return [json.loads(r["artifact_json"]) for r in rows]
+
+    def running_records(self) -> list[dict]:
+        """Every `running` row, as the INDEXED columns the stale sweep reads.
+
+        `list_reviews` decodes `artifact_json` for every row it returns, and
+        `recover_stale` called it with no branch on every push -- so the sweep
+        decoded every artifact ever stored to read a status that is an indexed
+        column, on the synchronous `git push` path. This reads three columns
+        and decodes nothing.
+
+        UNORDERED, unlike `list_reviews`: the sweep judges every row it is
+        given, independently, and never stops early, so `ORDER BY reviewed_at
+        DESC` bought it nothing. The ordering exists for the DISPLAY callers
+        and stays on `list_reviews` for them.
+
+        Deliberately UNSCOPED by repository: a stale row is stale whichever
+        repository recorded it, and scoping the sweep would strand the pre-v5
+        rows that `repo IS NULL` already hides from every scoped query.
+        """
+        rows = self._c.execute(
+            "SELECT id, reviewed_at, worst_runtime_sec FROM reviews"
+            " WHERE status=?", (RUNNING,)).fetchall()
+        return [{"id": r["id"], "reviewed_at": r["reviewed_at"],
+                 "worst_runtime_sec": r["worst_runtime_sec"]} for r in rows]
