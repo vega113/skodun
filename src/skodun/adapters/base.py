@@ -79,6 +79,45 @@ _SEVERITIES = frozenset({"high", "medium", "low"})
 REFUTER_VERDICTS = frozenset({"confirmed", "refuted", "uncertain"})
 
 
+#: The `ClassifyResult.category` a prompt-size refusal carries.
+#:
+#: A category of its own rather than `other`, and deliberately NOT `quota`:
+#: `quota` is the one category cached PROVIDER-WIDE (`chain._remember_
+#: unavailable`), and this is a fact about ONE PROMPT. The same provider will
+#: take the next, smaller one, so remembering it would black-hole a healthy
+#: provider for the whole TTL over a single oversized change.
+PROMPT_TOO_LARGE_CATEGORY = "prompt_size"
+
+
+class PromptTooLarge(ValueError):
+    """`build_cmd`'s refusal of a prompt this CLI cannot physically carry.
+
+    A DISTINCT type because `chain.run_chain` has to tell it apart from every
+    other `build_cmd` failure, and the two get opposite treatment:
+
+    * An effort the CLI cannot express, an unwritable schema sidecar, a prompt
+      that is not decodable text — CONFIG or REPO errors. They stop the chain.
+      Routing around one would review somewhere else at some other default and
+      say nothing, which is the unnoticed downgrade `build_cmd` raises to
+      prevent.
+    * A prompt over this CLI's ceiling — a statement about THIS PROVIDER's
+      capacity, which is exactly what `unavailable` means and exactly what a
+      fallback chain is for. It classifies `unavailable` and the chain advances.
+
+    Still fail-closed: an exhausted chain is a failure with `parsed=None`, and
+    `size`/`limit` are carried as fields as well as spelled in the message so a
+    caller can report both without parsing prose.
+
+    A `ValueError` subclass so that every existing caller and test that expects
+    `build_cmd` to raise `ValueError` keeps working unchanged.
+    """
+
+    def __init__(self, message: str, *, size: int, limit: int) -> None:
+        super().__init__(message)
+        self.size = size
+        self.limit = limit
+
+
 @dataclass(frozen=True)
 class ClassifyResult:
     """How the *run* went, independent of whether its output parsed.
@@ -403,5 +442,28 @@ class Adapter(Protocol):
         `build_cmd`, never a silently dropped flag: quietly reviewing at the
         CLI's default effort is exactly the kind of unnoticed downgrade the
         explicit-model rule exists to prevent.
+        """
+        ...
+
+    def prompt_limit(self) -> int | None:
+        """The largest prompt this CLI can be handed, in bytes, or None.
+
+        `None` means "this adapter imposes no ceiling of its own" and is the
+        answer for every CLI that takes the prompt as a FILE (grok's
+        `--prompt-file`, codex's stdin): the file is as large as the filesystem
+        allows and nothing in the invocation grows with it.
+
+        A number is the answer for a CLI that carries the prompt inside its
+        ARGV, where the kernel's per-argument cap applies. It is the same
+        number `build_cmd` enforces, not a second copy of it — the adapter
+        returns its own constant.
+
+        The planner (`budget.prompt_budget`) reads this BEFORE anything is
+        invoked, which is the whole point: without it the only place that knows
+        a provider cannot take this prompt is `build_cmd`, and by then the
+        batches have already been cut to a size that provider will refuse.
+        This is an upper bound on the WHOLE prompt, so a caller fitting an
+        envelope inside it must leave room for the prompt's own boilerplate;
+        `budget.PROMPT_OVERHEAD_BYTES` is that reservation.
         """
         ...

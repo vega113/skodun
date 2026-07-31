@@ -15,6 +15,7 @@ silently reviewing with the wrong model is worse than not reviewing at all.
 from __future__ import annotations
 
 from .base import (
+    PROMPT_TOO_LARGE_CATEGORY,
     REFUTER_CONTRACT,
     REFUTER_VERDICTS,
     REVIEW_CONTRACT,
@@ -23,6 +24,7 @@ from .base import (
     ClassifyResult,
     OutputContract,
     ParseResult,
+    PromptTooLarge,
 )
 from .agy import _STATUS_OK as _AGY_NORMAL_STOP
 from .agy import AgyAdapter
@@ -39,7 +41,9 @@ __all__ = [
     "GrokAdapter",
     "NORMAL_STOP_REASONS",
     "OutputContract",
+    "PROMPT_TOO_LARGE_CATEGORY",
     "ParseResult",
+    "PromptTooLarge",
     "REFUTER_CONTRACT",
     "REFUTER_VERDICTS",
     "REVIEW_CONTRACT",

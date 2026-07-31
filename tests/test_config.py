@@ -966,6 +966,100 @@ max_cost_usd = {literal}
     assert "max_cost_usd" in str(e.value), why
 
 
+# --------------------------------------------------------------------------
+# per-reviewer max_diff_bytes — the envelope override
+# --------------------------------------------------------------------------
+#
+# `[defaults] max_diff_bytes` is one global envelope, so it has to be fitted to
+# the LEAST capable provider in the config: this repo's own `.skodun.toml` had
+# to drop it to 100000 so `agy` could take the prompt, which needlessly shrank
+# the review for `codex` and `grok`, whose prompts travel as files. The override
+# lets one entry be budgeted differently without moving the global. Unset means
+# "use the global" — the shipped behaviour, unchanged.
+
+def test_reviewer_max_diff_bytes_defaults_to_none_meaning_use_the_global(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+""")
+    assert load_config(None, global_path=p).reviewers[0].max_diff_bytes is None
+
+
+def test_reviewer_max_diff_bytes_is_read_off_the_entry(tmp_path):
+    p = _write(tmp_path / "g.toml", """
+[defaults]
+max_diff_bytes = 100000
+[[reviewers]]
+name = "finder"
+provider = "openai"
+model = "m"
+max_diff_bytes = 400000
+""")
+    cfg = load_config(None, global_path=p)
+    assert cfg.defaults.max_diff_bytes == 100000
+    assert cfg.reviewers[0].max_diff_bytes == 400000
+
+
+@pytest.mark.parametrize("literal, shown, why", [
+    ("0", "must be >= 1", "zero diff bytes is a review that cannot happen"),
+    ("-1", "must be >= 1", "a negative envelope is a typo"),
+    ('"big"', "expected an integer, got str", "a quoted number is a string"),
+    ("true", "expected an integer, got bool",
+     "bool subclasses int, so `true` would otherwise load as a 1-byte envelope"),
+    ("1.5", "expected an integer, got float", "bytes do not come in halves"),
+])
+def test_reviewer_max_diff_bytes_is_validated_exactly_like_the_global(
+        tmp_path, literal, shown, why):
+    """The same rules as `[defaults] max_diff_bytes`, naming the REVIEWER.
+
+    A config may hold several entries, and the value's provenance is lost the
+    moment it reaches the planner — so the message has to say which entry.
+    """
+    p = _write(tmp_path / "g.toml", f"""
+[[reviewers]]
+name = "sec"
+provider = "xai"
+model = "m"
+max_diff_bytes = {literal}
+""")
+    with pytest.raises(ValueError,
+                       match=rf"reviewer 'sec': max_diff_bytes: {shown}") as e:
+        load_config(None, global_path=p)
+    assert "max_diff_bytes" in str(e.value), why
+
+
+def test_reviewer_max_diff_bytes_accepts_its_minimum(tmp_path):
+    """One byte is a coherent (if useless) envelope; zero is not."""
+    p = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+max_diff_bytes = 1
+""")
+    assert load_config(None, global_path=p).reviewers[0].max_diff_bytes == 1
+
+
+def test_reviewer_max_diff_bytes_merges_per_key_across_layers(tmp_path):
+    """The project layer may set it where the global did not, and vice versa."""
+    g = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "m"
+max_diff_bytes = 200000
+""")
+    repo = tmp_path / "repo"; repo.mkdir()
+    _write(repo / ".skodun.toml", """
+[[reviewers]]
+name = "finder"
+max_diff_bytes = 50000
+""")
+    assert load_config(repo, global_path=g).reviewers[0].max_diff_bytes == 50000
+
+
 # ---------------------------------------------------------------------------
 # `[dispatch]`: the background dispatcher's own table
 # ---------------------------------------------------------------------------

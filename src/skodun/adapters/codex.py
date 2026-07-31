@@ -298,6 +298,15 @@ class CodexAdapter:
         caller inspecting the table cannot mutate this adapter's behaviour."""
         return dict(_EFFORT_MAP)
 
+    def prompt_limit(self) -> int | None:
+        """No ceiling: the prompt is fed in on STDIN, never as an argv element.
+
+        `stdin_from_prompt_file` is the same fact stated for the runner; this
+        states it for the planner. Declaring a number here would shrink every
+        batch this provider reviews to fit a limit it does not have.
+        """
+        return None
+
     def build_cmd(self, prompt_file: Path, r: Reviewer, d: Defaults,
                   cwd: Path,
                   contract: OutputContract = REVIEW_CONTRACT) -> list[str]:

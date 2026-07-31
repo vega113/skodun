@@ -112,6 +112,16 @@ def test_prompt_travels_on_stdin():
     assert CodexAdapter.stdin_from_prompt_file is True
 
 
+def test_no_prompt_ceiling_because_the_prompt_never_enters_the_argv():
+    """A stdin-fed prompt has no argv-element cap, so the planner gets None.
+
+    Answering with a number instead would shrink every batch this provider
+    reviews to fit a limit it does not have — the global-envelope-fitted-to-
+    the-smallest-provider problem, moved one layer down.
+    """
+    assert CodexAdapter().prompt_limit() is None
+
+
 # --------------------------------------------------------------------------
 # the strict-mode schema projection
 # --------------------------------------------------------------------------

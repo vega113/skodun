@@ -1150,6 +1150,42 @@ class AdapterConformance:
                 f"{fx.name}: stdout must carry a usable payload for this rule "
                 f"to mean anything")
 
+    # ---- rule 8: the prompt ceiling is declared, not discovered ------------
+
+    def test_prompt_limit_is_declared(self):
+        """Every adapter answers "how large a prompt can you take?".
+
+        The planner sizes batches BEFORE anything is invoked, so a ceiling that
+        only `build_cmd` knows about is a ceiling discovered at the moment it
+        is too late to do anything but fail. An adapter whose CLI takes the
+        prompt as a file has no such ceiling and says so with `None`; one whose
+        CLI takes it in the argv returns the byte limit it enforces.
+
+        `None` is the only permitted non-integer, and a declared limit must be
+        a real capacity: zero would mean "no prompt is ever small enough",
+        which is a broken adapter rather than a tight one, and `bool`
+        subclasses `int` so `True` would otherwise read as a one-byte ceiling.
+        """
+        a = self.adapter()
+        assert hasattr(a, "prompt_limit"), (
+            f"adapter {a.name!r} does not implement `prompt_limit()`; every "
+            f"registered adapter must declare its prompt ceiling or None")
+        limit = a.prompt_limit()
+        if limit is None:
+            return
+        assert not isinstance(limit, bool) and isinstance(limit, int), (
+            f"adapter {a.name!r}: prompt_limit() returned {limit!r}; it must "
+            f"be an int or None")
+        assert limit >= 1, (
+            f"adapter {a.name!r}: prompt_limit() is {limit}, which no prompt "
+            f"can ever satisfy")
+        # Stable: the planner calls this once and invokes later, so a limit
+        # that moves between the two sizes a batch against a ceiling that no
+        # longer applies.
+        assert self.adapter().prompt_limit() == limit, (
+            f"adapter {a.name!r}: prompt_limit() is not stable across "
+            f"instances")
+
 
 def _invalidate_payload(stdout: bytes) -> bytes:
     """Break the review payload in-place, leaving the envelope well-formed.

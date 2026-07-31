@@ -1068,6 +1068,16 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     # --- 2. sweep the wreckage of any SIGKILLed predecessor ---------------
     recover_stale(store, cfg)
 
+    # --- 2b. THE envelope this review's finder may fill --------------------
+    # Resolved once, here, and it is the only one any of the sizing below reads
+    # — the batch plan, the context headroom, the prompt build, and the notes
+    # that quote a number at the operator. `budget.prompt_budget` is where "the
+    # global, or this entry's own override, capped by what its CLI can
+    # physically take" is decided; nothing downstream re-derives it from
+    # `d.max_diff_bytes`. The extra passes get their own, from the same helper,
+    # because they may run on a different reviewer entirely.
+    mdb = budget.prompt_budget(d, finder)
+
     # --- 3. the foreground lock -------------------------------------------
     # `lock_stale_ceiling`, NOT `worst_runtime`: the extra passes run inside this
     # lock with their own retry budgets, so a live holder can legitimately
@@ -1084,7 +1094,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     # review persists comes from the authoritative capture under the lock, and
     # the ceiling is re-derived there from the LARGER of the two plans.
     width = max_chain_width(cfg)
-    estimate = _estimate_batch_count(repo, d)
+    estimate = _estimate_batch_count(repo, d, finder)
     ceiling = float(budget.lock_stale_ceiling(d, width, estimate))
     stale = lock_stale if lock_stale is not None else _env_seconds(
         "SKODUN_LOCK_STALE_SECONDS", ceiling)
@@ -1143,7 +1153,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         # batches the lock's published budget is raised to match. It is never
         # lowered: the only thing riding on that number is a peer not reclaiming
         # a lock whose holder is still running.
-        plan = batch_plan(diff.data, d)
+        plan = batch_plan(diff.data, d, finder)
         planned = 0 if plan is None else len(plan)
         # Republished UNCONDITIONALLY from the authoritative plan, and
         # `_grow_budget` is what makes that safe: it never lowers the value. Not
@@ -1211,7 +1221,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             # ORACLE's own stderr line for this branch: an oversized diff is
             # reviewed in pieces rather than truncated, and the operator is told
             # how many pieces and whether a cross-file pass follows.
-            _note(f"diff is {len(diff.data)} bytes (> {d.max_diff_bytes}); "
+            _note(f"diff is {len(diff.data)} bytes (> {mdb}); "
                   f"reviewing {len(diff.files)} file(s) in {planned} "
                   f"deterministic batch(es) + "
                   f"{int(passes.should_run_integration(planned))} "
@@ -1313,7 +1323,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 pack_body = None
                 if d.context_pack:
                     headroom = promptbuild.context_headroom(
-                        d.max_diff_bytes, len(diff.data), packing=True)
+                        mdb, len(diff.data), packing=True)
                     # `pack_large_added=False`: this is the SINGLE-SHOT path, so
                     # the diff already carries every added file whole. Packing a
                     # large one again would spend headroom saying the same thing
@@ -1329,12 +1339,12 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
 
                 prompt = promptbuild.build(
                     branch, base.ref, base.sha, f"{head} (working tree)",
-                    diff.data, d.max_diff_bytes, selection, pack_body)
+                    diff.data, mdb, selection, pack_body)
                 if prompt.diff_truncated:
                     # Reachable only for a diff that is over the envelope and
                     # was NOT batched, i.e. one this build refused to split.
                     _note(f"diff is {len(diff.data)} bytes "
-                          f"(> {d.max_diff_bytes}); the prompt is truncated and "
+                          f"(> {mdb}); the prompt is truncated and "
                           f"this review cannot be trustworthy")
 
                 rec = dict(
@@ -1410,12 +1420,19 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
 
             # --- 9. the extra passes, still under the lock ----------------
             if hold_for_security:
+                # Sized for the reviewer that will RUN this pass, which may not
+                # be the finder and may not be on the finder's provider: a
+                # `[reviewers]` entry with role `security` is preferred here
+                # (see `_extra_pass`), and it can be a CLI with a tighter
+                # ceiling. One `prompt_budget` call per pass, per reviewer.
+                sec_reviewer = _pass_reviewer(cfg, "security", finder)
                 rec = _extra_pass(
                     rec, "security",
                     lambda: passes.security_prompt(
                         branch, base.ref, base.sha, f"{head} (working tree)",
-                        diff.data, d.max_diff_bytes, d.security_prompt_slots),
-                    _pass_reviewer(cfg, "security", finder), cfg, d, root,
+                        diff.data, budget.prompt_budget(d, sec_reviewer),
+                        d.security_prompt_slots),
+                    sec_reviewer, cfg, d, root,
                     store, scratch, cancel=cancel)
 
             if passes.should_run_skeptic(
@@ -1423,12 +1440,13 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     is_trustworthy(rec["parse_ok"], rec["degraded"],
                                    rec["diff_truncated"]),
                     rec["findings_total"]):
+                skeptic_reviewer = _pass_reviewer(cfg, "skeptic", finder)
                 rec = _extra_pass(
                     rec, "skeptic",
                     lambda: passes.skeptic_prompt(
                         branch, base.ref, base.sha, f"{head} (working tree)",
-                        diff.data, d.max_diff_bytes),
-                    _pass_reviewer(cfg, "skeptic", finder), cfg, d, root,
+                        diff.data, budget.prompt_budget(d, skeptic_reviewer)),
+                    skeptic_reviewer, cfg, d, root,
                     store, scratch, cancel=cancel)
 
             # --- 10. the refuter: a DIFFERENT provider re-examines the
@@ -1440,12 +1458,14 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             run_refuter, skip_note = passes.refuter_decision(
                 mode, finder_trustworthy, finder_findings_total, cfg)
             if run_refuter:
+                ref_reviewer = _pass_reviewer(cfg, "refuter", finder)
                 rec = _refuter_pass(
                     rec, finder_findings_total,
                     lambda: passes.refuter_prompt(
                         finder_findings, diff.data, branch, base.ref, base.sha,
-                        f"{head} (working tree)", d.max_diff_bytes),
-                    _pass_reviewer(cfg, "refuter", finder), cfg, d, root,
+                        f"{head} (working tree)",
+                        budget.prompt_budget(d, ref_reviewer)),
+                    ref_reviewer, cfg, d, root,
                     store, scratch, finder_provider, cancel=cancel)
             elif skip_note:
                 # `skip_note` is non-empty for exactly one case: an eligible
@@ -1663,10 +1683,11 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                 trustworthy=False,
                 failure_reason="the pushed ref has no outgoing changes to review")
 
-        plan = batch_plan(diff.data, d)
+        plan = batch_plan(diff.data, d, finder)
         planned = 0 if plan is None else len(plan)
         if plan is not None:
-            _note(f"diff is {len(diff.data)} bytes (> {d.max_diff_bytes}); "
+            _note(f"diff is {len(diff.data)} bytes "
+                  f"(> {budget.prompt_budget(d, finder)}); "
                   f"reviewing {len(diff.files)} file(s) in {planned} "
                   f"deterministic batch(es) + "
                   f"{int(passes.should_run_integration(planned))} "
@@ -1799,11 +1820,17 @@ def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
               f"{checklist.BUDGET}-byte budget after eviction; only undroppable "
               f"sections remain")
 
+    # The finder's OWN envelope, not the global: `dispatch.build_dedup_evidence`
+    # computes its candidate hash from the same call with the same reviewer, and
+    # a different headroom is a different identity for the same commit — nothing
+    # would ever dedup-match again.
+    mdb = budget.prompt_budget(d, finder)
+
     pack = None
     pack_body = None
     if d.context_pack:
         headroom = promptbuild.context_headroom(
-            d.max_diff_bytes, len(diff.data), packing=True)
+            mdb, len(diff.data), packing=True)
         # `pack_large_added=False`: the single-shot diff already carries every
         # added file whole. This is the SAME call `dispatch.build_dedup_evidence`
         # makes for its candidate hash, and it has to stay that way — a different
@@ -1815,9 +1842,9 @@ def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
         pack_body = pack.body
 
     prompt = promptbuild.build(branch, base.ref, base.sha, local_oid, diff.data,
-                              d.max_diff_bytes, selection, pack_body)
+                              mdb, selection, pack_body)
     if prompt.diff_truncated:
-        _note(f"diff is {len(diff.data)} bytes (> {d.max_diff_bytes}); the "
+        _note(f"diff is {len(diff.data)} bytes (> {mdb}); the "
               f"prompt is truncated and this review cannot be trustworthy")
 
     rec = _prepush_record(
@@ -1939,7 +1966,7 @@ def _apply(rec: dict, outcome: _Outcome) -> None:
 #     each — a partial pass must never read as a full all-clear.
 
 
-def _batch_budget(d: Defaults) -> int:
+def _batch_budget(d: Defaults, reviewer: Reviewer | None = None) -> int:
     """The per-batch DIFF budget an over-budget diff is split on.
 
     HALF the envelope when context packing is on, which is the oracle's own
@@ -1950,34 +1977,45 @@ def _batch_budget(d: Defaults) -> int:
     that need context most — each batch shows a slice of the change and the
     packer is the only thing that can show the rest of the file.
 
+    The envelope is `budget.prompt_budget`'s, never `d.max_diff_bytes` read
+    here: batches sized from the global number are batches the provider that
+    will actually run them may be unable to accept, and that mismatch used to
+    surface only at `build_cmd`. `reviewer=None` answers the global, which is
+    what a caller with no reviewer in hand should get.
+
     Clamped to at least 1, exactly as `batching.split` clamps its own budget: a
     computed budget can arrive at zero, and splitting maximally with every unit
     flagged as an irreducible floor says strictly more than refusing to split.
     """
-    envelope = d.max_diff_bytes
+    envelope = budget.prompt_budget(d, reviewer)
     if d.context_pack:
         envelope //= 2
     return max(1, envelope)
 
 
-def batch_plan(diff: bytes, d: Defaults) -> list[batching.Batch] | None:
+def batch_plan(diff: bytes, d: Defaults,
+               reviewer: Reviewer | None = None) -> list[batching.Batch] | None:
     """The batch plan for `diff`, or None when it fits one prompt.
 
     None is "this review is not batched at all", and it is the answer for every
     diff up to and including the envelope — the shipped single-shot path. The
-    threshold is the oracle's (`REVIEW_DIFF_BYTES -gt MAX_DIFF_BYTES`).
+    threshold is the oracle's (`REVIEW_DIFF_BYTES -gt MAX_DIFF_BYTES`), read
+    through `budget.prompt_budget` so that it is THIS reviewer's envelope: a
+    diff that fits `codex` and not `agy` must batch for one and not the other,
+    or the planner is once again sizing everyone to the smallest provider.
 
     An EMPTY list is a real answer and a terminal failure ("diff batching
     produced no batches"), never "nothing to review": `batching.split` returns
     no batches only for empty input, and an empty batch would send an empty
     prompt and risk minting a clean verdict for a diff nothing looked at.
     """
-    if len(diff) <= d.max_diff_bytes:
+    if len(diff) <= budget.prompt_budget(d, reviewer):
         return None
-    return batching.split(diff, _batch_budget(d))
+    return batching.split(diff, _batch_budget(d, reviewer))
 
 
-def _estimate_batch_count(repo: Path, d: Defaults) -> int:
+def _estimate_batch_count(repo: Path, d: Defaults,
+                          reviewer: Reviewer | None = None) -> int:
     """A PRE-LOCK guess at how many batches this review will need.
 
     STAGE ONE of the two-stage ordering, and an ESTIMATE by construction: it is
@@ -1998,7 +2036,7 @@ def _estimate_batch_count(repo: Path, d: Defaults) -> int:
     try:
         base = gitio.resolve_base(repo)
         diff = gitio.capture_diff(repo, base.sha, d.untracked_max)
-        plan = batch_plan(diff.data, d)
+        plan = batch_plan(diff.data, d, reviewer)
     except Exception as e:
         _note(f"could not size the lock budget before taking the lock: {e!r}")
         return 0
@@ -2232,6 +2270,13 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
     count = len(batches)
     mode = passes.batch_checklist_mode(count)
     sole = count == 1
+    # Every BATCH prompt is the finder's, so it is the finder's envelope — the
+    # same number `batch_plan` cut these batches with, read from the same
+    # helper rather than re-derived. The integration pass is a DIFFERENT
+    # reviewer and gets its own (see `integration_mdb` below): a cross-file
+    # pass on a provider with a tighter ceiling must not be sized for the
+    # finder's.
+    mdb = budget.prompt_budget(d, finder)
 
     metas: list[dict] = []
     subs: list[_Sub] = []
@@ -2280,7 +2325,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         pack = None
         if d.context_pack:
             headroom = promptbuild.context_headroom(
-                d.max_diff_bytes, len(batch.data), packing=True)
+                mdb, len(batch.data), packing=True)
             # `pack_large_added` is True for a real split (a batch may hold only
             # part of a large added file, so packing it whole adds what the
             # slice cannot show) and False for the sole batch, which already
@@ -2304,14 +2349,14 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         b_branch, b_head = _batch_labels(branch, head_label, index, count,
                                          list(batch.files))
         prompt = promptbuild.build(b_branch, base_ref, base_sha, b_head,
-                                   batch.data, d.max_diff_bytes, selection,
+                                   batch.data, mdb, selection,
                                    pack.body if pack is not None else None)
         prompt_bytes += prompt.prompt_bytes
         _note(f"batch {index}/{count} ({len(batch.files)} file(s), "
               f"{len(batch.data)} bytes) ...")
         if prompt.diff_truncated:
             _note(f"batch {index}/{count} is {len(batch.data)} bytes "
-                  f"(> {d.max_diff_bytes}); its prompt is truncated and this "
+                  f"(> {mdb}); its prompt is truncated and this "
                   f"review cannot be trustworthy")
         sub = _run_sub(finder, cfg,
                        _escalated(d, prompt.prompt_bytes, large_prompt),
@@ -2361,11 +2406,12 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         reviewer = _pass_reviewer(cfg, passes.INTEGRATION_PASS, finder)
         _note(f"integration pass over {count} batch seams ...")
         try:
+            integration_mdb = budget.prompt_budget(d, reviewer)
             prompt = passes.integration_prompt(
                 [passes.BatchSummary(files=list(b.files), diff=b.data,
                                      summary=s.summary, findings=s.findings)
                  for b, s in zip(batches, subs)],
-                selection, d.max_diff_bytes)
+                selection, integration_mdb)
         except Exception as e:
             # ORACLE: "integration context build produced no prompt" is a FAILED
             # pass, not an absent one -- the aggregate is demoted rather than
@@ -2383,7 +2429,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         else:
             prompt_bytes += prompt.prompt_bytes
             if prompt.diff_truncated:
-                _note(f"NOTE integration context capped at {d.max_diff_bytes} "
+                _note(f"NOTE integration context capped at {integration_mdb} "
                       f"bytes; some cross-file relationships were not shown")
             integration_sub = _run_sub(
                 reviewer, cfg,
@@ -2644,7 +2690,12 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
         reason = f"extra pass {name} could not be prepared: {e!r}"
         return _failed_pass(rec, name, reason, reason)
     if prompt.diff_truncated:
-        _note(f"NOTE {name} pass diff capped at {d.max_diff_bytes} bytes "
+        # The budget the CALLER built this prompt with, read from the same
+        # helper rather than from `d.max_diff_bytes` — this pass may run on a
+        # reviewer with a tighter ceiling than the global, and a note naming a
+        # number the prompt was not capped at is worse than no note.
+        _note(f"NOTE {name} pass diff capped at "
+              f"{budget.prompt_budget(d, reviewer)} bytes "
               f"(partial coverage, one-call bound)")
     try:
         outcome = _run_chain(reviewer, cfg, d, prompt.text, cwd, store,
@@ -2750,7 +2801,8 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
 
     notes: list[str] = []
     if prompt.diff_truncated:
-        _note(f"NOTE refuter pass diff capped at {d.max_diff_bytes} bytes "
+        _note(f"NOTE refuter pass diff capped at "
+              f"{budget.prompt_budget(d, reviewer)} bytes "
               f"(partial coverage, one-call bound)")
         notes.append("the refuter saw a size-capped diff (partial coverage)")
 

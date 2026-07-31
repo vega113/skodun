@@ -105,12 +105,33 @@ role     = "refuter"
 #    so skodun passes the reviewed diff as a command-line ARGUMENT. On a
 #    shared machine that diff is visible in `ps` (and on default Linux,
 #    world-readable at /proc/<pid>/cmdline) for the life of the review call.
-#    It also caps how large a diff this provider can review at all: the argv
-#    size guard here is 122,880 bytes (120 KB), well under the
-#    `max_diff_bytes` default of 400,000 -- a bigger diff is refused with a
-#    clear "too large to pass on the command line" error rather than a
-#    kernel-level failure. Lower `max_diff_bytes` if you configure this
-#    provider, or expect it to sit this one out on large changes.
+#    It also caps how large a prompt this provider can be handed at all: the
+#    argv size guard here is 122,880 bytes (120 KB), well under the
+#    `max_diff_bytes` default of 400,000. You do NOT have to lower the global
+#    for it -- the adapter DECLARES that ceiling (`prompt_limit()`), and the
+#    planner takes the smaller of it and your configured number, per reviewer.
+#    So this entry is budgeted to what it can carry while a `codex`/`grok`
+#    entry beside it keeps the whole envelope, and a large change simply
+#    splits into more, smaller batches for this provider.
+#
+#    A prompt that still does not fit -- a chain can span providers, and one
+#    sized for a file-fed head may reach this one as a fallback -- is refused
+#    with a clear "too large to pass on the command line" error rather than a
+#    kernel-level failure, classifies `unavailable`, and the chain moves to the
+#    next entry. An exhausted chain is still a failure.
+#
+# 3. `max_diff_bytes` may also be set PER REVIEWER, on the entry itself, when
+#    you want one model budgeted differently without moving the global:
+#
+#        [[reviewers]]
+#        name           = "finder-openai"
+#        provider       = "openai"
+#        model          = "gpt-5.4"
+#        max_diff_bytes = 600000       # this entry only
+#
+#    It replaces the global for that entry, in either direction, and is still
+#    capped by the adapter's own ceiling -- a ceiling is what the CLI can
+#    physically accept, and no configuration raises it.
 #
 # [[reviewers]]
 # name     = "finder-google"

@@ -224,6 +224,22 @@ def test_oversize_prompt_is_refused_loudly(tmp_path):
         AgyAdapter().build_cmd(prompt, R, D, tmp_path)
 
 
+def test_prompt_limit_is_the_argv_ceiling_the_guard_enforces(tmp_path):
+    """The declared ceiling and the enforced one are THE SAME NUMBER.
+
+    Two spellings of an argv limit is one edit away from a planner that sizes
+    every batch to a ceiling `build_cmd` no longer has — and the failure is
+    silent in the safe direction only by luck. `is` on the constant, not `==`
+    on a copy of the number: this asserts there is one definition, not two that
+    currently agree.
+    """
+    assert AgyAdapter().prompt_limit() is MAX_PROMPT_ARG_BYTES
+    # And the guard is still the thing that enforces it, one byte past.
+    prompt = written(tmp_path, "x" * (AgyAdapter().prompt_limit() + 1))
+    with pytest.raises(ValueError, match="prompt is too large"):
+        AgyAdapter().build_cmd(prompt, R, D, tmp_path)
+
+
 def test_a_prompt_at_the_limit_is_accepted(tmp_path):
     """The guard is a ceiling, not an off-by-one that rejects the limit."""
     prompt = written(tmp_path, "x" * MAX_PROMPT_ARG_BYTES)

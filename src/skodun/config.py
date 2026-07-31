@@ -250,6 +250,23 @@ class Reviewer:
     persona: str | None = None
     max_cost_usd: float | None = None
     enabled: bool = True
+    #: This entry's OWN prompt envelope, overriding `[defaults] max_diff_bytes`.
+    #: None means "use the global", which is what every config that does not
+    #: set it says.
+    #:
+    #: The global is one number for every reviewer, so it has to be fitted to
+    #: the LEAST capable provider configured — which needlessly shrinks the
+    #: review for every other one. A `codex` entry whose prompt travels as a
+    #: file can carry the whole change while an `agy` entry beside it, whose
+    #: prompt must fit one argv word, cannot. Validated exactly like the
+    #: `[defaults]` key it overrides (`_reviewer_max_diff_bytes`): it lands in
+    #: the same arithmetic, so a bad value is the same typo.
+    #:
+    #: This is a CEILING the operator asks for, not a guarantee: the planner
+    #: takes the smaller of it and the head adapter's own declared limit
+    #: (`budget.prompt_budget`), because an entry cannot be budgeted above what
+    #: its CLI can physically accept.
+    max_diff_bytes: int | None = None
     #: Ordered quota-fallback chain: other reviewer entries (by name) to try,
     #: in order, when THIS reviewer's own attempt classifies `unavailable`.
     #: Runtime-only uses the HEAD reviewer's list -- a chain member's own
@@ -413,11 +430,34 @@ def _max_cost(name: str, value: object) -> float | int:
             f"{value}")
     return value
 
+def _reviewer_max_diff_bytes(name: str, value: object) -> int:
+    """Validate one reviewer's `max_diff_bytes`, or raise naming the reviewer.
+
+    The SAME rule as `_bounded_int` applies to `[defaults] max_diff_bytes` —
+    an integer, not a `bool`, at least 1 — because the two values reach exactly
+    the same arithmetic: the planner takes one or the other and slices the diff
+    with it. A separate function only because the message names the REVIEWER: a
+    config may hold several entries, and the number's provenance is lost by the
+    time it reaches `promptbuild.build`.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"reviewer {name!r}: max_diff_bytes: expected an integer, got "
+            f"{type(value).__name__}")
+    if value < _DEFAULTS_MINIMUMS["max_diff_bytes"]:
+        raise ValueError(
+            f"reviewer {name!r}: max_diff_bytes: must be >= "
+            f"{_DEFAULTS_MINIMUMS['max_diff_bytes']}, got {value}")
+    return value
+
+
 def _validate(r: Reviewer) -> Reviewer:
     if r.effort is not None and r.effort not in EFFORTS:
         raise ValueError(f"reviewer {r.name!r}: unknown effort {r.effort!r}")
     if r.max_cost_usd is not None:
         _max_cost(r.name, r.max_cost_usd)
+    if r.max_diff_bytes is not None:
+        _reviewer_max_diff_bytes(r.name, r.max_diff_bytes)
     if r.role not in ROLES:
         raise ValueError(f"reviewer {r.name!r}: unknown role {r.role!r}")
     if not r.provider or not r.model:

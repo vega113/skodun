@@ -37,7 +37,7 @@ from skodun import (batching, budget, chain, checklist, contextpack, gitio,
                     passes, pipeline, promptbuild, runner, trust)
 from skodun.adapters import ParseResult
 from skodun.cli import main
-from skodun.config import load_config
+from skodun.config import Defaults, load_config
 from skodun.gate import run_gate
 from skodun.gitio import capture_diff, diff_identity, git_common_dir, resolve_base
 from skodun.pipeline import LockTimeout
@@ -163,6 +163,104 @@ def test_the_per_batch_diff_budget_halves_the_envelope_for_context_headroom():
     assert pipeline._batch_budget(off) == 4000
     # Never zero: `split` would then flag every unit as an irreducible floor.
     assert pipeline._batch_budget(Defaults(max_diff_bytes=1)) == 1
+
+
+def _synthetic_diff(files: int, lines_per_file: int) -> bytes:
+    """A well-formed multi-file unified diff, big enough to need splitting.
+
+    Synthetic rather than captured from a repo because these tests are about
+    the PLANNER's arithmetic at the shipped 400_000-byte envelope, and a git
+    fixture that large would dominate their runtime for no extra coverage.
+    """
+    out = bytearray()
+    for i in range(files):
+        out += f"diff --git a/f{i}.txt b/f{i}.txt\n".encode()
+        out += b"--- /dev/null\n"
+        out += f"+++ b/f{i}.txt\n".encode()
+        out += f"@@ -0,0 +1,{lines_per_file} @@\n".encode()
+        for j in range(lines_per_file):
+            out += f"+f{i} line {j:06d} {'x' * 60}\n".encode()
+    return bytes(out)
+
+
+def test_batches_are_sized_for_the_provider_that_will_actually_run_them(tmp_path):
+    """THE defect: the planner used to size every batch from the global number.
+
+    `agy` carries its prompt in one argv word and refuses anything over
+    `MAX_PROMPT_ARG_BYTES`; `codex`/`grok` pass a file and have no such limit.
+    At the shipped 400_000-byte envelope the planner cut batches ~200_000 bytes
+    wide, and every one of them was refused by `build_cmd` — the mismatch was
+    only ever discovered at invocation.
+    """
+    from skodun.adapters.agy import MAX_PROMPT_ARG_BYTES, AgyAdapter
+    from skodun.config import Reviewer
+
+    d = Defaults(max_diff_bytes=400_000)
+    agy = Reviewer(name="f", provider="google", model="m", role="finder")
+    diff = _synthetic_diff(files=8, lines_per_file=1200)
+    assert len(diff) > d.max_diff_bytes, "the fixture must need splitting"
+
+    # The premise, stated rather than assumed: sized from the global alone,
+    # the batches do not fit.
+    blind = pipeline.batch_plan(diff, d)
+    assert max(len(b.data) for b in blind) > MAX_PROMPT_ARG_BYTES
+
+    plan = pipeline.batch_plan(diff, d, agy)
+    envelope = budget.prompt_budget(d, agy)
+    assert plan and len(plan) > len(blind)
+    for i, b in enumerate(plan):
+        prompt = promptbuild.build("br", "origin/main", "0" * 40, "1" * 40,
+                                   b.data, envelope, None, None)
+        assert not prompt.diff_truncated, f"batch {i} does not fit its own budget"
+        pf = tmp_path / f"p{i}.txt"
+        pf.write_bytes(prompt.text)
+        # The proof: the provider the planner sized for accepts every batch.
+        AgyAdapter().build_cmd(pf, agy, d, tmp_path)
+
+
+def test_a_file_fed_head_is_not_shrunk_to_fit_an_argv_bound_one(tmp_path):
+    """The other half: `codex` must keep the whole envelope.
+
+    Fitting one global number to the least capable provider is exactly what
+    this change exists to stop, so a provider with no ceiling must plan
+    identically to a plan with no reviewer at all.
+    """
+    from skodun.config import Reviewer
+
+    d = Defaults(max_diff_bytes=400_000)
+    diff = _synthetic_diff(files=8, lines_per_file=1200)
+    codex = Reviewer(name="f", provider="openai", model="m", role="finder")
+    assert [b.data for b in pipeline.batch_plan(diff, d, codex)] == \
+        [b.data for b in pipeline.batch_plan(diff, d)]
+
+
+def test_the_batch_budget_is_the_reviewers_envelope_halved_not_the_globals():
+    """`_batch_budget` reads the ONE definition, not `d.max_diff_bytes`."""
+    from skodun.config import Reviewer
+
+    d = Defaults(max_diff_bytes=400_000, context_pack=True)
+    agy = Reviewer(name="f", provider="google", model="m", role="finder")
+    assert pipeline._batch_budget(d, agy) == budget.prompt_budget(d, agy) // 2
+    assert pipeline._batch_budget(d, agy) < pipeline._batch_budget(d)
+
+
+def test_a_diff_that_fits_the_reviewers_envelope_is_still_never_batched():
+    """The unbatched path stays the unbatched path: `None` up to the envelope.
+
+    The threshold moves WITH the reviewer's budget rather than being abandoned
+    — a diff over agy's tighter envelope now batches where it used to be
+    truncated, and one under it still does not batch at all.
+    """
+    from skodun.config import Reviewer
+
+    d = Defaults(max_diff_bytes=400_000)
+    agy = Reviewer(name="f", provider="google", model="m", role="finder")
+    envelope = budget.prompt_budget(d, agy)
+    assert pipeline.batch_plan(b"x" * envelope, d, agy) is None
+    assert pipeline.batch_plan(b"x" * (envelope + 1), d, agy) is not None
+    # ...and the same diff is a single prompt for a file-fed provider.
+    codex = Reviewer(name="f", provider="openai", model="m", role="finder")
+    assert pipeline.batch_plan(b"x" * (envelope + 1), d, codex) is None
 
 
 def test_a_small_diff_never_enters_the_orchestrator(tmp_path, capsys, monkeypatch):
