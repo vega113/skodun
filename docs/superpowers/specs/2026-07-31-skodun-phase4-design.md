@@ -261,7 +261,7 @@ Each of these is a decision, not an omission:
 ## 2. Stale-recovery scan
 
 `pipeline.recover_stale` iterates `store.list_reviews(None, _SCAN_ALL)`, and
-`list_reviews` is `SELECT artifact_json ... ` followed by `json.loads` per row.
+`list_reviews` is `SELECT artifact_json ...` followed by `json.loads` per row.
 It therefore **decodes every artifact ever stored** in order to find rows whose
 `status` is already an indexed column — on the synchronous `git push` path,
 inside the pre-push hook, where latency is felt directly. Measured: 0.31 s at

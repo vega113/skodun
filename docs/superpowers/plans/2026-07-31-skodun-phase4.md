@@ -8,7 +8,14 @@
 
 **Tech Stack:** unchanged — Python ≥ 3.12, stdlib-only runtime, pytest the only dev dependency.
 
-**Revision note (2026-07-31).** This plan was rewritten after an adversarial review found eight defects that would have produced broken code. The two that would have broken the *phase* rather than a task are called out where they land: T2 Step 6 (the background worker's record, without which the headline fix is inert) and T1 Step 4 (`_review_values` is hand-written, so appending to `_REVIEW_COLUMNS` alone is a `ProgrammingError` on every write). Every code block below has been checked against the shipped source and uses the test helpers that actually exist.
+**Execution note (2026-08-01).** Two findings from the review of this plan's own PR (#21) were confirmed against the executed code and are recorded here rather than left to contradict what shipped:
+
+* **The finalized-worker test in T2 as written could not kill its mutation.** It builds `rec` from `st.get_review(...)`, whose artifact already carries `repo`, so it passes even when `run_prepush_review` omits `repo=reserved.get("repo")` — the exact site the phase turns on. Found independently during execution and by the PR review. What shipped instead adds `repo` to `test_the_worker_preserves_every_reservation_owned_field`, which drives a real reserve → `run_worker` → finalize cycle; the mutation dies there and nowhere else (commit `0223358`).
+* **The T3 CLI/MCP `log` parity test as written was metadata-only** — it compared parser and schema shape, so acceptance criterion 7 could fail while it stayed green. The shipped suite adds `test_the_scoped_log_renders_identically_on_both_surfaces`, which runs the scoped form on both surfaces against one store and compares status and bytes.
+
+A third review finding — that the drill's delivery mutation could survive because `_ROUNDS_SELECT` returns terminal rows while the drill specifies running ones — was **refuted by execution**: the drill carries `b_round`, a finalized background round, and removing the delivery predicate does fail it. The plan text was the stale artifact there, not the implementation.
+
+**Revision note (2026-07-31).** This plan was rewritten after an adversarial review found eight defects that would have produced broken code. The two that would have broken the *phase* rather than a task are called out where they land: T2 Step 6 (the background worker's record, without which the headline fix is inert) and T1 Step 5 (`_review_values` is hand-written, so appending to `_REVIEW_COLUMNS` alone is a `ProgrammingError` on every write). Every code block below has been checked against the shipped source and uses the test helpers that actually exist.
 
 ## Global Constraints
 
@@ -28,7 +35,7 @@
 
 ## File Structure
 
-```
+```text
 src/skodun/
 ├── store.py       # modified (T1, T2, T3, T4): v5 delta, repo in _REVIEW_COLUMNS
 │                  #   AND _review_values, scoped supersede, list_reviews scoping,
@@ -473,7 +480,7 @@ def undelivered(store: Store, branch: str, repo: str) -> list[dict]:
 
 and `def surface(store: Store, branch: str, repo: str, fmt: str = TEXT, include_delivered: bool = False) -> SurfaceResult:`, whose body calls `_query(store, branch, repo, include_delivered)`. Add to `undelivered`'s eligibility docstring, beside the `mode`/`source` clauses:
 
-```
+```text
     * `repo=<the git common dir>` -- two repositories sharing one store collide
       on any common branch name, and a `surface` that reached across them
       delivered AND permanently acknowledged the other's rounds. `repo IS NULL`
