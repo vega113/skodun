@@ -528,3 +528,54 @@ def test_seam_misuse_is_a_message_never_a_traceback(tmp_path, monkeypatch,
     assert surface.misuse_needle in cap.out or surface.misuse_needle in cap.err, (
         f"expected {surface.misuse_needle!r} in stdout={cap.out!r} or "
         f"stderr={cap.err!r}")
+
+
+def test_an_unknown_reviewer_request_is_a_message_never_a_traceback(
+        tmp_path, monkeypatch, capsys):
+    """`review --reviewer <name>` -- the one misuse in this module argparse
+    CANNOT catch, which is why it is a test of its own rather than a
+    `Surface(...)` row.
+
+    `review` is not in `SURFACES`: that registry is the six Phase-3 surfaces the
+    plan names, pinned by the assertion under it, and every row's misuse is an
+    argv argparse itself refuses with `usage:`. This one is well-formed argv --
+    only the loaded config knows the name is wrong -- so it is refused by
+    `run_review`'s own preflight instead. The seam is the same seam: exit 2, a
+    message that names the mistake, and no traceback. The extra assertion is the
+    one `review` owes on every path: the LAST line of stdout is a verdict, even
+    when nothing ran.
+    """
+    overrides = _ov_git(tmp_path)
+    env = _subprocess_env(overrides)
+    repo = _tiny_repo(tmp_path, env)
+    (repo / ".skodun.toml").write_text(
+        '[[reviewers]]\nname = "primary"\nprovider = "xai"\n'
+        'model = "grok-4.20-0309-reasoning"\nrole = "finder"\n',
+        encoding="utf-8")
+    for key, value in overrides.items():
+        monkeypatch.setenv(key, value)
+    # A plain checkout is the primary one; without this the run is refused for
+    # a different reason entirely and this test would prove nothing.
+    monkeypatch.setenv("SKODUN_ALLOW_MAIN", "1")
+    # Nothing here may reach a real provider CLI. Not belt-and-braces: this is
+    # the ONE cell in this module whose command spends model calls when it is
+    # not refused, and `adapters.grok` prefers `~/.grok/bin/grok` over PATH, so
+    # a regression that turned this refusal into a review would run the
+    # developer's own paid CLI against a throwaway repo. (Verified: with the
+    # refusal mutated away, this variable is what makes the run fail rather
+    # than call out.)
+    monkeypatch.setenv("SKODUN_GROK_BIN", str(tmp_path / "no-bin" / "grok"))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["review", "--repo", str(repo), "--reviewer", "no-such"]) == 2
+
+    cap = capsys.readouterr()
+    _assert_seam_clean(cap.out, cap.err)
+    last = cap.out.strip().splitlines()[-1]
+    assert last.startswith("SKODUN VERDICT: trustworthy=false reason=")
+    assert "no-such" in last and "no review ran" in last
+    # Nothing ran, so nothing was recorded. (The store itself is opened by the
+    # CLI seam before the service is called, so its EXISTENCE proves nothing;
+    # its emptiness is the assertion worth making.)
+    with Store.open(Path(overrides["SKODUN_DB"])) as store:
+        assert store.list_reviews(None, 10) == []

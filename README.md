@@ -61,7 +61,7 @@ Background:
 
 | Command | What it does | Exit codes |
 | --- | --- | --- |
-| `skodun review [--repo DIR]` | Run one review of the outgoing change now, in the foreground, and record it. | `0` trustworthy and clean · `1` trustworthy, findings open · `2` preflight refusal (nothing ran) · `3` gave up waiting for the lock · `4` no trustworthy review was recorded · `130` interrupted with Ctrl-C (stdout is left empty on purpose — an operator's own interruption, not a refusal). |
+| `skodun review [--repo DIR] [--reviewer NAME]` | Run one review of the outgoing change now, in the foreground, and record it. `--reviewer` heads this run's chain with a named `[[reviewers]]` entry instead of the config's `finder` — see "Choosing the reviewer for one review" below. | `0` trustworthy and clean · `1` trustworthy, findings open · `2` preflight refusal (nothing ran) · `3` gave up waiting for the lock · `4` no trustworthy review was recorded · `130` interrupted with Ctrl-C (stdout is left empty on purpose — an operator's own interruption, not a refusal). |
 | `skodun gate [--repo DIR]` | Fail closed unless a trustworthy review already covers this exact diff; every decision is written to the audit log. Wire it into pre-push or CI. | `0` clean or every finding triaged · `1` findings open · `2` no trustworthy review covers this diff. Every unexpected exception maps to `2`, never `1`. |
 | `skodun providers [--repo DIR]` | List every registered provider adapter, whether its CLI binary is resolvable and executable right now, and its cached availability state. Read-only; never gates anything. | `0` always, even with missing binaries — that is exactly what this command exists to report · `1` a reviewer in the loaded config (enabled or not) names a `provider` with no registered adapter · `2` `--repo`/config/store could not be read at all. |
 | `skodun triage <review-id> <finding-index> "<reason>"` | Dismiss one finding with an audited reason. Reasons under 20 characters and known placeholders are rejected. | `0` dismissed · `2` rejected (bad review id, bad index, reason too short or a placeholder). |
@@ -195,6 +195,46 @@ hold at most 4 entries total (head + up to 3 fallbacks). A cycle anywhere in the
 fallback graph — direct or through several reviewers — is also a load-time error.
 A fallback member's own `fallbacks` are never followed while it is standing in for
 another reviewer; only the head's list is walked.
+
+### Choosing the reviewer for one review
+
+Normally the config decides: the chain is headed by the first enabled entry whose
+`role` is `finder`. `--reviewer` overrides that **for one run**, by entry name:
+
+```
+skodun review --reviewer finder-openai
+```
+
+and the MCP `review` tool takes the same argument (`{"reviewer": "finder-openai"}`).
+Use it when a provider is out of quota, when a change wants a second opinion from a
+different model, or when an agent already knows which provider is healthy.
+
+Three things it does *not* do:
+
+- **It does not disable the chain.** The chosen entry's own `fallbacks` still
+  apply, so this narrows where the chain *starts*, never whether it can recover.
+- **It does not touch the extra passes.** The security, skeptic, refuter and
+  integration passes still pick their reviewer by *role*; `--reviewer` selects the
+  finder head only. (Where the config names no reviewer for a role, that pass falls
+  back to whatever headed the chain, exactly as it always has.)
+- **It does not fall back to the config's default.** A name that is not configured,
+  is `enabled = false`, or sits on a provider with no registered adapter is refused
+  in preflight — exit `2`, "no review ran", nothing spawned and nothing recorded —
+  and the refusal lists the configured entries. Silently reviewing with the model
+  you were trying to route around would be worse than not reviewing.
+
+Selection is **by name, not by provider id**: two enabled entries may share a
+provider, and choosing between them by an unstated rule would also choose their
+model, effort, prompt budget and fallback chain. There is deliberately no
+`--provider` flag.
+
+The artifact records the request as a request: `requested_reviewer` is the name that
+was asked for (`null` when nobody asked), while `adapter`/`model` and the `attempts`
+provenance keep naming whoever actually *answered* — after a fallback those are two
+different providers, and both facts are worth having.
+
+`--reviewer` is a *foreground* flag. Background pre-push reviews use the configured
+chain; `dispatch` and `worker` take no such argument.
 
 ### The refuter
 
@@ -483,6 +523,12 @@ Tools: `gate`, `review`, `log`, `surface`, `triage_list`, `triage_dismiss`,
 `adopt_refuter`, `triage_reopen`. Prompts: `review-now` (run a review and report
 findings without triaging any of them) and `gate-check` (ask whether a trustworthy
 review covers the current change, and explain the verdict).
+
+`review` takes an optional `reviewer` argument — the name of a configured
+`[[reviewers]]` entry to head that one review's chain, exactly as the CLI's
+`--reviewer` does, with the same refusals in the same words. An agent has no way to
+enumerate the reviewer table (`providers` is deliberately not a tool), so the
+refusal for a name it guessed lists the configured entries and their providers.
 
 **`review` is long-running and only one may be in flight per server.** It runs
 the whole foreground review pipeline — minutes, real model calls — on a background

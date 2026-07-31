@@ -339,6 +339,30 @@ def _bool_arg(params: dict, name: str, tool: str,
     return value, ""
 
 
+def _opt_string_arg(params: dict, name: str,
+                    tool: str) -> tuple[str | None, str]:
+    """`(value-or-None, "")` or `(None, refusal)`. ABSENT is not the same as bad.
+
+    `_reason_arg`'s shape for an argument the SERVICE owns the semantics of. An
+    absent argument (or an explicit JSON `null`) is the caller declining to
+    choose and passes through as `None`; anything present that is not a string
+    is refused here, because argparse cannot produce that shape and so there is
+    no CLI wording to stay in step with.
+
+    The EMPTY string is deliberately NOT refused here, which is where this
+    differs from `_string_arg`: `skodun review --reviewer ""` is a request for a
+    reviewer named `""`, the service refuses it as a name nobody configured, and
+    the two surfaces have to say that in the same words. Refusing it at the
+    transport would give the agent a different sentence than the human gets.
+    """
+    if name not in params or params[name] is None:
+        return None, ""
+    value = params[name]
+    if not isinstance(value, str):
+        return None, (f"skodun {tool}: {name} must be a string; got {value!r}")
+    return value, ""
+
+
 def _reason_arg(params: dict, tool: str) -> tuple[str | None, str]:
     """`(reason-or-None, "")` or `(None, refusal)`. ABSENT is not the same as bad.
 
@@ -387,13 +411,24 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
     NOTHING is printed. `run_review` writes no stdout at all any more, and its
     progress goes to stderr -- which for an MCP server is the client's log, where
     a human debugging a slow review will actually look for it.
+
+    `reviewer` is the one argument this handler passes through without judging:
+    whether a name resolves is a question about the loaded config, and the
+    service (through `run_review`'s preflight) owns that refusal so an agent and
+    a human get the same sentence for the same mistake. Only its TYPE is checked
+    here, and before the store is opened, so a malformed call cannot start a
+    review of anything.
     """
     from . import services
     repo, refusal = _repo_arg(call.params, "review")
     if refusal:
         return HandlerResult(status=2, text=refusal)
+    reviewer, refusal = _opt_string_arg(call.params, "reviewer", "review")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
     with call.store_factory() as store:
-        status, text = services.svc_review(store, repo, cancel=call.cancel)
+        status, text = services.svc_review(store, repo, cancel=call.cancel,
+                                           reviewer=reviewer)
     return HandlerResult(status=status, text=text)
 
 
@@ -540,7 +575,26 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                         "store."),
         HandlerSpec(
             name="review", long_running=True,
-            input_schema=_schema(_REPO_PROPERTY),
+            input_schema=_schema({
+                **_REPO_PROPERTY,
+                # BY NAME, never by provider id: two enabled entries may share a
+                # provider, and choosing between them by an unstated rule would
+                # also choose a model, an effort, a prompt budget and a fallback
+                # chain the caller never asked about. A name that does not
+                # resolve is refused before anything runs, and the refusal lists
+                # the configured names -- which is how an agent discovers them,
+                # since `providers` is deliberately not a tool.
+                "reviewer": {
+                    "type": "string",
+                    "description": "name of the configured reviewer entry to "
+                                   "head this review's chain, instead of the "
+                                   "config's own `finder`; its own fallbacks "
+                                   "still apply. Defaults to the config's "
+                                   "choice. A name that is unknown, disabled, "
+                                   "or on a provider with no adapter is "
+                                   "refused before anything runs, and the "
+                                   "refusal names the configured entries"},
+            }),
             handler=_handle_review,
             description="Review the outgoing change NOW, in the foreground, and "
                         "record the verdict. LONG-RUNNING: it takes minutes and "

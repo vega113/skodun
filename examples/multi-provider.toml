@@ -27,6 +27,14 @@
 # has its own retry budget instead. A fallback member's role field is not
 # consulted while it stands in for the head: what runs is that entry's own
 # provider/model/effort, in the role the HEAD was serving.
+#
+# `name` is not decoration once there is more than one entry: it is how a
+# fallback chain refers to a member, and how ONE review asks for a different
+# head -- `skodun review --reviewer finder-openai` (MCP: the `review` tool's
+# `reviewer` argument) starts this run's chain at that entry instead of the
+# first enabled `finder`. The chosen entry's own `fallbacks` still apply, and
+# the extra passes below still choose by ROLE. A name that is not configured,
+# is disabled, or has no registered adapter is refused before anything runs.
 [[reviewers]]
 name      = "finder"
 provider  = "xai"

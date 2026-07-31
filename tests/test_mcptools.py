@@ -524,6 +524,134 @@ def test_a_non_positive_log_limit_is_refused_identically(tmp_path, monkeypatch,
 
 
 # ==========================================================================
+# choosing the reviewer for one review (issue #16)
+# ==========================================================================
+#
+# `skodun review --reviewer <name>` and the `review` tool's `reviewer` argument
+# are the same request, so a name that does not resolve must be refused with the
+# same words through both doors. There is exactly one implementation of that
+# refusal -- `run_review`'s preflight, reached through `services.svc_review` --
+# and these tests are what says so.
+
+#: Three entries covering the three ways a request can fail to resolve: a name
+#: nobody configured, a name that is configured but `enabled = false`, and a
+#: name whose provider has no registered adapter.
+REVIEWER_CFG = """
+[[reviewers]]
+name = "finder"
+provider = "xai"
+model = "grok-4.20-0309-reasoning"
+role = "finder"
+
+[[reviewers]]
+name = "retired"
+provider = "xai"
+model = "grok-4.20-0309-reasoning"
+role = "finder"
+enabled = false
+
+[[reviewers]]
+name = "offline"
+provider = "no-such-provider"
+model = "m"
+role = "finder"
+"""
+
+
+def _reviewer_repo(tmp_path: Path, monkeypatch) -> Path:
+    """A repo with an outgoing change and the three-entry table above.
+
+    `SKODUN_ALLOW_MAIN`, because a plain `_mkrepo` is a primary checkout and its
+    own preflight refusal would fire first -- identically on both surfaces, but
+    about something else entirely.
+    """
+    repo = _mkrepo(tmp_path)
+    (repo / ".skodun.toml").write_text(REVIEWER_CFG, encoding="utf-8")
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    monkeypatch.setenv("SKODUN_ALLOW_MAIN", "1")
+    return repo
+
+
+def test_the_review_tool_takes_a_reviewer_by_name_in_its_schema():
+    """An agent can only pass what the schema publishes, and `additionalProperties:
+    False` means an undeclared `reviewer` would be a client error rather than a
+    selection. Optional: absent means the config's own finder heads the chain."""
+    spec = _specs()["review"]
+    props = spec.input_schema["properties"]
+    assert set(props) == {"repo", "reviewer"}
+    assert props["reviewer"]["type"] == "string"
+    assert props["reviewer"]["description"]
+    assert spec.input_schema["required"] == []
+
+
+@pytest.mark.parametrize("name,needle", [
+    ("no-such-entry", "is not configured"),
+    ("retired", "is disabled"),
+    ("offline", "no-such-provider"),
+    # An EMPTY name is a request for a reviewer called "", not the absence of a
+    # request -- `--reviewer ""` and `{"reviewer": ""}` must therefore be the
+    # same refusal, and neither may quietly become "use the config default".
+    ("", "is not configured"),
+])
+def test_a_reviewer_that_does_not_resolve_is_refused_identically(
+        tmp_path, monkeypatch, capsys, name, needle):
+    repo = _reviewer_repo(tmp_path, monkeypatch)
+    db = tmp_path / "select.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+
+    cli, tool = _both(db, ["review", "--repo", str(repo), "--reviewer", name],
+                      "review", capsys, repo=str(repo), reviewer=name)
+
+    assert cli == tool, (cli, tool)
+    assert cli[0] == 2, cli
+    assert needle in cli[1] and "no review ran" in cli[1], cli[1]
+    # A refusal, so the banner invariant holds and nothing was recorded.
+    assert cli[1].startswith("SKODUN VERDICT: trustworthy=false reason=")
+    with Store.open(db) as st:
+        assert st.list_reviews(None, 10) == []
+
+
+def test_an_absent_reviewer_is_not_a_request_on_either_surface(tmp_path,
+                                                               monkeypatch,
+                                                               capsys):
+    """The asymmetry `_repo_arg` already has, for the same reason: an argument
+    nobody sent is the caller declining to choose, and it must not be refused.
+
+    Both surfaces get as far as the CONFIG's own finder and fail on the pinned-
+    away provider binary -- which is a review that ran badly (4), never the
+    preflight refusal (2) a bad name produces.
+    """
+    repo = _reviewer_repo(tmp_path, monkeypatch)
+    db = tmp_path / "absent.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+
+    cli, tool = _both(db, ["review", "--repo", str(repo)], "review", capsys,
+                      repo=str(repo))
+
+    assert cli[0] == tool[0] == 4, (cli, tool)
+    assert "is not configured" not in cli[1] and "is not configured" not in tool[1]
+
+
+def test_a_reviewer_of_the_wrong_type_is_refused_by_the_transport(tmp_path,
+                                                                  monkeypatch):
+    """argparse cannot produce these shapes, so they have no CLI wording to stay
+    in step with -- exactly the split `_int_arg` and `_reason_arg` already make.
+    Refused BEFORE the repo is touched, so nothing runs on a malformed call."""
+    # An ABSENT repo means the cwd, so the cwd is moved somewhere that is not a
+    # repository at all: a missing type check must not be able to launch a real
+    # review of whatever directory the suite happens to be running in.
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "t.db"
+    for bad in (["x"], 7, True, {"name": "x"}, 1.5):
+        res = _tool("review", db, reviewer=bad)
+        assert res.status == 2, (bad, res)
+        assert "reviewer must be" in res.text, (bad, res.text)
+        assert "Traceback" not in res.text, (bad, res.text)
+    assert not db.exists(), "a malformed call opened a store"
+
+
+# ==========================================================================
 # the decisions that DO record something
 # ==========================================================================
 

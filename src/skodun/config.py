@@ -370,10 +370,18 @@ def _bounded_dispatch_int(key: str, value: object, minimum: int) -> int:
 
 @dataclass(frozen=True)
 class Config:
-    # Reviewers are selected by ROLE, never by name: `pipeline._reviewer_for`
-    # takes the first enabled reviewer whose `role` matches. A lookup-by-name
-    # helper lived here and had no caller outside its own test; it is gone
-    # rather than kept as a second, unused selection rule.
+    # Reviewers are selected by ROLE: `pipeline._reviewer_for` takes the first
+    # enabled reviewer whose `role` matches, and that is what the config itself
+    # decides. A general lookup-by-name helper lived here and had no caller
+    # outside its own test; it is gone rather than kept as a second, unused
+    # selection rule.
+    #
+    # Two things DO address an entry by name, and neither is a config-level
+    # selection rule: `fallbacks` (a chain names its own members) and one run's
+    # explicit `--reviewer <name>` request, which narrows where that run's chain
+    # starts. Both resolve in `pipeline.py`, against `reviewers` as loaded, and
+    # both refuse a name that does not resolve rather than choosing something
+    # else.
     defaults: Defaults
     reviewers: tuple[Reviewer, ...]
     #: The `[dispatch]` table. Defaulted so that every shipped construction of

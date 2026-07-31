@@ -127,13 +127,28 @@ def svc_gate(store, repo) -> tuple[int, str]:
 # --- review -----------------------------------------------------------------
 
 
-def svc_review(store, repo, *, progress_sink=None,
-               cancel=None) -> tuple[int, str]:
+def svc_review(store, repo, *, progress_sink=None, cancel=None,
+               reviewer=None) -> tuple[int, str]:
     """Run one foreground review. `(code, banner)`. Exit codes, and why:
 
       0  trustworthy and clean            3  gave up waiting for the lock
       1  trustworthy, findings open       4  no trustworthy review exists
       2  preflight refusal (nothing ran)
+
+    `reviewer` is the NAME of a configured `[[reviewers]]` entry to head this
+    run's chain — `skodun review --reviewer <name>` and the MCP `review` tool's
+    `reviewer` argument are the same request arriving through two doors, and
+    this function is the one implementation both reach. `None` means the config
+    decides; the empty string does NOT (it is a request for an entry called
+    `""`, and it is refused like any other name nobody configured), so the test
+    below is `is not None` and never truthiness.
+
+    The refusals themselves live in `run_review`'s preflight rather than here:
+    they are decisions about the loaded CONFIG, which this function has not read
+    at the point a caller hands it a name, and they arrive as the
+    `PreflightRefused` the 2 branch below already renders. That is what makes
+    them word-for-word identical across the two surfaces without either surface
+    — or this module — owning the words.
 
     The banner is DERIVED here, from the record `run_review` returns, through
     `trust.banner` — the one definition of it. The pipeline itself prints
@@ -193,7 +208,7 @@ def svc_review(store, repo, *, progress_sink=None,
 
     try:
         rec = run_review(root, cfg, store, progress_sink=progress_sink,
-                         cancel=cancel)
+                         cancel=cancel, reviewer=reviewer)
     except PreflightRefused as e:
         return 2, banner_failure(str(e))
     except LockTimeout as e:
