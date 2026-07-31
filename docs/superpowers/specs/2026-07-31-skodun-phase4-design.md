@@ -268,10 +268,17 @@ inside the pre-push hook, where latency is felt directly. Measured: 0.31 s at
 7,000 rows against 0.007 s for a targeted query, growing linearly with review
 history forever.
 
-The fix is a new store method that selects the indexed columns
-`recover_stale` actually reads — id, status, `reviewed_at`, `worst_runtime_sec`
-— `WHERE status='running'`, with no artifact decode. `list_reviews` keeps its
-current shape for its display callers.
+The fix is a new store method that returns the three columns `recover_stale`
+actually reads — `id`, `reviewed_at`, `worst_runtime_sec` — selected
+`WHERE status='running'`, with no artifact decode. `status` is the PREDICATE,
+not a returned key: every row the method yields is running by construction, so
+returning the column would invite a caller to re-filter on it and drift from the
+query. `list_reviews` keeps its current shape for its display callers.
+
+(An earlier draft of this paragraph listed `status` among the returned columns,
+which contradicted the plan and the shipped method. Corrected after the review
+of PR #21 flagged the drift; the three-key shape is what shipped and what
+`test_recover_stale_reads_no_artifacts` pins.)
 
 Two properties must survive, both already pinned by Phase 3 tests and both
 easy to break here:
