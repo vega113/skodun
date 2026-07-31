@@ -1058,9 +1058,24 @@ def test_a_tree_path_has_a_size_but_no_blob_bytes(tmp_path):
 
 
 def test_a_submodule_path_is_not_a_blob_on_either_read_form(tmp_path):
-    """A gitlink is a COMMIT object in the tree, so `cat-file -s` sizes it too.
-    Same rule as a directory: not a blob, so neither read form invents bytes
-    for it."""
+    """A gitlink names a COMMIT object, so where that object is present
+    `cat-file -s` sizes it too. Same rule as a directory: not a blob, so
+    neither read form invents bytes for it.
+
+    The "is present" is a real qualifier, not pedantry: `submodule add` puts
+    the inner repo's objects under the outer repo's `.git/modules/`, NOT in
+    the outer repo's own object database, so `cat-file -s HEAD:mod` there
+    normally fails and `blob_size` correctly answers None. The `fetch` below
+    is what genuinely puts that commit in the outer ODB, and it is what makes
+    the size assertion true BY CONSTRUCTION. Without it the assertion passed
+    only by accident, and only sometimes: `_mkrepo` gives both repos identical
+    content, author, committer and message, so their initial commits get the
+    same sha whenever the two `git commit` calls land in the same clock second
+    — and the gitlink then happens to name an object the outer repo already
+    had. Straddle a second boundary and the shas differ and it fails (~2 runs
+    in 10). The three `blob_bytes` assertions never depended on any of this:
+    a gitlink is not a blob whether or not its object is reachable.
+    """
     (tmp_path / "inner").mkdir()
     (tmp_path / "outer").mkdir()
     inner = _mkrepo(tmp_path / "inner")
@@ -1069,6 +1084,8 @@ def test_a_submodule_path_is_not_a_blob_on_either_read_form(tmp_path):
          str(inner), "mod")
     _git(repo, "commit", "-m", "add submodule")
     oid = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "fetch", str(inner), "HEAD")  # see docstring: put HEAD:mod in this ODB
+    assert _git(repo, "cat-file", "-t", f"{oid}:mod") == "commit"
 
     assert blob_size(repo, oid, "mod") is not None
     assert blob_bytes(repo, oid, "mod") is None
