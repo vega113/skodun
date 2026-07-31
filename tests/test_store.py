@@ -483,15 +483,15 @@ def test_triage_reopen_rejects_a_missing_or_blank_reason(tmp_path, reason):
     assert _events(st) == []
 
 
-def test_the_event_column_admits_nothing_but_dismiss_and_reopen(tmp_path):
-    """A third verb would be read as "not a dismissal" by `triage_for` and as
+def test_the_event_column_admits_nothing_outside_the_three_verbs(tmp_path):
+    """A fourth verb would be read as "not a dismissal" by `triage_for` and as
     "dismissed" by nothing -- the CHECK constraint keeps the vocabulary closed
     even against a hand-written INSERT."""
     st = Store.open(tmp_path / "s.db")
     with pytest.raises(sqlite3.IntegrityError):
         st._c.execute("INSERT INTO triage_events (ledger_key, finding_key, event)"
                       " VALUES ('lk', 'k1', 'deleted')")
-    for event in ("dismiss", "reopen"):
+    for event in ("dismiss", "reopen", "defer"):
         st._c.execute("INSERT INTO triage_events (ledger_key, finding_key, event)"
                       " VALUES ('lk', 'k1', ?)", (event,))
 
@@ -501,8 +501,13 @@ def test_the_event_vocabulary_is_spelled_once_everywhere_it_matters():
     is a LITERAL in the v3 CHECK constraint and in the migration's seeding
     statement. A constant that drifted from those literals would make every
     seeded legacy dismissal stop matching -- silently, because the rows would
-    all still be there."""
-    from skodun.store import _MIGRATION_V3
+    all still be there.
+
+    The v4 rebuild re-spells the whole vocabulary in its own CHECK, so all three
+    constants are pinned against that DDL too: a `defer` the constant spells one
+    way and the constraint another is a verb that can never be written at all.
+    """
+    from skodun.store import _MIGRATION_V3, _MIGRATION_V4
 
     ddl = _MIGRATION_V3[0]
     assert "triage_events" in ddl
@@ -510,6 +515,243 @@ def test_the_event_vocabulary_is_spelled_once_everywhere_it_matters():
     seeding = [s for s in _MIGRATION_V3 if "INSERT INTO triage_events" in s]
     assert len(seeding) == 1
     assert f"'{Store.EVENT_DISMISS}'" in seeding[0]
+
+    rebuilt = _MIGRATION_V4[0]
+    for verb in (Store.EVENT_DISMISS, Store.EVENT_REOPEN, Store.EVENT_DEFER):
+        assert f"'{verb}'" in rebuilt, verb
+    # ... and the set the gate clears on is spelled from those same constants.
+    assert Store.CLEARING_EVENTS == frozenset(
+        {Store.EVENT_DISMISS, Store.EVENT_DEFER})
+
+
+# --- the THIRD verb: defer, with a mandatory tracking reference -------------
+#
+# `defer` means "real, not blast-radius for this change, filed as X". It clears
+# the gate exactly as `dismiss` does -- that is the escape from the endless
+# review round -- and the ONLY thing that keeps it honest is the filed
+# reference, which is why it lives in a column of its own rather than inside the
+# reason prose. A ledger that cannot answer "what has this project deferred and
+# where is it filed" is a ledger in which a deferral and an ignored finding are
+# the same artifact.
+
+DEFER_REASON = "in-bounds for this surface; the hot path is the batcher, not this"
+TRACKING_REF = "GH-412"
+
+
+def _deferral(**over) -> dict:
+    rec = dict(ledger_key="b\0" + "s" * 40 + "\0k1", finding_key="k1", review_id="r1",
+               branch="b", base_sha="s" * 40, file="a.py", line=7, severity="high",
+               title="boom", reason=DEFER_REASON, tracking_ref=TRACKING_REF,
+               at="2026-07-27T11:00:00Z")
+    rec.update(over)
+    return rec
+
+
+def test_triage_defer_appends_a_defer_event_carrying_its_reference(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.triage_defer(_deferral())
+    events = _events(st)
+    assert len(events) == 1
+    e = events[0]
+    assert (e["event"], e["finding_key"], e["review_id"]) == ("defer", "k1", "r1")
+    assert e["reason"] == DEFER_REASON
+    assert e["tracking_ref"] == TRACKING_REF
+    assert e["at"] == "2026-07-27T11:00:00Z"
+    # ... and the legacy single-row table stays untouched, as for every verb.
+    assert st._c.execute("SELECT count(*) FROM triage").fetchone()[0] == 0
+
+
+def test_a_deferred_finding_is_cleared_for_the_gate_exactly_like_a_dismissal(
+        tmp_path):
+    """THE property `gate.py` depends on without changing a byte: `triage_for`
+    is the map whose membership clears a finding, and a deferral belongs in it."""
+    st = Store.open(tmp_path / "s.db")
+    st.triage_defer(_deferral())
+    cleared = st.triage_for("b", "s" * 40)
+    assert set(cleared) == {"k1"}
+    assert cleared["k1"]["event"] == "defer"
+    assert cleared["k1"]["tracking_ref"] == TRACKING_REF
+
+
+def test_triage_for_is_exactly_the_cleared_subset_of_triage_state(tmp_path):
+    """ONE definition of "cleared", spelled from `CLEARING_EVENTS` and nowhere
+    else: a reopened finding is open, a dismissed or deferred one is not."""
+    st = Store.open(tmp_path / "s.db")
+    st.add_triage(_dismissal())
+    st.triage_defer(_deferral(ledger_key="b\0" + "s" * 40 + "\0k2", finding_key="k2"))
+    st.add_triage(_dismissal(ledger_key="b\0" + "s" * 40 + "\0k3", finding_key="k3"))
+    st.triage_reopen(_reopening(ledger_key="b\0" + "s" * 40 + "\0k3",
+                                finding_key="k3"))
+
+    state = st.triage_state("b", "s" * 40)
+    assert set(state) == {"k1", "k2", "k3"}
+    assert st.triage_for("b", "s" * 40) == {
+        k: v for k, v in state.items() if v["event"] in Store.CLEARING_EVENTS}
+    assert set(st.triage_for("b", "s" * 40)) == {"k1", "k2"}
+
+
+def test_a_defer_after_a_dismissal_wins_and_keeps_both_reasons(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.add_triage(_dismissal())
+    st.triage_defer(_deferral())
+    state = st.triage_state("b", "s" * 40)["k1"]
+    assert state["event"] == "defer"
+    assert state["deferred_at"] == "2026-07-27T11:00:00Z"
+    assert state["defer_reason"] == DEFER_REASON
+    assert state["deferred_ref"] == TRACKING_REF
+    assert state["dismissed_reason"] == DISMISS_REASON        # not lost
+    assert [h["event"] for h in st.triage_history(_dismissal()["ledger_key"])] == \
+        ["dismiss", "defer"]
+
+
+def test_a_reopen_after_a_defer_puts_the_finding_back_in_front_of_the_gate(
+        tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.triage_defer(_deferral())
+    st.triage_reopen(_reopening(at="2026-07-27T12:00:00Z"))
+    assert st.triage_for("b", "s" * 40) == {}
+    state = st.triage_state("b", "s" * 40)["k1"]
+    assert state["event"] == "reopen"
+    assert state["deferred_ref"] == TRACKING_REF          # the deferral is kept
+
+
+def test_the_last_defer_event_by_seq_wins_even_when_the_timestamps_disagree(
+        tmp_path):
+    """The mutation killer for "order by `at`", for the third verb.
+
+    A same-second test cannot catch it -- SQLite returns tied rows in rowid
+    order, which is `seq` order. Here the timestamps order the two events
+    BACKWARDS, which is what a clock adjustment or an operator-supplied `now`
+    produces, and only `seq` gives the right answer.
+    """
+    st = Store.open(tmp_path / "s.db")
+    st.triage_defer(_deferral(at="2026-07-27T10:00:02Z"))
+    st.triage_reopen(_reopening(at="2026-07-27T10:00:01Z"))   # EARLIER timestamp
+
+    assert st.triage_for("b", "s" * 40) == {}, (
+        "the reopen was recorded later and must win; timestamps are display-only")
+    assert st.triage_state("b", "s" * 40)["k1"]["event"] == "reopen"
+
+    # ... and the other direction: a defer recorded after a reopen, dated before
+    # it, still clears the gate.
+    st2 = Store.open(tmp_path / "s2.db")
+    st2.add_triage(_dismissal(dismissed_at="2026-07-27T10:00:00Z"))
+    st2.triage_reopen(_reopening(at="2026-07-27T10:00:09Z"))
+    st2.triage_defer(_deferral(at="2026-07-27T10:00:03Z"))    # EARLIER timestamp
+    assert set(st2.triage_for("b", "s" * 40)) == {"k1"}
+    assert st2.triage_state("b", "s" * 40)["k1"]["event"] == "defer"
+
+
+@pytest.mark.parametrize("ref", [None, "", "   ", 7])
+def test_triage_defer_rejects_a_missing_or_blank_tracking_reference(tmp_path, ref):
+    """The audit floor on the reference's SHAPE is `triage.validate_tracking_ref`;
+    this is the door. A `defer` row with no reference is the exact artifact this
+    verb exists to make impossible, so it must never reach the stream."""
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(ValueError):
+        st.triage_defer(_deferral(tracking_ref=ref))
+    assert _events(st) == []
+
+
+@pytest.mark.parametrize("reason", [None, "", "   ", 7])
+def test_triage_defer_rejects_a_missing_or_blank_reason(tmp_path, reason):
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(ValueError):
+        st.triage_defer(_deferral(reason=reason))
+    assert _events(st) == []
+
+
+@pytest.mark.parametrize("at", [None, "2026-07-27", "2026-7-27T12:00:00Z",
+                                "2026-07-27T12:00:00", 1751000000])
+def test_triage_defer_rejects_a_non_canonical_timestamp(tmp_path, at):
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(ValueError):
+        st.triage_defer(_deferral(at=at))
+    assert _events(st) == []
+
+
+def test_triage_defer_rejects_missing_review_id_and_id(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    rec = _deferral()
+    rec.pop("review_id")
+    with pytest.raises(KeyError):
+        st.triage_defer(rec)
+    assert _events(st) == []
+
+
+def test_triage_defer_accepts_either_review_id_spelling(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    rec = _deferral()
+    rec.pop("review_id")
+    st.triage_defer({**rec, "id": "rev-b"})
+    assert st.triage_history(rec["ledger_key"])[-1]["review_id"] == "rev-b"
+
+
+def test_the_other_two_verbs_never_write_a_tracking_reference(tmp_path):
+    """`tracking_ref` is the defer verb's column. A dismissal that carried one
+    would make the deferral listing report work nobody filed."""
+    st = Store.open(tmp_path / "s.db")
+    st.add_triage(dict(_dismissal(), tracking_ref="GH-9"))
+    st.triage_reopen(dict(_reopening(), tracking_ref="GH-9"))
+    assert [e["tracking_ref"] for e in _events(st)] == [None, None]
+
+
+# --- the cross-review listing that keeps deferrals from rotting -------------
+
+def test_open_deferrals_lists_only_findings_whose_last_event_is_a_defer(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.triage_defer(_deferral())                                   # still deferred
+    st.triage_defer(_deferral(ledger_key="b\0" + "s" * 40 + "\0k2", finding_key="k2",
+                              tracking_ref="SKO-7", at="2026-07-27T12:00:00Z"))
+    st.triage_reopen(_reopening(ledger_key="b\0" + "s" * 40 + "\0k2",
+                                finding_key="k2", at="2026-07-27T13:00:00Z"))
+    st.add_triage(_dismissal(ledger_key="b\0" + "s" * 40 + "\0k3",
+                             finding_key="k3"))                    # not a deferral
+
+    rows = st.open_deferrals()
+    assert [r["finding_key"] for r in rows] == ["k1"]
+    assert rows[0]["tracking_ref"] == TRACKING_REF
+    assert rows[0]["branch"] == "b" and rows[0]["review_id"] == "r1"
+
+
+def test_open_deferrals_spans_branches_and_bases_newest_first(tmp_path):
+    """The whole point of the listing: a deferral filed on a branch nobody is
+    looking at is exactly the one that rots."""
+    st = Store.open(tmp_path / "s.db")
+    st.triage_defer(_deferral())
+    st.triage_defer(_deferral(ledger_key="other\0" + "z" * 40 + "\0k9",
+                              finding_key="k9", branch="other", base_sha="z" * 40,
+                              tracking_ref="https://example.invalid/i/3",
+                              at="2026-07-27T09:00:00Z"))
+    rows = st.open_deferrals()
+    # NEWEST FIRST by `seq`, not by `at`: the second row's timestamp is EARLIER,
+    # and the listing still puts it first because it was recorded later.
+    assert [r["branch"] for r in rows] == ["other", "b"]
+    assert st.open_deferrals(limit=1) == rows[:1]
+
+
+def test_open_deferrals_agrees_with_triage_state_within_one_scope(tmp_path):
+    """Two definitions of "still deferred" would be two answers. This one is the
+    same last-event-by-seq rule, grouped by `ledger_key` instead of scoped."""
+    st = Store.open(tmp_path / "s.db")
+    st.triage_defer(_deferral())
+    st.add_triage(_dismissal(ledger_key="b\0" + "s" * 40 + "\0k2", finding_key="k2"))
+    st.triage_defer(_deferral(ledger_key="b\0" + "s" * 40 + "\0k2", finding_key="k2",
+                              at="2026-07-27T12:00:00Z"))
+    st.triage_defer(_deferral(ledger_key="b\0" + "s" * 40 + "\0k3", finding_key="k3",
+                              at="2026-07-27T12:30:00Z"))
+    st.triage_reopen(_reopening(ledger_key="b\0" + "s" * 40 + "\0k3",
+                                finding_key="k3", at="2026-07-27T13:00:00Z"))
+
+    from_state = {k for k, v in st.triage_state("b", "s" * 40).items()
+                  if v["event"] == Store.EVENT_DEFER}
+    assert {r["finding_key"] for r in st.open_deferrals()} == from_state == {"k1", "k2"}
+
+
+def test_open_deferrals_is_empty_on_a_store_with_none(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.add_triage(_dismissal())
+    assert st.open_deferrals() == []
 
 
 def test_triage_events_survive_a_reopen_of_the_store(tmp_path):
@@ -639,6 +881,14 @@ V3_TRIAGE_EVENT_COLUMNS = ["seq", "ledger_key", "finding_key", "event", "review_
 V3_DEDUP_EVENT_COLUMNS = ["at", "branch", "diff_hash", "matched_review_id"]
 V3_DELIVERY_COLUMNS = ["review_id", "delivered_at", "channel"]
 
+#: v4 rebuilds `triage_events` (SQLite cannot widen a CHECK in place) to admit
+#: the `defer` verb and to carry the deferral's filed reference. `tracking_ref`
+#: is APPENDED, so every v3 column keeps its v3 position -- exactly what an
+#: `ALTER TABLE ADD COLUMN` would have produced had the CHECK not forced a
+#: rebuild. `V3_TRIAGE_EVENT_COLUMNS` above stays frozen at the pre-v4 shape,
+#: for the same reason `PHASE1_SCHEMA` is frozen.
+V4_TRIAGE_EVENT_COLUMNS = V3_TRIAGE_EVENT_COLUMNS + ["tracking_ref"]
+
 #: One legacy `triage` row, in the shipped single-row-per-ledger-key shape the
 #: v3 migration has to seed an event from.
 LEGACY_TRIAGE = dict(ledger_key="b\0" + "s" * 40 + "\0k1", finding_key="k1",
@@ -724,7 +974,7 @@ def test_schema_is_frozen_at_the_phase1_baseline():
 def test_fresh_db_lands_at_schema_version(tmp_path):
     db = tmp_path / "s.db"
     st = Store.open(db)
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
     assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert ("table", "provider_state") in _objects(db)
     for table in V3_TABLES:
@@ -753,7 +1003,7 @@ def test_migration_from_true_phase1_db(tmp_path):
     raw.close()
     assert _user_version(db) == 0                     # it really starts at v0
     st = Store.open(db)
-    assert st._c.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert st._c.execute("PRAGMA user_version").fetchone()[0] == 4
     assert st.get_review("r1")["summary"] == "ok"     # rows preserved
     st.mark_provider_unavailable("openai", "quota", "quota",
                                  "2026-07-28T12:00:00Z")  # new table exists
@@ -877,8 +1127,8 @@ def test_a_store_one_version_above_this_build_is_refused_untouched(tmp_path):
     NEXT version, not 99. A real v3 store stamped v4 by a newer skodun must come
     back byte-identical, exactly as the v0/v2 fixtures above do."""
     db = _v2_db(tmp_path / "s.db")
-    Store.open(db).close()                              # a real, migrated v3 store
-    assert _user_version(db) == 3
+    Store.open(db).close()                          # a real, fully migrated store
+    assert _user_version(db) == SCHEMA_VERSION
     raw = sqlite3.connect(db)
     raw.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1:d}")
     raw.commit()
@@ -910,10 +1160,10 @@ def test_a_v2_store_gains_every_v3_delta(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == 3
+    assert _user_version(db) == SCHEMA_VERSION
     assert before <= _objects(db)                          # nothing dropped
     assert _objects(db) - before == {("table", t) for t in V3_TABLES}
-    assert _columns(db, "triage_events") == V3_TRIAGE_EVENT_COLUMNS
+    assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     assert _columns(db, "dedup_events") == V3_DEDUP_EVENT_COLUMNS
     assert _columns(db, "deliveries") == V3_DELIVERY_COLUMNS
     assert V3_REVIEW_COLUMNS <= set(_columns(db, "reviews"))
@@ -1072,7 +1322,7 @@ def test_a_crash_mid_v3_delta_leaves_a_clean_v2_store_that_migrates_on_retry(
 
     monkeypatch.undo()                               # the crash is over; retry
     st = Store.open(db)
-    assert _user_version(db) == 3
+    assert _user_version(db) == SCHEMA_VERSION
     assert V3_REVIEW_COLUMNS <= set(_columns(db, "reviews"))
     assert [e["event"] for e in _events(st)] == ["dismiss"]
 
@@ -1128,10 +1378,10 @@ def test_apply_atomic_is_a_no_op_when_a_peer_already_applied_the_delta(tmp_path)
     from skodun.store import _MIGRATION_V3, _apply_atomic
 
     db = _v2_db(tmp_path / "s.db")
-    st = Store.open(db)                     # migrates it to v3
-    assert _user_version(db) == 3
+    st = Store.open(db)                     # migrates it all the way up
+    assert _user_version(db) == SCHEMA_VERSION
     _apply_atomic(st._c, 3, _MIGRATION_V3)  # the loser's call: a no-op
-    assert _user_version(db) == 3
+    assert _user_version(db) == SCHEMA_VERSION
     assert [e["event"] for e in _events(st)] == ["dismiss"], (
         "the no-op re-seeded the triage stream")
     st.close()
@@ -1220,8 +1470,274 @@ def test_no_non_transactional_delta_carries_a_non_idempotent_statement():
             assert isinstance(delta, tuple) and all(isinstance(s, str) for s in delta)
     # The v3 delta specifically is the transactional kind, and it is the last
     # rung: `SCHEMA_VERSION` is what a fresh store is stamped with.
-    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 3
+    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 4
     assert isinstance(_MIGRATIONS[-1][1], tuple)
+
+
+# --- v4: widening the event vocabulary, which is a TABLE REBUILD ------------
+#
+# SQLite cannot alter a CHECK constraint in place, and v3 spelled the two-verb
+# vocabulary into one: `event TEXT CHECK(event IN ('dismiss','reopen'))`. So v4
+# is the first delta that DROPS a shipped table -- it copies every row into a
+# replacement, drops the original and renames. Two properties make that safe and
+# both are pinned below: it runs inside ONE transaction (a half-applied rebuild
+# is a store with no triage history at all), and it preserves `seq` VALUES, not
+# merely row order, because `seq` is the total order every effective-state read
+# in this project depends on.
+
+
+def _v3_db(path, *, triage_rows=(LEGACY_TRIAGE,)):
+    """A real v3-shaped store: the v2 fixture, migrated by the v3 delta ALONE.
+
+    Built by running the ladder with `SCHEMA_VERSION` pinned at 3, rather than
+    from a frozen copy of the v3 DDL, because the v3 delta is itself frozen and
+    tested above -- what this fixture has to be is exactly what the shipped v3
+    build left on a user's disk, which is what the v4 delta must upgrade.
+    """
+    _v2_db(path, triage_rows=triage_rows)
+    with _pinned_at_v3():
+        Store.open(path).close()
+    assert _user_version(path) == 3
+    assert _columns(path, "triage_events") == V3_TRIAGE_EVENT_COLUMNS
+    return path
+
+
+def test_a_v3_store_gains_the_widened_vocabulary_and_the_reference_column(tmp_path):
+    db = _v3_db(tmp_path / "s.db")
+    before = _objects(db)
+
+    st = Store.open(db)
+
+    assert _user_version(db) == SCHEMA_VERSION == 4
+    assert _objects(db) == before, "the rebuild added or dropped an object"
+    assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
+    # The seeded legacy dismissal came through the rebuild intact...
+    assert [e["event"] for e in _events(st)] == ["dismiss"]
+    assert set(st.triage_for("b", "s" * 40)) == {"k1"}
+    # ... and the third verb is now writable, which it was not before.
+    st.triage_defer(_deferral())
+    assert [e["event"] for e in _events(st)] == ["dismiss", "defer"]
+    st.close()
+
+
+def test_the_rebuild_preserves_every_row_and_its_seq_value(tmp_path):
+    """`seq` VALUES, not just order. Every effective-state read in this project
+    is "the last event by `seq`", and `triage_history` hands those numbers to
+    whoever audits the ledger -- a rebuild that renumbered them would silently
+    rewrite the order of decisions that are already recorded."""
+    db = _v3_db(tmp_path / "s.db")
+    # Written with RAW v3-shaped INSERTs, not through this build's `add_triage`:
+    # that writer now binds `tracking_ref` and would not fit the v3 table at
+    # all. The point of the fixture is rows a shipped v3 build really left.
+    raw = sqlite3.connect(db, isolation_level=None)
+    try:
+        for event, at in (("dismiss", "2026-07-27T10:00:00Z"),
+                          ("reopen", "2026-07-27T12:00:00Z")):
+            raw.execute(
+                """INSERT INTO triage_events (ledger_key, finding_key, event,
+                     review_id, branch, base_sha, file, line, severity, title,
+                     reason, at)
+                   VALUES (?, 'k2', ?, 'r1', 'b', ?, 'a.py', 7, 'high', 'boom',
+                     'a reason long enough to clear the audit floor here', ?)""",
+                ("b\0" + "s" * 40 + "\0k2", event, "s" * 40, at))
+    finally:
+        raw.close()
+    before = _events(db)
+    assert [e["seq"] for e in before] == [1, 2, 3]
+    assert [e["event"] for e in before] == ["dismiss", "dismiss", "reopen"]
+
+    st = Store.open(db)                                    # the v4 rebuild
+
+    after = _events(st)
+    assert after == [dict(e, tracking_ref=None) for e in before]
+    assert [e["seq"] for e in after] == [1, 2, 3]
+    # ... and the NEXT event continues the same sequence rather than restarting.
+    st.triage_defer(_deferral(ledger_key="b\0" + "s" * 40 + "\0k4",
+                              finding_key="k4"))
+    assert _events(st)[-1]["seq"] == 4
+    st.close()
+
+
+def _pinned_at_v3():
+    """A context manager that makes this build behave as the shipped v3 one."""
+    import contextlib
+    import unittest.mock as _mock
+
+    from skodun import store as store_mod
+
+    stack = contextlib.ExitStack()
+    stack.enter_context(_mock.patch.object(store_mod, "SCHEMA_VERSION", 3))
+    stack.enter_context(_mock.patch.object(
+        store_mod, "_MIGRATIONS",
+        tuple((t, d) for t, d in store_mod._MIGRATIONS if t <= 3)))
+    return stack
+
+
+def test_a_v0_and_a_v2_store_both_climb_the_whole_ladder_to_v4(tmp_path):
+    """The ladder is only load-bearing if every rung runs for a store that
+    starts below it. A v0 store must arrive with the v2 table, the v3 objects
+    AND the v4 vocabulary, in one open."""
+    v0 = _phase1_db(tmp_path / "v0.db")
+    v2 = _v2_db(tmp_path / "v2.db")
+    for db in (v0, v2):
+        st = Store.open(db)
+        assert _user_version(db) == SCHEMA_VERSION, db
+        assert ("table", "provider_state") in _objects(db), db
+        assert V3_TABLES <= {name for _, name in _objects(db)}, db
+        assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS, db
+        assert [e["event"] for e in _events(st)] == ["dismiss"], db
+        st.triage_defer(_deferral())                       # the new verb works
+        assert set(st.triage_for("b", "s" * 40)) == {"k1"}, db
+        st.close()
+
+
+def test_a_v4_store_is_left_alone_by_a_second_open(tmp_path):
+    db = _v2_db(tmp_path / "s.db")
+    Store.open(db).close()
+    before = _events(db)
+    st = Store.open(db)
+    assert _user_version(db) == SCHEMA_VERSION
+    assert _events(db) == before, "the rebuild ran again on an already-v4 store"
+    assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
+    st.close()
+
+
+def _broken_v4_ladder(monkeypatch):
+    """The real v4 delta with one failing statement injected AFTER the DROP.
+
+    THE crash that matters: the replacement table is populated and the original
+    `triage_events` is already gone, so a delta that was not transactional would
+    leave a store with no triage history and no version stamp to say so.
+    """
+    from skodun import store as store_mod
+
+    real = list(store_mod._MIGRATION_V4)
+    drop = max(i for i, s in enumerate(real)
+               if s.lstrip().upper().startswith("DROP TABLE"))
+    broken = tuple(real[:drop + 1]
+                   + ["INSERT INTO no_such_table_boom (x) VALUES (1)"]
+                   + real[drop + 1:])
+    monkeypatch.setattr(store_mod, "_MIGRATIONS",
+                        tuple((t, broken if t == 4 else d)
+                              for t, d in store_mod._MIGRATIONS))
+
+
+def test_a_crash_mid_v4_delta_leaves_a_clean_v3_store_that_migrates_on_retry(
+        tmp_path, monkeypatch):
+    """THE reason the v4 delta is transactional, mirroring the v3 drill above.
+
+    A half-applied rebuild is strictly worse than a half-applied `ALTER`: the
+    original table has been DROPPED, so the store would come back with its whole
+    triage ledger missing and every dismissal a human ever recorded gone.
+    """
+    db = _v3_db(tmp_path / "s.db")
+    _broken_v4_ladder(monkeypatch)
+
+    with pytest.raises(sqlite3.OperationalError):
+        Store.open(db)
+
+    # NOTHING from the delta survived: the v3 table is still there, with its
+    # v3 columns, its rows and its version.
+    assert _user_version(db) == 3
+    assert _columns(db, "triage_events") == V3_TRIAGE_EVENT_COLUMNS
+    assert [e["event"] for e in _events(db)] == ["dismiss"]
+    assert ("table", "triage_events_v4") not in _objects(db)
+
+    monkeypatch.undo()                                # the crash is over; retry
+    st = Store.open(db)
+    assert _user_version(db) == SCHEMA_VERSION
+    assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
+    assert [e["event"] for e in _events(st)] == ["dismiss"]
+    assert _events(st)[0]["seq"] == 1
+
+
+def test_a_crashed_v4_migration_never_leaves_the_store_open(tmp_path, monkeypatch):
+    """A leaked connection still holding the write lock would make the retry
+    above fail too -- and this delta holds the lock across a DROP."""
+    db = _v3_db(tmp_path / "s.db")
+    _broken_v4_ladder(monkeypatch)
+    with pytest.raises(sqlite3.OperationalError):
+        Store.open(db)
+    monkeypatch.undo()
+    other = sqlite3.connect(db, isolation_level=None, timeout=0.5)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.execute("ROLLBACK")
+    finally:
+        other.close()
+
+
+def test_replaying_the_v4_delta_silently_drops_every_tracking_reference(tmp_path):
+    """Pins the premise of the transaction rather than restating it in prose,
+    and the premise is WORSE than v3's.
+
+    v3 replayed raises `duplicate column name` -- loud, and the store is bricked
+    but nothing is lost. v4 replayed does not raise at ALL: the replacement name
+    is free again after the rename, so the whole rebuild runs a second time and
+    quietly copies the v3 column list, dropping every `tracking_ref` value on
+    the way. Silent loss of exactly the field that makes a deferral honest.
+
+    Which is why the version is re-read under the write lock in `_apply_atomic`:
+    a second opener that lost the migration race must be a NO-OP, and the test
+    below is the one that says so.
+    """
+    from skodun.store import _MIGRATION_V4
+
+    db = _v3_db(tmp_path / "s.db")
+    st = Store.open(db)
+    st.triage_defer(_deferral())
+    assert _events(st)[-1]["tracking_ref"] == TRACKING_REF
+
+    for sql in _MIGRATION_V4:               # the replay, statement by statement
+        st._c.execute(sql)
+
+    assert [e["event"] for e in _events(st)] == ["dismiss", "defer"]
+    assert _events(st)[-1]["tracking_ref"] is None, (
+        "the replay is meant to demonstrate the loss this delta must never "
+        "suffer twice")
+    st.close()
+
+
+def test_apply_atomic_is_a_no_op_for_v4_when_a_peer_already_applied_it(tmp_path):
+    """The migration race, at the statement that closes it, for the rebuild.
+
+    The caller's `user_version` read happens OUTSIDE any transaction, so two
+    openers can both see v3 and both arrive here. The loser must find v4 already
+    stamped and do nothing -- otherwise it rebuilds the table a second time and,
+    per the test above, silently discards every filed reference in the ledger.
+    """
+    from skodun.store import _MIGRATION_V4, _apply_atomic
+
+    db = _v3_db(tmp_path / "s.db")
+    st = Store.open(db)
+    st.triage_defer(_deferral())
+    assert _user_version(db) == SCHEMA_VERSION
+
+    _apply_atomic(st._c, 4, _MIGRATION_V4)          # the loser's call: a no-op
+
+    assert _user_version(db) == SCHEMA_VERSION
+    assert _events(st)[-1]["tracking_ref"] == TRACKING_REF, (
+        "the no-op rebuilt the table and lost the reference")
+    st.close()
+
+
+def test_a_store_stamped_v5_is_still_refused_untouched(tmp_path):
+    """The future-version refusal survives the rebuild: a real v4 store stamped
+    v5 by a newer skodun comes back byte-identical."""
+    db = _v2_db(tmp_path / "s.db")
+    Store.open(db).close()
+    assert _user_version(db) == 4
+    raw = sqlite3.connect(db)
+    raw.execute("PRAGMA user_version = 5")
+    raw.commit()
+    raw.close()
+    before = db.read_bytes()
+
+    with pytest.raises(ValueError, match="newer"):
+        Store.open(db)
+
+    assert db.read_bytes() == before
+    assert _user_version(db) == 5
 
 
 # --- provider_state ---------------------------------------------------------

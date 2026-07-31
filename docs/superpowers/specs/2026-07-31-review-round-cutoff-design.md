@@ -1,6 +1,8 @@
 # Bounding review rounds — where skodun should stop, and how clients should
 
 Date: 2026-07-31. Status: proposal, not yet owner-approved.
+R1 has since been implemented (issue #5, store v4) — see its section for what
+shipped and where it differs from the recommendation below.
 Prerequisite reading: `README.md` (the gate contract and the triage ledger),
 `docs/phase3-acceptance.md`.
 Supporting research: `sdd/review-cutoff-research.md` (sourced brief, with
@@ -117,7 +119,10 @@ machinery they are, rather than left as incidental:
 
 Ranked by value per unit of work. R1 is the one that matters.
 
-### R1 — A first-class `defer` verb (needs a v4 migration)
+### R1 — A first-class `defer` verb (needs a v4 migration) — **IMPLEMENTED**
+
+**Status: shipped (issue #5), as store v4.** The recommendation as written is
+below, unchanged; what was actually built and where it differs follows it.
 
 Today there is one way to clear a finding: `dismiss`, which means *this is not a
 defect*. The stopping rule needs a second: *this is a real defect, it is not
@@ -135,6 +140,37 @@ both makes the ledger lie about which findings the project still owes work on.
 - `triage --list` renders `DEFERRED → <ref>`; a listing of open deferrals across
   reviews (`skodun log --deferred`, or a `deferrals` subcommand) keeps them from
   rotting silently.
+
+**What shipped**, with the decisions the recommendation left open:
+
+- The CLI is exactly as specified, with `--reopen`'s exit contract (0 recorded /
+  1 refused / 2 not found). The MCP tool is `triage_defer`, the ninth, behind
+  `services.svc_triage_defer` so both surfaces refuse in the same words.
+- **The reference lives in its own `tracking_ref` column**, not inside `reason`.
+  Widening the v3 `CHECK(event IN ('dismiss','reopen'))` is a table rebuild
+  either way — SQLite cannot alter a CHECK in place — so the column cost one
+  more name in a column list, and it is what makes the reference *readable back*
+  rather than recoverable only by guessing at prose.
+- **The gate did not change by one byte.** `store.triage_for` returns the
+  findings whose last event is in `CLEARING_EVENTS` (`dismiss` or `defer`), and
+  `gate.py` already tested membership of that map and asked nothing further.
+  Both files stay byte-identical to their Phase-3 pins.
+- `triage --list` renders `DEFERRED -> <ref> <when>` (ASCII arrow, matching the
+  rest of the CLI's output).
+- The cross-review listing is **`skodun deferrals`**, a subcommand, not `log
+  --deferred`: `log` lists reviews one row each while a deferral is a finding
+  inside one, and the question "what has this project deferred" has no review to
+  scope it to. It is deliberately CLI-only — reviewing the backlog is a human's
+  periodic job, and an agent able to both file deferrals and mark them handled
+  would hold both ends of the audit trail.
+- **`reopen` was widened to overturn a deferral too.** Not in the
+  recommendation, but a `defer` moves the gate to 0 exactly as a dismissal does,
+  and §4 rests on every clearing decision being "reversible on the record".
+- Reference validation is minimal and honest: non-empty, one token (no
+  whitespace, no control characters), at least one alphanumeric, ≤200
+  characters. No pattern to conform to — a scheme tight enough to "validate" an
+  issue key would refuse whichever tracker skodun has never heard of, pushing
+  its users back to burying the reference in prose.
 
 ### R2 — Churn attribution on findings (cheap, no schema change)
 
@@ -183,8 +219,10 @@ is wasted. One review per head.
 **Batch fixes into one commit, then review once.** A fix-per-finding cadence
 multiplies rounds without improving the outcome.
 
-**Classify every finding by consequence, never by its severity badge.** Fix now
-only if the finding meets one of:
+**Classify every finding by consequence, never by its severity badge.** Record
+each deferral with `skodun triage --defer <review-id> <index> <tracking-ref>
+"<reason>"` — the reference is mandatory, and `skodun deferrals` is what stops
+the backlog from rotting. Fix now only if the finding meets one of:
 
 | Fix now | Defer, with a filed reference |
 |---|---|
@@ -214,9 +252,9 @@ holds:
   do not iterate. Model disagreement is what the refuter annotation is for, and
   it is deliberately not a dismissal.
 
-**Never let the agent dismiss on its own.** `triage_dismiss` and
-`adopt_refuter` carry out a decision a human already made; they are not a way to
-tidy a report. This is the shipped policy and the research supports it: an
+**Never let the agent clear a finding on its own.** `triage_dismiss`,
+`triage_defer` and `adopt_refuter` carry out a decision a human already made;
+none of them is a way to tidy a report. This is the shipped policy and the research supports it: an
 automated judge is only ~0.66 precise at deciding whether a review comment was
 even useful.
 
@@ -224,7 +262,7 @@ even useful.
 
 The deferral backlog is a liability transfer, not a fix: a project that defers
 everything ships the same code as a project with no review, and only the filed
-references make the difference visible. R1 makes deferral honest; it cannot make
-it wise. Whether the backlog is worked is a human discipline no gate enforces —
+references make the difference visible. R1 makes deferral honest — and now does
+so mechanically — but it cannot make it wise. Whether the backlog is worked is a human discipline no gate enforces —
 which is the correct division of labour, and worth stating so nobody mistakes a
 green gate for an absence of debt.

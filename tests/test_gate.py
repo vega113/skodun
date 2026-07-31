@@ -24,7 +24,7 @@ import skodun
 from skodun import gitio, triage
 from skodun.config import load_config
 from skodun.gate import GateResult, run_gate
-from skodun.store import Store
+from skodun.store import SCHEMA_VERSION, Store
 from tests.test_gitio import _git, _mkrepo
 from tests.test_triage import LEGACY, _load_legacy
 
@@ -285,8 +285,8 @@ def test_the_v3_migration_preserves_an_existing_dismissals_effect_on_the_gate(tm
     db = tmp_path / "s.db"
     _v2_store_with_a_dismissal(db, repo)
 
-    st = Store.open(db)                       # v2 -> v3, seeding the event stream
-    assert st._c.execute("PRAGMA user_version").fetchone()[0] == 3
+    st = Store.open(db)                    # v2 -> v4, seeding the event stream
+    assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
     r = run_gate(st, repo, _cfg(repo), env={})
     assert r.code == 0, r.message
@@ -335,6 +335,108 @@ def test_reopening_a_dismissed_finding_takes_the_gate_from_0_back_to_1(tmp_path)
                       finding_key(_FINDING["file"], _FINDING["title"]))
     assert [h["event"] for h in st.triage_history(lkey)] == \
         ["dismiss", "reopen", "dismiss"]
+
+
+# --------------------------------------------------------------------------
+# defer (v4): the gate's own answer, with gate.py still byte-identical
+# --------------------------------------------------------------------------
+#
+# `defer` is the escape from an endless review round -- "real, not blast-radius
+# for this change, filed as X" -- and the gate has to treat it as non-blocking
+# for that to be true. It does so WITHOUT ONE BYTE OF `gate.py` CHANGING: the
+# gate asks `store.triage_for(branch, base_sha)` and tests membership by
+# `finding_key`, so widening what that map contains is the whole of the change.
+# These tests assert the gate's exit code, which is the only thing that decision
+# is for; `tests/test_seams.py` pins the file's sha256 beside them.
+
+_DEFER_REASON = "in-bounds for this surface; the hot path is the batcher upstream"
+_TRACKING_REF = "GH-412"
+
+
+def test_deferring_a_finding_takes_the_gate_from_1_to_0(tmp_path):
+    """THE property issue #5 is about, at the enforcement point.
+
+    Mutation this kills: `triage_for` filtering on `dismiss` alone. With
+    `CLEARING_EVENTS` narrowed back to `{dismiss}` the deferral is recorded, the
+    listing says DEFERRED, and the gate still answers 1 -- a finding a human
+    triaged, on the record, with a filed reference, still blocking the push.
+    """
+    repo = _outgoing(_mkrepo(tmp_path))
+    st = Store.open(tmp_path / "s.db")
+    _reviewed(st, repo, findings=[_FINDING])
+    assert run_gate(st, repo, _cfg(repo), env={}).code == 1
+
+    triage.defer(st, _artifact(st), 0, _TRACKING_REF, _DEFER_REASON,
+                 "2026-07-27T11:00:00Z")
+
+    r = run_gate(st, repo, _cfg(repo), env={})
+    assert r.code == 0, r.message
+    assert "all triaged" in r.message
+    assert [e["outcome"] for e in _events(st)] == ["open-findings", "pass"]
+
+
+def test_a_refused_deferral_leaves_the_gate_blocking(tmp_path):
+    """The control. An unfiled deferral must not be able to clear anything --
+    that is what makes "an unfiled deferral and an ignored finding are the same
+    artifact" a mechanical fact rather than a slogan."""
+    repo = _outgoing(_mkrepo(tmp_path))
+    st = Store.open(tmp_path / "s.db")
+    _reviewed(st, repo, findings=[_FINDING])
+    for ref in ("", "   ", "I will file it later"):
+        with pytest.raises(triage.TriageError):
+            triage.defer(st, _artifact(st), 0, ref, _DEFER_REASON,
+                         "2026-07-27T11:00:00Z")
+        assert run_gate(st, repo, _cfg(repo), env={}).code == 1
+
+
+def test_reopening_a_deferral_takes_the_gate_from_0_back_to_1(tmp_path):
+    repo = _outgoing(_mkrepo(tmp_path))
+    st = Store.open(tmp_path / "s.db")
+    _reviewed(st, repo, findings=[_FINDING])
+    triage.defer(st, _artifact(st), 0, _TRACKING_REF, _DEFER_REASON,
+                 "2026-07-27T11:00:00Z")
+    assert run_gate(st, repo, _cfg(repo), env={}).code == 0
+
+    triage.reopen(st, _artifact(st), 0, _REOPEN_REASON, "2026-07-27T12:00:00Z")
+
+    r = run_gate(st, repo, _cfg(repo), env={})
+    assert r.code == 1
+    assert "1 finding(s) open" in r.message
+
+
+def test_a_deferral_scoped_to_another_base_does_not_clear_the_gate(tmp_path):
+    """The rebase rule applies to the new verb exactly as to a dismissal: a
+    deferral is scoped to the base it was filed against."""
+    repo = _outgoing(_mkrepo(tmp_path))
+    st = Store.open(tmp_path / "s.db")
+    _reviewed(st, repo, findings=[_FINDING])
+    art = dict(_artifact(st), base_sha="0" * 40)
+    triage.defer(st, art, 0, _TRACKING_REF, _DEFER_REASON, "2026-07-27T11:00:00Z")
+    assert run_gate(st, repo, _cfg(repo), env={}).code == 1
+
+
+def test_a_mixed_ledger_of_dismissals_and_deferrals_passes_the_gate(tmp_path):
+    """The ledger keeps the two apart -- outstanding debt versus rejected
+    findings -- while the gate treats both as triaged. That separation is the
+    whole reason `defer` exists rather than being spelled as a dismissal."""
+    second = dict(_FINDING, file="b.py", title="unbounded retry")
+    repo = _outgoing(_mkrepo(tmp_path))
+    st = Store.open(tmp_path / "s.db")
+    _reviewed(st, repo, findings=[_FINDING, second])
+    assert run_gate(st, repo, _cfg(repo), env={}).code == 1
+
+    triage.dismiss(st, _artifact(st), 0, _REASON, "2026-07-27T11:00:00Z")
+    assert run_gate(st, repo, _cfg(repo), env={}).code == 1     # one still open
+    triage.defer(st, _artifact(st), 1, _TRACKING_REF, _DEFER_REASON,
+                 "2026-07-27T11:00:01Z")
+    assert run_gate(st, repo, _cfg(repo), env={}).code == 0
+
+    art = _artifact(st)
+    state = st.triage_state(art["branch"], art["base_sha"])
+    events = {k: v["event"] for k, v in state.items()}
+    assert sorted(events.values()) == ["defer", "dismiss"]
+    # ... and only the deferral is outstanding work.
+    assert [r["tracking_ref"] for r in st.open_deferrals()] == [_TRACKING_REF]
 
 
 # --------------------------------------------------------------------------

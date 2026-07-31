@@ -867,6 +867,392 @@ def test_reopen_seam_console_script_entry_point(tmp_path, name, argv, expected):
     assert _still_dismissed(db) is (expected != 0)
 
 
+# ---------------------------------------------------------------------------
+# triage --defer: the third verb, and the reference that makes it honest
+# ---------------------------------------------------------------------------
+#
+# `skodun triage --defer <review-id> <finding-index> <tracking-ref> "<reason>"`.
+# Its exit contract is `--reopen`'s (0 recorded / 1 refused / 2 not found) and
+# what a 1 can mean here is the point of the verb: a deferral clears the gate,
+# so one that names nowhere the work is filed is refused exactly as a
+# placeholder reason is.
+
+DEFER_REASON = "in-bounds for this surface; the hot path is the batcher upstream"
+TRACKING_REF = "GH-412"
+
+#: The three outcomes, driven through the whole invocation matrix like
+#: `_REOPEN_CASES`. The store each row runs against holds one OPEN finding.
+_DEFER_CASES = [
+    ("recorded", ["triage", "--defer", "rev1", "0", TRACKING_REF, DEFER_REASON], 0),
+    ("refused", ["triage", "--defer", "rev1", "0", "", DEFER_REASON], 1),
+    ("not-found", ["triage", "--defer", "nope", "0", TRACKING_REF, DEFER_REASON], 2),
+]
+
+
+def _open_store(db: Path) -> Path:
+    """A store holding one review whose only finding is untriaged."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    st = Store.open(db)
+    st.save_review(_artifact([_finding(0)]))
+    st.close()
+    return db
+
+
+def _is_deferred(db: Path) -> bool:
+    st = Store.open(db)
+    try:
+        state = st.triage_state("feat", "s" * 40).get(finding_key("a0.py", "NPE 0"))
+        return bool(state) and state["event"] == "defer"
+    finally:
+        st.close()
+
+
+def test_defer_records_the_event_with_its_reference_and_reports_it(
+        tmp_path, monkeypatch, capsys):
+    st = _store(tmp_path, _finding(0), monkeypatch=monkeypatch)
+    assert main(["triage", "--defer", "rev1", "0", TRACKING_REF, DEFER_REASON]) == 0
+    out = capsys.readouterr().out
+    assert "rev1" in out and TRACKING_REF in out
+    history = st.triage_history(_lkey(st))
+    assert [h["event"] for h in history] == ["defer"]
+    assert history[-1]["tracking_ref"] == TRACKING_REF
+    assert history[-1]["reason"] == DEFER_REASON
+
+
+def test_defer_flips_the_gate_from_1_to_0_and_a_reopen_back_to_1(
+        tmp_path, monkeypatch, capsys):
+    """The whole point, end to end and through the LEDGER: the gate moves
+    because the event stream moved, not because the CLI said so."""
+    repo, st = _gated_repo(tmp_path, monkeypatch, None)
+    assert _gate_code(repo, st) == 1
+
+    assert main(["triage", "--defer", "rev1", "0", TRACKING_REF, DEFER_REASON]) == 0
+    assert _gate_code(repo, st) == 0
+
+    assert main(["triage", "--reopen", "rev1", "0", REOPEN_REASON]) == 0
+    assert _gate_code(repo, st) == 1
+    capsys.readouterr()
+
+    assert [h["event"] for h in st.triage_history(_lkey(st))] == ["defer", "reopen"]
+
+
+@pytest.mark.parametrize("ref", ["", "   ", "I will file it later", "#",
+                                 "GH 412"])
+def test_defer_without_a_usable_reference_is_a_1_and_records_nothing(
+        tmp_path, monkeypatch, capsys, ref):
+    """THE refusal issue #5 is about. An unfiled deferral and an ignored finding
+    are the same artifact, and this is what makes that mechanically true."""
+    db = _open_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["triage", "--defer", "rev1", "0", ref, DEFER_REASON]) == 1
+    cap = capsys.readouterr()
+    assert "refused" in cap.out
+    assert "Traceback" not in cap.out and "Traceback" not in cap.err
+    assert not _is_deferred(db)
+
+
+@pytest.mark.parametrize("reason", ["fp", "false positive", "wontfix", "too short"])
+def test_defer_refuses_an_unauditable_reason_as_a_1(tmp_path, monkeypatch, capsys,
+                                                    reason):
+    """A filed reference does not buy a way past the reason floor: "filed as
+    GH-1, wontfix" is a dismissal wearing a ticket number."""
+    db = _open_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["triage", "--defer", "rev1", "0", TRACKING_REF, reason]) == 1
+    assert "refused" in capsys.readouterr().out
+    assert not _is_deferred(db)
+
+
+def test_deferring_on_an_unknown_review_is_a_2(tmp_path, monkeypatch, capsys):
+    _open_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "cli.db"))
+    assert main(["triage", "--defer", "nope", "0", TRACKING_REF, DEFER_REASON]) == 2
+    assert "no such review" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("index", ["1", "-1", "99"])
+def test_deferring_an_out_of_range_index_is_a_2(tmp_path, monkeypatch, capsys,
+                                                index):
+    db = _open_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["triage", "--defer", "rev1", index, TRACKING_REF,
+                 DEFER_REASON]) == 2
+    cap = capsys.readouterr()
+    assert "usage:" not in cap.err                  # a real answer, not argparse
+    assert "out of range" in cap.out
+    assert not _is_deferred(db)
+
+
+@pytest.mark.parametrize("argv, expected_in_out", [
+    (["triage", "--defer", "--list", "rev1"], "--list"),
+    (["triage", "--defer", "--reopen", "rev1", "0", "x", "y"], "--reopen"),
+    (["triage", "--defer", "rev1"], "--defer"),
+    (["triage", "--defer", "rev1", "0"], "--defer"),
+    (["triage", "--defer", "rev1", "0", TRACKING_REF], "--defer"),
+    # The mirror image: a FOURTH positional on any other mode is one argument
+    # too many, and must not be silently thrown away -- somebody who typed a
+    # reference believes a deferral was recorded.
+    (["triage", "rev1", "0", TRACKING_REF, DEFER_REASON], "--defer"),
+    (["triage", "--reopen", "rev1", "0", TRACKING_REF, DEFER_REASON], "--defer"),
+])
+def test_defer_misuse_is_a_clear_message_and_a_2(tmp_path, monkeypatch, capsys,
+                                                 argv, expected_in_out):
+    db = _open_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(argv) == 2
+    cap = capsys.readouterr()
+    assert expected_in_out in cap.out, cap.out
+    assert "Traceback" not in cap.out and "Traceback" not in cap.err
+    assert "[0]" not in cap.out, "a listing must not be printed as if it were the ask"
+    assert not _is_deferred(db), "nothing may be recorded on a misuse"
+
+
+def test_defer_with_a_non_numeric_index_is_a_usage_error_not_a_traceback(
+        tmp_path, monkeypatch, capsys):
+    db = _open_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["triage", "--defer", "rev1", "zero", TRACKING_REF,
+                 DEFER_REASON]) == 2
+    cap = capsys.readouterr()
+    assert "Traceback" not in cap.err and "Traceback" not in cap.out
+    assert "usage:" in cap.err
+    assert not _is_deferred(db)
+
+
+def test_defer_appears_in_the_triage_help(capsys):
+    assert main(["triage", "--help"]) == 0
+    out = capsys.readouterr().out
+    assert "--defer" in out
+    assert "tracking" in out.lower(), "the help must say the reference is required"
+
+
+def test_list_renders_deferred_with_its_reference(tmp_path, monkeypatch, capsys):
+    """`DEFERRED -> <ref>` beside `DISMISSED`/`REOPENED`: at a glance, which
+    findings are outstanding debt and where that debt is filed."""
+    _store(tmp_path, _finding(0), _finding(1), monkeypatch=monkeypatch)
+
+    assert main(["triage", "--defer", "rev1", "0", TRACKING_REF, DEFER_REASON]) == 0
+    assert main(["triage", "rev1", "1", DISMISS_REASON]) == 0
+    capsys.readouterr()
+
+    assert main(["triage", "--list", "rev1"]) == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert f"(DEFERRED -> {TRACKING_REF} " in lines[0], lines[0]
+    assert "(DISMISSED " in lines[1], lines[1]
+
+
+def test_the_listing_and_the_gate_never_disagree_about_a_deferral(
+        tmp_path, monkeypatch, capsys):
+    repo, st = _gated_repo(tmp_path, monkeypatch, None)
+    for argv, gate_code, token in [
+            (["triage", "--defer", "rev1", "0", TRACKING_REF, DEFER_REASON], 0,
+             f"DEFERRED -> {TRACKING_REF}"),
+            (["triage", "--reopen", "rev1", "0", REOPEN_REASON], 1, "REOPENED")]:
+        assert main(argv) == 0
+        capsys.readouterr()
+        assert main(["triage", "--list", "rev1"]) == 0
+        assert f"({token} " in capsys.readouterr().out
+        assert _gate_code(repo, st) == gate_code
+
+
+# --- the seam matrix for the new flag -------------------------------------
+
+@pytest.mark.parametrize("name, argv, expected", _DEFER_CASES,
+                         ids=[c[0] for c in _DEFER_CASES])
+def test_defer_seam_normal_run(tmp_path, monkeypatch, capsys, name, argv, expected):
+    db = _open_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(argv) == expected
+    cap = capsys.readouterr()
+    assert cap.out.strip(), "every outcome says something on stdout"
+    assert "Traceback" not in cap.out and "Traceback" not in cap.err
+    assert _is_deferred(db) is (expected == 0)
+
+
+@pytest.mark.parametrize("name, argv, expected", _DEFER_CASES,
+                         ids=[c[0] for c in _DEFER_CASES])
+def test_defer_seam_closed_stdout(tmp_path, name, argv, expected):
+    """`skodun triage --defer ... > <dead pipe>`: a `BrokenPipeError` escaping
+    `_emit` would hand the shell the interpreter's own 1 -- exactly the value
+    that means "the deferral was refused"."""
+    db = _open_store(tmp_path / "sub" / "s.db")
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run([sys.executable, "-m", "skodun", *argv],
+                           stdout=w_fd, stderr=subprocess.PIPE, text=True,
+                           env=_subprocess_env(db))
+    finally:
+        os.close(w_fd)
+    assert p.returncode == expected, f"stderr={p.stderr!r}"
+    assert p.stderr == "", p.stderr
+    assert _is_deferred(db) is (expected == 0)
+
+
+@pytest.mark.parametrize("name, argv, expected", _DEFER_CASES,
+                         ids=[c[0] for c in _DEFER_CASES])
+def test_defer_seam_through_head_under_pipefail(tmp_path, name, argv, expected):
+    db = _open_store(tmp_path / "sub" / "s.db")
+    quoted = " ".join(shlex.quote(a) for a in argv)
+    script = (f'set -o pipefail; {shlex.quote(sys.executable)} -m skodun {quoted} '
+              f'| head -1; echo "SKODUN_EXIT=${{PIPESTATUS[0]}}"')
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                       env=_subprocess_env(db))
+    m = re.search(r"SKODUN_EXIT=(\d+)", p.stdout)
+    assert m, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert int(m.group(1)) == expected, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert "Traceback" not in p.stderr, p.stderr
+    assert _is_deferred(db) is (expected == 0)
+
+
+@pytest.mark.parametrize("name, argv, expected", _DEFER_CASES,
+                         ids=[c[0] for c in _DEFER_CASES])
+def test_defer_seam_console_script_entry_point(tmp_path, name, argv, expected):
+    db = _open_store(tmp_path / "sub" / "s.db")
+    p = subprocess.run(
+        [sys.executable, "-c", "from skodun.cli import entry; entry()", *argv],
+        capture_output=True, text=True, env=_subprocess_env(db))
+    assert p.returncode == expected, f"stdout={p.stdout!r} stderr={p.stderr!r}"
+    assert p.stderr == "", p.stderr
+    assert _is_deferred(db) is (expected == 0)
+
+
+# ---------------------------------------------------------------------------
+# skodun deferrals: the cross-review listing that keeps them from rotting
+# ---------------------------------------------------------------------------
+#
+# Its own subcommand rather than `log --deferred`, and the shape is the reason:
+# `log` lists REVIEWS, one row each, while a deferral is a FINDING inside one --
+# and `triage` needs a review id, which the question "what has this project
+# deferred" does not have. A deferral filed three branches ago is exactly the
+# one that rots, so the listing has no scope at all.
+
+
+def test_deferrals_lists_every_open_deferral_across_reviews(tmp_path, monkeypatch,
+                                                            capsys):
+    db = tmp_path / "cli.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    st = Store.open(db)
+    st.save_review(_artifact([_finding(0)], review_id="rev1"))
+    st.save_review(_artifact([_finding(1)], review_id="rev2", branch="other",
+                             base_sha="z" * 40))
+
+    assert main(["triage", "--defer", "rev1", "0", TRACKING_REF, DEFER_REASON]) == 0
+    assert main(["triage", "--defer", "rev2", "0", "SKO-7", DEFER_REASON]) == 0
+    capsys.readouterr()
+
+    assert main(["deferrals"]) == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 2, lines
+    assert lines[0].startswith("SKO-7 ")            # newest first
+    assert lines[1].startswith(f"{TRACKING_REF} ")
+    assert "other" in lines[0] and "feat" in lines[1]
+    assert "rev2" in lines[0] and "rev1" in lines[1]
+    st.close()
+
+
+def test_a_reopened_deferral_leaves_the_deferrals_listing(tmp_path, monkeypatch,
+                                                          capsys):
+    """The listing is outstanding work, not history: once the deferral is
+    overturned there is nothing filed to chase."""
+    db = _open_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["triage", "--defer", "rev1", "0", TRACKING_REF, DEFER_REASON]) == 0
+    capsys.readouterr()
+    assert main(["deferrals"]) == 0
+    assert TRACKING_REF in capsys.readouterr().out
+
+    assert main(["triage", "--reopen", "rev1", "0", REOPEN_REASON]) == 0
+    capsys.readouterr()
+    assert main(["deferrals"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_a_dismissal_never_appears_in_the_deferrals_listing(tmp_path, monkeypatch,
+                                                            capsys):
+    """The separation `defer` exists for: rejected findings are not debt."""
+    db = _open_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    assert main(["triage", "rev1", "0", DISMISS_REASON]) == 0
+    capsys.readouterr()
+    assert main(["deferrals"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_deferrals_on_an_empty_ledger_prints_nothing_and_exits_0(tmp_path,
+                                                                 monkeypatch,
+                                                                 capsys):
+    """A blank line is not an empty listing, and `skodun deferrals | wc -l` has
+    to be able to say zero. The note goes to STDERR, like `surface`'s."""
+    _open_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "cli.db"))
+    assert main(["deferrals"]) == 0
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert "no open deferrals" in cap.err
+
+
+@pytest.mark.parametrize("limit", ["0", "-1"])
+def test_deferrals_refuses_a_non_positive_limit(tmp_path, monkeypatch, capsys,
+                                                limit):
+    _open_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "cli.db"))
+    assert main(["deferrals", "-n", limit]) == 2
+    assert "positive" in capsys.readouterr().out
+
+
+def test_deferrals_honours_its_row_limit(tmp_path, monkeypatch, capsys):
+    db = _open_store(tmp_path / "cli.db")
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    st = Store.open(db)
+    st.save_review(_artifact([_finding(1)], review_id="rev2"))
+    st.close()
+    assert main(["triage", "--defer", "rev1", "0", TRACKING_REF, DEFER_REASON]) == 0
+    assert main(["triage", "--defer", "rev2", "0", "SKO-7", DEFER_REASON]) == 0
+    capsys.readouterr()
+    assert main(["deferrals", "-n", "1"]) == 0
+    assert len(capsys.readouterr().out.strip().splitlines()) == 1
+
+
+def test_deferrals_reports_an_unreadable_store_as_a_2(tmp_path, monkeypatch,
+                                                      capsys):
+    bad = tmp_path / "not-a-db"
+    bad.write_text("this is not sqlite", encoding="utf-8")
+    monkeypatch.setenv("SKODUN_DB", str(bad))
+    assert main(["deferrals"]) == 2
+    cap = capsys.readouterr()
+    assert "Traceback" not in cap.out and "Traceback" not in cap.err
+
+
+def test_deferrals_appears_in_the_top_level_help(capsys):
+    assert main(["--help"]) == 0
+    assert "deferrals" in capsys.readouterr().out
+
+
+def test_deferrals_survives_a_closed_stdout(tmp_path):
+    """`skodun deferrals | head -1` on a long backlog: `_emit`, not `print`."""
+    db = _open_store(tmp_path / "sub" / "s.db")
+    st = Store.open(db)
+    for i in range(1, 60):
+        st.save_review(_artifact([_finding(i)], review_id=f"rev{i}"))
+    st.close()
+    env = _subprocess_env(db)
+    for i in range(1, 60):
+        p = subprocess.run([sys.executable, "-m", "skodun", "triage", "--defer",
+                            f"rev{i}", "0", f"GH-{i}", DEFER_REASON],
+                           capture_output=True, text=True, env=env)
+        assert p.returncode == 0, p.stdout + p.stderr
+    r_fd, w_fd = os.pipe()
+    os.close(r_fd)
+    try:
+        p = subprocess.run([sys.executable, "-m", "skodun", "deferrals"],
+                           stdout=w_fd, stderr=subprocess.PIPE, text=True, env=env)
+    finally:
+        os.close(w_fd)
+    assert p.returncode == 0, p.stderr
+    assert p.stderr == "", p.stderr
+
+
 def test_triage_list_still_exits_0_on_a_stdout_that_cannot_encode_the_line(tmp_path):
     """DOCUMENTED, and no longer narrow.
 

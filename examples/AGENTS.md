@@ -27,13 +27,22 @@ trustworthy review must cover it.
   with a named reviewer entry — a second opinion, or a provider you know is
   healthy. A name that does not resolve is refused before anything runs, and the
   refusal lists the configured names; do not retry with a guess.
-- `skodun triage --list <review-id>` — the findings, with their triage state.
+- `skodun triage --list <review-id>` — the findings, with their triage state
+  (`OPEN`, `DISMISSED`, `DEFERRED -> <ref>`, `REOPENED`).
+- `skodun triage --defer <review-id> <n> <tracking-ref> "<reason>"` — record that
+  a finding is real, is not blast-radius for this change, and is FILED as
+  `<tracking-ref>`. It clears the gate; the reference is mandatory and a deferral
+  without one is refused. See "A deferral must be filed" below.
+- `skodun deferrals` — every finding still standing as deferred, across all
+  reviews. This is the backlog the deferrals above created; it is a human's to
+  review.
 - `skodun surface` — background rounds nobody has seen yet (from the pre-push
   hook). Reports history; it never certifies the current change.
 
 If skodun is wired in over MCP, the same operations are the `gate`, `review`,
-`log`, `surface`, `triage_list`, `triage_dismiss`, `adopt_refuter` and
-`triage_reopen` tools, with identical wording and identical refusals.
+`log`, `surface`, `triage_list`, `triage_dismiss`, `adopt_refuter`,
+`triage_reopen` and `triage_defer` tools, with identical wording and identical
+refusals. There is no `deferrals` tool: reviewing the backlog is a human's job.
 
 ### The loop
 
@@ -56,7 +65,7 @@ Judge every finding by its **consequence**, never by its severity label — labe
 are wrong in both directions. Fix before merging only if the finding meets one
 of these:
 
-| Fix now | Defer, with a filed issue |
+| Fix now | Defer (`triage --defer`), with a filed issue |
 |---|---|
 | The change does not work as described (dead on arrival, silent no-op) | Performance that is within bounds for this surface |
 | A safety property the change or its docs explicitly promise is false | Style, naming, consistency |
@@ -67,9 +76,22 @@ Calibrate to what the code promises: a change to a safety mechanism legitimately
 treats "a stated guarantee is false" as blocking, where an ordinary feature
 defers the same class of finding.
 
-**A deferral must be filed.** [Open an issue in <your tracker> and reference it
-in the dismissal reason.] An unfiled deferral and an ignored finding are the
-same artifact.
+**A deferral must be filed, and skodun enforces it.** Open an issue in [<your
+tracker>] FIRST, then record the deferral against its reference:
+
+```bash
+skodun triage --defer <review-id> <n> <tracking-ref> "<why it can wait>"
+```
+
+`<tracking-ref>` is an issue number, a tracker key or a URL — one token, not
+prose — and it is **mandatory**: a deferral without a usable reference is refused
+exactly as a placeholder reason is, because an unfiled deferral and an ignored
+finding are the same artifact. Do NOT dismiss a real finding and mention the
+issue in the reason; `dismiss` means "not a defect", and using it for a deferral
+makes the ledger stop distinguishing outstanding debt from rejected findings.
+
+The deferral clears the gate. It does not clear the work: `skodun deferrals`
+lists every one that is still open, across every review and branch.
 
 ### When to stop and ask a human instead of running another round
 
@@ -85,9 +107,11 @@ converge on its own. Escalate rather than iterate when:
 
 ### What you must not do
 
-- **Never dismiss a finding on your own.** `skodun triage <id> <n> "<reason>"`
-  and `--adopt-refuter` record a *human's* decision in an audit ledger; they are
-  not a way to tidy a report. Present the findings and let a human decide.
+- **Never clear a finding on your own.** `skodun triage <id> <n> "<reason>"`,
+  `--defer` and `--adopt-refuter` all record a *human's* decision in an audit
+  ledger and all move the gate; none of them is a way to tidy a report. Present
+  the findings and let a human decide — including which ones may be deferred and
+  under what reference.
 - **Never push with `SKODUN_PREPUSH_SKIP=1`** or by disabling the hook to get a
   green run. If the gate refuses, that is the product working.
 - **Never treat `surface` output as a verdict.** It reports history. Only `gate`

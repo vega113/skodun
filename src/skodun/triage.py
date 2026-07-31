@@ -1,13 +1,22 @@
-"""Human dismissal of review findings, with an audited reason -- and the
-audited un-dismissal that overturns one -- plus the fail-closed artifact
-validation that keeps a corrupt or hand-edited review from ever satisfying the
-gate.
+"""Human triage of review findings, with an audited reason -- dismissal,
+deferral, and the un-dismissal that overturns either -- plus the fail-closed
+artifact validation that keeps a corrupt or hand-edited review from ever
+satisfying the gate.
 
-Both decisions are APPENDED to the store's triage event stream: `dismiss` and
-`reopen` (see `reopen` below and `store.Store.triage_state`). Nothing is edited
-or deleted, so an overturned dismissal keeps its reason and the whole history of
-a finding reads back in order. `reopen` clears the same audit floor a dismissal
-does, from the same `validate_reason`.
+Every decision is APPENDED to the store's triage event stream: `dismiss`,
+`defer` and `reopen` (see below and `store.Store.triage_state`). Nothing is
+edited or deleted, so an overturned dismissal keeps its reason and the whole
+history of a finding reads back in order. All three verbs clear the same audit
+floor on their reason, from the same `validate_reason`.
+
+`defer` is skodun's own and is the newest of the three. `dismiss` says *not a
+defect*; `defer` says *a defect, not blast-radius for this change, filed as X*,
+and it clears the gate just as a dismissal does -- which is the escape from a
+review loop that need not terminate, since every round of fixes is new code the
+reviewer will review. What keeps it from being an auto-dismissal with better
+manners is `validate_tracking_ref`: the filed reference is MANDATORY and is
+refused on exactly the terms a placeholder reason is, because an unfiled
+deferral and an ignored finding are the same artifact.
 
 PARITY-CRITICAL: ported from the oracle's `grok_review_triage.py`. Where this
 module's *review semantics* and the oracle's disagree, the oracle wins — the
@@ -65,6 +74,13 @@ PLACEHOLDER_REASONS = {
 }
 MIN_REASON_CHARS = 20
 
+#: How long a tracking reference may be. It is an IDENTIFIER to look a deferral
+#: up by -- an issue number, a tracker key, a URL -- not the explanation, which
+#: is what `reason` is for. Generous enough for a long self-hosted URL and short
+#: enough that the reference cannot become a second, unvalidated reason. It also
+#: bounds what `skodun deferrals` prints per row.
+MAX_TRACKING_REF_CHARS = 200
+
 #: The key a refuter annotation lives under on a finding, and the name of the
 #: pass in `extra_passes`. Spelled here rather than imported from `passes`
 #: because that module already imports THIS one (`MIN_REASON_CHARS`), and a
@@ -119,6 +135,69 @@ def validate_reason(reason: str) -> None:
             f"reason is {len(cleaned)} chars; at least {MIN_REASON_CHARS} are "
             "required. A dismissal nobody can audit later is indistinguishable "
             "from ignoring the finding.")
+
+
+def validate_tracking_ref(ref) -> str:
+    """Return the canonical reference, or raise TriageError. THE one floor.
+
+    The deferral floor, standing beside `validate_reason` rather than inside it:
+    a `defer` clears the gate, and the only thing separating "we filed this and
+    will do it" from "we stopped looking at it" is a reference somebody can
+    actually open. *An unfiled deferral and an ignored finding are the same
+    artifact* -- so a missing reference is refused exactly as a placeholder
+    reason is, and skodun's own name for that rule is this function.
+
+    Validation is DELIBERATELY MINIMAL, and the restraint is the design. There
+    is no pattern to conform to: an issue number (`#412`), a bare number, a
+    tracker key (`SKO-7`), a repo-qualified issue (`owner/repo#5`) and a URL are
+    all references, and a scheme tight enough to "validate" them would refuse
+    the tracker this project has never heard of -- pushing its users back to
+    burying the reference in prose, which is the failure being fixed. What is
+    checked is only what makes a value unusable AS a reference:
+
+    * empty or whitespace-only -- there is nothing filed;
+    * longer than `MAX_TRACKING_REF_CHARS` -- that is a reason, not an
+      identifier, and the reason field is right there;
+    * containing whitespace or a control character -- a reference is ONE token
+      nobody has to interpret. `I will file it later` is a promise, not a
+      filing; and this value is printed on a one-line-per-item listing, so a
+      newline could forge a row and an ESC could rewrite what the terminal
+      already showed. (`shown_field` bounds it again at display time; refusing
+      it at the door means the ledger never stores one in the first place.)
+    * carrying no letter or digit -- `---` and `#` name nothing that can be
+      looked up.
+
+    Returns the STRIPPED value, which is what gets stored and printed: the
+    surrounding whitespace of a pasted reference is a copy-paste artefact, not
+    part of the identifier.
+    """
+    if not isinstance(ref, str):
+        raise TriageError(
+            f"a tracking reference must be text ({ref!r}); a deferral has to "
+            "name where the work is filed")
+    cleaned = ref.strip()
+    if not cleaned:
+        raise TriageError(
+            "a tracking reference is required (it was empty). A deferral says "
+            "the finding is real and the work is filed somewhere -- name the "
+            "issue, ticket or URL. An unfiled deferral and an ignored finding "
+            "are the same artifact.")
+    if len(cleaned) > MAX_TRACKING_REF_CHARS:
+        raise TriageError(
+            f"tracking reference is {len(cleaned)} chars; at most "
+            f"{MAX_TRACKING_REF_CHARS} are allowed. It is the identifier to "
+            "look the deferral up by, not the explanation -- put that in the "
+            "reason.")
+    if any(c.isspace() for c in cleaned) or _CONTROL_CHARS.search(cleaned):
+        raise TriageError(
+            f"{cleaned!r} is prose, not a filed reference. A tracking "
+            "reference is one token nobody has to interpret: an issue number "
+            "(#412), a tracker key (SKO-7), or a URL.")
+    if not any(c.isalnum() for c in cleaned):
+        raise TriageError(
+            f"{cleaned!r} names nothing that can be looked up; a tracking "
+            "reference must carry at least one letter or digit.")
+    return cleaned
 
 
 # DELIBERATE, DOCUMENTED DIVERGENCE FROM THE ORACLE — read before "fixing"
@@ -231,6 +310,50 @@ def dismiss(store: Store, review: dict, index: int, reason: str, now: str) -> di
     return rec
 
 
+def defer(store: Store, review: dict, index: int, tracking_ref: str, reason: str,
+          now: str) -> dict:
+    """Record an audited deferral of one finding and return the ledger row.
+
+    Appends a `defer` event (v4): *this finding is real, it is not blast-radius
+    for this change, and the work is filed as `tracking_ref`*. It CLEARS the
+    gate exactly as a dismissal does -- see `store.Store.triage_for` -- which is
+    what lets a review loop terminate on a non-trivial change without anybody
+    pretending a real defect is a false positive.
+
+    Two floors, and both are the shared ones rather than new copies: the reason
+    clears `validate_reason` (the same function a dismissal and a reopen clear,
+    placeholder set included -- "filed as GH-1" plus a reason of `wontfix` is a
+    dismissal wearing a ticket number), and the reference clears
+    `validate_tracking_ref`.
+
+    THE ORDER OF THE CHECKS IS THE EXIT CONTRACT, and it matches `reopen`'s.
+    `FindingNotFound` -- which the CLI reports as 2, "the thing you named does
+    not exist" -- is raised before either floor is applied, because a reference
+    cannot be refused on behalf of no finding. Only then can a `TriageError`
+    (reported as 1, "it exists and the deferral was declined") arise.
+
+    The REFERENCE is judged before the reason: it is what distinguishes this
+    verb from `dismiss`, so an agent or a human who left it out should be told
+    that, not lectured about prose they did write.
+
+    There is no state precondition. Deferring an already-dismissed finding, or
+    re-filing a deferral under a different reference, is another event on the
+    stream exactly as a re-dismissal is -- nothing is edited, and the earlier
+    reference and its reason stay readable in `triage_history`.
+    """
+    review = load_valid_artifact(review)
+    f, fkey, lkey = _keys_for(review, index)
+    tracking_ref = validate_tracking_ref(tracking_ref)
+    validate_reason(reason)
+    rec = dict(ledger_key=lkey, finding_key=fkey, id=review["id"],
+               branch=review["branch"], base_sha=review["base_sha"],
+               file=f.get("file"), line=f.get("line"), severity=f.get("severity"),
+               title=f.get("title"), reason=reason, tracking_ref=tracking_ref,
+               at=now)
+    store.triage_defer(rec)
+    return rec
+
+
 def open_findings(review: dict, triaged: dict[str, dict]) -> list[dict]:
     """Findings from `review` with no matching entry in `triaged`."""
     out = []
@@ -264,36 +387,41 @@ def _effective_event(store: Store, review: dict, fkey: str) -> str | None:
 
 
 def reopen(store: Store, review: dict, index: int, reason: str, now: str) -> dict:
-    """Overturn one finding's dismissal with an audited reason. Append-only.
+    """Overturn one finding's dismissal OR deferral, with an audited reason.
 
-    A dismissal is not a verdict for all time: a fix regresses, a base moves, a
-    reason turns out to have been wrong. Reopening is therefore a first-class
-    decision recorded in the same stream, and it is subject to the SAME audit
-    floor a dismissal clears -- `validate_reason`, the identical function, so
-    the two floors cannot drift. A reopen moves the gate from 0 to 1, which is
-    exactly the kind of change nobody should be able to make without saying
-    why.
+    A cleared finding is not cleared for all time: a fix regresses, a base
+    moves, a reason turns out to have been wrong, a deferral turns out to have
+    been the wrong call. Reopening is therefore a first-class decision recorded
+    in the same stream, and it is subject to the SAME audit floor a dismissal
+    clears -- `validate_reason`, the identical function, so the floors cannot
+    drift. A reopen moves the gate from 0 to 1, which is exactly the kind of
+    change nobody should be able to make without saying why.
 
-    Nothing is edited or deleted: the dismissal and its reason stay in the
-    stream, readable by `store.triage_history`, and the reopen is appended
-    after them.
+    It overturns whichever CLEARING verb is in force (`Store.CLEARING_EVENTS`),
+    not `dismiss` alone. That is not a convenience: `defer` moves the gate to 0
+    just as `dismiss` does, so a deferral with no audited undo would be the one
+    decision in this ledger that cannot be taken back on the record.
+
+    Nothing is edited or deleted: the dismissal or deferral stays in the stream
+    with its own reason and its filed reference, readable by
+    `store.triage_history`, and the reopen is appended after it.
 
     THE ORDER OF THE CHECKS IS THE EXIT CONTRACT. `FindingNotFound` (which the
     CLI reports as 2, "the thing you named does not exist") is raised before
     the reason is judged and before the ledger is consulted, because a reason
     cannot be refused on behalf of no finding. Only then does a `TriageError`
     (reported as 1, "it exists and the reopen was declined") become possible:
-    an unauditable reason, or a finding that is not dismissed in the first
+    an unauditable reason, or a finding that is not cleared in the first
     place -- for which there is nothing to overturn, and an event claiming
-    otherwise would be a reopen with no dismissal behind it.
+    otherwise would be a reopen with nothing behind it.
     """
     review = load_valid_artifact(review)
     f, fkey, lkey = _keys_for(review, index)
     validate_reason(reason)
     state = _effective_event(store, review, fkey)
-    if state != Store.EVENT_DISMISS:
+    if state not in Store.CLEARING_EVENTS:
         raise TriageError(
-            f"finding {index} is not dismissed"
+            f"finding {index} is not dismissed or deferred"
             + (" (it was already reopened)" if state == Store.EVENT_REOPEN else "")
             + "; there is nothing to reopen")
     rec = dict(ledger_key=lkey, finding_key=fkey, id=review["id"],
@@ -307,21 +435,39 @@ def reopen(store: Store, review: dict, index: int, reason: str, now: str) -> dic
 def status_token(state) -> str:
     """The `(...)` status `triage --list` prints for one finding.
 
-    `OPEN`, `DISMISSED <when>`, or `REOPENED <when>, dismissed <when>` -- both
+    `OPEN`, `DISMISSED <when>`, `REOPENED <when>, dismissed <when>` -- both
     timestamps whenever both decisions exist, because "reopened today" is only
-    meaningful next to the dismissal it overturned.
+    meaningful next to the dismissal it overturned -- or `DEFERRED -> <ref>
+    <when>`.
+
+    The deferral token carries its REFERENCE and not its counterpart timestamp,
+    and that asymmetry is the point of the verb: what a reader of this listing
+    needs from a deferred finding is where the work is filed, which is the only
+    thing distinguishing outstanding debt from a rejected finding.
 
     `state` is one value from `store.triage_state`, or None for a finding with
-    no events. Every timestamp goes through `shown_field`: a seeded legacy
-    `dismissed_at` is whatever the archive happened to contain, and it prints on
-    the same terminal line as the finding's own status -- the exact exposure
-    that rule exists for. An unknown event verb renders `OPEN`, the safe
-    direction: a finding shown as open is one a human still has to look at.
+    no events. Every field goes through `shown_field`: a seeded legacy
+    `dismissed_at` is whatever the archive happened to contain, a `tracking_ref`
+    could have been hand-edited into the store, and both print on the same
+    terminal line as the finding's own status -- the exact exposure that rule
+    exists for. An unknown event verb renders `OPEN`, the safe direction: a
+    finding shown as open is one a human still has to look at.
 
     Rendering may never be the thing that crashes a listing, so nothing here
     raises for any input.
     """
     event = state.get("event") if isinstance(state, dict) else None
+    if event == Store.EVENT_DEFER:
+        # A deferral always has a reference (the store's door enforces it), so
+        # the empty case is a hand-edited or seeded row -- rendered as a bare
+        # DEFERRED rather than as `DEFERRED -> `, which would read as a filing
+        # whose name merely failed to print.
+        out = "DEFERRED"
+        ref = shown_field(state.get("tracking_ref"))
+        if ref:
+            out += f" -> {ref}"
+        when = shown_field(state.get("deferred_at"))
+        return f"{out} {when}" if when else out
     if event == Store.EVENT_DISMISS:
         label, own, other, other_word = ("DISMISSED", "dismissed_at",
                                          "reopened_at", "reopened")

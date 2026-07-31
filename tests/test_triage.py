@@ -1150,7 +1150,267 @@ def test_reopen_is_scoped_to_the_reviews_own_branch_and_base(tmp_path):
     assert st.triage_history(_lkey(other))[-1]["event"] == "dismiss"
 
 
+# ---------------------------------------------------------------------------
+# defer: the third verb, and the reference that makes it honest
+# ---------------------------------------------------------------------------
+#
+# `dismiss` says "not a defect". `defer` says "a defect, not blast-radius for
+# this change, filed as X" -- and it clears the gate, which is the escape from
+# a review loop that would otherwise never terminate (each round of fixes is
+# new code the reviewer will review). The ONE thing standing between that and
+# an auto-dismissal with better manners is the FILED REFERENCE: a deferral
+# nobody filed and an ignored finding are the same artifact, so a deferral with
+# no reference is refused exactly as a placeholder reason is.
+
+DEFER_REASON = "in-bounds for this surface; the hot path is the batcher upstream"
+TRACKING_REF = "GH-412"
+
+
+def test_defer_records_an_audited_deferral_and_clears_the_gate(tmp_path):
+    from skodun.triage import defer
+
+    st = Store.open(tmp_path / "s.db")
+    assert len(open_findings(GOOD, _triaged(st))) == 1
+
+    rec = defer(st, GOOD, 0, TRACKING_REF, DEFER_REASON, now="2026-07-27T11:00:00Z")
+
+    assert rec["finding_key"] == finding_key("a.py", "NPE")
+    assert rec["ledger_key"] == _lkey()
+    assert rec["tracking_ref"] == TRACKING_REF
+    assert rec["reason"] == DEFER_REASON
+    assert rec["at"] == "2026-07-27T11:00:00Z"
+    # The gate's view: the finding no longer counts as open.
+    assert open_findings(GOOD, _triaged(st)) == []
+    assert [h["event"] for h in st.triage_history(_lkey())] == ["defer"]
+    assert st.triage_history(_lkey())[-1]["tracking_ref"] == TRACKING_REF
+
+
+@pytest.mark.parametrize("ref", [None, "", "   ", "\t\n ", 7, 412, ["GH-1"]])
+def test_defer_refuses_a_missing_or_unusable_tracking_reference(tmp_path, ref):
+    """THE property of this verb. `defer` clears the gate, so a deferral that
+    names nowhere the work is filed is an auto-dismissal with better manners."""
+    from skodun.triage import defer
+
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(TriageError):
+        defer(st, GOOD, 0, ref, DEFER_REASON, now="2026-07-27T11:00:00Z")
+    assert st.triage_history(_lkey()) == [], "a refusal recorded something"
+    assert len(open_findings(GOOD, _triaged(st))) == 1, "a refusal moved the gate"
+
+
+@pytest.mark.parametrize("reason", ["fp", "false positive", "wontfix", "",
+                                    "   ", "too short"])
+def test_defer_refuses_an_unauditable_reason_too(tmp_path, reason):
+    """A reference is necessary and NOT sufficient: the reason clears exactly
+    the floor a dismissal's does, from the same `validate_reason`. "filed as
+    GH-1" with a reason of "wontfix" is a dismissal wearing a ticket number."""
+    from skodun.triage import defer
+
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(TriageError):
+        defer(st, GOOD, 0, TRACKING_REF, reason, now="2026-07-27T11:00:00Z")
+    assert st.triage_history(_lkey()) == []
+
+
+@pytest.mark.parametrize("ref", [
+    "#412", "GH-412", "SKO-7", "https://example.invalid/issues/412",
+    "vega113/skodun#5", "412", "JIRA-1234", "T4",
+])
+def test_a_reference_anybody_can_look_up_is_accepted(tmp_path, ref):
+    """Validation is minimal and honest on purpose: an issue number, a tracker
+    key, or a URL. There is no scheme to conform to, because inventing one
+    would refuse the trackers this project has never heard of."""
+    from skodun.triage import defer
+
+    st = Store.open(tmp_path / "s.db")
+    rec = defer(st, GOOD, 0, ref, DEFER_REASON, now="2026-07-27T11:00:00Z")
+    assert rec["tracking_ref"] == ref
+
+
+@pytest.mark.parametrize("ref, why", [
+    ("I will file it later", "prose is not a reference"),
+    ("GH 412", "a reference is one token"),
+    ("---", "no letter or digit: nothing to look up"),
+    ("#", "no letter or digit: nothing to look up"),
+    ("GH-1\x1b[2K", "a control character is a terminal instruction"),
+    ("GH-1\nGH-2", "a newline could forge a second row in the listing"),
+    ("GH-" + "9" * 400, "an identifier, not the reason"),
+])
+def test_a_reference_nobody_can_look_up_is_refused(tmp_path, ref, why):
+    from skodun.triage import defer
+
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(TriageError):
+        defer(st, GOOD, 0, ref, DEFER_REASON, now="2026-07-27T11:00:00Z")
+    assert st.triage_history(_lkey()) == [], why
+
+
+def test_the_stored_reference_is_the_stripped_one(tmp_path):
+    """Surrounding whitespace is a copy-paste artefact, not part of an
+    identifier; what is stored is what a listing will print and what somebody
+    will paste into a tracker."""
+    from skodun.triage import defer
+
+    st = Store.open(tmp_path / "s.db")
+    rec = defer(st, GOOD, 0, "  GH-412\t", DEFER_REASON, now="2026-07-27T11:00:00Z")
+    assert rec["tracking_ref"] == "GH-412"
+    assert st.triage_history(_lkey())[-1]["tracking_ref"] == "GH-412"
+
+
+@pytest.mark.parametrize("index", [1, -1, 99, True, "0", None, 1.0])
+def test_defer_raises_finding_not_found_for_an_unresolvable_index(tmp_path, index):
+    """`FindingNotFound`, not `TriageError`: the CLI maps them to DIFFERENT exit
+    codes -- 2 for "the thing you named does not exist", 1 for "it exists and
+    the deferral was refused"."""
+    from skodun.triage import defer
+
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(FindingNotFound):
+        defer(st, GOOD, index, TRACKING_REF, DEFER_REASON,
+              now="2026-07-27T11:00:00Z")
+    assert st.triage_history(_lkey()) == []
+
+
+def test_defer_reports_a_bad_index_before_it_judges_the_reference(tmp_path):
+    """Both are wrong; the honest answer is the one about the thing that does
+    not exist, because a reference cannot be refused on behalf of no finding."""
+    from skodun.triage import defer
+
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(FindingNotFound):
+        defer(st, GOOD, 99, "", "fp", now="2026-07-27T11:00:00Z")
+
+
+def test_defer_rejects_a_corrupt_artifact_before_writing(tmp_path):
+    from skodun.triage import defer
+
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(ArtifactError):
+        defer(st, dict(GOOD, findings_total=2), 0, TRACKING_REF, DEFER_REASON,
+              now="2026-07-27T11:00:00Z")
+    assert st.triage_history(_lkey()) == []
+
+
+def test_defer_rejects_a_non_canonical_timestamp(tmp_path):
+    from skodun.triage import defer
+
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(ValueError):
+        defer(st, GOOD, 0, TRACKING_REF, DEFER_REASON, now="2026-07-27 11:00:00")
+    assert st.triage_history(_lkey()) == []
+
+
+def test_a_deferral_is_append_only_like_every_other_decision(tmp_path):
+    """Re-filing under a different reference is another `defer` event, not an
+    edit: the first reference and its reason stay readable."""
+    from skodun.triage import defer
+
+    st = Store.open(tmp_path / "s.db")
+    _dismissed(st)
+    defer(st, GOOD, 0, TRACKING_REF, DEFER_REASON, now="2026-07-27T11:00:00Z")
+    defer(st, GOOD, 0, "SKO-7", "re-filed against the platform backlog instead",
+          now="2026-07-27T12:00:00Z")
+    history = st.triage_history(_lkey())
+    assert [h["event"] for h in history] == ["dismiss", "defer", "defer"]
+    assert [h["tracking_ref"] for h in history] == [None, TRACKING_REF, "SKO-7"]
+    assert history[0]["reason"] == GOOD_REASON          # nothing overwritten
+
+
+def test_reopen_overturns_a_deferral_too(tmp_path):
+    """A deferral moves the gate to 0, so there has to be an audited way to move
+    it back -- the same one a dismissal has. `reopen` overturns whichever
+    CLEARING verb is in force; it is not a dismissal-only undo."""
+    from skodun.triage import defer, reopen
+
+    st = Store.open(tmp_path / "s.db")
+    defer(st, GOOD, 0, TRACKING_REF, DEFER_REASON, now="2026-07-27T11:00:00Z")
+    assert open_findings(GOOD, _triaged(st)) == []
+
+    reopen(st, GOOD, 0, "the deferral was wrong: this corrupts the ledger row",
+           now="2026-07-27T12:00:00Z")
+
+    assert len(open_findings(GOOD, _triaged(st))) == 1
+    history = st.triage_history(_lkey())
+    assert [h["event"] for h in history] == ["defer", "reopen"]
+    assert history[0]["tracking_ref"] == TRACKING_REF   # the filing is not erased
+
+
+def test_reopen_still_refuses_a_finding_that_is_neither_dismissed_nor_deferred(
+        tmp_path):
+    from skodun.triage import defer, reopen
+
+    st = Store.open(tmp_path / "s.db")
+    with pytest.raises(TriageError) as e:
+        reopen(st, GOOD, 0, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+    assert "not dismissed" in str(e.value).lower()
+    defer(st, GOOD, 0, TRACKING_REF, DEFER_REASON, now="2026-07-27T11:00:00Z")
+    reopen(st, GOOD, 0, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+    with pytest.raises(TriageError):                    # already reopened
+        reopen(st, GOOD, 0, "and once more, with a different reason entirely",
+               now="2026-07-27T13:00:00Z")
+
+
+def test_a_deferral_is_scoped_to_the_reviews_own_branch_and_base(tmp_path):
+    from skodun.triage import defer
+
+    st = Store.open(tmp_path / "s.db")
+    other = dict(GOOD, base_sha="0" * 40)
+    defer(st, other, 0, TRACKING_REF, DEFER_REASON, now="2026-07-27T11:00:00Z")
+    assert len(open_findings(GOOD, _triaged(st))) == 1, (
+        "a deferral under another base cleared this one")
+
+
+def test_validate_tracking_ref_returns_the_canonical_value_and_is_the_one_floor():
+    """One definition of "a usable reference", so the CLI, the MCP tool and the
+    store door cannot drift into three answers."""
+    from skodun.triage import validate_tracking_ref
+
+    assert validate_tracking_ref(" GH-412 ") == "GH-412"
+    with pytest.raises(TriageError):
+        validate_tracking_ref("")
+
+
 # --- the status token the listing prints ----------------------------------
+
+def test_status_token_renders_deferred_with_its_reference(tmp_path):
+    """`DEFERRED -> <ref>` is how a human sees, at a glance, which findings the
+    project still owes work on and where that work is filed."""
+    from skodun.triage import defer, reopen, status_token
+
+    st = Store.open(tmp_path / "s.db")
+    fkey = finding_key("a.py", "NPE")
+
+    def token():
+        return status_token(st.triage_state(GOOD["branch"],
+                                            GOOD["base_sha"]).get(fkey))
+
+    assert token() == "OPEN"
+    defer(st, GOOD, 0, TRACKING_REF, DEFER_REASON, now="2026-07-27T11:00:00Z")
+    assert token() == "DEFERRED -> GH-412 2026-07-27T11:00:00Z"
+    # Overturned, the token goes back to the reopen shape -- the deferral is
+    # history now, not the state.
+    reopen(st, GOOD, 0, REOPEN_REASON, now="2026-07-27T12:00:00Z")
+    assert token().startswith("REOPENED 2026-07-27T12:00:00Z")
+
+
+def test_the_deferred_token_never_trusts_the_stored_reference_either():
+    """The reference is validated at the door, but this renderer also reads
+    SEEDED and hand-edited rows, and it may never be the thing that crashes a
+    listing or lets a stored value rewrite the terminal."""
+    from skodun.triage import status_token
+
+    assert status_token({"event": "defer"}) == "DEFERRED"
+    assert status_token({"event": "defer", "tracking_ref": None}) == "DEFERRED"
+    hostile = status_token({"event": "defer",
+                            "tracking_ref": "GH\x1b[2K\n1 (OPEN) " + "z" * 5000,
+                            "deferred_at": "2026-07-27T11:00:00Z"})
+    assert hostile.startswith("DEFERRED -> ")
+    assert "\x1b" not in hostile and "\n" not in hostile
+    assert len(hostile) < 300, len(hostile)
+    for junk in [{"event": "defer", "tracking_ref": ["x"]},
+                 {"event": "defer", "tracking_ref": 7, "deferred_at": {}}]:
+        assert isinstance(status_token(junk), str), junk
+
 
 def test_status_token_renders_open_dismissed_and_reopened(tmp_path):
     from skodun.triage import reopen, status_token

@@ -13,12 +13,17 @@ rewritten, and a store stamped with a version this build does not understand is
 refused without being written to at all.
 
 Triage decisions are an APPEND-ONLY EVENT STREAM (v3). ``triage_events`` holds
-one row per decision -- ``dismiss`` or ``reopen`` -- and the effective state of
-a finding is its LAST EVENT BY ``seq``. Nothing is ever overwritten or deleted,
-so a finding's whole history reads back in order and every reason survives the
-decision that overturned it. The pre-v3 single-row ``triage`` table is still
-here and is now READ-ONLY: it is the audit source the migration seeded the
-stream from.
+one row per decision -- ``dismiss``, ``reopen`` or, since v4, ``defer`` -- and
+the effective state of a finding is its LAST EVENT BY ``seq``. Nothing is ever
+overwritten or deleted, so a finding's whole history reads back in order and
+every reason survives the decision that overturned it. The pre-v3 single-row
+``triage`` table is still here and is now READ-ONLY: it is the audit source the
+migration seeded the stream from.
+
+``defer`` (v4) means *real, not blast-radius for this change, filed as X*. It
+CLEARS the gate exactly as ``dismiss`` does -- ``triage_for`` returns both -- and
+the only thing that keeps it honest is its filed reference, which is why
+``tracking_ref`` is a COLUMN rather than a convention inside ``reason``.
 """
 
 from __future__ import annotations
@@ -48,7 +53,7 @@ RUNNING = "running"
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: Set to anything other than "0", unset, or blank to ignore `provider_state`
 #: entirely.
@@ -164,6 +169,59 @@ _MIGRATION_V3: tuple[str, ...] = (
        FROM triage ORDER BY rowid""",
 )
 
+# --- v4: a third triage verb, which SQLite makes a TABLE REBUILD ------------
+#
+# `defer` -- "real, not blast-radius for this change, filed as X" -- is the
+# third event verb, and it needs two things v3 cannot be asked for in place:
+#
+#   * the CHECK constraint widened. v3 spelled the vocabulary INTO the table
+#     (`event TEXT CHECK(event IN ('dismiss','reopen'))`) and SQLite has no
+#     `ALTER TABLE ... ALTER CONSTRAINT`. Widening it is a rebuild: create a
+#     replacement, copy every row, drop the original, rename. That is the whole
+#     reason this delta exists and the reason it looks nothing like v3's.
+#   * `tracking_ref`, the deferral's filed reference. It is a COLUMN and not a
+#     convention inside `reason` because `triage --list` and `skodun deferrals`
+#     must READ it back as a value: a reference buried in prose can only be
+#     recovered by guessing at free text a human wrote, which is precisely the
+#     "an unfiled deferral and an ignored finding are the same artifact" failure
+#     the mandatory reference exists to prevent. The rebuild is happening
+#     anyway, so the column costs one more name in a column list.
+#
+# TWO PROPERTIES ARE LOAD-BEARING, and both are pinned by tests:
+#
+#   1. `seq` VALUES are copied, not regenerated. `seq` is the total order every
+#      effective-state read in this project resolves by (`triage_state`,
+#      `triage_history`, `open_deferrals`), and `triage_history` hands those
+#      numbers to whoever audits the ledger. A rebuild that renumbered them
+#      would silently rewrite the order of decisions already recorded. The
+#      explicit `seq` in the INSERT column list is that guarantee; `ORDER BY
+#      seq` keeps the physical order matching it as well.
+#   2. It runs inside ONE `BEGIN IMMEDIATE` (see `_apply_atomic`), and this
+#      delta needs that even more than v3 did: it DROPS a shipped table. A crash
+#      between the drop and the rename would leave a store with no triage ledger
+#      at all -- every dismissal a human ever recorded gone -- and no version
+#      stamp to say anything happened.
+#
+# `tracking_ref` is APPENDED rather than slotted beside `reason`, so every v3
+# column keeps its v3 position: the rebuilt table is byte-for-byte the shape an
+# `ALTER TABLE ADD COLUMN` would have produced had the CHECK not forced a
+# rebuild, which keeps this delta's blast radius exactly one constraint wide.
+_MIGRATION_V4: tuple[str, ...] = (
+    """CREATE TABLE triage_events_v4 (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, ledger_key TEXT, finding_key TEXT,
+      event TEXT CHECK(event IN ('dismiss','reopen','defer')), review_id TEXT,
+      branch TEXT, base_sha TEXT, file TEXT, line INTEGER, severity TEXT,
+      title TEXT, reason TEXT, at TEXT, tracking_ref TEXT
+    )""",
+    """INSERT INTO triage_events_v4 (seq, ledger_key, finding_key, event, review_id,
+         branch, base_sha, file, line, severity, title, reason, at)
+       SELECT seq, ledger_key, finding_key, event, review_id, branch, base_sha,
+         file, line, severity, title, reason, at
+       FROM triage_events ORDER BY seq""",
+    "DROP TABLE triage_events",
+    "ALTER TABLE triage_events_v4 RENAME TO triage_events",
+)
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -176,13 +234,17 @@ _MIGRATION_V3: tuple[str, ...] = (
 #   * a `tuple[str, ...]` is applied inside one `BEGIN IMMEDIATE` together with
 #     its own version stamp: all of it commits, or none of it does. This is
 #     mandatory for any delta containing a statement that cannot be replayed --
-#     `ALTER TABLE ADD COLUMN` above being the reason it exists.
+#     v3's `ALTER TABLE ADD COLUMN` (which raises `duplicate column name` the
+#     second time) and v4's table rebuild (whose replay would silently DROP
+#     every stored `tracking_ref`) are both in this lane, and each is why it
+#     exists.
 #
 # `test_no_non_transactional_delta_carries_a_non_idempotent_statement` pins the
 # rule, because putting a delta in the wrong lane is invisible until a crash.
 _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (2, _MIGRATION_V2),
     (3, _MIGRATION_V3),
+    (4, _MIGRATION_V4),
 )
 
 
@@ -1000,30 +1062,47 @@ class Store:
 
     # --- the append-only triage event stream --------------------------------
     #
-    # The two verbs, and the ONE writer behind them. Effective state is the last
-    # event by `seq` (see `triage_state`), so a re-dismissal after a reopen is
-    # just another `dismiss` event -- there is no third verb and nothing here
+    # The three verbs, and the ONE writer behind them. Effective state is the
+    # last event by `seq` (see `triage_state`), so a re-dismissal after a reopen
+    # is just another `dismiss` event -- there is no "re-" verb and nothing here
     # updates or deletes a row.
 
     #: The closed event vocabulary. Also spelled as a CHECK constraint in the
-    #: v3 DDL, so a hand-written INSERT cannot widen it either.
+    #: v4 DDL, so a hand-written INSERT cannot widen it either.
     EVENT_DISMISS = "dismiss"
     EVENT_REOPEN = "reopen"
+    EVENT_DEFER = "defer"
 
-    def _append_triage_event(self, event: str, rec: dict, reason, at) -> None:
+    #: The verbs whose effective state CLEARS a finding for the gate. ONE
+    #: definition, read by `triage_for` and by nothing else -- `gate.py` tests
+    #: membership of the map `triage_for` returns and asks no further question,
+    #: which is exactly why a third clearing verb needed no gate change.
+    #:
+    #: `dismiss` and `defer` clear for different reasons and the ledger keeps
+    #: them apart: one says the finding is not a defect, the other says it is
+    #: one and names where the work is filed. `reopen` is deliberately absent.
+    CLEARING_EVENTS = frozenset({EVENT_DISMISS, EVENT_DEFER})
+
+    def _append_triage_event(self, event: str, rec: dict, reason, at,
+                             tracking_ref=None) -> None:
         # Fail closed on the review_id/id spelling: `rec.get("review_id") or
         # rec.get("id")` would silently write NULL (no review linkage) when
         # neither key is present. Require one of the two spellings explicitly
         # so a malformed record raises KeyError instead of persisting an
         # orphaned event.
+        #
+        # `tracking_ref` defaults to NULL and only `triage_defer` passes one:
+        # a dismissal carrying a reference would appear in the deferral listing
+        # as outstanding work nobody filed.
         review_id = rec["review_id"] if "review_id" in rec else rec["id"]
         self._c.execute(
             """INSERT INTO triage_events (ledger_key, finding_key, event, review_id,
-                 branch, base_sha, file, line, severity, title, reason, at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 branch, base_sha, file, line, severity, title, reason, at,
+                 tracking_ref)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (rec["ledger_key"], rec["finding_key"], event, review_id, rec["branch"],
              rec["base_sha"], rec.get("file"), rec.get("line"), rec.get("severity"),
-             rec.get("title"), reason, at))
+             rec.get("title"), reason, at, tracking_ref))
 
     def add_triage(self, rec: dict) -> None:
         """Append a `dismiss` event. Takes the record shape it always took.
@@ -1062,6 +1141,26 @@ class Store:
         at = _require_ts("at", rec.get("at"))
         self._append_triage_event(self.EVENT_REOPEN, rec, reason, at)
 
+    def triage_defer(self, rec: dict) -> None:
+        """Append a `defer` event: the finding is real, and filed as `rec`'s ref.
+
+        As strict at the door as `triage_reopen`, plus one requirement that is
+        the whole point of the verb: `tracking_ref` is MANDATORY. A `defer` row
+        with no reference clears the gate while naming no work anybody owes,
+        which is indistinguishable from having ignored the finding -- so it may
+        not reach the stream at all, exactly as a reopen with no reason may not.
+
+        The audit FLOORS -- what a usable reason is, what a usable reference
+        looks like -- stay in `triage.validate_reason` and
+        `triage.validate_tracking_ref`, applied by `triage.defer` before it gets
+        here. This is the door, not the floor.
+        """
+        reason = _require_text("reason", rec.get("reason"))
+        tracking_ref = _require_text("tracking_ref", rec.get("tracking_ref"))
+        at = _require_ts("at", rec.get("at"))
+        self._append_triage_event(self.EVENT_DEFER, rec, reason, at,
+                                  tracking_ref=tracking_ref)
+
     def triage_state(self, branch: str, base_sha: str) -> dict[str, dict]:
         """Effective triage state per `finding_key` for one review scope.
 
@@ -1078,10 +1177,10 @@ class Store:
         BACKWARDS. `seq` is a monotonic total order; timestamps are display.
 
         Each value carries the last event's own fields plus, independently, the
-        last `dismiss` and the last `reopen` -- so `dismissed_reason` and
-        `dismissed_at` keep the meaning they had before v3 (the dismissal's
-        own, not "the latest event's"), and a listing can show both sides of an
-        overturned decision.
+        last `dismiss`, the last `reopen` and the last `defer` -- so
+        `dismissed_reason` and `dismissed_at` keep the meaning they had before
+        v3 (the dismissal's own, not "the latest event's"), and a listing can
+        show every side of an overturned decision.
         """
         rows = self._c.execute(
             "SELECT * FROM triage_events WHERE branch=? AND base_sha=? ORDER BY seq",
@@ -1090,24 +1189,37 @@ class Store:
         for r in rows:
             cur = state.setdefault(r["finding_key"], dict(
                 dismissed_reason=None, dismissed_at=None,
-                reopen_reason=None, reopened_at=None))
+                reopen_reason=None, reopened_at=None,
+                defer_reason=None, deferred_at=None, deferred_ref=None))
             cur.update(dict(r))          # last event by seq wins
             if r["event"] == self.EVENT_DISMISS:
                 cur["dismissed_reason"], cur["dismissed_at"] = r["reason"], r["at"]
             elif r["event"] == self.EVENT_REOPEN:
                 cur["reopen_reason"], cur["reopened_at"] = r["reason"], r["at"]
+            elif r["event"] == self.EVENT_DEFER:
+                cur["defer_reason"], cur["deferred_at"] = r["reason"], r["at"]
+                cur["deferred_ref"] = r["tracking_ref"]
         return state
 
     def triage_for(self, branch: str, base_sha: str) -> dict[str, dict]:
-        """The findings in this scope whose last event is a `dismiss`.
+        """The findings in this scope whose last event CLEARS them for the gate.
 
         SHIPPED SHAPE, unchanged: a `finding_key`-keyed map whose rows carry
         `dismissed_reason` and `dismissed_at`. `gate.open_findings` tests
-        membership by `finding_key` and reads nothing else, so the gate needed
-        no change for the event stream -- and must not need one.
+        membership by `finding_key` and reads nothing else, which is what let
+        v3's event stream and v4's `defer` verb both land WITHOUT a byte of
+        `gate.py` changing -- a deferred finding is in this map, so the gate
+        counts it as triaged and stops blocking on it. That is the escape from
+        the endless review round, and it is deliberately implemented here rather
+        than as a second rule the enforcement point would have to know about.
+
+        `CLEARING_EVENTS`, never a literal: a filter that spelled `dismiss`
+        again here would be a second definition of "cleared", and the one place
+        it disagreed with the ledger is the place a human is told a finding is
+        handled while their push is still blocked.
         """
         return {k: v for k, v in self.triage_state(branch, base_sha).items()
-                if v["event"] == self.EVENT_DISMISS}
+                if v["event"] in self.CLEARING_EVENTS}
 
     def triage_history(self, ledger_key: str) -> list[dict]:
         """Every decision ever recorded for one finding, oldest first.
@@ -1120,6 +1232,37 @@ class Store:
         rows = self._c.execute(
             "SELECT * FROM triage_events WHERE ledger_key=? ORDER BY seq",
             (ledger_key,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def open_deferrals(self, limit: int = 50) -> list[dict]:
+        """Every finding, across every review, still standing as DEFERRED.
+
+        The listing that keeps a deferral from rotting. `defer` clears the gate,
+        so once it is recorded nothing in the review loop will ever mention that
+        finding again -- and the backlog it created is invisible unless
+        something asks for it across reviews. Deliberately NOT scoped to a
+        branch or a base: a deferral filed on a branch nobody is looking at is
+        exactly the one that goes stale.
+
+        "Still deferred" is the SAME last-event-by-`seq` rule `triage_state`
+        applies, only grouped by `ledger_key` (branch + base_sha + finding_key)
+        instead of scoped to one branch and base -- which is the same grouping,
+        because a ledger key is a finding key inside a scope. A separate
+        "latest row" query here would be a second definition of effective state,
+        and it could report as outstanding a deferral somebody has since
+        reopened.
+
+        Newest first by `seq`, not by `at`: `at` is display, and the store's
+        one-second resolution cannot order two decisions taken in the same
+        second.
+        """
+        rows = self._c.execute(
+            """SELECT e.* FROM triage_events e
+               JOIN (SELECT ledger_key, MAX(seq) AS seq FROM triage_events
+                     GROUP BY ledger_key) last ON e.seq = last.seq
+               WHERE e.event = ?
+               ORDER BY e.seq DESC LIMIT ?""",
+            (self.EVENT_DEFER, limit)).fetchall()
         return [dict(r) for r in rows]
 
     # --- provider availability cache ---------------------------------------
