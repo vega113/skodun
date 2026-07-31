@@ -490,7 +490,8 @@ def _disabled_note(reason: str, discarded: int) -> None:
 
 def failed_record(branch: str, reason: str, *, head: str = "",
                   base_ref: str = "", base_sha: str = "",
-                  diff_hash: str = "", now: str | None = None,
+                  diff_hash: str = "", repo: str | None = None,
+                  now: str | None = None,
                   record_id: str | None = None) -> dict:
     """A fully-shaped `failed` prepush record for a failure with no review.
 
@@ -518,13 +519,29 @@ def failed_record(branch: str, reason: str, *, head: str = "",
         base_sha=base_sha, diff_hash=diff_hash, mode="prepush",
         status="failed", parse_ok=False, degraded=False, diff_truncated=False,
         usable_output=False, failure_reason=reason, worst_runtime_sec=None,
-        pid=None, superseded_by=None,
+        pid=None, superseded_by=None, repo=repo,
     )
 
 
 def _iso_now() -> str:
     from .store import _TS_FORMAT
     return time.strftime(_TS_FORMAT, time.gmtime())
+
+
+def _repo_scope(repo: Path) -> str | None:
+    """`repo`'s git common dir for a failure record, or None if git cannot say.
+
+    Best-effort on purpose: this is only ever called on the failure path, where
+    raising would cost the durable record entirely. None is honest -- the row is
+    then invisible to a scoped `surface`, the same fate as a pre-v5 row and
+    strictly better than no row at all.
+    """
+    from . import gitio
+    try:
+        return str(gitio.git_common_dir(repo))
+    except BaseException as e:      # pragma: no cover - defensive
+        _note(f"could not identify the repository for a failure record: {e!r}")
+        return None
 
 
 def _record_failure(store: "Store", branch: str, reason: str, **identity) -> None:
@@ -912,7 +929,8 @@ def run_dispatch(stdin_text: str, repo: Path, store_path: Path, *,
                 _record_failure(
                     store, ref.branch,
                     f"the skodun config could not be loaded, so no review "
-                    f"ran{where}: {e!r}", head=ref.local_oid)
+                    f"ran{where}: {e!r}", head=ref.local_oid,
+                    repo=_repo_scope(repo))
             return 0
 
         if cfg.dispatch.enabled is not True:
@@ -933,7 +951,7 @@ def run_dispatch(stdin_text: str, repo: Path, store_path: Path, *,
                 _record_failure(
                     store, ref.branch,
                     f"the review could not be dispatched{where}: {e!r}",
-                    head=ref.local_oid)
+                    head=ref.local_oid, repo=_repo_scope(repo))
     return 0
 
 
