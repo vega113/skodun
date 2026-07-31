@@ -53,7 +53,7 @@ RUNNING = "running"
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 #: Set to anything other than "0", unset, or blank to ignore `provider_state`
 #: entirely.
@@ -222,6 +222,28 @@ _MIGRATION_V4: tuple[str, ...] = (
     "ALTER TABLE triage_events_v4 RENAME TO triage_events",
 )
 
+# --- v5: repository scoping -------------------------------------------------
+#
+# `reviews` was keyed by branch alone, so two repositories sharing one store
+# collided on any common branch name: a push in one retired and SIGTERMed the
+# other's running worker, and one `surface` call delivered AND acknowledged
+# both repositories' rounds. The column carries `gitio.git_common_dir(repo)` --
+# the same expression the foreground lock scopes by, so "the same repository"
+# has one definition.
+#
+# NO BACKFILL. A pre-v5 row keeps `repo IS NULL` permanently and `repo = ?`
+# excludes it from every scoped query, which is fail-closed: an old row goes
+# invisible rather than the wrong repository's worker being killed. The
+# accepted cost is that background rounds recorded before the upgrade are
+# never delivered by `surface`.
+_MIGRATION_V5: tuple[str, ...] = (
+    "ALTER TABLE reviews ADD COLUMN repo TEXT",
+    # The shipped `ix_reviews_branch` is kept (the Phase 1 additive rule); this
+    # one leads with the column the scoped queries now filter on first.
+    "CREATE INDEX IF NOT EXISTS ix_reviews_repo_branch"
+    " ON reviews(repo, branch, reviewed_at)",
+)
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -245,6 +267,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (2, _MIGRATION_V2),
     (3, _MIGRATION_V3),
     (4, _MIGRATION_V4),
+    (5, _MIGRATION_V5),
 )
 
 
@@ -525,7 +548,7 @@ _REVIEW_COLUMNS = (
     "context_hash", "mode", "model", "adapter", "status", "parse_ok", "degraded",
     "diff_truncated", "trustworthy", "stop_reason", "findings_total", "sev_high",
     "sev_medium", "sev_low", "summary", "source", "artifact_json",
-    "worst_runtime_sec", "pid", "superseded_by",
+    "worst_runtime_sec", "pid", "superseded_by", "repo",
 )
 
 
@@ -535,6 +558,11 @@ def _review_values(rec: Mapping) -> tuple:
     `artifact_json` is serialized from the SAME dict the indexed columns are
     read from, which is what makes an index row that disagrees with its artifact
     impossible by construction (the Phase 1 rule).
+
+    THIS TUPLE IS HAND-WRITTEN AND POSITIONAL: it is not derived from
+    `_REVIEW_COLUMNS`, while `_INSERT_REVIEW` and `_FINALIZE_REVIEW` size their
+    placeholders from that list. Adding a column to one without the other is a
+    `sqlite3.ProgrammingError` on every review write.
     """
     sev = rec.get("severity") or {}
     return (
@@ -550,6 +578,7 @@ def _review_values(rec: Mapping) -> tuple:
         json.dumps(rec, ensure_ascii=False),
         _opt_positive_int(rec.get("worst_runtime_sec")),
         _opt_positive_int(rec.get("pid")), rec.get("superseded_by"),
+        rec.get("repo"),
     )
 
 
