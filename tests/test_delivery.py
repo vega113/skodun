@@ -73,7 +73,7 @@ def _evidence():
 def _reserve(st, **kw):
     args = dict(branch="b", head="h" * 40, base_ref="origin/main",
                 base_sha="s" * 40, diff_hash="d" * 40, worst_runtime_sec=99,
-                evidence=_evidence())
+                evidence=_evidence(), repo="/repos/a")
     args.update(kw)
     return st.reserve_prepush(**args)
 

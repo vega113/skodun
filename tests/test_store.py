@@ -2365,7 +2365,7 @@ RESERVED_KEYS = {
     "id", "reviewed_at", "branch", "head", "base_ref", "base_sha", "diff_hash",
     "mode", "source", "status", "parse_ok", "degraded", "diff_truncated",
     "findings", "findings_total", "summary", "failure_reason", "usable_output",
-    "worst_runtime_sec", "pid", "superseded_by",
+    "worst_runtime_sec", "pid", "superseded_by", "repo",
     # Computed at the chokepoint from the three axes, never caller-supplied.
     "trustworthy",
 }
@@ -2382,7 +2382,7 @@ def _evidence(enabled=True, valid=True, candidate=None):
 def _reserve(st, **kw):
     args = dict(branch="b", head="h" * 40, base_ref="origin/main",
                 base_sha="s" * 40, diff_hash="d" * 40, worst_runtime_sec=1234,
-                evidence=_evidence(enabled=False))
+                evidence=_evidence(enabled=False), repo="/repos/a")
     args.update(kw)
     return st.reserve_prepush(**args)
 
@@ -2424,7 +2424,9 @@ def test_reserve_prepush_writes_the_documented_running_shape(tmp_path):
     assert rec["summary"] == "" and rec["failure_reason"] is None
     assert rec["worst_runtime_sec"] == 1234
     assert rec["pid"] is None and rec["superseded_by"] is None
+    assert rec["repo"] == "/repos/a"
     row = _raw_row(db, res.record_id)
+    assert row["repo"] == "/repos/a", "the INDEXED column, not just the JSON"
     assert row["status"] == "running" and row["trustworthy"] == 0
     assert row["worst_runtime_sec"] == 1234
     assert row["pid"] is None and row["superseded_by"] is None
@@ -2445,6 +2447,17 @@ def test_reserve_prepush_mints_a_fresh_id_per_call(tmp_path):
     second = _reserve(st).record_id
     assert first != second
     assert first.startswith("sk_") and second.startswith("sk_")
+
+
+def test_reserve_prepush_refuses_to_reserve_without_a_repository(tmp_path):
+    """`repo` is REQUIRED, with no default. A default would have to mean "match
+    everything", which is exactly the silent wrong answer this scoping removes:
+    it would reserve a row no scoped reader can see and no scoped supersede can
+    retire, and it would let a caller forget the question entirely."""
+    with Store.open(tmp_path / "s.db") as st:
+        with pytest.raises(TypeError):
+            st.reserve_prepush("b", "h" * 40, "origin/main", "s" * 40,
+                               "d" * 40, 1, _evidence(enabled=False))
 
 
 def test_the_reservation_time_is_the_stores_canonical_timestamp(tmp_path):
@@ -2470,7 +2483,11 @@ def test_reserving_retires_every_running_prepush_row_of_the_branch(tmp_path):
     second = "hand-written-running"
     st.save_review({**PREPUSH, "id": second, "branch": "b", "status": "running",
                     "parse_ok": False, "usable_output": False,
-                    "diff_hash": "2" * 40, "pid": None})
+                    "diff_hash": "2" * 40, "pid": None,
+                    # The SAME repository as `_reserve`'s, or the scoped
+                    # supersede would skip it and this test would pass for the
+                    # wrong reason -- proving only that a foreign row is spared.
+                    "repo": "/repos/a"})
 
     third = _reserve(st, diff_hash="3" * 40)
 
@@ -2493,8 +2510,10 @@ def test_supersede_never_touches_another_branch_or_a_foreground_run(tmp_path):
     db = tmp_path / "s.db"
     st = Store.open(db)
     other = _reserve(st, branch="other").record_id
+    # `repo` matches `_reserve`'s, so `mode` is the only thing sparing this row.
     st.save_review({**REC, "id": "fg", "branch": "b", "mode": "now",
-                    "status": "running", "parse_ok": False})
+                    "status": "running", "parse_ok": False,
+                    "repo": "/repos/a"})
 
     res = _reserve(st, branch="b")
 
@@ -2504,10 +2523,37 @@ def test_supersede_never_touches_another_branch_or_a_foreground_run(tmp_path):
     assert _raw_row(db, "fg")["superseded_by"] is None
 
 
+def test_supersede_does_not_retire_another_repositorys_running_review(tmp_path):
+    """The exact defect: two repositories, one store, the same branch name.
+    Reserving in A must not touch B's running row, and must not return it for
+    signalling -- returning it is what SIGTERMed an unrelated worker.
+
+    BOTH repositories have a running row, and that is deliberate: with only B's
+    row present the scoped SELECT returns nothing, `retired` is empty and the
+    UPDATE is skipped entirely (`store.py:858`), so an UNSCOPED UPDATE would
+    still leave B alone and the mutation that drops `repo=?` from it would
+    survive. A's own row is what makes the UPDATE actually run.
+    """
+    with Store.open(tmp_path / "s.db") as st:
+        in_b = _reserve(st, branch="main", repo="/repos/b")
+        in_a = _reserve(st, branch="main", repo="/repos/a")
+
+        newer = _reserve(st, branch="main", repo="/repos/a")
+
+        assert newer.record_id is not None
+        assert [r["id"] for r in newer.superseded] == [in_a.record_id], (
+            "the supersede must return A's own row and nothing else")
+        assert st.get_review(in_b.record_id)["status"] == "running"
+        assert st.get_review(in_b.record_id)["superseded_by"] is None
+        assert st.get_review(in_a.record_id)["status"] == "superseded"
+
+
 def test_supersede_leaves_terminal_rows_of_the_same_branch_alone(tmp_path):
     db = tmp_path / "s.db"
     st = Store.open(db)
-    st.save_review({**PREPUSH, "id": "done", "branch": "b", "status": "clean"})
+    # `repo` matches `_reserve`'s, so `status` is the only thing sparing it.
+    st.save_review({**PREPUSH, "id": "done", "branch": "b", "status": "clean",
+                    "repo": "/repos/a"})
 
     res = _reserve(st, branch="b")
 
@@ -3015,6 +3061,24 @@ def test_finalize_review_merges_the_database_owned_pid_and_supersede(tmp_path):
 
     assert _raw_row(db, rid)["pid"] == 5150
     assert st.get_review(rid)["pid"] == 5150
+
+
+def test_a_finalized_record_keeps_the_reservations_repo(tmp_path):
+    """`finalize_review` binds every column from the WORKER's dict and merges
+    only `pid`/`superseded_by` back, so a worker record with no `repo` would
+    write NULL over the reservation's value -- on the only rounds `surface`
+    ever delivers."""
+    with Store.open(tmp_path / "s.db") as st:
+        res = _reserve(st, branch="main", repo="/repos/a")
+        rec = dict(st.get_review(res.record_id), status="clean", parse_ok=True,
+                   usable_output=True, summary="ok", findings=[],
+                   findings_total=0)
+
+        assert st.finalize_review(res.record_id, rec) is True
+
+        assert st.get_review(res.record_id)["repo"] == "/repos/a"
+        row = _raw_row(tmp_path / "s.db", res.record_id)
+        assert row["repo"] == "/repos/a", "the INDEXED column, not just the JSON"
 
 
 def test_a_pid_attach_between_reread_and_update_is_not_erased(tmp_path):
