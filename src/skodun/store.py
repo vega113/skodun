@@ -838,7 +838,7 @@ class Store:
 
     def reserve_prepush(self, branch: str, head: str, base_ref: str,
                         base_sha: str, diff_hash: str, worst_runtime_sec: int,
-                        evidence, *, now: str | None = None,
+                        evidence, *, repo: str, now: str | None = None,
                         id_prefix: str = "sk_") -> Reservation:
         """Decide dedup, retire the branch's older runs, and reserve one record.
 
@@ -853,9 +853,9 @@ class Store:
         2. **The audit row**, in the same transaction as the suppression it
            records. A suppression that committed without its `dedup_events` row
            would be a skipped review with no trace of why.
-        3. **The supersede**, with `superseded_by` persisted to the index AND the
-           artifact atomically, and the retired rows RETURNED rather than
-           re-queried afterwards.
+        3. **The supersede**, SCOPED TO `repo`, with `superseded_by` persisted
+           to the index AND the artifact atomically, and the retired rows
+           RETURNED rather than re-queried afterwards.
         4. **The insert** of the new `running` row, `pid=NULL`.
 
         SQLite's write lock serializes racing dispatchers, so whichever
@@ -865,6 +865,14 @@ class Store:
         The base identity (`base_ref`, `base_sha`) is reservation-owned: it is
         written here and `finalize_review` refuses any record that disagrees
         with it.
+
+        `repo` is REQUIRED and has no default, because a default would have to
+        mean "match every repository" -- and one branch name is shared by every
+        checkout that ever pushed to this store, so an unscoped supersede
+        retires (and SIGTERMs the worker of) a running review that belongs to
+        somebody else's tree. It is the string form of
+        `gitio.git_common_dir(repo_path)`, computed by the CALLER: the store
+        never shells out to git.
         """
         at = _iso_now() if now is None else _require_ts("now", now)
         self._c.execute("BEGIN IMMEDIATE")
@@ -879,18 +887,24 @@ class Store:
                 return Reservation(suppressed_by=matched)
 
             record_id = ids.new_review_id(id_prefix)
+            # BOTH statements carry `repo=?`, and both must: the SELECT decides
+            # which workers get signalled, the UPDATE decides which rows get
+            # retired, and a scope on one alone is a half-fix. Pre-v5 rows hold
+            # `repo=NULL`, which `repo=?` never matches -- deliberately, since a
+            # row that cannot say which tree it belongs to must not be retired
+            # on the strength of its branch name alone.
             rows = self._c.execute(
                 "SELECT id, pid FROM reviews"
-                " WHERE branch=? AND mode=? AND status=?",
-                (branch, PREPUSH_MODE, RUNNING)).fetchall()
+                " WHERE repo=? AND branch=? AND mode=? AND status=?",
+                (repo, branch, PREPUSH_MODE, RUNNING)).fetchall()
             retired = tuple({"id": r["id"], "pid": r["pid"]} for r in rows)
             if retired:
                 self._c.execute(
                     """UPDATE reviews SET status='superseded', superseded_by=?,
                          artifact_json=json_set(artifact_json,
                            '$.status', 'superseded', '$.superseded_by', ?)
-                       WHERE branch=? AND mode=? AND status=?""",
-                    (record_id, record_id, branch, PREPUSH_MODE, RUNNING))
+                       WHERE repo=? AND branch=? AND mode=? AND status=?""",
+                    (record_id, record_id, repo, branch, PREPUSH_MODE, RUNNING))
             # THE reserved record's exact initial shape. Strict bools throughout
             # (`trustworthy` recomputes False from them at the chokepoint), a
             # `usable_output` of False because nothing has answered yet, and the
@@ -904,7 +918,7 @@ class Store:
                 parse_ok=False, degraded=False, diff_truncated=False,
                 findings=[], findings_total=0, summary="", failure_reason=None,
                 usable_output=False, worst_runtime_sec=worst_runtime_sec,
-                pid=None, superseded_by=None,
+                pid=None, superseded_by=None, repo=repo,
             ), label="reserve_prepush"))
             self._c.execute("COMMIT")
             return Reservation(record_id=record_id, superseded=retired)

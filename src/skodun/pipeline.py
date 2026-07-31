@@ -1260,6 +1260,11 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             # since have changed — and never sweeps a live multi-batch run at
             # the single-review ceiling.
             worst_runtime_sec=budget.worst_runtime(d, width, planned),
+            # WHICH TREE this record is about. The shared git dir, so a repo
+            # and all of its linked worktrees agree on one value -- and so a
+            # scoped reader cannot tell two checkouts of the same repository
+            # apart, which is the intended equivalence.
+            repo=str(gitio.git_common_dir(repo)),
         )
 
         # THE PRE-PERSISTENCE BOUNDARY, and it covers all three of the persist
@@ -1697,10 +1702,11 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
 
     Reservation-owned fields are carried through untouched — `id`, `branch`,
     `head`, `base_ref`, `base_sha`, `diff_hash`, `mode`, `worst_runtime_sec`,
-    `pid` — because `finalize_review` refuses a record whose identity disagrees
-    with the stored row rather than overwriting it. `worst_runtime_sec` and `pid`
-    are read back off the reserved row rather than taken as parameters: they are
-    DATABASE-owned, so the database is where their values come from.
+    `pid`, `repo` — because `finalize_review` refuses a record whose identity
+    disagrees with the stored row rather than overwriting it.
+    `worst_runtime_sec`, `pid` and `repo` are read back off the reserved row
+    rather than taken as parameters: they are DATABASE-owned, so the database is
+    where their values come from.
 
     `reviewed_at` is likewise the RESERVATION's timestamp, not this function's.
     It answers "when was this content pushed", which is what orders the dedup
@@ -1745,6 +1751,15 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
         max_turns=d.max_turns,
         worst_runtime_sec=reserved.get("worst_runtime_sec"),
         pid=reserved.get("pid"),
+        # FROM THE RESERVATION, not from a fresh git call. `finalize_review`
+        # binds every column from this dict and merges only `pid` and
+        # `superseded_by` back, so omitting `repo` here writes NULL over the
+        # value the reservation persisted -- at the exact moment the round
+        # becomes deliverable, and background rounds are the only kind
+        # `surface` delivers. Read off the reserved row for the same reason
+        # `worst_runtime_sec` is: it is a fact about the reservation, and a
+        # worker recomputing it could disagree with the row it is finalizing.
+        repo=reserved.get("repo"),
     )
     #: `(threshold, foreground cap)`, or None when the two caps coincide.
     large_prompt = (cfg.dispatch.large_prompt_bytes, cfg.defaults.timeout_sec)

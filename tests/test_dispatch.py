@@ -1365,7 +1365,8 @@ def test_a_suppressed_push_never_touches_an_in_flight_review(tmp_path,
         st.save_review(dict(rec, status="clean"))
         # A DIFFERENT in-flight prepush review of the same branch.
         other = st.reserve_prepush("feat", "f" * 40, "main", "b" * 40,
-                                   "otherhash", 100, _evidence())
+                                   "otherhash", 100, _evidence(),
+                                   repo=str(gitio.git_common_dir(repo)))
     before = len(spawns)
     run_dispatch(_push_line(repo), repo, db)
     with Store.open(db) as st:
@@ -1411,7 +1412,8 @@ def _reserve(db: Path, repo: Path, branch: str = "feat") -> tuple[str, dict]:
         res = st.reserve_prepush(branch, head, base.ref, base.sha,
                                 gitio.diff_identity(diff.data),
                                 reserved_budget(load_config(repo), diff.data),
-                                _evidence(valid=False))
+                                _evidence(valid=False),
+                                repo=str(gitio.git_common_dir(repo)))
     return res.record_id, {"head": head, "base_ref": base.ref,
                            "base_sha": base.sha}
 
@@ -1505,7 +1507,8 @@ def test_a_worker_whose_reservation_was_superseded_changes_nothing(tmp_path):
     rid, ident = _reserve(db, repo)
     with Store.open(db) as st:
         newer = st.reserve_prepush("feat", "f" * 40, "main", "b" * 40, "h2",
-                                   100, _evidence(valid=False))
+                                   100, _evidence(valid=False),
+                                   repo=str(gitio.git_common_dir(repo)))
         assert st.get_review(rid)["status"] == "superseded"
     out = run_worker(rid, repo, "feat", ident["head"], ident["base_sha"],
                      ident["base_ref"], db)
@@ -1708,7 +1711,8 @@ def test_the_post_commit_demotion_leaves_an_already_superseded_record_alone(
     rid, _ = _reserve(db, repo)
     with Store.open(db) as st:
         st.reserve_prepush("feat", "f" * 40, "main", "b" * 40, "h2", 100,
-                           _evidence(valid=False))
+                           _evidence(valid=False),
+                           repo=str(gitio.git_common_dir(repo)))
         assert st.mark_cancelled(rid, "cancelled") is False
         assert st.get_review(rid)["status"] == "superseded"
 
@@ -1907,7 +1911,8 @@ def test_a_live_but_unconfirmABLE_worker_cannot_resurrect_its_record(tmp_path):
     with Store.open(db) as st:
         assert st.attach_pid(rid, os.getpid())
         newer = st.reserve_prepush("feat", "f" * 40, "main", "b" * 40, "h2",
-                                   100, _evidence(valid=False))
+                                   100, _evidence(valid=False),
+                                   repo=str(gitio.git_common_dir(repo)))
     assert not pid_is_skodun_worker(os.getpid(), rid)
     assert signal_superseded(newer.superseded) == 0, "we signalled a stranger"
     # The unconfirmed worker finishes anyway. Its answer is refused.
@@ -1926,11 +1931,16 @@ def test_a_now_record_is_never_superseded_or_signalled(tmp_path):
     repo = _bg_repo(tmp_path)
     db = tmp_path / "s.db"
     with Store.open(db) as st:
+        # Same repository as the reservation below, so `mode` is the only
+        # thing sparing this row -- otherwise the scope would spare it and the
+        # test would pass without exercising the `--now` rule at all.
         st.save_review(dict(
             failed_record("feat", ""), id="sk_fg", mode="now", status="running",
-            pid=os.getpid(), failure_reason=None))
+            pid=os.getpid(), failure_reason=None,
+            repo=str(gitio.git_common_dir(repo))))
         res = st.reserve_prepush("feat", "a" * 40, "main", "b" * 40, "h", 100,
-                                 _evidence(valid=False))
+                                 _evidence(valid=False),
+                                 repo=str(gitio.git_common_dir(repo)))
         assert res.superseded == ()
         assert st.get_review("sk_fg")["status"] == "running"
 
@@ -3122,7 +3132,8 @@ def test_a_deleted_branch_does_not_interfere_and_a_cleanly_finishing_superseded_
     # still-running worker.
     with Store.open(db) as st:
         newer = st.reserve_prepush("feat", "f" * 40, "main", "b" * 40, "h2",
-                                   100, _evidence(valid=False))
+                                   100, _evidence(valid=False),
+                                   repo=str(gitio.git_common_dir(repo)))
         assert st.get_review(rid1)["status"] == "superseded"
     assert newer.superseded and newer.superseded[0]["id"] == rid1
 
