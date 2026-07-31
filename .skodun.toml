@@ -2,9 +2,15 @@
 # because it is the provider that is reliably available here; codex remains in
 # the chain so a quota outage on either one costs an attempt, not the review.
 #
-# `agy` passes its prompt on the command line and refuses above ~120 KB, so a
-# very large change reviewed through it needs a lower `max_diff_bytes` (which
-# makes more, smaller batches) -- the refusal says so when it happens.
+# `agy` passes its prompt on the command line and refuses above ~120 KB. The
+# prompt is much bigger than the diff -- context packing adds the full text of
+# every changed file, so a 53 KB diff built a 338 KB prompt -- and
+# `max_diff_bytes` is what bounds the whole envelope, not just the diff. 100 KB
+# keeps an ordinary change inside agy's ceiling; a larger change simply splits
+# into more, smaller batches, which is the documented cost of this provider.
+
+[defaults]
+max_diff_bytes = 100000
 
 [[reviewers]]
 name      = "finder"
