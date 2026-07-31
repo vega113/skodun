@@ -466,7 +466,16 @@ def test_aggregate_stop_reason_is_a_pure_function_of_the_sub_reviews():
     assert agg([sub("EndTurn", parse_ok=False)]) is None
     # ...but an abnormal one still is (see the test above).
     assert agg([sub("Cancelled", parse_ok=False)]) == "Cancelled"
-    # 4. nothing reported at all.
+    # 4. the normal word comes from a sub-review that PRODUCED a review. A
+    #    failed sub-review can still report its adapter's normal terminal
+    #    status (an exhausted chain whose last attempt exited cleanly with
+    #    nothing usable in it), and reporting that word would describe the
+    #    process of a run that answered nothing, over the word of the run that
+    #    answered. Abnormality is still judged across ALL of them (case 3).
+    assert agg([sub("SUCCESS", parse_ok=False), sub("EndTurn")]) == "EndTurn"
+    assert agg([sub("EndTurn", parse_ok=False), sub("SUCCESS"),
+                sub("SUCCESS", parse_ok=False)]) == "SUCCESS"
+    # 5. nothing reported at all.
     assert agg([sub(None), sub("")]) is None
     assert agg([]) is None
 
