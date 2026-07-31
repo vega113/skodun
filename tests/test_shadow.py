@@ -782,18 +782,28 @@ def test_cli_shadow_compare_archive_without_an_index_says_so_too(
 
 def test_cli_log_prints_columns_newest_first_with_bang_on_untrustworthy(
         tmp_path, monkeypatch, capsys):
+    from skodun import gitio
     from skodun.cli import main
+    from tests.test_gitio import _mkrepo
+
+    # `log --branch` is scoped to a repository now, so the rows have to carry
+    # the one this invocation resolves -- otherwise the listing under test is
+    # empty for a reason that has nothing to do with its columns.
+    repo = _mkrepo(tmp_path)
+    monkeypatch.chdir(repo)
+    scope = str(gitio.git_common_dir(repo))
     dbpath = tmp_path / "cli.db"
     monkeypatch.setenv("SKODUN_DB", str(dbpath))
     st = Store.open(dbpath)
     st.save_review({**REC, "id": "old", "reviewed_at": "2026-07-27T09:00:00Z",
                     "branch": "feat", "files_changed": ["a.py"],
-                    "status": "clean", "summary": "all good"})
+                    "status": "clean", "summary": "all good", "repo": scope})
     st.save_review({**REC, "id": "new", "reviewed_at": "2026-07-27T12:00:00Z",
                     "branch": "feat", "files_changed": ["a.py", "b.py", "c.py"],
                     "trustworthy": False, "degraded": True, "status": "degraded",
                     "summary": "the reviewer stalled", "findings_total": 0,
-                    "severity": {"high": 0, "medium": 0, "low": 0}})
+                    "severity": {"high": 0, "medium": 0, "low": 0},
+                    "repo": scope})
     assert main(["log", "--branch", "feat"]) == 0
     out = capsys.readouterr().out
     lines = [l for l in out.splitlines() if l.strip()]

@@ -18,6 +18,14 @@ from skodun.store import Store
 
 # --- fixtures ---------------------------------------------------------------
 
+#: The two repositories every scoping assertion in this file is written
+#: against. A literal is enough HERE because nothing in this module shells out
+#: to git -- `repo` is an opaque string to the delivery SQL, and it is the
+#: TRANSPORTS (`cli._cmd_surface`, `mcpserver._handle_surface`) that must turn a
+#: checkout path into `gitio.git_common_dir`. Their tests use real repositories.
+REPO_A = "/repos/a"
+REPO_B = "/repos/b"
+
 
 def _rec(**kw) -> dict:
     """A finalized background round, in the shape the worker persists."""
@@ -29,7 +37,7 @@ def _rec(**kw) -> dict:
         degraded_reason="", diff_truncated=False, stop_reason="EndTurn",
         summary="ok", findings=[], findings_total=0,
         severity={"high": 0, "medium": 0, "low": 0}, failure_reason="",
-        usable_output=True, superseded_by=None)
+        usable_output=True, superseded_by=None, repo=REPO_A)
     rec.update(kw)
     return rec
 
@@ -73,7 +81,7 @@ def _evidence():
 def _reserve(st, **kw):
     args = dict(branch="b", head="h" * 40, base_ref="origin/main",
                 base_sha="s" * 40, diff_hash="d" * 40, worst_runtime_sec=99,
-                evidence=_evidence(), repo="/repos/a")
+                evidence=_evidence(), repo=REPO_A)
     args.update(kw)
     return st.reserve_prepush(**args)
 
@@ -96,7 +104,7 @@ def test_undelivered_returns_terminal_skodun_prepush_rounds_oldest_first(tmp_pat
     with _store(tmp_path) as st:
         _save(st, id="sk_b", reviewed_at="2026-07-30T11:00:00Z")
         _save(st, id="sk_a", reviewed_at="2026-07-30T10:00:00Z")
-        assert _ids(delivery.undelivered(st, "b")) == ["sk_a", "sk_b"]
+        assert _ids(delivery.undelivered(st, "b", REPO_A)) == ["sk_a", "sk_b"]
 
 
 @pytest.mark.parametrize("status", ["clean", "degraded", "failed", "superseded"])
@@ -104,7 +112,7 @@ def test_every_terminal_status_is_eligible(tmp_path, status):
     with _store(tmp_path) as st:
         _save(st, status=status, parse_ok=status == "clean",
               degraded=status == "degraded", usable_output=status == "clean")
-        assert _ids(delivery.undelivered(st, "b")) == ["sk_1"]
+        assert _ids(delivery.undelivered(st, "b", REPO_A)) == ["sk_1"]
 
 
 def test_a_running_round_is_invisible_and_becomes_visible_when_it_finalizes(tmp_path):
@@ -113,7 +121,7 @@ def test_a_running_round_is_invisible_and_becomes_visible_when_it_finalizes(tmp_
     delivery of a review that has not happened yet."""
     with _store(tmp_path) as st:
         res = _reserve(st)
-        assert delivery.undelivered(st, "b") == []
+        assert delivery.undelivered(st, "b", REPO_A) == []
 
         reserved = st.get_review(res.record_id)
         final = dict(reserved, status="clean", parse_ok=True, usable_output=True,
@@ -121,7 +129,7 @@ def test_a_running_round_is_invisible_and_becomes_visible_when_it_finalizes(tmp_
                      severity={"high": 0, "medium": 0, "low": 0})
         assert st.finalize_review(res.record_id, final) is True
 
-        assert _ids(delivery.undelivered(st, "b")) == [res.record_id]
+        assert _ids(delivery.undelivered(st, "b", REPO_A)) == [res.record_id]
 
 
 def test_a_legacy_imported_prepush_round_never_surfaces(tmp_path):
@@ -134,36 +142,76 @@ def test_a_legacy_imported_prepush_round_never_surfaces(tmp_path):
                       findings=[_finding(), _finding()])
         legacy.pop("usable_output")      # it predates the concept entirely
         st.save_review(legacy)
-        assert _ids(delivery.undelivered(st, "b")) == ["sk_mine"]
+        assert _ids(delivery.undelivered(st, "b", REPO_A)) == ["sk_mine"]
 
 
 def test_a_foreground_round_never_surfaces(tmp_path):
     with _store(tmp_path) as st:
         _save(st, id="sk_now", mode="now", findings_total=1,
               findings=[_finding()])
-        assert delivery.undelivered(st, "b") == []
+        assert delivery.undelivered(st, "b", REPO_A) == []
 
 
 def test_another_branchs_rounds_never_surface(tmp_path):
     with _store(tmp_path) as st:
         _save(st, id="sk_other", branch="other")
-        assert delivery.undelivered(st, "b") == []
+        assert delivery.undelivered(st, "b", REPO_A) == []
+
+
+def test_surface_never_delivers_another_repositorys_rounds(tmp_path):
+    """One store, two repositories, the same branch. Surfacing A must not
+    render B's round -- and must not ACKNOWLEDGE it, which is what left the
+    other repository's session with nothing to show."""
+    with _store(tmp_path) as st:
+        _save(st, id="sk_b", repo=REPO_B)
+
+        assert delivery.undelivered(st, "b", REPO_A) == []
+
+        status, text, pending = delivery.surface(st, "b", REPO_A)
+        assert "sk_b" not in text
+        assert pending == []
+        assert _deliveries(tmp_path / "s.db") == [], (
+            "another repository's round was acknowledged")
+
+        # The REPLAY sibling is built from the same select and must be scoped
+        # with it: `--include-delivered` reaching across repositories would
+        # render B's history into A's session.
+        assert delivery.surface(st, "b", REPO_A, include_delivered=True).text == ""
+        assert _ids(delivery.undelivered(st, "b", REPO_B)) == ["sk_b"]
+
+
+def test_a_pre_v5_row_is_reachable_from_no_repository_at_all(tmp_path):
+    """The fail-closed NULL rule, at the delivery seam. `repo = ?` never matches
+    NULL, so a row written before v5 is invisible to every scoped surface --
+    deliberately: guessing which repository an unstamped round belongs to is how
+    one repository's session gets another's findings."""
+    with _store(tmp_path) as st:
+        rec = _rec(id="sk_old", findings=[_finding()], findings_total=1)
+        rec.pop("repo")
+        st.save_review(rec)
+        assert st._c.execute(
+            "SELECT repo FROM reviews WHERE id=?", ("sk_old",)
+        ).fetchone()["repo"] is None
+        assert delivery.undelivered(st, "b", REPO_A) == []
+        assert delivery.undelivered(st, "b", REPO_B) == []
+        assert delivery.surface(st, "b", REPO_A, include_delivered=True).text == ""
+        assert _deliveries(tmp_path / "s.db") == []
 
 
 def test_an_acknowledged_round_stops_being_undelivered(tmp_path):
     with _store(tmp_path) as st:
         _save(st, id="sk_1", findings=[_finding()], findings_total=1,
               severity={"high": 1, "medium": 0, "low": 0})
-        assert _ids(delivery.undelivered(st, "b")) == ["sk_1"]
+        assert _ids(delivery.undelivered(st, "b", REPO_A)) == ["sk_1"]
         delivery.acknowledge(st, ["sk_1"], "cli-text")
-        assert delivery.undelivered(st, "b") == []
+        assert delivery.undelivered(st, "b", REPO_A) == []
 
 
 # --- the presentations ------------------------------------------------------
 
 
-def _surface(st, branch="b", **kw):
-    return delivery.surface(st, branch, **kw)
+def _surface(st, branch="b", repo=REPO_A, **kw):
+    return delivery.surface(st, branch, repo, **kw)
 
 
 def test_no_usable_output_prints_the_reserved_line_plus_its_failure_reason(tmp_path):
@@ -374,7 +422,7 @@ def test_an_unreadable_artifact_still_surfaces_its_round(tmp_path):
         _save(st, status="failed", parse_ok=False, usable_output=False)
         st._c.execute("UPDATE reviews SET artifact_json='{not json' WHERE id=?",
                       ("sk_1",))
-        rows = delivery.undelivered(st, "b")
+        rows = delivery.undelivered(st, "b", REPO_A)
         assert _ids(rows) == ["sk_1"]
         out = _surface(st)
         assert delivery.NO_REVIEW_LINE in out.text
@@ -522,7 +570,7 @@ def test_an_unknown_format_is_refused(tmp_path):
 def test_surface_returns_the_status_text_pending_acks_triple(tmp_path):
     with _store(tmp_path) as st:
         _save(st, findings=[_finding()], findings_total=1)
-        status, text, pending = delivery.surface(st, "b")
+        status, text, pending = delivery.surface(st, "b", REPO_A)
         assert status == 0
         assert text
         assert pending == ["sk_1"]
@@ -715,10 +763,16 @@ def test_the_template_end_to_end_against_the_real_command(tmp_path):
     """One real pass: a store with one failed round, the actual CLI behind the
     template, and the reserved line arriving inside a valid SessionStart
     envelope."""
+    from skodun import gitio
+
+    repo = _repo(tmp_path)
     db = tmp_path / "s.db"
     with Store.open(db) as st:
+        # The REAL common dir, because a real `skodun surface` is what resolves
+        # it here: a literal `REPO_A` would make this pass render nothing and
+        # the assertions below would be about an empty envelope.
         rec = _rec(branch="main", status="failed", parse_ok=False,
-                   usable_output=False,
+                   usable_output=False, repo=str(gitio.git_common_dir(repo)),
                    failure_reason="the background review failed: Timeout()")
         st.save_review(rec)
     src = str(Path(__file__).resolve().parents[1] / "src")
@@ -727,7 +781,7 @@ def test_the_template_end_to_end_against_the_real_command(tmp_path):
     env = {"SKODUN_DB": str(db),
            "PYTHONPATH": src,
            "PYTHONUNBUFFERED": "1"}
-    p = _run_template("claude", _repo(tmp_path), bin_dir, **env)
+    p = _run_template("claude", repo, bin_dir, **env)
     assert p.returncode == 0, p.stderr
     payload = json.loads(p.stdout)
     assert delivery.NO_REVIEW_LINE in (
@@ -898,7 +952,7 @@ def test_known_divergence_the_oracle_hides_a_degraded_rounds_findings(tmp_path):
               usable_output=True, summary="two real problems",
               findings=[_finding(), _finding(severity="medium", title="second")],
               findings_total=2, severity={"high": 1, "medium": 1, "low": 0})
-        out = delivery.surface(st, "feat")
+        out = delivery.surface(st, "feat", REPO_A)
     assert delivery.NO_REVIEW_LINE not in out.text
     assert delivery.INCOMPLETE_WARNING in out.text
     assert "two real problems" in out.text
@@ -927,7 +981,7 @@ def test_parity_the_ack_split_is_the_oracles_own(tmp_path):
         _save(st, id="sk_loud", branch="feat", reviewed_at="2026-07-30T11:00:00Z",
               summary="one problem", findings=[_finding()], findings_total=1,
               severity={"high": 1, "medium": 0, "low": 0})
-        out = delivery.surface(st, "feat")
+        out = delivery.surface(st, "feat", REPO_A)
         rows = [(r["review_id"], r["channel"]) for r in st._c.execute(
             "SELECT review_id, channel FROM deliveries")]
     assert rows == [("sk_quiet", "quiet")]

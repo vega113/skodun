@@ -1376,12 +1376,21 @@ class Store:
                  "active": _still_unavailable(r["unavailable_until"], now_iso)}
                 for r in rows]
 
-    def list_reviews(self, branch: str | None, limit: int = 30) -> list[dict]:
+    def list_reviews(self, branch: str | None, limit: int = 30,
+                     repo: str | None = None) -> list[dict]:
         q = "SELECT artifact_json FROM reviews"
         args: tuple = ()
         if branch is not None:
+            # Scoped ONLY with a branch: a branch name is the ambiguous key.
+            # `branch=None` is a human's "show me everything" and stays
+            # unscoped across repositories -- so a `repo` handed in without a
+            # branch is ignored, which is this method's published contract and
+            # what `log --repo`'s help text says.
             q += " WHERE branch=?"
             args = (branch,)
+            if repo is not None:
+                q += " AND repo=?"
+                args += (repo,)
         q += " ORDER BY reviewed_at DESC LIMIT ?"
         rows = self._c.execute(q, args + (limit,)).fetchall()
         return [json.loads(r["artifact_json"]) for r in rows]

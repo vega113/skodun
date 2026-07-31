@@ -137,7 +137,7 @@ SELECT r.id AS row_id, r.status AS row_status, r.reviewed_at, r.branch, r.head,
        d.delivered_at AS delivered_at, d.channel AS delivery_channel
 FROM reviews r
 LEFT JOIN deliveries d ON d.review_id = r.id
-WHERE r.branch = ? AND r.mode = ? AND r.source = ?
+WHERE r.repo = ? AND r.branch = ? AND r.mode = ? AND r.source = ?
   AND r.status IN (%s)""" % ",".join("?" * len(TERMINAL_STATUSES))
 
 #: `reviewed_at` then `id`: the store's timestamps have one-second resolution, so
@@ -215,18 +215,25 @@ def _record(row: sqlite3.Row) -> dict:
     return rec
 
 
-def _query(store: Store, branch: str, include_delivered: bool) -> list[dict]:
+def _query(store: Store, branch: str, repo: str,
+           include_delivered: bool) -> list[dict]:
     sql = _ALL_ROUNDS_SQL if include_delivered else _UNDELIVERED_SQL
     rows = _conn(store).execute(
-        sql, (branch, PREPUSH_MODE, SKODUN_SOURCE, *TERMINAL_STATUSES)).fetchall()
+        sql, (repo, branch, PREPUSH_MODE, SKODUN_SOURCE,
+              *TERMINAL_STATUSES)).fetchall()
     return [_record(r) for r in rows]
 
 
-def undelivered(store: Store, branch: str) -> list[dict]:
-    """The rounds on `branch` a reader has never been shown, oldest first.
+def undelivered(store: Store, branch: str, repo: str) -> list[dict]:
+    """The rounds on `branch` in `repo` a reader has never been shown, oldest
+    first.
 
     Eligibility, and every clause of it is load-bearing:
 
+    * `repo=<the git common dir>` -- two repositories sharing one store collide
+      on any common branch name, and a `surface` that reached across them
+      delivered AND permanently acknowledged the other's rounds. `repo IS NULL`
+      (every pre-v5 row) matches nothing, deliberately.
     * `mode="prepush"` -- a foreground round was watched by the human who ran it.
     * `source="skodun"` -- a legacy-imported archive holds thousands of
       `mode=prepush` rows, and surfacing them would bury the first post-upgrade
@@ -237,7 +244,7 @@ def undelivered(store: Store, branch: str) -> list[dict]:
     Ordered oldest-first (see `_ROUNDS_ORDER`), because that is the order the
     rounds happened in and a reader is being told a history.
     """
-    return _query(store, branch, include_delivered=False)
+    return _query(store, branch, repo, include_delivered=False)
 
 
 # --- the signal -------------------------------------------------------------
@@ -590,7 +597,7 @@ def _acknowledge_quiet(store: Store, ids: list[str]) -> None:
 # --- the transport-agnostic surface ----------------------------------------
 
 
-def surface(store: Store, branch: str, fmt: str = TEXT,
+def surface(store: Store, branch: str, repo: str, fmt: str = TEXT,
             include_delivered: bool = False) -> SurfaceResult:
     """Render one delivery pass. NO printing, no argparse, no exit codes.
 
@@ -601,11 +608,16 @@ def surface(store: Store, branch: str, fmt: str = TEXT,
 
     `fmt` is validated FIRST, before the store is touched: misuse must not
     acknowledge anything.
+
+    `repo` is REQUIRED and has no default. Every row this pass renders it also
+    ACKNOWLEDGES -- permanently, and a quiet round before the caller has written
+    anything -- so a guessed repository would spend another repository's single
+    delivery. See `undelivered` for the clause itself.
     """
     if fmt not in FORMATS:
         raise ValueError(
             f"unknown surface format {fmt!r}; expected one of {list(FORMATS)}")
-    rounds = _query(store, branch, include_delivered)
+    rounds = _query(store, branch, repo, include_delivered)
     quiet: list[str] = []
     pending: list[str] = []
     lines: list[str] = []

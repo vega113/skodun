@@ -147,6 +147,14 @@ def build_parser() -> argparse.ArgumentParser:
     log = sub.add_parser("log", help="show recent reviews, newest first")
     log.add_argument("--branch", default=None,
                      help="restrict to one branch (default: every branch)")
+    # `surface`'s shape exactly (`type=Path, default=None`), because the two
+    # surfaces must be able to aim the same scope: a scope the CLI cannot aim is
+    # a scope the user cannot inspect. It narrows `--branch` and nothing else --
+    # `Store.list_reviews`'s own contract, said here so the help text and the
+    # query cannot drift apart.
+    log.add_argument("--repo", type=Path, default=None,
+                     help="narrow --branch to one repository (default: the "
+                          "current directory); ignored without --branch")
     log.add_argument("-n", type=int, default=20, dest="limit",
                      help="maximum rows to show (default: 20)")
 
@@ -658,8 +666,8 @@ def _cmd_surface(args) -> int:
 
       0  the report reached stdout and the ledger recorded it (or there was
          nothing to report)
-      2  it did not: no store, no branch, an unwritable report, or an
-         unrecordable delivery
+      2  it did not: no store, no branch, no readable repository to scope the
+         rounds to, an unwritable report, or an unrecordable delivery
 
     There is no code for "there were findings", deliberately: this command
     delivers history and certifies nothing about the working tree, so a hook
@@ -686,7 +694,7 @@ def _cmd_surface(args) -> int:
     flushed, from a fresh Store -- same discipline, different channel.
     """
     try:
-        from . import delivery, services
+        from . import delivery, gitio, services
         from .store import Store
     except BaseException as e:
         return _warn(f"skodun surface: could not load the delivery surface: {e!r}",
@@ -703,6 +711,21 @@ def _cmd_surface(args) -> int:
     if not branch:
         return _warn(why_not, 2)
 
+    # The repo the ROWS are scoped by, resolved from the SAME argument
+    # `resolve_surface_branch` just used. NEVER `Path(".")`: with a hardcoded
+    # cwd, `skodun surface --repo /other` would deliver AND permanently
+    # acknowledge the CWD repository's rounds -- a fresh instance of the defect
+    # this phase closes. A repo git cannot read is a refusal, exactly as it
+    # already is for the branch -- including when `--branch` was given, because
+    # there is no repository to scope the rows to and guessing one is the whole
+    # bug.
+    try:
+        repo = str(gitio.git_common_dir(
+            args.repo if args.repo is not None else Path(".")))
+    except BaseException as e:
+        return _warn(f"skodun surface: could not resolve the repository to "
+                     f"report on: {e!r}", 2)
+
     try:
         store = Store.open(_store_path())
     except BaseException as e:
@@ -710,7 +733,7 @@ def _cmd_surface(args) -> int:
 
     with store:
         status, text, pending = services.svc_surface(
-            store, branch, fmt, bool(args.include_delivered))
+            store, branch, repo, fmt, bool(args.include_delivered))
         if status != 0:
             # `text` is a diagnostic, not a payload: onto stderr with it, where a
             # hook consuming stdout cannot mistake it for a report.
@@ -1217,16 +1240,33 @@ def _cmd_log(args) -> int:
 
     An empty store prints NOTHING and exits 0: `svc_log` returns `""`, and a
     blank line is not an empty listing.
+
+    `--repo` narrows `--branch` and is resolved ONLY when one is given, because
+    `gitio.git_common_dir` shells out to git and `skodun log` with no branch has
+    always been runnable from anywhere. A repository git cannot read is a
+    refusal (2) with a message, never a traceback.
     """
     from .services import svc_log
 
+    repo = None
+    if args.branch is not None:
+        # ONLY with a branch, and wrapped. `git_common_dir` shells out to git
+        # and raises outside a repository -- and `skodun log` with no branch
+        # running from anywhere is this command's contract, not an accident.
+        from . import gitio
+        try:
+            repo = str(gitio.git_common_dir(
+                args.repo if args.repo is not None else Path(".")))
+        except BaseException as e:
+            return _emit(f"skodun log: could not resolve the repository for "
+                         f"--branch: {e!r}", 2)
     try:
         from .store import Store
         store = Store.open(_store_path())
     except BaseException as e:
         return _emit(f"skodun log: could not read the store: {e!r}", 2)
     with store:
-        code, text = svc_log(store, args.branch, args.limit)
+        code, text = svc_log(store, args.branch, args.limit, repo)
     return _emit(text, code) if text else code
 
 
