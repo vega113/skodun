@@ -889,6 +889,12 @@ V3_DELIVERY_COLUMNS = ["review_id", "delivered_at", "channel"]
 #: for the same reason `PHASE1_SCHEMA` is frozen.
 V4_TRIAGE_EVENT_COLUMNS = V3_TRIAGE_EVENT_COLUMNS + ["tracking_ref"]
 
+#: The one object the v5 delta adds (its column is not an object). Named so the
+#: "and nothing else was added" assertions stay EXACT sets rather than being
+#: loosened to subsets -- a delta that quietly creates or drops something else
+#: has to stay a red test.
+V5_INDEX = ("index", "ix_reviews_repo_branch")
+
 #: One legacy `triage` row, in the shipped single-row-per-ledger-key shape the
 #: v3 migration has to seed an event from.
 LEGACY_TRIAGE = dict(ledger_key="b\0" + "s" * 40 + "\0k1", finding_key="k1",
@@ -974,7 +980,7 @@ def test_schema_is_frozen_at_the_phase1_baseline():
 def test_fresh_db_lands_at_schema_version(tmp_path):
     db = tmp_path / "s.db"
     st = Store.open(db)
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
     assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert ("table", "provider_state") in _objects(db)
     for table in V3_TABLES:
@@ -1003,7 +1009,7 @@ def test_migration_from_true_phase1_db(tmp_path):
     raw.close()
     assert _user_version(db) == 0                     # it really starts at v0
     st = Store.open(db)
-    assert st._c.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert st._c.execute("PRAGMA user_version").fetchone()[0] == 5
     assert st.get_review("r1")["summary"] == "ok"     # rows preserved
     st.mark_provider_unavailable("openai", "quota", "quota",
                                  "2026-07-28T12:00:00Z")  # new table exists
@@ -1021,7 +1027,7 @@ def test_phase1_store_upgrade_preserves_every_table_index_and_row(tmp_path):
 
     after = _objects(db)
     assert before <= after, before - after            # nothing dropped
-    assert after - before == {("table", "provider_state")} | {
+    assert after - before == {("table", "provider_state"), V5_INDEX} | {
         ("table", t) for t in V3_TABLES}              # nothing else added
     assert sorted(r["id"] for r in st.list_reviews(None, 100)) == ["r1", "r2", "r3"]
     assert st.triage_for("b", "s" * 40)["k1"]["dismissed_reason"] == "wontfix"
@@ -1162,7 +1168,7 @@ def test_a_v2_store_gains_every_v3_delta(tmp_path):
 
     assert _user_version(db) == SCHEMA_VERSION
     assert before <= _objects(db)                          # nothing dropped
-    assert _objects(db) - before == {("table", t) for t in V3_TABLES}
+    assert _objects(db) - before == {("table", t) for t in V3_TABLES} | {V5_INDEX}
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     assert _columns(db, "dedup_events") == V3_DEDUP_EVENT_COLUMNS
     assert _columns(db, "deliveries") == V3_DELIVERY_COLUMNS
@@ -1470,7 +1476,7 @@ def test_no_non_transactional_delta_carries_a_non_idempotent_statement():
             assert isinstance(delta, tuple) and all(isinstance(s, str) for s in delta)
     # The v3 delta specifically is the transactional kind, and it is the last
     # rung: `SCHEMA_VERSION` is what a fresh store is stamped with.
-    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 4
+    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 5
     assert isinstance(_MIGRATIONS[-1][1], tuple)
 
 
@@ -1508,8 +1514,11 @@ def test_a_v3_store_gains_the_widened_vocabulary_and_the_reference_column(tmp_pa
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 4
-    assert _objects(db) == before, "the rebuild added or dropped an object"
+    assert _user_version(db) == SCHEMA_VERSION == 5
+    # A v3 store now climbs two rungs in one open, and v5 adds exactly one
+    # index; anything else appearing or vanishing is the rebuild misbehaving.
+    assert _objects(db) == before | {V5_INDEX}, (
+        "the rebuild added or dropped an object")
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     # The seeded legacy dismissal came through the rebuild intact...
     assert [e["event"] for e in _events(st)] == ["dismiss"]
@@ -1573,10 +1582,10 @@ def _pinned_at_v3():
     return stack
 
 
-def test_a_v0_and_a_v2_store_both_climb_the_whole_ladder_to_v4(tmp_path):
+def test_a_v0_and_a_v2_store_both_climb_the_whole_ladder_to_v5(tmp_path):
     """The ladder is only load-bearing if every rung runs for a store that
-    starts below it. A v0 store must arrive with the v2 table, the v3 objects
-    AND the v4 vocabulary, in one open."""
+    starts below it. A v0 store must arrive with the v2 table, the v3 objects,
+    the v4 vocabulary AND the v5 column, in one open."""
     v0 = _phase1_db(tmp_path / "v0.db")
     v2 = _v2_db(tmp_path / "v2.db")
     for db in (v0, v2):
@@ -1585,6 +1594,7 @@ def test_a_v0_and_a_v2_store_both_climb_the_whole_ladder_to_v4(tmp_path):
         assert ("table", "provider_state") in _objects(db), db
         assert V3_TABLES <= {name for _, name in _objects(db)}, db
         assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS, db
+        assert "repo" in _columns(db, "reviews"), db
         assert [e["event"] for e in _events(st)] == ["dismiss"], db
         st.triage_defer(_deferral())                       # the new verb works
         assert set(st.triage_for("b", "s" * 40)) == {"k1"}, db
@@ -1721,14 +1731,19 @@ def test_apply_atomic_is_a_no_op_for_v4_when_a_peer_already_applied_it(tmp_path)
     st.close()
 
 
-def test_a_store_stamped_v5_is_still_refused_untouched(tmp_path):
-    """The future-version refusal survives the rebuild: a real v4 store stamped
-    v5 by a newer skodun comes back byte-identical."""
+def test_a_store_stamped_v6_is_still_refused_untouched(tmp_path):
+    """The future-version refusal survives the rebuild: a real current-version
+    store stamped one higher by a newer skodun comes back byte-identical.
+
+    The stamp tracks `SCHEMA_VERSION + 1` rather than any literal: this pinned
+    v5 until v5 became this build, and the rule it is about has always been
+    `> SCHEMA_VERSION` (see `test_a_future_version_store_is_refused`).
+    """
     db = _v2_db(tmp_path / "s.db")
     Store.open(db).close()
-    assert _user_version(db) == 4
+    assert _user_version(db) == SCHEMA_VERSION
     raw = sqlite3.connect(db)
-    raw.execute("PRAGMA user_version = 5")
+    raw.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1:d}")
     raw.commit()
     raw.close()
     before = db.read_bytes()
@@ -1737,7 +1752,134 @@ def test_a_store_stamped_v5_is_still_refused_untouched(tmp_path):
         Store.open(db)
 
     assert db.read_bytes() == before
-    assert _user_version(db) == 5
+    assert _user_version(db) == SCHEMA_VERSION + 1 == 6
+
+
+# --- v5: repository scoping -------------------------------------------------
+#
+# `reviews` was keyed by branch alone, so two repositories sharing one store
+# collided on any common branch name. v5 adds a `repo` column and an index that
+# leads with it. The delta is additive and BACKFILLS NOTHING: a pre-v5 row keeps
+# `repo IS NULL` forever, which `repo = ?` excludes from every scoped query --
+# fail-closed, because an invisible old row is strictly better than the wrong
+# repository's worker being killed.
+
+
+def _pinned_at_v4():
+    """A context manager that makes this build behave as the shipped v4 one."""
+    import contextlib
+    import unittest.mock as _mock
+
+    from skodun import store as store_mod
+
+    stack = contextlib.ExitStack()
+    stack.enter_context(_mock.patch.object(store_mod, "SCHEMA_VERSION", 4))
+    stack.enter_context(_mock.patch.object(
+        store_mod, "_MIGRATIONS",
+        tuple((t, d) for t, d in store_mod._MIGRATIONS if t <= 4)))
+    return stack
+
+
+def _v4_db(path, *, triage_rows=(LEGACY_TRIAGE,)):
+    """A real v4-shaped store: the v3 fixture, migrated by the v4 delta ALONE.
+
+    What a shipped v4 build left on a user's disk, which is what the v5 delta
+    must upgrade. Carries `_v2_db`'s `r1` review row, which is the pre-v5 row
+    the NULL rule is about.
+    """
+    _v3_db(path, triage_rows=triage_rows)
+    with _pinned_at_v4():
+        Store.open(path).close()
+    assert _user_version(path) == 4
+    assert "repo" not in _columns(path, "reviews")
+    return path
+
+
+def test_a_v4_store_gains_the_repo_column_and_its_index(tmp_path):
+    """v5 is additive: the column arrives NULL on every existing row and the
+    shipped index is kept, not replaced."""
+    db = _v4_db(tmp_path / "s.db")
+    before = _objects(db)
+
+    st = Store.open(db)
+
+    assert _user_version(db) == SCHEMA_VERSION == 5
+    assert "repo" in _columns(db, "reviews")
+    row = st._c.execute("SELECT repo FROM reviews WHERE id='r1'").fetchone()
+    assert row["repo"] is None, "a pre-v5 row must not be backfilled"
+    idx = {name for kind, name in _objects(db) if kind == "index"}
+    assert "ix_reviews_repo_branch" in idx
+    assert "ix_reviews_branch" in idx, "the shipped index is kept, not dropped"
+    assert before < _objects(db), "the delta added nothing"
+    st.close()
+
+
+def _broken_v5_ladder(monkeypatch):
+    """The real v5 delta with one failing statement injected AFTER the ALTER.
+
+    The crash that matters: the column has been added inside the transaction and
+    the version has NOT been stamped yet. `max()` raising here would mean the
+    delta no longer contains an `ALTER TABLE` at all, which is itself the thing
+    that makes the transaction mandatory -- so the lookup is deliberately not
+    defensive.
+    """
+    from skodun import store as store_mod
+
+    real = list(store_mod._MIGRATION_V5)
+    last_alter = max(i for i, s in enumerate(real)
+                     if s.lstrip().upper().startswith("ALTER TABLE"))
+    broken = tuple(real[:last_alter + 1]
+                   + ["INSERT INTO no_such_table_boom (x) VALUES (1)"]
+                   + real[last_alter + 1:])
+    monkeypatch.setattr(store_mod, "_MIGRATIONS",
+                        tuple((t, broken if t == 5 else d)
+                              for t, d in store_mod._MIGRATIONS))
+
+
+def test_a_crash_mid_v5_delta_leaves_a_clean_v4_store_that_migrates_on_retry(
+        tmp_path, monkeypatch):
+    """THE reason the v5 delta is transactional, mirroring the v3 drill.
+
+    `ALTER TABLE ADD COLUMN` is not replay-idempotent: a store that added the
+    column and then crashed before the stamp comes back at v4 and replays the
+    `ALTER` into `duplicate column name` on every subsequent open -- bricked,
+    with every review ever recorded inside it.
+    """
+    db = _v4_db(tmp_path / "s.db")
+    _broken_v5_ladder(monkeypatch)
+
+    with pytest.raises(sqlite3.OperationalError):
+        Store.open(db)
+
+    # NOTHING from the delta survived: not the column, not the index, not the
+    # stamp -- and the v4 store is otherwise exactly as it was.
+    assert _user_version(db) == 4
+    assert "repo" not in _columns(db, "reviews")
+    assert V5_INDEX not in _objects(db)
+    assert [e["event"] for e in _events(db)] == ["dismiss"]
+
+    monkeypatch.undo()                                # the crash is over; retry
+    st = Store.open(db)
+    assert _user_version(db) == SCHEMA_VERSION
+    assert "repo" in _columns(db, "reviews")
+    assert V5_INDEX in _objects(db)
+    st.close()
+
+
+def test_a_crashed_v5_migration_never_leaves_the_store_open(tmp_path, monkeypatch):
+    """A leaked connection still holding the write lock would make the retry
+    above fail too."""
+    db = _v4_db(tmp_path / "s.db")
+    _broken_v5_ladder(monkeypatch)
+    with pytest.raises(sqlite3.OperationalError):
+        Store.open(db)
+    monkeypatch.undo()
+    other = sqlite3.connect(db, isolation_level=None, timeout=0.5)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.execute("ROLLBACK")
+    finally:
+        other.close()
 
 
 # --- provider_state ---------------------------------------------------------
