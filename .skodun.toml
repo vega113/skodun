@@ -1,0 +1,21 @@
+# skodun reviewing skodun. The finder is `agy` (google) rather than `codex`
+# because it is the provider that is reliably available here; codex remains in
+# the chain so a quota outage on either one costs an attempt, not the review.
+#
+# `agy` passes its prompt on the command line and refuses above ~120 KB, so a
+# very large change reviewed through it needs a lower `max_diff_bytes` (which
+# makes more, smaller batches) -- the refusal says so when it happens.
+
+[[reviewers]]
+name      = "finder"
+provider  = "google"
+model     = "gemini-3.6-flash-high"
+role      = "finder"
+fallbacks = ["finder-openai"]
+
+[[reviewers]]
+name     = "finder-openai"
+provider = "openai"
+model    = "gpt-5.4"
+effort   = "medium"
+role     = "finder"
