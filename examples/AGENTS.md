@@ -22,7 +22,11 @@ trustworthy review must cover it.
   the only command that answers that question. Exit `0` clean or all findings
   triaged, `1` findings still open, `2` nothing trustworthy covers this content.
 - `skodun review` — run a review now, in the foreground. Minutes, and it spends
-  model calls. Do not run two at once; they serialize on a lock.
+  model calls. Do not run two at once; they serialize on a lock. Add
+  `--reviewer <name>` (MCP: `{"reviewer": "<name>"}`) to head this one review
+  with a named reviewer entry — a second opinion, or a provider you know is
+  healthy. A name that does not resolve is refused before anything runs, and the
+  refusal lists the configured names; do not retry with a guess.
 - `skodun triage --list <review-id>` — the findings, with their triage state.
 - `skodun surface` — background rounds nobody has seen yet (from the pre-push
   hook). Reports history; it never certifies the current change.

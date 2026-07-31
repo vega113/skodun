@@ -975,14 +975,238 @@ role = "integrator"
 
 
 # --------------------------------------------------------------------------
-# extra-pass provenance
+# choosing the head for ONE run (issue #16)
 # --------------------------------------------------------------------------
+#
+# `--reviewer <name>` narrows where the chain STARTS. Everything else about the
+# chain is unchanged, and the tests below are written as that contrast: the
+# requested entry heads the chain, its own `fallbacks` still recover, the extra
+# passes still choose by ROLE, and a name that does not resolve is refused
+# before the lock rather than quietly falling back to the config's own finder.
 
 
 def _risky(repo: Path) -> Path:
     (repo / "auth").mkdir()
     (repo / "auth" / "session.py").write_text("token = 1\n", encoding="utf-8")
     return repo
+
+
+#: Two enabled entries either of which can head a chain. `primary` is the
+#: config's own finder -- `_reviewer_for` takes the FIRST enabled `finder` --
+#: so `second-opinion` is reachable only by asking for it by name.
+CFG_TWO_HEADS = f"""
+[[reviewers]]
+name = "primary"
+provider = "xai"
+model = "{FAKE_XAI_MODEL}"
+role = "finder"
+
+[[reviewers]]
+name = "second-opinion"
+provider = "openai"
+model = "{FAKE_OPENAI_MODEL}"
+role = "finder"
+fallbacks = ["primary"]
+"""
+
+CFG_WITH_A_DISABLED_ENTRY = CFG_XAI_ONLY + f"""
+[[reviewers]]
+name = "retired"
+provider = "openai"
+model = "{FAKE_OPENAI_MODEL}"
+role = "finder"
+enabled = false
+"""
+
+#: An entry NOTHING resolves by default: it is not the first enabled finder, it
+#: holds no other role, and no chain names it as a fallback. Preflight therefore
+#: never reaches it unless the run asks for it by name -- which is exactly what
+#: makes it the right fixture for "the request is what found the config error".
+CFG_WITH_AN_UNREACHABLE_BAD_PROVIDER = CFG_XAI_ONLY + """
+[[reviewers]]
+name = "offline"
+provider = "no-such-provider"
+model = "m"
+role = "finder"
+"""
+
+
+def test_the_requested_reviewer_heads_the_chain_instead_of_the_config_finder(
+        tmp_path, capsys):
+    """The whole feature in one contrast, against ONE config and one repo.
+
+    Asked for by name, `second-opinion` runs and `primary` never spawns; asked
+    for nothing, the config's own finder heads the chain exactly as it always
+    has. The record says which of the two happened -- `requested_reviewer` is
+    the NAME that was asked for, and `None` when nobody asked.
+    """
+    _fake_cli(tmp_path, "codex", _emit(CODEX_CLEAN))
+    _fake_cli(tmp_path, "grok", _emit(CLEAN))
+    repo = _repo(tmp_path, CFG_TWO_HEADS)
+    st = _store(tmp_path)
+
+    chosen = _run(repo, st, reviewer="second-opinion")
+
+    assert chosen["trustworthy"] is True
+    assert _calls(tmp_path) == ["codex"]     # the config's finder never spawned
+    assert chosen["adapter"] == "codex" and chosen["model"] == FAKE_OPENAI_MODEL
+    assert chosen["requested_reviewer"] == "second-opinion"
+
+    default = _run(repo, st)
+
+    assert default["trustworthy"] is True
+    assert _calls(tmp_path) == ["codex", "grok"]
+    assert default["adapter"] == "grok" and default["model"] == FAKE_XAI_MODEL
+    # The field that makes the two distinguishable on the artifact. Explicit
+    # `None` rather than an absent key: a reader must be able to tell "nobody
+    # asked" from "this record predates the field".
+    assert default["requested_reviewer"] is None
+    assert "requested_reviewer" in default
+
+
+def test_the_requested_heads_own_fallbacks_still_apply(tmp_path, monkeypatch,
+                                                       capsys):
+    """The choice narrows where the chain STARTS, never whether it can recover.
+
+    And it is the strongest form of the provenance rule: after the fallback the
+    two fields say different things on purpose -- `requested_reviewer` names who
+    was ASKED FOR, `adapter`/`model` name who ANSWERED.
+    """
+    monkeypatch.setenv("SKODUN_CODEX_BIN", "/nonexistent/skodun-dead")
+    _fake_cli(tmp_path, "grok", _emit(CLEAN))
+    repo = _repo(tmp_path, CFG_TWO_HEADS)
+
+    rec = _run(repo, _store(tmp_path), reviewer="second-opinion")
+
+    assert rec["trustworthy"] is True
+    assert [a["provider"] for a in rec["attempts"]] == ["openai", "xai"]
+    assert rec["attempts"][0]["classification"]["kind"] == "unavailable"
+    assert rec["adapter"] == "grok" and rec["model"] == FAKE_XAI_MODEL
+    assert rec["requested_reviewer"] == "second-opinion"
+
+
+def test_the_request_does_not_hijack_a_role_chosen_extra_pass(tmp_path,
+                                                              monkeypatch,
+                                                              capsys):
+    """`--reviewer` selects the FINDER head. The extra passes choose by ROLE.
+
+    Two selection systems, and they must not be one: an operator who configured
+    a `security` reviewer chose it for the security pass specifically, and a
+    request for a second opinion on the FINDER is not a request to re-point that
+    pass at a model with no security role.
+    """
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "1")
+    _fake_cli(tmp_path, "codex", _emit(CODEX_CLEAN))
+    _fake_cli(tmp_path, "grok", _emit(CLEAN))
+    cfg = CFG_TWO_HEADS + f"""
+[[reviewers]]
+name = "sec"
+provider = "xai"
+model = "{FAKE_XAI_MODEL}-sec"
+role = "security"
+"""
+    repo = _risky(_repo(tmp_path, cfg))
+
+    rec = _run(repo, _store(tmp_path), reviewer="second-opinion")
+
+    # The finder is the requested entry...
+    assert rec["adapter"] == "codex" and rec["model"] == FAKE_OPENAI_MODEL
+    # ...and the security pass is still the role's, on the other provider.
+    meta = rec["extra_passes"]["security"]
+    assert meta["ran"] is True
+    assert meta["provider"] == "xai" and meta["model"] == f"{FAKE_XAI_MODEL}-sec"
+    assert _calls(tmp_path) == ["codex", "grok"]
+
+
+def test_an_unknown_requested_reviewer_is_refused_before_anything_runs(
+        tmp_path, capsys):
+    """A preflight refusal, in the shape every other preflight refusal has:
+    exit 2's `PreflightRefused`, "no review ran", no lock, no record, no spawn.
+
+    It also names what IS configured. An agent over MCP has no way to enumerate
+    the reviewer table -- `providers` is deliberately not a tool -- so the one
+    moment it can learn the real names is the refusal for a name it guessed.
+    """
+    _fake_cli(tmp_path, "grok", _emit(CLEAN))
+    _fake_cli(tmp_path, "codex", _emit(CODEX_CLEAN))
+    repo = _repo(tmp_path, CFG_TWO_HEADS)
+    st = _store(tmp_path)
+
+    with pytest.raises(PreflightRefused) as e:
+        _run(repo, st, reviewer="no-such-entry")
+
+    message = str(e.value)
+    assert "no-such-entry" in message and "no review ran" in message
+    assert "primary (xai)" in message and "second-opinion (openai)" in message
+    assert _calls(tmp_path) == []
+    assert st.list_reviews(None, 1000) == []
+    assert not (git_common_dir(repo) / "grok-reviews-foreground.lock").exists()
+
+
+def test_a_disabled_requested_reviewer_is_refused_rather_than_enabled(
+        tmp_path, capsys):
+    """`enabled = false` is the operator taking an entry out of service. A
+    request may not put it back: the run would spend a model call on a provider
+    the config says not to use, and silently succeeding at that is worse than
+    the refusal."""
+    _fake_cli(tmp_path, "grok", _emit(CLEAN))
+    repo = _repo(tmp_path, CFG_WITH_A_DISABLED_ENTRY)
+    st = _store(tmp_path)
+
+    with pytest.raises(PreflightRefused) as e:
+        _run(repo, st, reviewer="retired")
+
+    assert "retired" in str(e.value) and "disabled" in str(e.value)
+    assert "no review ran" in str(e.value)
+    assert _calls(tmp_path) == []
+    assert st.list_reviews(None, 1000) == []
+
+
+def test_a_requested_reviewer_with_no_registered_adapter_is_refused(tmp_path,
+                                                                    capsys):
+    """The third refusal, and it comes from the SHIPPED preflight resolver
+    rather than from a fourth copy of "unknown provider": the requested entry
+    simply joins the graph every run already resolves. Nothing else in the
+    config reaches this entry, so the request is what found the error."""
+    _fake_cli(tmp_path, "grok", _emit(CLEAN))
+    repo = _repo(tmp_path, CFG_WITH_AN_UNREACHABLE_BAD_PROVIDER)
+    st = _store(tmp_path)
+
+    # ...and with no request at all it is never resolved, so the run is fine.
+    assert _run(repo, st)["trustworthy"] is True
+
+    with pytest.raises(PreflightRefused) as e:
+        _run(repo, st, reviewer="offline")
+
+    assert "offline" in str(e.value) and "no-such-provider" in str(e.value)
+    assert "no review ran" in str(e.value)
+    assert _calls(tmp_path) == ["grok"]      # only the unrequested run spawned
+
+
+def test_the_cli_flag_chooses_the_head_and_a_bad_one_is_exit_2(tmp_path,
+                                                               capsys):
+    """The flag really reaches `run_review`, and its refusal really is the
+    CLI's exit 2 with a verdict line -- not an exception on the way past."""
+    _fake_cli(tmp_path, "codex", _emit(CODEX_CLEAN))
+    _fake_cli(tmp_path, "grok", _emit(CLEAN))
+    repo = _repo(tmp_path, CFG_TWO_HEADS)
+
+    assert main(["review", "--repo", str(repo),
+                 "--reviewer", "second-opinion"]) == 0
+    assert _calls(tmp_path) == ["codex"]
+    assert capsys.readouterr().out.strip().splitlines()[-1].startswith(
+        "SKODUN VERDICT: trustworthy=true")
+
+    assert main(["review", "--repo", str(repo), "--reviewer", "nope"]) == 2
+    out = capsys.readouterr().out.strip().splitlines()
+    assert _calls(tmp_path) == ["codex"]     # still nothing new spawned
+    assert out[-1].startswith("SKODUN VERDICT: trustworthy=false reason=")
+    assert "nope" in out[-1] and "no review ran" in out[-1]
+
+
+# --------------------------------------------------------------------------
+# extra-pass provenance
+# --------------------------------------------------------------------------
 
 
 def test_an_extra_pass_records_the_accepted_attempts_provenance(tmp_path,

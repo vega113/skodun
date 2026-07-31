@@ -933,9 +933,56 @@ def _pass_reviewer(cfg: Config, pass_name: str, finder: Reviewer) -> Reviewer:
     """The reviewer an extra pass will use: its role's, else the finder's.
 
     See `_extra_pass` for why the role-specific preference exists at all.
+
+    UNCHANGED by `run_review`'s `reviewer=` request, and deliberately: that
+    request selects the FINDER head for one run, while the passes select by
+    ROLE, and letting one override the other would re-point a pass the operator
+    configured on purpose. The request reaches a pass only through the shipped
+    `else the finder's` fallback — i.e. only where the config named no reviewer
+    for that role at all, and the pass was already going to run on whatever
+    headed the chain.
     """
     reviewer = _reviewer_for(cfg, _EXTRA_PASS_ROLES[pass_name])
     return reviewer if reviewer is not None else finder
+
+
+def _requested_head(cfg: Config, requested: str) -> Reviewer:
+    """The configured entry a caller asked for BY NAME, or refuse the run.
+
+    `--reviewer <name>` / the MCP `review` tool's `reviewer` argument: it
+    narrows where this run's chain STARTS, and nothing else — the entry's own
+    `fallbacks` are followed exactly as they would be for the config's finder
+    (`_chain_for`), so the choice cannot cost the run its ability to recover.
+
+    Both refusals are `PreflightRefused`, so they land before the lock, before
+    any record and before any process, with the "no review ran" every other
+    preflight refusal carries. NEITHER may fall back to the config's own finder:
+    a caller who asked for a second opinion from a specific provider and
+    silently got the first one back has been answered by the model they were
+    trying to route around, and nothing in the record would say so.
+
+    A name that resolves but whose PROVIDER has no adapter is not refused here —
+    it is refused by `_adapter_for`, in the same words as any other unresolvable
+    provider, because the requested entry simply joins the graph preflight
+    already walks.
+
+    The refusal for an unknown name lists what IS configured, `name (provider)`
+    each. An agent driving the MCP server cannot enumerate the reviewer table —
+    `providers` is deliberately not a tool — so the refusal for a name it
+    guessed is the one place it can learn the real ones.
+    """
+    for entry in cfg.reviewers:
+        if entry.name == requested:
+            if not entry.enabled:
+                raise PreflightRefused(
+                    f"requested reviewer {requested!r} is disabled in the "
+                    f"config; no review ran")
+            return entry
+    known = ", ".join(f"{r.name} ({r.provider})"
+                      for r in cfg.reviewers if r.enabled)
+    raise PreflightRefused(
+        f"requested reviewer {requested!r} is not configured; enabled "
+        f"reviewers: {known or '(none)'}; no review ran")
 
 
 def _adapter_for(reviewer: Reviewer):
@@ -964,7 +1011,8 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                id_prefix: str = "sk_",
                lock_stale: float | None = None, *,
                progress_sink=None,
-               cancel: "threading.Event | None" = None) -> dict:
+               cancel: "threading.Event | None" = None,
+               reviewer: str | None = None) -> dict:
     """Run one foreground review and return the record that was persisted.
 
     WRITES NOTHING TO STDOUT. Progress goes to stderr (or to `progress_sink`);
@@ -975,8 +1023,8 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
     line, so the "last stdout line is a verdict" invariant holds on every path,
     including the ones that never got this far.
 
-    Two keyword-only parameters, both defaulting to the shipped behaviour so that
-    every existing call site is unchanged:
+    Three keyword-only parameters, all defaulting to the shipped behaviour so
+    that every existing call site is unchanged:
 
     * **`progress_sink`** — a `callable(str)` that receives each progress line
       instead of stderr, for the length of THIS call and on THIS thread only
@@ -1014,6 +1062,14 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                                          trustworthy one.
 
       The lock is released on every one of them by the same `finally`.
+
+    * **`reviewer`** — the NAME of a configured `[[reviewers]]` entry to head
+      this run's chain, instead of the config's own `finder` role. `None` (the
+      default, and every pre-existing call site) means "the config decides", and
+      is recorded on the artifact as `requested_reviewer: null`. A name that
+      does not resolve is a `PreflightRefused` (see `_requested_head`): the
+      request is never quietly downgraded to the config default. It selects the
+      FINDER head only — the extra passes still choose by role.
     """
     repo = Path(repo)
     d = cfg.defaults
@@ -1024,7 +1080,7 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
         _PROGRESS.sink = progress_sink
     try:
         return _run_review(repo, cfg, store, mode, lock_wait, lock_poll,
-                           id_prefix, lock_stale, cancel, d)
+                           id_prefix, lock_stale, cancel, d, reviewer)
     finally:
         if progress_sink is not None:
             _PROGRESS.sink = None
@@ -1033,7 +1089,8 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
 def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 lock_wait: float | None, lock_poll: float | None,
                 id_prefix: str, lock_stale: float | None,
-                cancel: "threading.Event | None", d: Defaults) -> dict:
+                cancel: "threading.Event | None", d: Defaults,
+                requested: str | None = None) -> dict:
     """`run_review`'s body. Split off ONLY so the progress sink can be installed
     and removed around it without wrapping 400 lines in another indent level."""
 
@@ -1044,10 +1101,21 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         raise PreflightRefused(
             f"{repo} is the primary checkout; run the review from a linked "
             f"worktree or set SKODUN_ALLOW_MAIN=1; no review ran")
-    finder = _reviewer_for(cfg, "finder")
-    if finder is None:
-        raise PreflightRefused(
-            "no enabled reviewer with role 'finder' is configured; no review ran")
+    if requested is None:
+        finder = _reviewer_for(cfg, "finder")
+        if finder is None:
+            raise PreflightRefused(
+                "no enabled reviewer with role 'finder' is configured; no "
+                "review ran")
+    else:
+        # The caller named the head for THIS run. The role-based lookup above is
+        # skipped rather than merely overridden: the request already supplies
+        # the one thing that lookup exists to produce, so a config with no
+        # `finder` role at all is a perfectly runnable review once somebody says
+        # which entry to start from. Everything downstream — the chain, the
+        # budget, the extra passes' fallback — reads `finder`, so from here the
+        # run is shaped exactly as any other.
+        finder = _requested_head(cfg, requested)
     # Resolved here, before anything is locked or persisted: an unknown
     # provider is a config error, not a review failure. EVERY reviewer this run
     # may reach for is resolved now, not just the finder's — a bad provider on a
@@ -1175,6 +1243,18 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             diff_hash=diff_hash, mode=mode, model=finder.model,
             adapter=adapter.name, timeout_seconds=d.timeout_sec,
             max_turns=d.max_turns,
+            # WHO WAS ASKED FOR, which is not the same question as who
+            # answered. `adapter`/`model` and the `attempts[]` provenance are
+            # rewritten by `_apply` to name whoever actually served, so after a
+            # fallback they name a provider nobody requested — and without this
+            # field nothing on the artifact would distinguish "this run was
+            # explicitly routed to entry X" from "the config's finder happens to
+            # be X today". Explicit `None` rather than an absent key: absence
+            # would be indistinguishable from a record written before the field
+            # existed. The NAME, not the provider id: the name is what was
+            # asked for, and it is what would have to be typed again to
+            # reproduce the run.
+            requested_reviewer=requested,
             # The budget for THIS review's own shape, persisted on the record so
             # `recover_stale` never has to recompute it from a config that may
             # since have changed — and never sweeps a live multi-batch run at

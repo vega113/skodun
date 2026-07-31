@@ -97,6 +97,20 @@ def build_parser() -> argparse.ArgumentParser:
         "review", help="review the outgoing change now, in the foreground")
     review.add_argument("--repo", type=Path, default=Path("."),
                         help="repository to review (default: the current directory)")
+    # THE NAME of a `[[reviewers]]` entry, never a provider id: two enabled
+    # entries may share a provider, and picking one of them by a rule nobody
+    # asked about would also pick its model, its effort, its own prompt budget
+    # and its fallback chain. A name is the one identifier that says all of
+    # those. Its own `fallbacks` still apply -- this narrows where the chain
+    # STARTS, not whether it can recover -- and a name that does not resolve is
+    # refused by `run_review`'s preflight (exit 2, nothing ran), never
+    # downgraded to the config's default.
+    review.add_argument("--reviewer", default=None, dest="reviewer",
+                        metavar="NAME",
+                        help="name of the configured [[reviewers]] entry to "
+                             "head this review's chain, instead of the "
+                             "config's own 'finder' role (default: the "
+                             "config decides)")
 
     imp = sub.add_parser(
         "import-legacy",
@@ -529,7 +543,13 @@ def _cmd_review(args) -> int:
         # `svc_review` re-raises `KeyboardInterrupt` past every one of its own
         # guards so `main`'s carve-out can report 130; the `with` closes the
         # store on the way past.
-        code, text = svc_review(store, Path(args.repo))
+        # `args.reviewer` reaches the service UNCHECKED, and that is the point:
+        # whether a name resolves is a question about the loaded config, which
+        # this seam has not read, and the MCP tool must be refused in the same
+        # words. `getattr` because `_cmd_review` is called by name in the suite
+        # with hand-built argument objects that predate the flag.
+        code, text = svc_review(store, Path(args.repo),
+                                reviewer=getattr(args, "reviewer", None))
     return _emit(text, code)
 
 
