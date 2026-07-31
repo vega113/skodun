@@ -1375,3 +1375,35 @@ def test_oracle_parity_oid_source_with_a_bad_oid(tmp_path):
     assert got.included == want_included == []
     assert got.omitted == want_omitted
     assert {r for _, r in got.omitted} == {"deleted", "missing"}
+
+
+# --------------------------------------------------------------------------
+# the signature itself
+# --------------------------------------------------------------------------
+
+
+def test_everything_after_headroom_is_keyword_only(tmp_path):
+    """`oid` was INSERTED between `source` and `per_file_cap`.
+
+    A positional caller written against the older signature therefore binds
+    `per_file_cap` to `oid` and `pack_large_added` to `per_file_cap` -- silently,
+    and with a consequence (`source="wt"` plus a non-empty `oid`) that this
+    module refuses only when it can see it. The four parameters whose ORDER can
+    still change are keyword-only, so the mistake is a `TypeError` at the call
+    rather than a wrong pack.
+    """
+    import inspect
+
+    params = list(inspect.signature(pack).parameters.values())
+    names = [p.name for p in params]
+    assert names[:4] == ["repo", "files", "statuses", "headroom"]
+    after = params[names.index("headroom") + 1:]
+    assert after, "the point of this test is the parameters AFTER headroom"
+    assert [p.name for p in after] == ["source", "oid", "per_file_cap",
+                                       "pack_large_added"]
+    assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in after), \
+        [(p.name, str(p.kind)) for p in after]
+
+    (tmp_path / "a.txt").write_text("hello\n", encoding="utf-8")
+    with pytest.raises(TypeError):
+        pack(tmp_path, ["a.txt"], {}, 10_000, "wt", None, 50)

@@ -552,9 +552,6 @@ property everything here is arranged around — but each is a real rough edge.
   empty ref list rather than the live stdin. Only the "no temp file at all" case
   is currently handled — that one correctly skips skodun and hands the chained
   hook the original stdin.
-- **The shim does not shell-escape the chained hook's path.** It embeds it as
-  `SKODUN_SHIM_CHAIN='<path>'`, so a repository under a path containing a single
-  quote gets a syntactically invalid hook.
 - **A triage decision has only two verbs.** `dismiss` means "not a defect", and
   there is no way to say "real, but not for this change, filed as X" — so a
   deferral has to masquerade as a dismissal and the ledger stops distinguishing
@@ -567,20 +564,6 @@ property everything here is arranged around — but each is a real rough edge.
   triaged", nor mark a finding as landing in code the previous round's fix
   wrote — the signal that most reliably says a review loop is chasing its own
   tail. Both are computable from what the store and git already hold.
-- **`contextpack.pack()`'s parameters after `headroom` are positional.** `oid`
-  was inserted before `per_file_cap`, so a positional caller written against the
-  older signature would silently bind the wrong arguments. Every caller in this
-  repository uses keywords; making them keyword-only would close it for good.
-- **The pid-reuse guard is not bound to a record.** Before signalling a
-  superseded worker, the dispatcher confirms the pid still names a skodun worker
-  — but not *which* one, so a reused pid belonging to a different in-flight
-  review could be signalled. Checking `--record-id` in the argv would tighten it.
-- **`svc_triage_dismiss` does not guard store I/O** the way `svc_adopt_refuter`
-  and `svc_triage_reopen` do, so a SQLite failure escapes as an exception rather
-  than the `(status, text)` refusal both surfaces promise.
-- **`runner._sleep_or_cancelled` catches `BaseException`** around its token wait,
-  which swallows a `Ctrl-C` arriving during a foreground lock wait and keeps
-  polling instead of aborting.
 
 ## Requirements
 

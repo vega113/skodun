@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 
 from skodun import (batching, budget, chain, checklist, contextpack, gitio,
-                    passes, pipeline, promptbuild, runner)
+                    passes, pipeline, promptbuild, runner, trust)
 from skodun.adapters import ParseResult
 from skodun.cli import main
 from skodun.config import load_config
@@ -329,6 +329,162 @@ def test_a_clean_run_reports_the_normal_stop_reason(tmp_path, capsys):
     _fake_grok(tmp_path, _emit(CLEAN))
     rec = _run(_oversized(tmp_path), _store(tmp_path))
     assert rec["stop_reason"] == "EndTurn"
+
+
+# --------------------------------------------------------------------------
+# a round where NOTHING ran must not report a success-shaped stop reason
+#
+# Observed live, and the shape is the point: nine batches whose chain was
+# exhausted (`parsed=None`, so `stop_reason` is None on every one of them) and
+# a cross-file pass on a SECOND provider that answered rc 0 with the agy
+# harness's own normal terminal status, `SUCCESS`, and no usable payload. Two
+# defects met:
+#
+#   * `_aggregate_stop_reason` measured "abnormal" as `!= "EndTurn"` -- grok's
+#     word -- so another adapter's NORMAL word was promoted as if it were a
+#     truncation signal; and
+#   * `integration{}` never recorded a `stop_reason` at all, so the value at the
+#     top of the record was attributable to nothing a reader could see. The
+#     verdict banner said `stop_reason=SUCCESS` for a round that produced no
+#     review whatsoever.
+#
+# The trust axes were already right (`parse_ok=False` -> `trustworthy=false` ->
+# gate 2), and nothing here may change them.
+# --------------------------------------------------------------------------
+
+#: rc 0, the harness's normal terminal status, and NOTHING usable in it. The
+#: captured auto-denied-tool shape (`adapters/agy.py`), which is also what a
+#: run that never got an answer out of the provider looks like from outside.
+AGY_SUCCESS_BUT_EMPTY = json.dumps({"status": "SUCCESS", "response": ""})
+
+_AGY_INTEGRATOR_CFG = """
+[[reviewers]]
+name = "integrator"
+provider = "google"
+model = "gemini-test-0309"
+role = "integrator"
+"""
+
+
+def _fake_agy(body: str) -> Path:
+    """A fake agy CLI at the path `SKODUN_AGY_BIN` already points at.
+
+    No `tmp_path`, unlike `_fake_grok`: the autouse `_isolate` fixture already
+    pins `SKODUN_AGY_BIN` inside it, and re-deriving the path here would be a
+    second answer to where the fake goes.
+    """
+    path = Path(os.environ["SKODUN_AGY_BIN"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _nothing_ran_round(tmp_path):
+    """Every batch answers garbage; the cross-file pass answers `SUCCESS` and
+    nothing else. Returns `(repo, cfg, store, rec)`."""
+    _fake_grok(tmp_path, GARBAGE)
+    _fake_agy(_emit(AGY_SUCCESS_BUT_EMPTY))
+    repo = _oversized(tmp_path, _AGY_INTEGRATOR_CFG)
+    cfg = load_config(repo)
+    _diff, plan = _plan(repo, cfg)
+    assert len(plan) >= 2, "the integration pass must be scheduled"
+    st = _store(tmp_path)
+    return repo, cfg, st, _run(repo, st)
+
+
+def test_a_round_where_nothing_ran_reports_no_stop_reason(tmp_path, capsys):
+    repo, cfg, st, rec = _nothing_ran_round(tmp_path)
+
+    # The fixture really is the observed shape, or the assertion below is vacuous.
+    assert [b["stop_reason"] for b in rec["batches"]] == \
+        [None] * rec["batch_count"]
+    assert rec["integration"]["ran"] is True
+    assert rec["integration"]["parse_ok"] is False
+    assert rec["usable_output"] is False, "nothing in this round produced a review"
+
+    assert rec["stop_reason"] is None
+    assert "stop_reason=SUCCESS" not in trust.banner(rec)
+
+
+def test_the_integration_pass_records_the_stop_reason_it_saw(tmp_path, capsys):
+    """The aggregate's `stop_reason` has to be attributable. `batches[]` has
+    carried one since Task 6; `integration{}` did not, so the one sub-review
+    that could put a word at the top of the record was the one sub-review whose
+    word was invisible."""
+    _repo_, _cfg, _st, rec = _nothing_ran_round(tmp_path)
+    assert rec["integration"]["stop_reason"] == "SUCCESS"
+
+
+def test_the_trust_axes_of_a_nothing_ran_round_are_untouched(tmp_path, capsys):
+    """The REPORTING fix may not move a single trust axis: this round is
+    exactly as untrustworthy as it was, and the gate still refuses it."""
+    repo, cfg, st, rec = _nothing_ran_round(tmp_path)
+    assert rec["parse_ok"] is False
+    assert rec["trustworthy"] is False
+    assert rec["status"] == "failed"
+    assert run_gate(st, repo, cfg).code == 2
+
+
+def test_an_abnormal_stop_reason_still_wins_even_when_nothing_ran(tmp_path,
+                                                                 capsys):
+    """The suppression is of NORMAL words only. A round in which everything
+    failed AND something reported `MaxOutputTokens` must still say so -- that is
+    the diagnostic the field exists for, and it is most valuable precisely when
+    there is no review to read instead."""
+    _fake_grok(tmp_path, _per_call(GARBAGE, _emit(TOKENS), GARBAGE))
+    _fake_agy(_emit(AGY_SUCCESS_BUT_EMPTY))
+    repo = _oversized(tmp_path, _AGY_INTEGRATOR_CFG)
+    st = _store(tmp_path)
+
+    rec = _run(repo, st)
+
+    assert rec["usable_output"] is True     # the TOKENS batch did parse
+    assert rec["stop_reason"] == "MaxOutputTokens"
+
+
+def test_aggregate_stop_reason_is_a_pure_function_of_the_sub_reviews():
+    """The rule, spelled out at the seam. Four cases, and the third is the one
+    that was wrong."""
+    def sub(stop_reason, parse_ok=True):
+        return pipeline._Sub(parse_ok, False, "", stop_reason, False, "", [],
+                             "", [], {}, None)
+
+    agg = pipeline._aggregate_stop_reason
+    # 1. the first ABNORMAL value wins, over any later one and over normality.
+    assert agg([sub("EndTurn"), sub("Cancelled"), sub("MaxOutputTokens")]) \
+        == "Cancelled"
+    # 2. every reporting sub-review ended normally: its own word, not a
+    #    translation of it into another adapter's vocabulary.
+    assert agg([sub("EndTurn"), sub("EndTurn")]) == "EndTurn"
+    assert agg([sub("SUCCESS"), sub("SUCCESS")]) == "SUCCESS"
+    assert agg([sub("turn.completed")]) == "turn.completed"
+    # 3. a NORMAL word from a round in which nothing produced a review is not
+    #    reported at all -- the record's own "nothing to say" value instead.
+    assert agg([sub(None, parse_ok=False), sub("SUCCESS", parse_ok=False)]) \
+        is None
+    assert agg([sub("EndTurn", parse_ok=False)]) is None
+    # ...but an abnormal one still is (see the test above).
+    assert agg([sub("Cancelled", parse_ok=False)]) == "Cancelled"
+    # 4. nothing reported at all.
+    assert agg([sub(None), sub("")]) is None
+    assert agg([]) is None
+
+
+def test_every_adapters_own_normal_terminal_value_is_in_the_set():
+    """Assembled from the three adapters' OWN constants, so the aggregation
+    rule cannot drift away from what an adapter actually reports -- which is
+    exactly how agy's `SUCCESS` came to be read as an abnormal stop."""
+    from skodun.adapters import NORMAL_STOP_REASONS
+    from skodun.adapters import agy as agy_mod
+    from skodun.adapters import codex as codex_mod
+    from skodun.adapters import grok as grok_mod
+
+    assert NORMAL_STOP_REASONS == frozenset(
+        {grok_mod._STOP_REASON_OK, agy_mod._STATUS_OK,
+         codex_mod._TURN_COMPLETED})
+    assert "EndTurn" in NORMAL_STOP_REASONS
+    assert "SUCCESS" in NORMAL_STOP_REASONS
 
 
 def test_a_failed_integration_pass_demotes_an_aggregate_whose_batches_answered(

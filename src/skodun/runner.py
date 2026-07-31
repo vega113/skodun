@@ -105,17 +105,25 @@ def _cancelled(cancel: "threading.Event | None") -> bool:
     watchdog loop. An unreadable token reads as NOT cancelled -- the review
     continues and its own timeout still bounds it, which is strictly safer than
     aborting a run that nobody asked to stop.
+
+    "Never raises" has ONE exception, and it is `KeyboardInterrupt`: see
+    `_sleep_or_cancelled` for the whole argument, including why `SystemExit` is
+    deliberately not treated the same way.
     """
     if cancel is None:
         return False
     try:
         return bool(cancel.is_set())
-    except BaseException:       # pragma: no cover - defensive
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
         return False
 
 
 def _sleep_or_cancelled(cancel: "threading.Event | None", seconds: float) -> bool:
-    """Wait up to `seconds`, returning True if the token became set. Never raises.
+    """Wait up to `seconds`, returning True if the token became set.
+
+    Never raises, with ONE exception: `KeyboardInterrupt`.
 
     The difference from `time.sleep` is the only reason it exists: a waiter that
     sleeps on the CLOCK notices a cancellation one whole tick late, and the
@@ -126,13 +134,28 @@ def _sleep_or_cancelled(cancel: "threading.Event | None", seconds: float) -> boo
     An Event-shaped-but-not token (a `Mock`, a stale proxy) falls back to a plain
     sleep and reports NOT cancelled, exactly as `_cancelled` does: an unreadable
     token must never abort a review nobody asked to stop.
+
+    A `KeyboardInterrupt` is the one thing that fallback may NOT eat, and this is
+    the function where it matters most: in the foreground, a lock wait blocks
+    HERE, in the main thread, for the whole poll interval. Swallowing the Ctrl-C
+    raised out of `wait` left the operator's interrupt doing nothing at all --
+    the loop simply polled again. It is re-raised, and the caller (`cli`, through
+    `services`) turns it into the 130 it always has.
+
+    `SystemExit` is deliberately NOT re-raised, the same distinction `svc_gate`
+    makes: it carries an arbitrary exit code, 0 included, and letting one escape
+    a fail-closed path from inside a token read would be a worse regression than
+    the swallowed interrupt. It falls back to the plain sleep like any other
+    unreadable token.
     """
     if cancel is None:
         time.sleep(seconds)
         return False
     try:
         return bool(cancel.wait(seconds))
-    except BaseException:       # pragma: no cover - defensive
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
         time.sleep(seconds)
         return False
 

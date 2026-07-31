@@ -441,6 +441,12 @@ def svc_triage_dismiss(store, review_id, index, reason) -> tuple[int, str]:
     reason is a 2 rather than the 1 `--adopt-refuter` and `--reopen` use. That is
     deliberately left alone: it is a shipped contract that pre-push hooks and
     humans already read.
+
+    What it does NOT keep is being the one triage service whose store I/O could
+    escape. It guarded the validation errors and nothing else, so a store that
+    stopped accepting writes came out of here as a traceback and broke the
+    `(status, text)` contract the CLI and the MCP transport are both built on.
+    Its two siblings already had the guard; this is the same one.
     """
     import time
 
@@ -458,6 +464,12 @@ def svc_triage_dismiss(store, review_id, index, reason) -> tuple[int, str]:
                 now=time.strftime(_TS_FORMAT, time.gmtime()))
     except (TriageError, ArtifactError) as e:
         return 2, f"skodun triage: rejected: {e}"
+    except KeyboardInterrupt:
+        raise           # 130's; the guard below is for a store that broke
+    except BaseException as e:
+        # A store that stopped accepting writes is not a refusal about the
+        # reason — nothing was decided and nothing was recorded.
+        return 2, f"skodun triage: could not record the dismissal: {e!r}"
     return 0, (f"skodun triage: dismissed finding {index} on review "
                f"{review_id}")
 
