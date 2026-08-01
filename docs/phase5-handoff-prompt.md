@@ -21,10 +21,10 @@ Repository: `github.com/vega113/skodun`, public, Apache-2.0. All paths below are
 to its root. Working checkout: `/Users/vega/devroot/skodun`, on `main` at `c313e34`.
 
 **The oracle is located ONLY via the `SKODUN_ORACLE_DIR` environment variable.** Never
-hardcode a path to it — not in code, not in a test, not in a plan. Locally:
-`export SKODUN_ORACLE_DIR=/Users/vega/devroot/tubescribes`. Subagents do not inherit it;
-pass it explicitly and always report ran-vs-skipped test counts, because oracle-gated tests
-silently skip without it.
+hardcode a path to it — not in code, not in a test, not in a plan, not in this document.
+Export it to your own oracle checkout before running anything that needs it. Subagents do
+not inherit it; pass it explicitly and always report ran-vs-skipped test counts, because
+oracle-gated tests silently skip without it and a green run then proves less than it looks.
 
 ## Read these first, in this order
 
@@ -53,6 +53,34 @@ silently skip without it.
 spine), R2/R3 review-loop ergonomics, operational debt, and what remains uncut from earlier
 phases. Read it. **Deciding the scope is part of your job** — say what you cut and why, the
 way the earlier phases did.
+
+### If you take the `junie` adapter: the port source is in the oracle checkout
+
+Do not design the containment from first principles. It exists, it is in production in the
+sibling project, and it was hardened through its own review cycle. Under
+`$SKODUN_ORACLE_DIR`:
+
+| Path | What it is |
+|---|---|
+| `scripts/junie-sanitized-exec.py` | ~410 lines: the macOS Seatbelt profile, the sanitized environment, the capsule layout, the exec |
+| `scripts/junie_confined_io.py` | ~55 lines: descriptor-confined reads of what the capsule produced (`O_NOFOLLOW`, single-link regular files only) |
+| `scripts/junie-sanitized-exec.test.py`, `scripts/junie_confined_io.test.py` | their tests |
+| `docs/superpowers/specs/2026-07-28-junie-review-fallback-design.md` | the design, including the approaches it REJECTED — §4.1 rejects junie's own `--review` mode, §4.3 explains why the empty capsule was chosen |
+| `docs/superpowers/plans/2026-07-28-junie-review-fallback.md` | its implementation plan |
+
+This is a **vendor-and-adapt port** against skodun's `Adapter` protocol and its conformance
+suite (`tests/adapter_conformance.py`), exactly as the grok/codex/agy adapters were ported —
+not a re-derivation from prose. Read §6 "Junie execution contract" and §7 "Output and trust
+contract" of that design before writing anything: they pin the invocation (stdin transport
+to avoid `ARG_MAX`, `--output-format json`, an empty temporary project, disabled discovery
+locations) and the seven conditions under which its envelope may be accepted at all. Its
+§12 "Landmine checklist" is the single highest-value page for a port of security code — it
+is the list of ways this exact containment was got wrong the first time.
+
+The genericity rule still binds the result: the oracle's own private surfaces must not end
+up in shipped prompt text or config defaults. Phase 3 hit exactly that trap — a security
+prompt hardcoding one project's surfaces — and solved it with a config key carrying generic
+defaults, with the oracle's fragments living in `examples/scala-angular-monorepo.toml`.
 
 ## How this project works — non-negotiable
 
