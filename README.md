@@ -29,8 +29,9 @@ review, quota-fallback chains, and cross-provider refutation on top of it; Phase
 adds a pre-push dispatcher with background review, its delivery surface, and an MCP
 server for agent harnesses.** Here is the honest scope:
 
-- What exists: three registered provider adapters (`xai` driving `grok`, `openai`
-  driving `codex`, `google` driving `agy`), per-reviewer quota-fallback chains, an
+- What exists: four registered provider adapters (`xai` driving `grok`, `openai`
+  driving `codex`, `google` driving `agy`, `junie` driving the JetBrains `junie`
+  CLI under macOS Seatbelt confinement), per-reviewer quota-fallback chains, an
   annotation-only refuter pass, the thirteen subcommands below, the SQLite store, the
   gate, the triage ledger, a one-shot importer for the archive of the previous
   implementation, a shadow comparison used to check the two against each other, a
@@ -99,7 +100,7 @@ wins per key, reviewers merge by `name`). The store lives at
 # ~/.config/skodun/config.toml
 [[reviewers]]
 name     = "finder"
-provider = "xai"        # xai | openai | google are registered -- run `skodun providers`
+provider = "xai"        # xai | openai | google | junie are registered -- run `skodun providers`
 model    = "grok-4.5"   # must be an id your CLI offers -- run `grok models`
 effort   = "high"
 role     = "finder"     # finder | refuter | security | triager | integrator
@@ -134,12 +135,14 @@ availability state:
 ```
 $ skodun providers
 google | adapter=agy | binary=agy (executable) | state=none
+junie | adapter=junie | binary=junie (executable) | state=none
 openai | adapter=codex | binary=codex (executable) | state=none
 xai | adapter=grok | binary=/home/you/.grok/bin/grok (executable) | state=none
 ```
 
-Three providers are registered: `xai` (the `grok` CLI), `openai` (the `codex`
-CLI), and `google` (the `agy` CLI). **`anthropic` is not registered** — there is
+Four providers are registered: `xai` (the `grok` CLI), `openai` (the `codex`
+CLI), `google` (the `agy` CLI), and `junie` (the JetBrains `junie` CLI, macOS
+only — see below). **`anthropic` is not registered** — there is
 no shipped adapter for it. A reviewer entry naming `provider = "anthropic"` (or
 any other unregistered name) loads fine — `load_config` only requires `provider`
 and `model` to be non-empty strings, it does not check the name against the
@@ -165,9 +168,23 @@ adapter is a normal task — the contract it would implement is already the same
 `openai` and `google` satisfy.
 
 Per-adapter binary overrides: `SKODUN_GROK_BIN`, `SKODUN_CODEX_BIN`,
-`SKODUN_AGY_BIN` (a path, or a bare name resolved on `PATH`; unset or empty is
-treated as "use the default"). `grok` additionally falls back to
-`~/.grok/bin/grok` before `PATH` if that path is executable.
+`SKODUN_AGY_BIN`, `SKODUN_JUNIE_BIN` (a path, or a bare name resolved on `PATH`;
+unset or empty is treated as "use the default"). `grok` additionally falls back
+to `~/.grok/bin/grok` before `PATH` if that path is executable.
+
+#### The `junie` adapter (macOS only)
+
+`provider = "junie"` drives the JetBrains `junie` CLI as a prompt-only reviewer.
+It does **not** point junie at your real worktree: every attempt runs in an empty
+temporary capsule under a deny-by-default macOS Seatbelt profile, with operator
+and foreign-provider credentials stripped from the environment, discovery
+locations disabled, and post-run mutation checks before any envelope is trusted.
+Off macOS — or when `/usr/bin/sandbox-exec` is missing — the adapter refuses
+before inference (`unavailable`) rather than running unconfined. The prompt
+travels as a file into the capsule and then on stdin (`--input-format text`),
+never on argv. Effort values are `low` / `medium` / `high`; `max` is refused
+loudly. Prefer a model id your junie install actually serves (for example
+`gpt-5.6-luna`); the model is always explicit from the reviewer entry.
 
 ### Quota-fallback chains
 
@@ -683,6 +700,10 @@ property everything here is arranged around — but each is a real rough edge.
   triaged", nor mark a finding as landing in code the previous round's fix
   wrote — the signal that most reliably says a review loop is chasing its own
   tail. Both are computable from what the store and git already hold.
+- **The `junie` adapter is macOS-only.** Confinement uses `sandbox-exec`. On
+  any other platform a junie reviewer classifies `unavailable` and the chain
+  advances (or the review fails closed if junie is alone). There is no
+  unconfined soft fallback.
 
 ## Requirements
 
