@@ -1244,6 +1244,32 @@ class Store:
                 cur["deferred_ref"] = r["tracking_ref"]
         return state
 
+    def count_triaged_on_reviews(self, branch: str,
+                                 review_ids: set[str] | frozenset[str]) -> int:
+        """How many finding_keys are currently CLEARED by a last event on one of
+        `review_ids` for this branch.
+
+        Used by R3 "findings already triaged in earlier rounds": effective
+        state is still the last event by `seq` (same rule as `triage_state`),
+        and we only count a finding when that last clearing event was recorded
+        against an earlier review id. A reopen after that last clearing is not
+        counted — the finding is open again.
+        """
+        if not review_ids:
+            return 0
+        rows = self._c.execute(
+            "SELECT finding_key, event, review_id FROM triage_events"
+            " WHERE branch=? ORDER BY seq",
+            (branch,)).fetchall()
+        last: dict[str, tuple[str, str]] = {}
+        for r in rows:
+            last[r["finding_key"]] = (r["event"], r["review_id"])
+        n = 0
+        for event, rid in last.values():
+            if event in self.CLEARING_EVENTS and rid in review_ids:
+                n += 1
+        return n
+
     def triage_for(self, branch: str, base_sha: str) -> dict[str, dict]:
         """The findings in this scope whose last event CLEARS them for the gate.
 

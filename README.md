@@ -695,11 +695,11 @@ property everything here is arranged around — but each is a real rough edge.
   empty ref list rather than the live stdin. Only the "no temp file at all" case
   is currently handled — that one correctly skips skodun and hands the chained
   hook the original stdin.
-- **A review round carries no context about the rounds before it.** skodun
-  cannot say "this is review 3 of this branch, and 6 findings were already
-  triaged", nor mark a finding as landing in code the previous round's fix
-  wrote — the signal that most reliably says a review loop is chasing its own
-  tail. Both are computable from what the store and git already hold.
+- **Round context and churn attribution are presentation-only.** `skodun triage
+  --list` and `skodun log` report which review round this is on the branch and
+  whether findings land in files changed since the previous trustworthy review
+  (R2/R3). That never narrows what the model reviews or what the gate
+  certifies — the full outgoing diff is still the unit of trust.
 - **The `junie` adapter is macOS-only.** Confinement uses `sandbox-exec`. On
   any other platform a junie reviewer classifies `unavailable` and the chain
   advances (or the review fails closed if junie is alone). There is no

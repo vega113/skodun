@@ -177,10 +177,16 @@ def _store(tmp_path, *findings, monkeypatch=None, **extra):
 
 # --- --list ---------------------------------------------------------------
 
+def _finding_lines(out: str) -> list[str]:
+    """Finding/refuter lines only — skip R2/R3 header lines (round:/churn:)."""
+    return [ln for ln in out.strip().splitlines()
+            if ln.startswith("[") or ln.startswith("refuter(")]
+
+
 def test_triage_list_shows_the_refuter_annotation(tmp_path, monkeypatch, capsys):
     _store(tmp_path, _finding(0, _annotation()), monkeypatch=monkeypatch)
     assert main(["triage", "--list", "rev1"]) == 0
-    lines = capsys.readouterr().out.strip().splitlines()
+    lines = _finding_lines(capsys.readouterr().out)
     assert lines[0].startswith("[0] ")
     assert lines[1] == f"refuter(openai/model-x): refuted — {REASONING}"
 
@@ -190,7 +196,7 @@ def test_triage_list_omits_the_line_for_an_unannotated_finding(tmp_path, monkeyp
     _store(tmp_path, _finding(0), _finding(1, _annotation(verdict="confirmed")),
            monkeypatch=monkeypatch)
     assert main(["triage", "--list", "rev1"]) == 0
-    lines = capsys.readouterr().out.strip().splitlines()
+    lines = _finding_lines(capsys.readouterr().out)
     assert len(lines) == 3
     assert lines[0].startswith("[0] ") and lines[1].startswith("[1] ")
     assert lines[2].startswith("refuter(openai/model-x): confirmed")
@@ -204,7 +210,7 @@ def test_triage_list_keeps_one_line_per_annotation(tmp_path, monkeypatch, capsys
            _finding(0, _annotation(reasoning="a\nb\r\nc " + "z" * 4000)),
            monkeypatch=monkeypatch)
     assert main(["triage", "--list", "rev1"]) == 0
-    lines = capsys.readouterr().out.strip().splitlines()
+    lines = _finding_lines(capsys.readouterr().out)
     assert len(lines) == 2, lines
     assert len(lines[1]) < 200, len(lines[1])
 
@@ -1036,7 +1042,7 @@ def test_list_renders_deferred_with_its_reference(tmp_path, monkeypatch, capsys)
     capsys.readouterr()
 
     assert main(["triage", "--list", "rev1"]) == 0
-    lines = capsys.readouterr().out.strip().splitlines()
+    lines = _finding_lines(capsys.readouterr().out)
     assert f"(DEFERRED -> {TRACKING_REF} " in lines[0], lines[0]
     assert "(DISMISSED " in lines[1], lines[1]
 

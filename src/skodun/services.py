@@ -271,7 +271,11 @@ def svc_log(store, branch, limit, repo=None) -> tuple[int, str]:
     and required on `svc_surface` for one reason: a listing that crossed
     repositories shows a reader too much, while a `surface` that did would
     deliver and permanently acknowledge rounds that were never theirs.
+
+    Each line may append R3 round context (`round: review N of M ...`) when
+    the review can be placed on its branch; R3 is annotation only.
     """
+    from .roundctx import round_context_for_review
     from .trust import coerce_count, one_line
 
     try:
@@ -305,11 +309,15 @@ def svc_log(store, branch, limit, repo=None) -> tuple[int, str]:
         mark = "!" if not trustworthy else " "
         # Counts read by THE project's single count rule, so `log` and `banner`
         # can never disagree about the same stored row.
-        lines.append(
+        line = (
             f"{mark}{rec.get('reviewed_at')} | {rec.get('branch')} | {nfiles} | "
             f"{coerce_count(sev.get('high'))}-{coerce_count(sev.get('medium'))}"
             f"-{coerce_count(sev.get('low'))} | "
             f"{rec.get('status')} | {summary}")
+        ctx = round_context_for_review(store, rec)
+        if ctx is not None:
+            line = f"{line} | {ctx.line()}"
+        lines.append(line)
     return 0, "\n".join(lines)
 
 
@@ -422,7 +430,13 @@ def svc_triage_list(store, review_id) -> tuple[int, str]:
     reads through `triage_for`, which is a filter over exactly this map. A
     second, independent "latest decision" query here could print DISMISSED for a
     finding the gate still counts as open.
+
+    R2/R3 annotations are prepended (round context + churn summary) and each
+    finding line may carry a `churn:yes|no|?` marker. Annotation only: the
+    gate still reads the raw findings through `triage_for`.
     """
+    from .roundctx import (churn_for_review, churn_marker,
+                           round_context_for_review)
     from .textnorm import finding_key
     from .triage import (refuter_annotation, refuter_line, refuter_pass_ran,
                          shown_field, status_token)
@@ -438,8 +452,23 @@ def svc_triage_list(store, review_id) -> tuple[int, str]:
     # `refuter(<provider>/<model>)` would be this program vouching for a second
     # opinion that was never sought.
     annotated = refuter_pass_ran(review)
-    lines = []
-    for i, f in enumerate(review["findings"]):
+
+    # R3 then R2 headers — fail closed inside the helpers; never raise out.
+    lines: list[str] = []
+    try:
+        ctx = round_context_for_review(store, review)
+        if ctx is not None:
+            lines.append(ctx.line())
+    except Exception:  # noqa: BLE001 - listing must still show findings
+        pass
+    try:
+        findings, churn, _prev = churn_for_review(store, review)
+        lines.append(churn.line())
+    except Exception:  # noqa: BLE001
+        findings = list(review["findings"])
+        lines.append("churn: unavailable")
+
+    for i, f in enumerate(findings):
         fkey = finding_key(f.get("file", ""), f.get("title", ""))
         # `OPEN`, `DISMISSED <when>`, or `REOPENED <when>, dismissed <when>` —
         # one definition, in `triage.status_token`, which bounds and strips the
@@ -451,16 +480,21 @@ def svc_triage_list(store, review_id) -> tuple[int, str]:
         # the parsed payload, exactly like `title`. `shown_field` strips the same
         # control/ANSI exposure and bounds the same way, so no field can forge an
         # extra row or rewrite this line's own status the instant it is printed.
-        # Only `[{i}]` and `({status})` are ours.
+        # Only `[{i}]` and `({status})` are ours. Churn marker is ours too.
+        marker = churn_marker(f)
+        marker_s = f" ({marker})" if marker else ""
         lines.append(f"[{i}] {shown_field(f.get('severity'))} "
                      f"{shown_field(f.get('file'))}:{shown_field(f.get('line'))} "
-                     f"{shown_field(f.get('title'))} ({status})")
+                     f"{shown_field(f.get('title'))} ({status}){marker_s}")
         # One extra line for an annotated finding, and never more than one:
         # `refuter_line` flattens and bounds every field it prints, so arbitrary
         # model text cannot forge a second `[n]` row. An annotation is shown
         # whatever its verdict says — the listing reports what the refuter
         # answered; only `--adopt-refuter` decides what may be acted on.
-        annotation = refuter_annotation(f) if annotated else None
+        # Refuter annotations still read from the ORIGINAL finding dict so a
+        # shallow churn copy that dropped keys cannot hide them.
+        raw = review["findings"][i] if i < len(review["findings"]) else f
+        annotation = refuter_annotation(raw) if annotated else None
         if annotation is not None:
             lines.append(refuter_line(annotation))
     return 0, "\n".join(lines)

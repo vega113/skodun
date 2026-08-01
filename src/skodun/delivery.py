@@ -441,16 +441,21 @@ def _severity_phrase(rec: Mapping) -> str:
             f"{coerce_count(sev.get('low'))} low")
 
 
-def round_lines(rec: Mapping) -> list[str]:
+def round_lines(rec: Mapping, *, store=None) -> list[str]:
     """Every line this round contributes, or `[]` when it is quiet.
 
     An empty list is the ONLY thing that makes a round quiet, so
     "acknowledged immediately" and "rendered nothing" can never disagree.
+
+    When `store` is provided, R3 round context is inserted under the head line
+    (annotation only; absence of store keeps the previous shape byte-stable
+    for unit tests that call this helper directly).
     """
     kind = classify(rec)
     if kind == "quiet":
         return []
     prefix = _head_prefix(rec)
+    ctx_lines = _round_context_lines(rec, store)
     if kind == "superseded":
         superseding = one_line(rec.get("superseded_by")).strip()
         # The PERSISTED field, written atomically by the reservation that retired
@@ -459,6 +464,7 @@ def round_lines(rec: Mapping) -> list[str]:
         tail = (f"superseded by {shown_field(superseding)}" if superseding
                 else "superseded by a newer push, which did not record its id")
         lines = [f"{prefix}: {tail}; read that round instead of this one"]
+        lines += ctx_lines
         if has_usable_output(rec) or _has_evidence(rec):
             # Unreachable through any writer -- the reservation supersedes only
             # `running` rows, and a `running` row has neither findings nor usable
@@ -469,12 +475,26 @@ def round_lines(rec: Mapping) -> list[str]:
                       *_findings_lines(rec)]
         return lines
     if kind == "no-output":
-        return [f"{prefix}: {NO_REVIEW_LINE}", *_reason_lines(rec)]
+        return [f"{prefix}: {NO_REVIEW_LINE}", *ctx_lines, *_reason_lines(rec)]
     if kind == "incomplete":
-        return [f"{prefix}: {INCOMPLETE_WARNING}", *_reason_lines(rec),
-                *_findings_lines(rec)]
+        return [f"{prefix}: {INCOMPLETE_WARNING}", *ctx_lines,
+                *_reason_lines(rec), *_findings_lines(rec)]
     return [f"{prefix}: {_count_phrase(rec)} -- {_severity_phrase(rec)}",
-            *_findings_lines(rec)]
+            *ctx_lines, *_findings_lines(rec)]
+
+
+def _round_context_lines(rec: Mapping, store) -> list[str]:
+    """R3 line under a surface head, or empty when store/context is unavailable."""
+    if store is None:
+        return []
+    try:
+        from .roundctx import round_context_for_review
+        ctx = round_context_for_review(store, rec)
+    except Exception:  # noqa: BLE001 - surface must still render the round
+        return []
+    if ctx is None:
+        return []
+    return [f"      {ctx.line()}"]
 
 
 def _count_phrase(rec: Mapping) -> str:
@@ -622,7 +642,7 @@ def surface(store: Store, branch: str, repo: str, fmt: str = TEXT,
     pending: list[str] = []
     lines: list[str] = []
     for rec in rounds:
-        rendered = round_lines(rec)
+        rendered = round_lines(rec, store=store)
         review_id = rec.get("id")
         if not isinstance(review_id, str) or not review_id:
             # Unreachable through the store (`reviews.id` is the primary key);
