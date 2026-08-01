@@ -236,8 +236,15 @@ def normalize_envelope(
         raise ValueError("upstream provider appears in junie usage")
 
     if review_exists:
+        # open_confined_text compares abspath(path) against abspath(root). On
+        # macOS, Path.resolve() rewrites /var -> /private/var while an
+        # unresolved Path under tempfile.gettempdir() stays /var/folders/...;
+        # mixing the two makes commonpath "/" and every legitimate review.json
+        # looks like an escape. Both arguments must share one form — realpath.
+        review_for_read = review_path.resolve()
         with open_confined_text(
-            str(review_path), str(capsule_real), "junie review", errors="strict"
+            str(review_for_read), str(capsule_real), "junie review",
+            errors="strict",
         ) as fh:
             review = json.load(fh)
         if not (
@@ -424,11 +431,14 @@ def run_confined_junie(
         except Exception as e:  # noqa: BLE001 - surface as unavailable
             return 2, b"", f"junie spawn failed: {e!r}\n".encode("utf-8")
 
-        # Collect stderr for classify (confined).
+        # Collect stderr for classify (confined). Path and root must share one
+        # realpath form — see normalize_envelope's review.json open.
+        inner_real = inner.resolve()
         err_bytes = b""
         try:
             with open_confined_text(
-                str(child_stderr), str(inner), "junie stderr", errors="replace"
+                str(child_stderr.resolve()), str(inner_real),
+                "junie stderr", errors="replace",
             ) as fh:
                 err_bytes = fh.read().encode("utf-8", "replace")
         except (ValueError, OSError):
@@ -443,7 +453,8 @@ def run_confined_junie(
 
         try:
             with open_confined_text(
-                str(envelope_path), str(inner), "junie envelope", errors="replace"
+                str(envelope_path.resolve()), str(inner_real),
+                "junie envelope", errors="replace",
             ) as fh:
                 envelope = json.load(fh)
             payload = normalize_envelope(

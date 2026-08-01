@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -72,6 +75,162 @@ def test_normalize_from_review_json(tmp_path: Path):
     )
     assert got["summary"] == "one issue"
     assert len(got["findings"]) == 1
+
+
+def test_normalize_review_json_under_production_tempdir():
+    """review.json path must survive /var vs /private/var on macOS.
+
+    Production capsules are made with tempfile.mkdtemp under gettempdir(),
+    which on macOS is typically /var/folders/... while Path.resolve() rewrites
+    that to /private/var/folders/.... pytest's tmp_path is already under
+    /private/var, so it cannot catch the commonpath mismatch. This test stages
+    under the real temp root and passes unresolved Path objects the way
+    run_confined_junie does.
+    """
+    tmp = tempfile.gettempdir()
+    root = Path(tempfile.mkdtemp(prefix="skodun-junie-prod-shape.", dir=tmp))
+    try:
+        # Document the split when present: unresolved root is /var/...,
+        # resolve() is /private/var/.... That is the defect surface.
+        unresolved = str(root)
+        resolved = str(root.resolve())
+        if unresolved != resolved:
+            assert unresolved.startswith("/var/"), unresolved
+            assert resolved.startswith("/private/var/"), resolved
+
+        capsule = root / "capsule"
+        project = capsule / "project"
+        project.mkdir(parents=True)
+        review = {
+            "summary": "prod-shaped capsule",
+            "findings": [
+                {
+                    "file": "b.py",
+                    "line": 2,
+                    "severity": "medium",
+                    "category": "bug",
+                    "title": "prod",
+                    "detail": "detail",
+                }
+            ],
+        }
+        (project / "review.json").write_text(json.dumps(review), encoding="utf-8")
+        # Unresolved paths — what stage_capsule / run_confined_junie hand in.
+        assert "/private/" not in str(project) or unresolved == resolved
+        env = _envelope(changes=[{"afterRelativePath": "review.json"}])
+        got = jr.normalize_envelope(
+            env,
+            project=project,          # unresolved
+            capsule=capsule,          # unresolved; normalize resolves both sides
+            configured_model="gpt-5.6-luna",
+        )
+        assert got["summary"] == "prod-shaped capsule"
+        assert got["findings"][0]["title"] == "prod"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_run_confined_junie_e2e_review_json_via_spawner():
+    """Full run_confined_junie path: spawner writes envelope + review.json.
+
+    Drives the shipped entry point on a production-shaped mkdtemp capsule so
+    confined reads of review.json and the envelope go through the real
+    normalize path, not a pytest tmp_path shortcut.
+    """
+    # Pre-stage nothing: run_confined_junie stages under gettempdir().
+    with tempfile.TemporaryDirectory(prefix="skodun-junie-e2e-prompt.") as td:
+        prompt = Path(td) / "prompt.txt"
+        prompt.write_text("review the change", encoding="utf-8")
+        fake_bin = Path(td) / "junie"
+        fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+        fake_bin.chmod(0o755)
+
+        review = {
+            "summary": "e2e review.json",
+            "findings": [
+                {
+                    "file": "c.py",
+                    "line": 3,
+                    "severity": "low",
+                    "category": "style",
+                    "title": "e2e",
+                    "detail": "from spawner",
+                }
+            ],
+        }
+
+        def spawner(argv, *, env, cwd, stdin_path, stdout_path, stderr_path):
+            # Locate --json-output-file and --project from the sandboxed argv.
+            # argv is [sandbox-exec, -f, profile, junie, ...flags...]
+            out_file = None
+            project_dir = None
+            i = 0
+            while i < len(argv):
+                if argv[i] == "--json-output-file" and i + 1 < len(argv):
+                    out_file = Path(argv[i + 1])
+                if argv[i] == "--project" and i + 1 < len(argv):
+                    project_dir = Path(argv[i + 1])
+                i += 1
+            assert out_file is not None and project_dir is not None
+            project_dir.mkdir(parents=True, exist_ok=True)
+            (project_dir / "review.json").write_text(
+                json.dumps(review), encoding="utf-8"
+            )
+            envelope = {
+                "changes": [{"afterRelativePath": "review.json"}],
+                "llmUsage": [
+                    {"model": "gpt-5.6-luna", "inputTokens": 1, "outputTokens": 1}
+                ],
+            }
+            out_file.write_text(json.dumps(envelope), encoding="utf-8")
+            Path(stdout_path).write_bytes(b"")
+            Path(stderr_path).write_bytes(b"")
+            # Prompt was staged into the capsule and opened as stdin.
+            assert Path(stdin_path).is_file()
+            assert b"review the change" in Path(stdin_path).read_bytes()
+            # Capsule must be under the system temp root (production shape).
+            capsule_inner = project_dir.parent
+            tmp = Path(tempfile.gettempdir())
+            assert os.path.commonpath(
+                (str(capsule_inner.resolve()), str(tmp.resolve()))
+            ) == str(tmp.resolve())
+            return 0
+
+        # Force darwin path so the spawner runs; skip real sandbox-exec by
+        # injecting resolve_sandbox_exec and binary resolution via mocks.
+        import unittest.mock as mock
+
+        with mock.patch.object(
+            jr.js, "resolve_sandbox_exec", return_value="/usr/bin/sandbox-exec"
+        ), mock.patch.object(
+            jr.js, "resolve_junie_binary",
+            side_effect=lambda binary, junie_data: binary,
+        ), mock.patch.object(
+            jr.js, "require_managed_junie_data",
+            side_effect=lambda path, home, require_existing=False: path,
+        ), mock.patch.object(
+            jr.js, "build_sandbox_profile",
+            return_value="(version 1)\n(allow default)\n",
+        ), mock.patch.object(
+            jr.js, "account_home",
+            return_value=str(Path.home()),
+        ), mock.patch.object(
+            jr.js, "write_profile",
+        ):
+            rc, out, err = jr.run_confined_junie(
+                prompt_file=prompt,
+                binary=str(fake_bin),
+                model="gpt-5.6-luna",
+                effort="high",
+                timeout_ms=5000,
+                contract_schema='{"type":"object"}',
+                spawner=spawner,
+                platform="darwin",
+            )
+        assert rc == 0, (rc, err)
+        payload = json.loads(out.decode("utf-8"))
+        assert payload["summary"] == "e2e review.json"
+        assert payload["findings"][0]["title"] == "e2e"
 
 
 def test_normalize_rejects_unexpected_project_file(tmp_path: Path):
