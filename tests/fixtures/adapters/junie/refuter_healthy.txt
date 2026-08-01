@@ -1,0 +1,6 @@
+rc=0
+--- stdout ---
+{"verdicts":[{"index":0,"verdict":"confirmed","reasoning":"Direct _STORE[key] lookup raises KeyError on misses."},{"index":1,"verdict":"refuted","reasoning":"Overwriting cache entries is standard behavior."},{"index":2,"verdict":"uncertain","reasoning":"Insufficient context to judge the purge condition."}]}
+
+--- stderr ---
+

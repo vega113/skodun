@@ -1,0 +1,10 @@
+rc=0
+--- stdout ---
+{"summary":"Reviewed svc/token.py and identified two security vulnerabilities.","findings":[{"file":"svc/token.py","line":7,"severity":"high","category":"security","title":"Insecure random number generator used for token generation","detail":"make_token uses random instead of secrets."},{"file":"svc/token.py","line":11,"severity":"high","category":"security","title":"Non constant time string comparison vulnerable to timing attack","detail":"compare uses standard equality; use hmac.compare_digest."}]}
+
+--- stderr ---
+Authentication required. Please visit the URL to log in:
+  https://accounts.example/oauth2/auth?REDACTED
+Waiting for authentication (timeout 60s)...
+Error: authentication timed out.
+

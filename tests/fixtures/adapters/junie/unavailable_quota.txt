@@ -1,0 +1,7 @@
+rc=1
+category=quota
+--- stdout ---
+
+--- stderr ---
+Error: payment required — quota exceeded for this account (rate limit).
+

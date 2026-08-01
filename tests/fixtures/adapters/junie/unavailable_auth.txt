@@ -1,0 +1,7 @@
+rc=1
+category=auth
+--- stdout ---
+
+--- stderr ---
+Error: authentication failed: invalid api key or not logged in.
+

@@ -1,0 +1,7 @@
+rc=1
+category=model
+--- stdout ---
+
+--- stderr ---
+Error: unknown model "gpt-9.9-nonexistent": model not found
+
