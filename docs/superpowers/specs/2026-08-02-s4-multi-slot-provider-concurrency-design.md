@@ -24,12 +24,18 @@ HTTP providers; MCP fingerprint queue (keep refuse-if-busy unless amended).
 |---|---|
 | Goal | Throughput of **independent** reviews |
 | Repo concurrency | `review-fg` capacity N; FIFO retained from S3 |
-| Physical multi-slot | Only when `SKODUN_LEGACY_FG_LOCK=0` (default **1**/on) |
-| Provider concurrency | Class `provider:<provider_id>`; default max_in_flight **1** |
-| 429 handling | `unavailable` + `quota` → `provider_state` + reduce effective slots for P |
+| Physical multi-slot | Only when `SKODUN_LEGACY_FG_LOCK=0` (default **1**/on; junk→on) |
+| Provider concurrency | Class `provider:<provider_id>`; default max_in_flight **1** (junk→1) |
+| 429 handling | `unavailable` + `quota` → `provider_state` + effective slots **0** for TTL |
+| Shared wait budget | One admission wait covers repo + provider waits + hop selection |
+| Queue position | Per resource_class+scope (S3 ordering) |
+| Reclaim | Same dead-pid / stale-holder rules for every class |
 | Recovery | Next free chain entry, else bounded wait/retry, else untrustworthy fail |
 | MCP | Unchanged refuse-if-busy per process |
 | gate/trust | Unchanged |
+
+See epic seed § “Normative config and semantics” for invalid-value and
+rollback rules — those are part of the design contract.
 
 ## Resource classes
 
