@@ -451,7 +451,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
         # S4 Phase B: hold provider:<id> for the whole entry (retries included).
         # Repo review-fg is already held by pipeline before run_chain runs.
         # Release on every terminal: hop, quota, cancel, success, fatal return.
-        # Metered API providers: refuse before spawn if the daily spend cap is up.
+        # Metered API providers (e.g. openai-api): refuse before spawn if this
+        # provider's **UTC-day** spend cap is up (default $10/day; not lifetime).
         if _api_spend_blocked(store, entry):
             n += 1
             detail = _api_spend_block_detail(store, entry.provider)

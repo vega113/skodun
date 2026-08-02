@@ -10,9 +10,11 @@ Everything here is behaviour skodun already enforces or that its design
 documents; nothing needs a plugin.
 
 **Smaller paste-ins** (MCP-only loop, MCP topology, concurrency, operator MCP
-JSON): [`fragments/`](fragments/) — start with
+JSON, OpenAI API BYOK): [`fragments/`](fragments/) — start with
 [`fragments/mcp-review-topology.md`](fragments/mcp-review-topology.md) if agents
-confuse MCP process, repository, and worktree.  
+confuse MCP process, repository, and worktree; use
+[`fragments/openai-api.md`](fragments/openai-api.md) for metered OpenAI HTTP
+(`OPENAI_API_KEY` / MCP `env`, daily spend cap).  
 **Full client integration** (install, MCP, gate wiring):  
 [`../docs/integrate-external-project.md`](../docs/integrate-external-project.md).
 
