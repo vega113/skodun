@@ -81,6 +81,18 @@ TRIAGE_DEFER_USAGE = (
 #: and a cancelled run must never be able to report anything gentler.
 REVIEW_CANCELLED_REASON = "review cancelled"
 
+#: Durable demotion reason written when cancel-by-id must finish a dead or
+#: unsignallable `running` row. Mapped to report state `cancelled` by
+#: `report_state` (substring "cancel"), without introducing a new store status
+#: that could drift gate/trust.
+REVIEW_CANCEL_DURABLE_REASON = "cancelled by review-cancel"
+
+#: Report vocabulary for `review-status` / `review_status` (epic S1). Durable
+#: store statuses stay on the existing enum (`running`/`failed`/`clean`/…);
+#: this is the READ MODEL only, so a cancelled round still demotes to
+#: `failed`+cancel reason for gate/trust while agents observe `cancelled`.
+REPORT_STATES = ("queued", "running", "cancelled", "failed", "clean", "findings")
+
 
 # --- gate -------------------------------------------------------------------
 
@@ -751,3 +763,367 @@ def svc_deferrals(store, limit=50) -> tuple[int, str]:
         f"deferred {shown_field(r.get('at'))} | review "
         f"{shown_field(r.get('review_id'))}"
         for r in rows)
+
+
+# --- review status + cancel (epic S1) ---------------------------------------
+
+
+def report_state(rec: dict) -> str:
+    """Map a durable review record to the S1 status vocabulary.
+
+    Durable cancel still lands as `status=failed` with a cancel reason (see
+    `pipeline.cancellation_transform` / `store.mark_cancelled`); introducing a
+    new store enum would risk gate/trust drift. This function is the one place
+    that maps those rows to reportable `cancelled`.
+    """
+    status = rec.get("status")
+    if status == "running":
+        # Prepush reservation before the worker attached a pid: admitted but
+        # not yet executing. FG rows always carry pid once persisted.
+        if rec.get("pid") is None and rec.get("mode") == "prepush":
+            return "queued"
+        return "running"
+    if _looks_cancelled(rec):
+        return "cancelled"
+    if status in ("failed", "degraded", "superseded"):
+        return "failed"
+    try:
+        total = int(rec.get("findings_total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total > 0:
+        return "findings"
+    if status == "clean" or rec.get("parse_ok") is True:
+        return "clean"
+    return "failed"
+
+
+def _looks_cancelled(rec: dict) -> bool:
+    for key in ("failure_reason", "degraded_reason"):
+        val = str(rec.get(key) or "").lower()
+        if "cancel" in val:
+            return True
+    return False
+
+
+def _status_field(label: str, val) -> str:
+    """One ``key=value`` token; quote values that would break space-splitting."""
+    import json
+
+    if val is None:
+        return f"{label}="
+    if isinstance(val, bool):
+        return f"{label}={str(val).lower()}"
+    if isinstance(val, int) and not isinstance(val, bool):
+        return f"{label}={val}"
+    text = str(val)
+    # Unquoted only when a single shell-like token; otherwise JSON-string form
+    # so `branch=feature one` cannot inject a phantom field.
+    if text and all(c.isalnum() or c in "._:@/+-" for c in text):
+        return f"{label}={text}"
+    return f"{label}={json.dumps(text)}"
+
+
+def format_status_line(rec: dict, *, now: float | None = None) -> str:
+    """One machine-readable status line for CLI and MCP.
+
+    Always includes `id=` and `state=` (the S1 vocabulary). Age, provider,
+    model, mode, and branch are appended when known — absence is omission, not
+    a second guess. Values with whitespace or special characters are emitted
+    as JSON strings so space-splitting consumers stay safe.
+    """
+    import time as _time
+
+    from .pipeline import _epoch
+
+    state = report_state(rec)
+    parts = [_status_field("id", rec.get("id")),
+             _status_field("state", state)]
+    started = _epoch(rec.get("reviewed_at"))
+    if started is not None:
+        age = int(max(0.0, (now if now is not None else _time.time()) - started))
+        parts.append(f"age={age}s")
+    for key, label in (
+            ("mode", "mode"),
+            ("adapter", "provider"),
+            ("model", "model"),
+            ("branch", "branch"),
+            ("pid", "pid"),
+    ):
+        val = rec.get(key)
+        if val is not None and val != "":
+            parts.append(_status_field(label, val))
+    return " ".join(parts)
+
+
+def _maybe_recover_stale(store) -> None:
+    """Sweep aged `running` rows with the same rules prepush uses.
+
+    Status and cancel are observation points that must not leave forever-
+    `running` FG rows when no push is happening; `recover_stale` is the one
+    janitor. Failures here are swallowed -- a broken sweep must not block a
+    status read.
+    """
+    try:
+        from .config import load_config
+        from .pipeline import recover_stale
+        # Config is host-global for budget defaults when no repo is in hand;
+        # recover_stale prefers each row's own persisted worst_runtime_sec.
+        recover_stale(store, load_config(Path(".")))
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        pass
+
+
+def svc_review_status(store, review_id=None, repo=None) -> tuple[int, str]:
+    """Observe one review. `(0, line)` or `(2, why-not)`.
+
+    `review_id` wins when both are given. Without an id, `repo` selects the
+    current review for that repository (newest `running`, else newest terminal);
+    without either, the host-wide current review. Not a gate: never computes
+    trust over the worktree.
+
+    Runs `recover_stale` first so an aged FG `running` row is reported as the
+    terminal state the sweep produces rather than as forever-running.
+    """
+    _maybe_recover_stale(store)
+    try:
+        if review_id is not None and str(review_id).strip() != "":
+            rid = str(review_id).strip()
+            rec = store.get_review(rid)
+            if rec is None:
+                return 2, f"skodun review-status: no such review: {rid}"
+        else:
+            scope = None
+            if repo is not None and str(repo).strip() != "":
+                scope = str(repo).strip()
+            rec = store.current_review(scope)
+            if rec is None:
+                if scope is not None:
+                    return 2, (f"skodun review-status: no review for repo "
+                               f"{scope}")
+                return 2, "skodun review-status: no reviews in the store"
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:
+        return 2, f"skodun review-status: could not read the store: {e!r}"
+    return 0, format_status_line(rec)
+
+
+def svc_review_cancel(store, review_id) -> tuple[int, str]:
+    """Request cancellation of one in-flight review. `(0, text)` or `(2, why)`.
+
+    Order of operations (each step is best-effort; together they cover FG, MCP
+    long-running slot, and background workers):
+
+    1. Refuse missing ids and already-terminal rows (same words on both
+       surfaces).
+    2. Set the in-process cancel token when this process holds it (MCP /
+       same-process FG).
+    3. SIGTERM a confirmed background worker, or a live FG pid that still owns
+       the row (handler sets the token).
+    4. If nothing is alive to finish the demotion, `fail_if_running` with a
+       cancel reason so the row is not forever-`running` and the next FG wait
+       is not blocked by a ghost.
+
+    The live path's own finally (FG lock release, provider process-group kill)
+    still owns cleanup when the process is reachable; this function does not
+    re-implement that stack.
+    """
+    import os
+    import signal
+
+    from . import dispatch, pipeline
+    from .store import RUNNING
+
+    if review_id is None or str(review_id).strip() == "":
+        return 2, "skodun review-cancel: review_id is required"
+    rid = str(review_id).strip()
+    _maybe_recover_stale(store)
+    try:
+        rec = store.get_review(rid)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:
+        return 2, f"skodun review-cancel: could not read the store: {e!r}"
+    if rec is None:
+        return 2, f"skodun review-cancel: no such review: {rid}"
+    if rec.get("status") != RUNNING:
+        state = report_state(rec)
+        return 2, (f"skodun review-cancel: review {rid} is already terminal "
+                   f"({state})")
+
+    token_set = pipeline.request_cancel(rid)
+    signalled = False
+    pid = rec.get("pid")
+    # When the token is in THIS process, setting it is enough: SIGTERM would
+    # hit our own process (tests, MCP server) and is unnecessary. Cross-process
+    # cancel is the only case that needs a signal.
+    if not token_set:
+        if dispatch.pid_is_skodun_worker(pid, rid):
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+                signalled = True
+            except (OSError, ProcessLookupError, ValueError, TypeError):
+                pass
+        elif _pid_is_live_skodun_fg(pid) and int(pid) != os.getpid():
+            # Foreground CLI or MCP server in another process. MCP installs its
+            # SIGTERM forwarder on the MAIN thread (reviews run on a worker
+            # thread where signal handlers cannot be installed); that forwarder
+            # sets the cancel token so the review's finally demotes cleanly.
+            # Never signal ourselves.
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+                signalled = True
+            except (OSError, ProcessLookupError, ValueError, TypeError):
+                pass
+
+    demoted = False
+    if not token_set and not signalled:
+        # Dead or unconfirmable holder: durable terminal now, same fail-closed
+        # posture as recover_stale, with a cancel reason so report_state maps
+        # to `cancelled` rather than a generic failed sweep.
+        try:
+            demoted = bool(store.fail_if_running(rid, REVIEW_CANCEL_DURABLE_REASON))
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:
+            return 2, (f"skodun review-cancel: could not demote review {rid}: "
+                       f"{e!r}")
+    elif signalled:
+        # Wait briefly for the holder to demote via its cancel path. If the
+        # process died without demoting (no SIGTERM handler — the MCP bug this
+        # poll closes), finish the row here so it is not forever-running.
+        outcome = _await_cancel_or_demote(store, rid, pid)
+        if outcome == "done":
+            return 0, f"skodun review-cancel: cancel completed for {rid}"
+        if outcome == "demoted":
+            return 0, (f"skodun review-cancel: cancelled {rid} "
+                       f"(durable terminal; holder exited without demoting)")
+        # Still running: cancel was requested; the holder is finishing.
+        return 0, f"skodun review-cancel: cancel requested for {rid}"
+
+    if demoted:
+        return 0, (f"skodun review-cancel: cancelled {rid} "
+                   f"(durable terminal; holder was not reachable)")
+    if token_set:
+        return 0, f"skodun review-cancel: cancel requested for {rid}"
+    # Live but unconfirmable pid: do not SIGTERM a stranger. Operator can
+    # re-run after the process dies, or recover_stale will sweep by age.
+    return 0, (f"skodun review-cancel: cancel noted for {rid}; "
+               f"holder pid {pid!r} could not be confirmed — "
+               f"re-check with review-status")
+
+
+#: How long cross-process cancel waits for the holder to demote before either
+#: demoting a dead unclean exit or returning "cancel requested". Short enough
+#: for CLI UX; long enough for a token-driven demotion + provider SIGKILL grace.
+_CANCEL_AWAIT_SEC = 8.0
+
+
+def _await_cancel_or_demote(store, review_id: str, pid) -> str:
+    """After signalling: wait for terminal, or demote if the holder died dirty.
+
+    Returns ``"done"`` when the row left ``running`` on its own, ``"demoted"``
+    when this function applied `fail_if_running`, or ``"pending"`` when the
+    holder is still alive and still running (cancel requested; re-check later).
+    """
+    import time as _time
+
+    from .store import RUNNING
+
+    deadline = _time.monotonic() + _CANCEL_AWAIT_SEC
+    while _time.monotonic() < deadline:
+        try:
+            rec = store.get_review(review_id)
+        except KeyboardInterrupt:
+            raise
+        except BaseException:
+            return "pending"
+        if rec is None or rec.get("status") != RUNNING:
+            return "done"
+        if not _pid_alive(pid):
+            try:
+                if store.fail_if_running(review_id, REVIEW_CANCEL_DURABLE_REASON):
+                    return "demoted"
+            except KeyboardInterrupt:
+                raise
+            except BaseException:
+                return "pending"
+            # Race: another transition already terminalised the row.
+            try:
+                rec = store.get_review(review_id)
+            except BaseException:
+                return "pending"
+            if rec is None or rec.get("status") != RUNNING:
+                return "done"
+            return "pending"
+        _time.sleep(0.05)
+    # Still running and (if we can tell) still alive.
+    try:
+        rec = store.get_review(review_id)
+    except BaseException:
+        return "pending"
+    if rec is None or rec.get("status") != RUNNING:
+        return "done"
+    if not _pid_alive(pid):
+        try:
+            if store.fail_if_running(review_id, REVIEW_CANCEL_DURABLE_REASON):
+                return "demoted"
+        except BaseException:
+            pass
+        return "pending"
+    return "pending"
+
+
+def _pid_alive(pid) -> bool:
+    """Whether `pid` still exists. False when unknown / dead / invalid."""
+    import os as _os
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        _os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:                 # pragma: no cover - not ours
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _pid_is_live_skodun_fg(pid) -> bool:
+    """Whether `pid` looks like a live skodun foreground/MCP process.
+
+    Stricter than `kill -0` alone (pid reuse), laxer than the worker argv
+    guard: FG argv is `skodun review` / `python -m skodun` / an MCP host
+    spawning `skodun mcp`, not `skodun worker --record-id ...`. Requires
+    `skodun` in the command line and forbids the worker tokens so a recycled
+    pid on another skodun worker is not signalled as FG.
+    """
+    import subprocess
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        cp = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
+                            capture_output=True, timeout=30)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    if cp.returncode != 0:
+        return False
+    args = cp.stdout.decode("utf-8", "replace")
+    if "skodun" not in args:
+        return False
+    # Never treat a background worker as FG: workers have their own path.
+    # Require BOTH the worker argv tokens AND `--record-id` so a generic
+    # path that happens to contain the substring "worker" does not strip
+    # FG liveness. `any` of the tokens alone would refuse every FG argv
+    # (they all contain `skodun`) and leave cancel on the dead-pid path.
+    from .dispatch import WORKER_ARGV_TOKENS, WORKER_RECORD_FLAG
+    if (all(tok in args for tok in WORKER_ARGV_TOKENS)
+            and WORKER_RECORD_FLAG in args):
+        return False
+    return True

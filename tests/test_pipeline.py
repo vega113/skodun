@@ -1020,10 +1020,11 @@ def test_a_broken_extra_pass_demotes_the_review_instead_of_destroying_it(
     real = pipeline._run_chain
 
     def only_the_skeptic_explodes(head, cfg, d, prompt, cwd, store, scratch,
-                                  tag, contract=REVIEW_CONTRACT):
+                                  tag, contract=REVIEW_CONTRACT, **kw):
         if tag == "skeptic":
             raise RuntimeError("adapter exploded mid-pass")
-        return real(head, cfg, d, prompt, cwd, store, scratch, tag, contract)
+        return real(head, cfg, d, prompt, cwd, store, scratch, tag,
+                    contract, **kw)
 
     monkeypatch.setattr(pipeline, "_run_chain", only_the_skeptic_explodes)
     rec = _run(repo, _store(tmp_path))

@@ -205,6 +205,10 @@ STALE_RECOVERY_REASON = "stale recovery: worker exceeded its runtime budget"
 #: The `failure_reason` the foreground cleanup writes when a run left a
 #: persisted `running`/committed record behind without finalizing it.
 UNFINISHED_REASON = ("the review did not finish; its record was never finalized")
+#: Same durable demotion as `UNFINISHED_REASON`, but named so S1's
+#: `report_state` maps it to `cancelled` rather than generic `failed`.
+UNFINISHED_CANCEL_REASON = (
+    "cancelled: the review did not finish; its record was never finalized")
 
 
 class PipelineError(RuntimeError):
@@ -245,6 +249,68 @@ class PersistenceFailed(PipelineError):
 #: It is NOT a stdout redirect. A process-global `redirect_stdout` would corrupt
 #: the JSON-RPC stream this exists to keep clean.
 _PROGRESS = threading.local()
+
+# --- in-process cancel-by-id (epic S1) --------------------------------------
+#
+# MCP disconnect already sets one Event for the long-running review slot. Status
+# and cancel-by-id need the same token keyed by review id so a peer tool call in
+# the same process can stop a hang without waiting for session EOF. Background
+# workers still use SIGTERM (dispatch installs the handler); this registry only
+# covers processes that hold the Event in memory.
+_ACTIVE_CANCELS: dict[str, "threading.Event"] = {}
+_ACTIVE_CANCELS_LOCK = threading.Lock()
+
+
+def register_cancel(review_id: str, cancel: "threading.Event") -> None:
+    """Publish `cancel` for `review_id` so `request_cancel` can set it."""
+    if not isinstance(review_id, str) or not review_id:
+        return
+    with _ACTIVE_CANCELS_LOCK:
+        _ACTIVE_CANCELS[review_id] = cancel
+
+
+def unregister_cancel(review_id: str) -> None:
+    """Drop a published cancel token. Idempotent."""
+    if not isinstance(review_id, str) or not review_id:
+        return
+    with _ACTIVE_CANCELS_LOCK:
+        _ACTIVE_CANCELS.pop(review_id, None)
+
+
+def request_cancel(review_id: str) -> bool:
+    """Set the in-process cancel token for `review_id` if one is registered.
+
+    Returns True when a token was found and set. False means this process does
+    not hold that review's Event (another process owns it, or nothing is in
+    flight under that id here) -- callers should still try process signalling
+    and durable demotion.
+    """
+    if not isinstance(review_id, str) or not review_id:
+        return False
+    with _ACTIVE_CANCELS_LOCK:
+        cancel = _ACTIVE_CANCELS.get(review_id)
+    if cancel is None:
+        return False
+    cancel.set()
+    return True
+
+
+def request_cancel_all() -> int:
+    """Set every in-process cancel token. Used by the MCP main-thread SIGTERM
+    forwarder: long-running reviews run on a worker thread where
+    `signal.signal` cannot install a handler, so the process handler must fan
+    out to every registered Event (and the server's own `_worker_cancel`).
+
+    Returns how many tokens were set.
+    """
+    with _ACTIVE_CANCELS_LOCK:
+        tokens = list(_ACTIVE_CANCELS.values())
+    for cancel in tokens:
+        try:
+            cancel.set()
+        except Exception:                   # pragma: no cover - defensive
+            pass
+    return len(tokens)
 
 
 def _note(message: str) -> None:
@@ -1191,6 +1257,17 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                             **_cancel_kw(cancel))
 
     rid = _new_id(id_prefix)
+    # Always have a token once under the lock: cancel-by-id (S1) needs one even
+    # when the CLI path did not pass an Event. Callers that already supplied one
+    # keep it so MCP disconnect and tests still share the same object.
+    if cancel is None:
+        cancel = threading.Event()
+    register_cancel(rid, cancel)
+    # SIGTERM sets the token (worker path already does this via dispatch). A bare
+    # process death would orphan the provider group and leave a `running` row
+    # until recover_stale; with a handler, review-cancel can signal this pid and
+    # the existing cancel machinery demotes + releases the FG lock.
+    previous_sigterm = _install_fg_sigterm(cancel)
     persisted = False
     finalized = False
     try:
@@ -1261,6 +1338,10 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             # scoped reader cannot tell two checkouts of the same repository
             # apart, which is the intended equivalence.
             repo=str(gitio.git_common_dir(repo)),
+            # Process identity for cancel-by-id (S1). Background workers already
+            # attach a pid via the reservation lease; foreground rows need it
+            # too so a peer can SIGTERM a live holder or demote a dead one.
+            pid=os.getpid(),
         )
 
         # THE PRE-PERSISTENCE BOUNDARY, and it covers all three of the persist
@@ -1600,10 +1681,51 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 # that row certifying a review nobody could read back -- the
                 # stale-recovery bug, one call site over. `mark_failed` demotes
                 # the status AND the trust axes in one statement.
-                store.mark_failed(rid, UNFINISHED_REASON)
+                # When the cancel token is set, name the demotion for S1's
+                # report vocabulary (`cancelled`); a crash unfinished stays
+                # plain failed.
+                reason = (UNFINISHED_CANCEL_REASON
+                          if runner._cancelled(cancel) else UNFINISHED_REASON)
+                store.mark_failed(rid, reason)
             except Exception:
                 pass   # the crash that got us here is the story, not this
+        unregister_cancel(rid)
+        _restore_fg_sigterm(previous_sigterm)
         _release_fg_lock(lock)
+
+
+#: Returned by ``_install_fg_sigterm`` when install is impossible. Distinct
+#: from ``None`` (a valid previous disposition from ``signal.signal``).
+_SIGTERM_INSTALL_FAILED = object()
+
+
+def _install_fg_sigterm(cancel: "threading.Event"):
+    """Make SIGTERM set the FG cancel token. Same posture as the worker.
+
+    Returns the previous handler, or ``_SIGTERM_INSTALL_FAILED`` when install
+    is impossible (not the main thread). Restored in `run_review`'s finally so
+    a long-lived process (MCP) does not keep a review-scoped handler after the
+    review ends.
+    """
+    import signal
+
+    def handler(signum, frame):        # pragma: no cover - driven by a signal
+        cancel.set()
+    try:
+        return signal.signal(signal.SIGTERM, handler)
+    except (ValueError, OSError, RuntimeError):
+        return _SIGTERM_INSTALL_FAILED
+
+
+def _restore_fg_sigterm(previous) -> None:
+    if previous is _SIGTERM_INSTALL_FAILED:
+        return
+    import signal
+    try:
+        signal.signal(signal.SIGTERM,
+                      signal.SIG_DFL if previous is None else previous)
+    except (ValueError, OSError, RuntimeError):
+        pass
 
 
 #: `runner.ReviewCancelled`, aliased under this module's name. Defined in

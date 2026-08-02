@@ -164,7 +164,7 @@ Most tools accept optional `repo`: a path **inside** the git worktree.
 - **Best practice for external projects:** always pass an absolute project root
   as `repo` on `gate`, `review`, `log`, and `surface`.
 
-### Tools (today) — 9 tools, 2 prompts
+### Tools (today) — 11 tools, 2 prompts
 
 | MCP tool | CLI analogue | Notes |
 |---|---|---|
@@ -172,6 +172,8 @@ Most tools accept optional `repo`: a path **inside** the git worktree.
 | `review` | `skodun review` | Long-running; optional `reviewer` **name** (not provider id) |
 | `log` | `skodun log` | Optional `branch`, `limit` |
 | `surface` | `skodun surface` | History only — **not** a gate |
+| `review_status` | `skodun review-status` | Lifecycle observe; not a gate |
+| `review_cancel` | `skodun review-cancel` | Cancel in-flight by id |
 | `triage_list` | `triage --list` | Needs `review_id` |
 | `triage_dismiss` | default triage dismiss | `review_id`, `index`, `reason` |
 | `triage_defer` | `triage --defer` | + mandatory `tracking_ref` |
@@ -207,10 +209,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocol
 2. **One MCP `review` per server process.** A second call returns
    `"review already in flight"` — **not** queued (a queue would run against a
    moved tree).
-3. Closing the MCP session **cancels** the in-flight MCP review (today).
-   Cross-session cancel-by-id is epic **S1**.
+3. **Status / cancel (S1):** `skodun review-status` / `skodun review-cancel`
+   and MCP `review_status` / `review_cancel` observe or stop in-flight work
+   without a second gate. Closing the MCP session still cancels the in-flight
+   MCP review.
 4. **Do not poll** with full agent turns every 30–60s. Wait outside the model,
-   then call `gate` / `log` / `surface`.
+   then call `review-status` / `gate` / `log` / `surface`.
 5. Providers are a **fallback chain**, not parallel slots.
 
 Epic **S3** will add fair capacity + telemetry; update this section when it ships.

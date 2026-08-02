@@ -41,7 +41,8 @@ from tests.test_gitio import _git, _mkrepo
 #: not a step in the loop an agent drives).
 STORE_BACKED = ["svc_gate", "svc_review", "svc_log", "svc_surface",
                 "svc_triage_list", "svc_triage_dismiss", "svc_adopt_refuter",
-                "svc_triage_reopen", "svc_triage_defer", "svc_deferrals"]
+                "svc_triage_reopen", "svc_triage_defer", "svc_deferrals",
+                "svc_review_status", "svc_review_cancel"]
 
 #: A deferral needs a filed reference and a reason that clears the same audit
 #: floor a dismissal's does -- both, or the service refuses.

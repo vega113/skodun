@@ -25,12 +25,22 @@ telemetry) will replace blind multi-hour waits. Until then: **serialize
 foreground reviews**; do not start competing full suites + reviews on the same
 repo without coordination.
 
-### Cancel / status (epic S1 — when shipped)
+### Cancel / status (epic S1 — shipped)
 
-Use `review_status` / `review_cancel` (CLI + MCP) instead of abandoning an
-in-flight provider. **Today:** closing the MCP session cancels the in-flight
-MCP `review`; there is no cancel-by-id from another session yet. Do not leave a
-second agent waiting on the same repo lock without a human timeout.
+| Surface | Verb |
+|---|---|
+| CLI | `skodun review-status [id] [--repo PATH]` |
+| CLI | `skodun review-cancel <id>` |
+| MCP | `review_status` (`review_id` and/or `repo`) |
+| MCP | `review_cancel` (`review_id`) |
+
+Status reports one of `queued|running|cancelled|failed|clean|findings` plus
+age / provider / model when known. Cancel sets the in-process token (same MCP
+process) or signals a confirmed worker or FG process; that live holder then
+demotes the row and releases the FG lock. If the holder is already gone,
+cancel writes a durable untrustworthy terminal so nothing stays forever-
+`running`, and the stale sweep reclaims the FG lock. Closing the MCP session
+still cancels the in-flight MCP `review`. Prefer cancel-by-id over abandon.
 
 ### Cost policy
 

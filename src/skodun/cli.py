@@ -112,6 +112,27 @@ def build_parser() -> argparse.ArgumentParser:
                              "config's own 'finder' role (default: the "
                              "config decides)")
 
+    # Epic S1: observe / cancel without a second gate. Hyphenated CLI names
+    # match install-hooks / import-legacy; MCP tools use underscores like the
+    # rest of the tool surface (review_status, review_cancel).
+    rstatus = sub.add_parser(
+        "review-status",
+        help="show status of a review by id, or the current one for --repo")
+    rstatus.add_argument(
+        "review_id", nargs="?", default=None, metavar="REVIEW-ID",
+        help="review id to inspect (default: current for --repo, or host-wide)")
+    rstatus.add_argument(
+        "--repo", type=Path, default=None,
+        help="when no id is given, report the current review for this "
+             "repository (default: host-wide current)")
+
+    rcancel = sub.add_parser(
+        "review-cancel",
+        help="cancel an in-flight review by id (token, signal, durable terminal)")
+    rcancel.add_argument(
+        "review_id", metavar="REVIEW-ID",
+        help="id of the running review to cancel")
+
     imp = sub.add_parser(
         "import-legacy",
         help="import a legacy .grok-reviews archive into the skodun store")
@@ -1415,6 +1436,43 @@ def _cmd_log(args) -> int:
     return _emit(text, code) if text else code
 
 
+def _cmd_review_status(args) -> int:
+    """Print one status line for a review. Service owns refusals; we own Store."""
+    from .services import svc_review_status
+
+    repo = None
+    if getattr(args, "repo", None) is not None and args.review_id is None:
+        from . import gitio
+        try:
+            repo = str(gitio.git_common_dir(Path(args.repo)))
+        except BaseException as e:
+            return _emit(f"skodun review-status: could not resolve --repo: "
+                         f"{e!r}", 2)
+    try:
+        from .store import Store
+        store = Store.open(_store_path())
+    except BaseException as e:
+        return _emit(f"skodun review-status: could not read the store: {e!r}", 2)
+    with store:
+        code, text = svc_review_status(
+            store, review_id=getattr(args, "review_id", None), repo=repo)
+    return _emit(text, code)
+
+
+def _cmd_review_cancel(args) -> int:
+    """Request cancel for one review id. Service owns refusals; we own Store."""
+    from .services import svc_review_cancel
+
+    try:
+        from .store import Store
+        store = Store.open(_store_path())
+    except BaseException as e:
+        return _emit(f"skodun review-cancel: could not read the store: {e!r}", 2)
+    with store:
+        code, text = svc_review_cancel(store, args.review_id)
+    return _emit(text, code)
+
+
 def _cmd_deferrals(args) -> int:
     """Print every finding still standing as DEFERRED. `2` if unreadable.
 
@@ -1638,6 +1696,10 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_shadow_compare(args)
         if args.command == "log":
             return _cmd_log(args)
+        if args.command == "review-status":
+            return _cmd_review_status(args)
+        if args.command == "review-cancel":
+            return _cmd_review_cancel(args)
         if args.command == "triage":
             return _cmd_triage(args)
         if args.command == "deferrals":
