@@ -165,8 +165,8 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import (batching, budget, chain, checklist, contextpack, gitio, ids,
-               passes, promptbuild, runner)
+from . import (batching, budget, capacity, chain, checklist, contextpack, gitio,
+               ids, passes, promptbuild, runner)
 from .adapters import NORMAL_STOP_REASONS, REFUTER_CONTRACT, get_adapter
 from .config import Config, Defaults, Reviewer
 from .store import Store, _TS_FORMAT
@@ -1195,6 +1195,14 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         for entry in _chain_for(cfg, reviewer):
             _adapter_for(entry)
 
+    # --- 1b. entire finder chain known unavailable → fail fast (S3) -------
+    # Before spending any admission / lock wait budget: if every entry the
+    # finder chain could hop to is cached-unavailable, the wait cannot produce
+    # inference. Extra-pass roles are not required for this short-circuit.
+    unavailable = _finder_chain_unavailable(store, cfg, finder)
+    if unavailable is not None:
+        raise PreflightRefused(unavailable)
+
     # --- 2. sweep the wreckage of any SIGKILLed predecessor ---------------
     recover_stale(store, cfg)
 
@@ -1249,12 +1257,67 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     # waiter reading it inside that window would reclaim a live batched holder:
     # the exact overlap the sidecar exists to prevent.
     #
-    # `**_cancel_kw`: `_acquire_fg_lock` is spied on by name in the suite too, so
-    # a run with no token must call it exactly as it always has.
-    lock = _acquire_fg_lock(gitio.git_common_dir(repo), root,
-                            wait=wait, poll=poll, stale=stale,
-                            budget_sec=ceiling,
-                            **_cancel_kw(cancel))
+    # --- 3b. review-fg capacity (FIFO) + legacy FG lock dual-hold (S3) ----
+    # Store FIFO orders skodun waiters; the mkdir lock keeps tubescribes /
+    # legacy scripts serializing against us. Admission budget defaults to the
+    # same wait figure as the lock (override: SKODUN_ADMISSION_WAIT_SECONDS).
+    common_dir = gitio.git_common_dir(repo)
+    scope = str(common_dir)
+    admission_wait = capacity.admission_wait_from_env(wait)
+    cap_n = capacity.capacity_from_env()
+    lock_cell: dict = {"lock": None}
+    capacity_ticket: capacity.Ticket | None = None
+
+    def _try_fg_lock(slice_sec: float) -> bool:
+        """One dual-hold attempt: True when this process holds the FG lock."""
+        try:
+            # `_acquire_fg_lock` is spied on by name in the suite; keep calling
+            # it here so those tests still drive the real lock path.
+            held = _acquire_fg_lock(
+                common_dir, root,
+                wait=float(slice_sec),
+                poll=min(poll, max(float(slice_sec), 0.01)),
+                stale=stale,
+                budget_sec=ceiling,
+                **_cancel_kw(cancel))
+        except LockTimeout:
+            return False
+        except ReviewCancelled as e:
+            raise capacity.AdmissionCancelled(str(e)) from e
+        lock_cell["lock"] = held
+        return True
+
+    try:
+        capacity_ticket = capacity.acquire_for_fg(
+            store, scope=scope, capacity=cap_n,
+            wait_sec=admission_wait, poll_sec=poll,
+            stale_sec=stale,
+            cancel=cancel, on_progress=_note, try_lock=_try_fg_lock)
+    except capacity.AdmissionTimeout as e:
+        if lock_cell["lock"] is not None:
+            _release_fg_lock(lock_cell["lock"])
+            lock_cell["lock"] = None
+        raise LockTimeout(str(e)) from e
+    except capacity.AdmissionCancelled as e:
+        if lock_cell["lock"] is not None:
+            _release_fg_lock(lock_cell["lock"])
+            lock_cell["lock"] = None
+        raise ReviewCancelled(str(e)) from e
+    except BaseException:
+        if lock_cell["lock"] is not None:
+            _release_fg_lock(lock_cell["lock"])
+            lock_cell["lock"] = None
+        raise
+    lock = lock_cell["lock"]
+    if lock is None:
+        # Defensive: acquire_for_fg must not return without try_lock True.
+        if capacity_ticket is not None:
+            capacity.finish(store, capacity_ticket,
+                            status=capacity.STATUS_REJECTED,
+                            expire_reason="lock_missing")
+        raise LockTimeout(
+            "review-fg admission succeeded without the foreground lock; "
+            f"re-run or remove {common_dir / LOCK_NAME} if it is wedged")
 
     rid = _new_id(id_prefix)
     # Always have a token once under the lock: cancel-by-id (S1) needs one even
@@ -1263,6 +1326,12 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     if cancel is None:
         cancel = threading.Event()
     register_cancel(rid, cancel)
+    # Attach the review id to capacity telemetry once known.
+    if capacity_ticket is not None:
+        try:
+            capacity.mark_started(store, capacity_ticket, review_id=rid)
+        except Exception:
+            pass
     # SIGTERM sets the token (worker path already does this via dispatch). A bare
     # process death would orphan the provider group and leave a `running` row
     # until recover_stale; with a handler, review-cancel can signal this pid and
@@ -1691,7 +1760,41 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 pass   # the crash that got us here is the story, not this
         unregister_cancel(rid)
         _restore_fg_sigterm(previous_sigterm)
+        if capacity_ticket is not None and capacity_ticket.status in (
+                capacity.STATUS_QUEUED, capacity.STATUS_ADMITTED,
+                capacity.STATUS_RUNNING):
+            try:
+                reason = (capacity.REASON_CANCELLED
+                          if runner._cancelled(cancel) else None)
+                status = (capacity.STATUS_REJECTED if reason
+                          else capacity.STATUS_RELEASED)
+                capacity.finish(store, capacity_ticket, status=status,
+                                expire_reason=reason)
+            except Exception:
+                pass
         _release_fg_lock(lock)
+
+
+def _finder_chain_unavailable(store: Store, cfg: Config,
+                              finder: Reviewer) -> str | None:
+    """Reason string if every finder-chain provider is cached-unavailable.
+
+    Returns None when at least one entry is free of an active provider_state
+    TTL (or the chain is empty, which preflight already refused elsewhere).
+    """
+    chain_entries = _chain_for(cfg, finder)
+    if not chain_entries:
+        return None
+    now = _iso_now()
+    parts: list[str] = []
+    for entry in chain_entries:
+        reason = store.provider_unavailable_reason(entry.provider, now)
+        if reason is None:
+            return None
+        parts.append(f"{entry.provider}: {reason}")
+    return (
+        "entire finder provider chain is known unavailable "
+        f"({'; '.join(parts)}); no review ran")
 
 
 #: Returned by ``_install_fg_sigterm`` when install is impossible. Distinct

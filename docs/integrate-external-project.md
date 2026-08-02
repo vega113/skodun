@@ -10,7 +10,8 @@ config, and agent instructions.
 - Status + cancel — **S1** [#41](https://github.com/vega113/skodun/issues/41)
 - Fair review capacity — **S3** [#42](https://github.com/vega113/skodun/issues/42)
 
-Until those land, treat concurrency rules below as **current product behaviour**.
+S1 (status/cancel) and S3 (fair capacity) are **shipped** — concurrency rules
+below match current product behaviour.
 
 | More detail | Path |
 |---|---|
@@ -204,20 +205,25 @@ printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocol
 
 ### Concurrency (agents must know)
 
-1. **One foreground review per repository** (repo lock). A second CLI review
-   waits, then may exit **`3`**.
-2. **One MCP `review` per server process.** A second call returns
-   `"review already in flight"` — **not** queued (a queue would run against a
-   moved tree).
+1. **CLI foreground reviews:** FIFO **review-fg** capacity (default **1** per
+   repository) dual-held with the legacy `grok-reviews-foreground.lock`.
+   Waiters are ordered; progress reports **queue position** and **remaining
+   wait budget**; bounded wait then exit **`3`**. Raise capacity with
+   `SKODUN_REVIEW_FG_CAPACITY` (legacy lock still serializes physical runs to
+   1 while shadow scripts coexist). Telemetry is persisted
+   (`capacity_admissions`).
+2. **MCP `review`:** **One per server process.** A second call returns
+   `"review already in flight"` — **not** queued (S3 policy: a queue would run
+   against a moved tree).
 3. **Status / cancel (S1):** `skodun review-status` / `skodun review-cancel`
    and MCP `review_status` / `review_cancel` observe or stop in-flight work
    without a second gate. Closing the MCP session still cancels the in-flight
    MCP review.
 4. **Do not poll** with full agent turns every 30–60s. Wait outside the model,
    then call `review-status` / `gate` / `log` / `surface`.
-5. Providers are a **fallback chain**, not parallel slots.
-
-Epic **S3** will add fair capacity + telemetry; update this section when it ships.
+5. Providers are a **fallback chain**, not parallel slots. If the **entire**
+   finder chain is known unavailable via `provider_state`, the run fails fast
+   (exit 2) without burning the full admission wait.
 
 ---
 
@@ -318,5 +324,5 @@ Last reviewed against skodun **0.4.x** / post-epic-#23 main:
 | CLI-only ops list | doctor, providers, retain, schedule, install-hooks, … |
 | Links to #41 / #42 | present |
 
-When S1/S3 land, update §2 concurrency and the fragments in the same PR as the
-feature.
+S1 and S3 are shipped: §2 concurrency and `examples/fragments/concurrency.md`
+match the product (FIFO review-fg + MCP refuse-if-busy).
