@@ -192,3 +192,15 @@ Follow the shape the earlier phases used:
 Ask the owner rather than guessing when a decision is theirs: scope cuts, anything touching
 the byte-pinned files, a schema change, or a policy that would let something ship
 unreviewed.
+
+---
+
+## Superseded for epic close-out
+
+**2026-08-01:** Epic #23 was rewritten as “complete skodun MCP as designed.”
+For finishing the epic (junie/R2–R3 land, ops debt, doctor, retention, schedule,
+MCP/docs parity), use:
+
+**[`docs/epic-23-completion-handoff-prompt.md`](epic-23-completion-handoff-prompt.md)**
+
+and the live issue body: https://github.com/vega113/skodun/issues/23

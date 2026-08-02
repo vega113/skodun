@@ -273,10 +273,13 @@ def test_a_superseded_round_names_the_superseding_record(tmp_path):
         text = _surface(st).text
         assert "sk_newer" in text
         assert delivery.NO_REVIEW_LINE not in text
-        # ONE line for the round itself, plus the header and the footer.
+        # ONE head line for the round itself, plus the header and the footer.
+        # R3 may add an indented round-context line under the head; findings
+        # are still absent for a no-output superseded row.
         rounds = [ln for ln in text.splitlines() if ln.startswith("  - ")]
         assert len(rounds) == 1
-        assert len([ln for ln in text.splitlines() if ln.startswith("      ")]) == 0
+        indented = [ln for ln in text.splitlines() if ln.startswith("      ")]
+        assert all("round:" in ln for ln in indented)
 
 
 def test_a_superseded_round_reads_the_persisted_field_never_the_branch(tmp_path):
