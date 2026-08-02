@@ -11,6 +11,7 @@ Or paste only what you need:
 | [`mcp-review-topology.md`](mcp-review-topology.md) | MCP process vs repo vs worktree (definitions) |
 | [`concurrency.md`](concurrency.md) | Multi-agent / multi-provider capacity knobs |
 | [`feedback.md`](feedback.md) | Agent/human non-gate feedback (judgment + product bugs) |
+| [`review-troubleshooting.md`](review-troubleshooting.md) | Failed reviews, junie install, skeptic/quota, reviewers |
 
 Long-form integration: [`../../docs/integrate-external-project.md`](../../docs/integrate-external-project.md).
 
