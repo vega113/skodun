@@ -1,0 +1,6 @@
+rc=0
+--- stdout ---
+{"summary":"Reviewed the cache implementation in svc/cache.py and identified three issues.","findings":[{"file":"svc/cache.py","line":11,"severity":"high","category":"correctness","title":"Unhandled KeyError when fetching non existent key","detail":"The get function unpacks _STORE[key] without verifying key existence."},{"file":"svc/cache.py","line":24,"severity":"medium","category":"maintainability","title":"Expired entries are counted in size","detail":"The size function returns len(_STORE), which counts expired items."},{"file":"svc/cache.py","line":28,"severity":"high","category":"correctness","title":"Purge condition allows unintended deletion","detail":"if confirm == \"yes\" or confirm is truthy for any non-empty string."}]}
+
+--- stderr ---
+

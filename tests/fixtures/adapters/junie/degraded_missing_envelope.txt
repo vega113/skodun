@@ -1,0 +1,6 @@
+rc=2
+--- stdout ---
+
+--- stderr ---
+junie did not produce a JSON output envelope
+

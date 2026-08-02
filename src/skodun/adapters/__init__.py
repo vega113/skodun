@@ -32,6 +32,7 @@ from .codex import _TURN_COMPLETED as _CODEX_NORMAL_STOP
 from .codex import CodexAdapter
 from .grok import _STOP_REASON_OK as _GROK_NORMAL_STOP
 from .grok import GrokAdapter
+from .junie import JunieAdapter
 
 __all__ = [
     "Adapter",
@@ -39,6 +40,7 @@ __all__ = [
     "ClassifyResult",
     "CodexAdapter",
     "GrokAdapter",
+    "JunieAdapter",
     "NORMAL_STOP_REASONS",
     "OutputContract",
     "PROMPT_TOO_LARGE_CATEGORY",
@@ -52,8 +54,8 @@ __all__ = [
 ]
 
 #: Every value a `ParseResult.stop_reason` can carry for a run that ENDED
-#: NORMALLY, across all three adapters — grok's `EndTurn`, agy's `SUCCESS`,
-#: codex's `turn.completed`.
+#: NORMALLY, across adapters that expose one — grok's `EndTurn`, agy's
+#: `SUCCESS`, codex's `turn.completed`.
 #:
 #: Assembled from each adapter's OWN constant rather than re-spelled, because a
 #: second list of these words is a list that drifts — and it already had. The
@@ -65,6 +67,11 @@ __all__ = [
 #: run's health itself, on its own terms, in `parse`/`classify` — this is the
 #: one place that has to compare terminal words ACROSS adapters, because a
 #: single batched review can be answered by several of them.
+#:
+#: Junie is deliberately absent: its outer runner emits a contract payload
+#: with no harness completion word equivalent to EndTurn/SUCCESS, so
+#: `stop_reason` stays None rather than inventing a token the CLI does not
+#: produce.
 NORMAL_STOP_REASONS: frozenset[str] = frozenset(
     {_GROK_NORMAL_STOP, _AGY_NORMAL_STOP, _CODEX_NORMAL_STOP})
 
@@ -77,6 +84,7 @@ _REGISTRY: dict[str, type[Adapter]] = {
     "xai": GrokAdapter,
     "openai": CodexAdapter,
     "google": AgyAdapter,
+    "junie": JunieAdapter,
 }
 
 

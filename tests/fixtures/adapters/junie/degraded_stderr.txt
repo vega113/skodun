@@ -1,0 +1,6 @@
+rc=2
+--- stdout ---
+
+--- stderr ---
+junie envelope refused: unexpected project file: ./evil.py
+
