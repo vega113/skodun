@@ -28,9 +28,9 @@ repo without coordination.
 ### Cancel / status (epic S1 — when shipped)
 
 Use `review_status` / `review_cancel` (CLI + MCP) instead of abandoning an
-in-flight provider. Until then: closing the MCP session cancels the in-flight
-MCP review; do not leave a second agent waiting on the same lock without a
-human timeout.
+in-flight provider. **Today:** closing the MCP session cancels the in-flight
+MCP `review`; there is no cancel-by-id from another session yet. Do not leave a
+second agent waiting on the same repo lock without a human timeout.
 
 ### Cost policy
 

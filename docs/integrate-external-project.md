@@ -1,18 +1,23 @@
 # Integrate skodun into an external project (CLI + MCP)
 
-This guide is for **client repositories** (e.g. TubeScribes, app monorepos) that
-want skodun as the **local review backend**. skodun itself lives in a separate
-checkout; the client only needs the CLI on `PATH`, optional MCP wiring, and
-agent instructions.
+This guide is for **client repositories** (TubeScribes, app monorepos, etc.) that
+want skodun as the **local review backend**. skodun is a separate install; the
+client needs the CLI on `PATH` (or an absolute command), optional MCP wiring,
+config, and agent instructions.
 
 **Related product epics (post #23):**
 
-- Status + cancel (no orphan in-flight reviews) — epic **S1** [#41](https://github.com/vega113/skodun/issues/41)
-- Fair review capacity (FIFO admission, telemetry) — epic **S3** [#42](https://github.com/vega113/skodun/issues/42)
+- Status + cancel — **S1** [#41](https://github.com/vega113/skodun/issues/41)
+- Fair review capacity — **S3** [#42](https://github.com/vega113/skodun/issues/42)
 
-Until those land, use the **current** concurrency rules in
-[`examples/AGENTS.md`](../examples/AGENTS.md) and the fragments under
-[`examples/fragments/`](../examples/fragments/).
+Until those land, treat concurrency rules below as **current product behaviour**.
+
+| More detail | Path |
+|---|---|
+| Full agent template | [`examples/AGENTS.md`](../examples/AGENTS.md) |
+| Pasteable fragments | [`examples/fragments/`](../examples/fragments/) |
+| MCP deep dive (tools, upgrade) | [README — MCP server](../README.md#mcp-server) |
+| Epic seeds | [`docs/epics/`](epics/) |
 
 ---
 
@@ -21,48 +26,106 @@ Until those land, use the **current** concurrency rules in
 | Is | Is not |
 |---|---|
 | Review + triage + gate on **exact diff identity** | Your full test suite / CI matrix |
-| Provider-neutral (grok, codex, agy, junie, …) | Hardcoded “must be Grok” |
-| CLI and stdio MCP with the **same** service semantics | A multi-agent OS or host job scheduler |
-| Optional background pre-push + `surface` later | A push that waits for model inference |
+| Provider-neutral (configured adapters: grok, codex, agy, junie, …) | Hardcoded “must be Grok” |
+| CLI and stdio MCP with the **same** service path (`services.py`) | A multi-agent OS or host job scheduler |
+| Optional background pre-push + later `surface` | A push that waits for model inference |
 
-Client projects should treat **`skodun gate` exit 0** as “review coverage OK”
-and keep expensive certification (backend/frontend/e2e) in **their** gate/CI.
+**`skodun gate` exit `0`** means: a trustworthy review covers this exact tree
+**and** there are no open findings (clean **or** all findings triaged with an
+audited reason). Keep expensive certification (backend/frontend/e2e) in the
+**client** gate/CI.
 
 ---
 
-## 1. Install and verify
+## 1. Prerequisites and install
+
+- **Python ≥ 3.12** (runtime is **stdlib-only**; pytest is dev-only).
+- At least one configured provider CLI installed and authenticated (`grok`,
+  `codex`, `agy`, and/or `junie` on macOS — see `skodun providers`).
+
+### From a skodun source checkout
 
 ```bash
-# From the skodun checkout (or your packaging path):
-pip install -e /path/to/skodun   # or: python -m pip install ...
+cd /path/to/skodun
+python3 -m pip install -e .          # installs the `skodun` console script
+skodun --version                     # should match pyproject.toml (e.g. 0.4.0)
+```
 
-skodun --version
+Without an install, you can still run:
+
+```bash
+cd /path/to/skodun
+PYTHONPATH=src python3 -m skodun --version
+# MCP from source:
+#   claude mcp add skodun -- python3 -m skodun mcp
+# with cwd/env so `python3 -m skodun` resolves (see README MCP section).
+```
+
+There is no requirement that skodun live *inside* the client monorepo.
+
+### Verify against the client tree
+
+```bash
 skodun doctor --repo /path/to/your/project
 skodun providers --repo /path/to/your/project
 ```
 
-Configure reviewers in:
+`doctor` is read-only. Fix missing binaries / config before expecting `review`
+to succeed.
 
-- global: `~/.config/skodun/config.toml` (or `SKODUN_CONFIG`)
-- project: `/path/to/your/project/.skodun.toml` (project wins per key)
+### Config
 
-See `examples/multi-provider.toml` and `examples/scala-angular-monorepo.toml`.
+| Layer | Path |
+|---|---|
+| Global | `~/.config/skodun/config.toml` or `SKODUN_CONFIG` |
+| Project | `<project>/.skodun.toml` (wins per-key over global) |
 
-Store location: `SKODUN_DB` or default under XDG (`~/.local/share/skodun/…`).
-**Never** point tests or CI at a shared developer store without isolation.
+Minimal shape (edit models to what your CLIs actually serve):
+
+```toml
+[[reviewers]]
+name = "finder"
+provider = "xai"          # or openai | google | junie
+model = "grok-4.20-0309-reasoning"
+role = "finder"
+effort = "medium"
+```
+
+Worked examples: `examples/multi-provider.toml`,
+`examples/scala-angular-monorepo.toml`.
+
+### Store
+
+| | |
+|---|---|
+| Default | under XDG, typically `~/.local/share/skodun/skodun.db` |
+| Override | `SKODUN_DB=/absolute/path/to.db` |
+
+Prefer **one durable store per machine or per product**, with reviews scoped by
+`repo` (see README “One store per repository…”). **Never** point automated
+tests at a shared human store without isolation.
 
 ---
 
-## 2. MCP wiring (Claude Code, Cursor, Codex, etc.)
+## 2. MCP wiring
 
-skodun speaks **stdio MCP** (`skodun mcp`). One process per client is normal.
+skodun serves **stdio MCP** only: `skodun mcp` (no network port, no SDK).
 
-### Claude Code / similar JSON config
+### Claude Code (quick)
+
+```bash
+claude mcp add skodun -- skodun mcp
+# source checkout without console script:
+# claude mcp add skodun -- python3 -m skodun mcp
+```
+
+### Project `.mcp.json` / JSON-shaped hosts
 
 ```json
 {
   "mcpServers": {
     "skodun": {
+      "type": "stdio",
       "command": "skodun",
       "args": ["mcp"]
     }
@@ -70,97 +133,128 @@ skodun speaks **stdio MCP** (`skodun mcp`). One process per client is normal.
 }
 ```
 
-Optional env for a dedicated store:
+Optional project-local store (use a **real absolute path** if the host does not
+expand `${workspaceFolder}`):
 
 ```json
 {
   "mcpServers": {
     "skodun": {
+      "type": "stdio",
       "command": "skodun",
       "args": ["mcp"],
       "env": {
-        "SKODUN_DB": "/path/to/project/.skodun/skodun.db"
+        "SKODUN_DB": "/absolute/path/to/project/.skodun/skodun.db"
       }
     }
   }
 }
 ```
 
-Prefer **one store per product** (or per machine with `repo` scoping) so
-`surface` / triage stay coherent. See README “One store per repository…”.
+Operator fragment: [`examples/fragments/mcp-server-config.md`](../examples/fragments/mcp-server-config.md).
 
-### After upgrade
+### `repo` argument (easy to get wrong)
 
-Restart the MCP client. Confirm `skodun --version` matches what the server
-reports in initialize/`serverInfo` if your client shows it.
+Most tools accept optional `repo`: a path **inside** the git worktree.
 
-### Tools agents get (today)
+- **Absent** → skodun uses the **MCP server process cwd** (often *not* your
+  project if the client started the server elsewhere).
+- **Wrong type** (array, number, blank) → refused (`repo must be a path…`),
+  never silently remapped to cwd.
+- **Best practice for external projects:** always pass an absolute project root
+  as `repo` on `gate`, `review`, `log`, and `surface`.
 
-| MCP tool | Same idea as CLI |
-|---|---|
-| `gate` | `skodun gate` |
-| `review` | `skodun review` (long-running; **one in flight per server**) |
-| `log` | `skodun log` |
-| `surface` | `skodun surface` |
-| `triage_list` / `triage_dismiss` / `triage_defer` / `triage_reopen` / `adopt_refuter` | triage verbs |
+### Tools (today) — 9 tools, 2 prompts
 
-**Not** MCP tools (shell out / human ops): `doctor`, `retain`, `schedule`,
-`install-hooks`, `providers`, `dispatch`, bulk triage.
+| MCP tool | CLI analogue | Notes |
+|---|---|---|
+| `gate` | `skodun gate` | Status 0/1/2 as CLI |
+| `review` | `skodun review` | Long-running; optional `reviewer` **name** (not provider id) |
+| `log` | `skodun log` | Optional `branch`, `limit` |
+| `surface` | `skodun surface` | History only — **not** a gate |
+| `triage_list` | `triage --list` | Needs `review_id` |
+| `triage_dismiss` | default triage dismiss | `review_id`, `index`, `reason` |
+| `triage_defer` | `triage --defer` | + mandatory `tracking_ref` |
+| `triage_reopen` | `triage --reopen` | |
+| `adopt_refuter` | `triage --adopt-refuter` | |
+
+**Not** MCP tools (shell / human ops): `doctor`, `providers`, `retain`,
+`schedule`, `install-hooks`, `dispatch`, `worker`, `import-legacy`,
+`shadow-compare`, bulk triage, `deferrals`.
 
 Prompts: `review-now`, `gate-check` (static policy text).
 
-### Current concurrency rules (agents must know these)
+### After upgrade
+
+A running MCP process keeps the **old** Python build until the client restarts
+it. After upgrading skodun:
+
+1. Restart the MCP connection/session.
+2. Confirm version: `skodun --version` and `serverInfo.version` from
+   `initialize` (pinned to `pyproject.toml`).
+
+Smoke initialize (optional):
+
+```bash
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"check","version":"0"}}}' \
+  | skodun mcp
+```
+
+### Concurrency (agents must know)
 
 1. **One foreground review per repository** (repo lock). A second CLI review
-   waits then may exit `3`.
+   waits, then may exit **`3`**.
 2. **One MCP `review` per server process.** A second call returns
-   `"review already in flight"` — **not** a queue.
-3. **Do not poll** with full agent turns every 30s. Prefer: start review → work
-   elsewhere or wait outside the model → `gate` / `log` / `surface`.
-4. **Providers are a fallback chain**, not parallel slots. Prefer one finder
-   chain; do not run skodun + oracle scripts + every cloud bot for every change.
+   `"review already in flight"` — **not** queued (a queue would run against a
+   moved tree).
+3. Closing the MCP session **cancels** the in-flight MCP review (today).
+   Cross-session cancel-by-id is epic **S1**.
+4. **Do not poll** with full agent turns every 30–60s. Wait outside the model,
+   then call `gate` / `log` / `surface`.
+5. Providers are a **fallback chain**, not parallel slots.
 
-Epic **S1** adds first-class `status` / `cancel`. Epic **S3** adds fair capacity
-and queue telemetry. Update this section when those ship.
+Epic **S3** will add fair capacity + telemetry; update this section when it ships.
 
 ---
 
 ## 3. Wire the client gate (provider-neutral)
 
-Client pre-push or `ci-local-gate` should:
+Client pre-push or `ci-local-gate` should treat skodun as coverage of the
+**exact working tree** (or the tree you intentionally review):
 
 ```bash
+ROOT=/path/to/your/project
 skodun gate --repo "$ROOT"
-# 0 → review coverage OK for this exact tree
-# 1 → findings open (triage or fix)
-# 2 → no trustworthy review (run skodun review, then gate again)
+# 0 → trustworthy coverage; no open findings (clean or all triaged)
+# 1 → findings still open → fix or audited triage, then gate again
+# 2 → no trustworthy review for this content → skodun review, then gate
 ```
 
-**Do not** require a Grok-only artifact if skodun already recorded a trustworthy
-review from junie/codex/agy. That is a client cutover bug, not a skodun gate bug.
+**Do not** require a Grok-only log/artifact if skodun already stored a
+trustworthy review from junie/codex/agy. That is a **client cutover** defect.
 
-Background optional:
+### Optional background pre-push
 
 ```bash
-skodun install-hooks --repo "$ROOT"   # may need --force to chain existing hook
-# push returns; later:
+skodun install-hooks --repo "$ROOT"   # --force chains a foreign pre-push
+# git push returns without waiting for the model; later:
 skodun surface --repo "$ROOT"
 ```
+
+`surface` never certifies the current tree — only `gate` does.
 
 ---
 
 ## 4. Agent instructions for the client repo
 
-Paste one of:
-
 | Artifact | Use when |
 |---|---|
-| [`examples/AGENTS.md`](../examples/AGENTS.md) | Full template (recommended first paste) |
-| [`examples/fragments/mcp-loop.md`](../examples/fragments/mcp-loop.md) | Project already has AGENTS; add MCP loop only |
-| [`examples/fragments/concurrency.md`](../examples/fragments/concurrency.md) | Multi-agent / multi-provider machines |
-| [`examples/fragments/mcp-server-config.md`](../examples/fragments/mcp-server-config.md) | Operator doc for MCP JSON only |
+| [`examples/AGENTS.md`](../examples/AGENTS.md) | Full template (first paste) |
+| [`examples/fragments/mcp-loop.md`](../examples/fragments/mcp-loop.md) | MCP loop only |
+| [`examples/fragments/concurrency.md`](../examples/fragments/concurrency.md) | Multi-agent / multi-provider |
+| [`examples/fragments/mcp-server-config.md`](../examples/fragments/mcp-server-config.md) | Operator MCP JSON |
 
-Edit bracketed project-specific bits (tracker URL, branch defaults).
+Edit bracketed project bits (tracker URL for deferrals, etc.).
 
 ---
 
@@ -168,31 +262,57 @@ Edit bracketed project-specific bits (tracker URL, branch defaults).
 
 ```text
 freeze the diff
-→ skodun gate   (if 0: stop — already covered)
-→ skodun review (or MCP review) once
-→ triage only with human decisions (defer needs a filed tracking ref)
-→ skodun gate until 0
+→ gate (if 0: stop — already covered)
+→ review once (CLI or MCP; pass absolute repo)
+→ human triage only (defer requires a filed tracking ref)
+→ gate until 0
 ```
 
 Optional security/refuter when path-risky or R2 churn marks say the loop is
-chasing its own tail. **Not** default: every local provider + every cloud
-reviewer for every low-risk change.
+chasing its own tail. **Not** default: skodun + legacy oracle scripts + every
+cloud bot for every low-risk change.
 
 ---
 
 ## 6. Smoke checklist for a new client
 
-- [ ] `skodun doctor --repo .` clean enough to review  
-- [ ] `skodun providers` lists intended adapters; binaries executable  
-- [ ] MCP tools list includes `gate` + `review`  
-- [ ] Agent AGENTS section present; stopping rule is `gate → 0`  
-- [ ] Client gate invokes `skodun gate` without provider name hardcoding  
+- [ ] Python ≥ 3.12; `skodun --version` matches the intended build  
+- [ ] `skodun doctor --repo <project>` usable (config + store + adapters)  
+- [ ] `skodun providers --repo <project>` shows intended adapters executable  
+- [ ] MCP tools list includes `gate` + `review` (+ triage family)  
+- [ ] Agents pass absolute `repo` (or MCP cwd is the project)  
+- [ ] AGENTS section present; **stop when `gate` → 0**  
+- [ ] Client gate calls `skodun gate` without hardcoding a provider name  
 - [ ] (Optional) `install-hooks`; `surface` after a push  
+- [ ] After upgrade: MCP client restarted; versions agree  
 
 ---
 
-## 7. Out of scope for client integration
+## 7. Out of scope for this integration
 
-- Host-wide fair queue for all work (DB suites, Karma, Heroku) — client gate  
-- TubeScribes cutover of `grok-review-*.sh` — separate client epic  
-- Anthropic adapter, severity-tier gating — not required for MCP integration  
+- Host-wide fair queue for non-review work (DB suites, Karma, Heroku)  
+- TubeScribes cutover of `grok-review-*.sh` (client epic)  
+- Anthropic/`claude` adapter (deliberately unshipped; see README)  
+- Severity-tier gating or re-review-only-last-delta  
+- Changing `gate.py` / `trust.py` semantics  
+
+---
+
+## Self-review notes (maintainers)
+
+Last reviewed against skodun **0.4.x** / post-epic-#23 main:
+
+| Check | Result |
+|---|---|
+| Tool list matches `default_tools()` | 9 tools + 2 prompts |
+| MCP busy string | `"review already in flight"` |
+| Gate 0 meaning | clean **or** all findings triaged |
+| `repo` optional, defaults to server cwd | documented; recommend absolute path |
+| `reviewer` is config **name**, not provider id | documented |
+| Console script + `python3 -m skodun` | both documented |
+| Upgrade requires MCP restart | documented |
+| CLI-only ops list | doctor, providers, retain, schedule, install-hooks, … |
+| Links to #41 / #42 | present |
+
+When S1/S3 land, update §2 concurrency and the fragments in the same PR as the
+feature.
