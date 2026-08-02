@@ -29,7 +29,9 @@ The key is read from the **process environment** only:
 
 ```bash
 export OPENAI_API_KEY=sk-...          # or SKODUN_OPENAI_API_KEY
-export SKODUN_OPENAI_API_SPEND_LIMIT_USD=10   # optional; default 10
+# Daily ceiling (UTC day), NOT lifetime — resets every UTC midnight (default 10):
+export SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY=10
+# alias (same meaning): SKODUN_OPENAI_API_SPEND_LIMIT_USD=10
 
 skodun review --repo /abs/worktree --reviewer finder-openai-api
 ```
@@ -50,7 +52,7 @@ literal):
       "args": ["mcp"],
       "env": {
         "OPENAI_API_KEY": "${OPENAI_API_KEY}",
-        "SKODUN_OPENAI_API_SPEND_LIMIT_USD": "10"
+        "SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY": "10"
       }
     }
   }
@@ -104,8 +106,11 @@ in the process env of whichever surface is running.
 ## Spend tracking
 
 - Tokens + estimated $ → store `api_spend_events` + `attempts[].usage`
-- Daily ceiling per provider (UTC), default **$10** (`SKODUN_OPENAI_API_SPEND_LIMIT_USD`)
-- At the cap, `openai-api` is skipped so the chain can hop
+- **Per UTC day** ceiling per provider (default **$10**), via
+  `SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY` (or alias without `_PER_DAY`)
+- **Not a lifetime total** — the counter resets at UTC midnight; you only raise
+  the limit if a *single day* needs more headroom
+- At the daily cap, `openai-api` is skipped so the chain can hop
 
 Optional rate overrides (USD per 1M tokens):
 

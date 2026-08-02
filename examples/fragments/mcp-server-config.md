@@ -59,7 +59,7 @@ client’s key (BYOK). Prefer host secret expansion, not a committed literal:
       "args": ["mcp"],
       "env": {
         "OPENAI_API_KEY": "${OPENAI_API_KEY}",
-        "SKODUN_OPENAI_API_SPEND_LIMIT_USD": "10"
+        "SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY": "10"
       }
     }
   }

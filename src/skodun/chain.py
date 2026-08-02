@@ -221,8 +221,9 @@ def _api_spend_block_detail(store: Store, provider: str) -> str:
         from . import spend as spend_mod
         limit = spend_mod.spend_limit_usd(provider)
         spent = spend_mod.spent_today_usd(store, provider)
-        return (f"api spend limit reached for {provider} "
-                f"(${spent:.4f} / ${limit:g} USD today UTC)")
+        return (f"api daily spend limit reached for {provider} "
+                f"(${spent:.4f} / ${limit:g} USD this UTC day; "
+                f"resets at next UTC midnight — not a lifetime cap)")
     except Exception as e:
         return f"api spend limit check failed: {e!r}"
 

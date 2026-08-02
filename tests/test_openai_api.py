@@ -78,21 +78,36 @@ def test_parse_usage_line():
 
 
 def test_estimate_cost_and_limits(tmp_path, monkeypatch):
-    monkeypatch.delenv("SKODUN_OPENAI_API_SPEND_LIMIT_USD", raising=False)
-    monkeypatch.delenv("SKODUN_API_SPEND_LIMIT_USD", raising=False)
+    for k in (
+        "SKODUN_OPENAI_API_SPEND_LIMIT_USD",
+        "SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY",
+        "SKODUN_API_SPEND_LIMIT_USD",
+        "SKODUN_API_SPEND_LIMIT_USD_PER_DAY",
+    ):
+        monkeypatch.delenv(k, raising=False)
     assert spend.spend_limit_usd(PROVIDER_ID) == 10.0
-    monkeypatch.setenv("SKODUN_OPENAI_API_SPEND_LIMIT_USD", "2.5")
+    monkeypatch.setenv("SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY", "2.5")
     assert spend.spend_limit_usd(PROVIDER_ID) == 2.5
     cost = spend.estimate_cost_usd(
         MODEL, prompt_tokens=1_000_000, completion_tokens=0)
     assert cost > 0
 
 
-def test_spend_ledger_and_block(tmp_path, monkeypatch):
-    monkeypatch.setenv("SKODUN_OPENAI_API_SPEND_LIMIT_USD", "0.01")
+def test_spend_ledger_is_per_utc_day_not_lifetime(tmp_path, monkeypatch):
+    """Limit compares only today's rows; yesterday does not burn the budget."""
+    monkeypatch.setenv("SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY", "0.01")
     st = Store.open(tmp_path / "s.db")
     assert SCHEMA_VERSION == 8
     with st:
+        # Yesterday's heavy spend must not count.
+        spend.record_usage(
+            st, provider=PROVIDER_ID, model=MODEL,
+            prompt_tokens=100, completion_tokens=100, cost_usd=9.99,
+            at="2020-01-01T12:00:00Z")
+        assert spend.spent_today_usd(st, PROVIDER_ID) == 0.0
+        assert not spend.would_exceed_limit(
+            st, PROVIDER_ID, additional_usd=0.0)
+        # Today's spend does.
         spend.record_usage(
             st, provider=PROVIDER_ID, model=MODEL,
             prompt_tokens=100, completion_tokens=100, cost_usd=0.02)

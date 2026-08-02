@@ -12,7 +12,8 @@ Clients bring their own key via shell export or MCP server ``env`` (BYOK).
 Optional:
 
 * ``SKODUN_OPENAI_API_BASE`` — endpoint override (tests / proxies)
-* ``SKODUN_OPENAI_API_SPEND_LIMIT_USD`` — daily USD ceiling (default 10)
+* ``SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY`` — USD ceiling **per UTC day**
+  (default 10; not lifetime). Alias: ``SKODUN_OPENAI_API_SPEND_LIMIT_USD``
 * ``SKODUN_OPENAI_API_INPUT_USD_PER_1M`` / ``_OUTPUT_`` — rate overrides
 
 Any model id the OpenAI API accepts may be set on the reviewer entry.
