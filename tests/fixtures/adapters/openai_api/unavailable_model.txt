@@ -1,0 +1,6 @@
+rc=1
+category=model
+--- stdout ---
+
+--- stderr ---
+model failure: model_not_found

@@ -76,7 +76,8 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
              timed_out: bool | None = None, duration_sec: float | None = None,
              first_output_sec: float | None = None,
              classification: dict | None = None,
-             skipped: str | None = None) -> dict:
+             skipped: str | None = None,
+             usage: dict | None = None) -> dict:
     """One `attempts[]` row, in the ONE shape the artifact schema defines.
 
     Every row carries the identity of the entry it belongs to (`provider`,
@@ -109,6 +110,8 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
     }
     if skipped is not None:
         row["skipped"] = skipped
+    if usage is not None:
+        row["usage"] = usage
     return row
 
 
@@ -199,6 +202,79 @@ def _effective_provider_capacity(store: Store, provider: str) -> int:
     if _cached_unavailable(store, provider) is not None:
         return 0
     return capacity.provider_max_in_flight_from_env()
+
+
+def _api_spend_blocked(store: Store, entry: Reviewer) -> bool:
+    """True when a metered API provider has no remaining daily budget."""
+    if entry.provider != "openai-api":
+        return False
+    try:
+        from . import spend as spend_mod
+        return spend_mod.would_exceed_limit(
+            store, entry.provider, additional_usd=0.0)
+    except Exception:
+        return False
+
+
+def _api_spend_block_detail(store: Store, provider: str) -> str:
+    try:
+        from . import spend as spend_mod
+        limit = spend_mod.spend_limit_usd(provider)
+        spent = spend_mod.spent_today_usd(store, provider)
+        return (f"api spend limit reached for {provider} "
+                f"(${spent:.4f} / ${limit:g} USD today UTC)")
+    except Exception as e:
+        return f"api spend limit check failed: {e!r}"
+
+
+def _record_api_usage(store: Store, adapter, entry: Reviewer,
+                      stderr: bytes, *, review_tag: str) -> dict | None:
+    """Persist usage from metered runners; attach dict for attempts[]."""
+    if entry.provider != "openai-api":
+        return None
+    from .pipeline import _note
+    try:
+        from .adapters.openai_api import parse_usage_line
+        from . import spend as spend_mod
+    except Exception:
+        return None
+    raw = parse_usage_line(stderr)
+    if not raw:
+        return None
+    try:
+        pt = int(raw.get("prompt_tokens") or 0)
+        ct = int(raw.get("completion_tokens") or 0)
+        tt = int(raw.get("total_tokens") or (pt + ct))
+        cost = raw.get("cost_usd")
+        cost_f = float(cost) if cost is not None else None
+        row = spend_mod.record_usage(
+            store,
+            provider=entry.provider,
+            model=str(raw.get("model") or entry.model or ""),
+            prompt_tokens=pt,
+            completion_tokens=ct,
+            total_tokens=tt,
+            cost_usd=cost_f,
+            review_id=None,  # pre-id wait may not have review id; tag only
+            request_id=(str(raw["request_id"])
+                        if raw.get("request_id") else None),
+        )
+        usage = {
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "total_tokens": tt,
+            "cost_usd": float(row["cost_usd"]),
+            "model": row.get("model"),
+        }
+        if raw.get("request_id"):
+            usage["request_id"] = str(raw["request_id"])
+        _note(
+            f"{entry.provider} usage: tokens={tt} "
+            f"est_cost=${usage['cost_usd']:.6f} (tag={review_tag})")
+        return usage
+    except Exception as e:
+        _note(f"could not record api usage: {e!r}")
+        return None
 
 
 def _release_provider_slot(store: Store,
@@ -374,6 +450,18 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
         # S4 Phase B: hold provider:<id> for the whole entry (retries included).
         # Repo review-fg is already held by pipeline before run_chain runs.
         # Release on every terminal: hop, quota, cancel, success, fatal return.
+        # Metered API providers: refuse before spawn if the daily spend cap is up.
+        if _api_spend_blocked(store, entry):
+            n += 1
+            detail = _api_spend_block_detail(store, entry.provider)
+            _note(f"{entry.name} ({entry.provider}): {detail}")
+            attempts.append(_attempt(
+                n, entry, skipped=detail,
+                classification={"kind": "unavailable", "category": "quota",
+                                "detail": detail}))
+            exhausted.append(f"{entry.name}/{entry.provider}: {detail}")
+            continue
+
         # Remaining shared admit+bind budget — not a fresh full wait per hop.
         wait_sec = _remaining_admission_sec(admission_deadline)
         provider_ticket: capacity.Ticket | None = None
@@ -498,11 +586,21 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
 
                 stdout, stderr = _read(out_path), _read(err_path)
                 verdict = adapter.classify(result.rc, stdout, stderr, contract)
+                usage = _record_api_usage(
+                    store, adapter, entry, stderr, review_tag=tag)
+                if (usage is not None and entry.max_cost_usd is not None
+                        and float(usage.get("cost_usd") or 0)
+                        > float(entry.max_cost_usd) + 1e-12):
+                    _note(
+                        f"{entry.name}: attempt cost "
+                        f"${float(usage['cost_usd']):.4f} exceeded "
+                        f"max_cost_usd=${float(entry.max_cost_usd):g}")
                 attempts.append(_attempt(
                     n, entry, rc=result.rc, timed_out=False,
                     duration_sec=round(result.duration_sec, 3),
                     first_output_sec=_round(result.first_output_sec),
-                    classification=_classification(verdict)))
+                    classification=_classification(verdict),
+                    usage=usage))
 
                 if verdict.kind == "unavailable":
                     # Quota shrinks effective max_in_flight to 0 via

@@ -43,8 +43,10 @@ audited reason). Keep expensive certification (backend/frontend/e2e) in the
 ## 1. Prerequisites and install
 
 - **Python ≥ 3.12** (runtime is **stdlib-only**; pytest is dev-only).
-- At least one configured provider CLI installed and authenticated (`grok`,
-  `codex`, `agy`, and/or `junie` on macOS — see `skodun providers`).
+- At least one configured provider: subscription CLIs (`grok`, `codex`, `agy`,
+  and/or `junie` on macOS) and/or optional metered **`openai-api`** with
+  `OPENAI_API_KEY` — see `skodun providers` and
+  [`examples/fragments/openai-api.md`](../examples/fragments/openai-api.md).
 
 ### From a skodun source checkout
 

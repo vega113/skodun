@@ -1,0 +1,6 @@
+rc=1
+category=quota
+--- stdout ---
+
+--- stderr ---
+rate limit: http 429: too many requests

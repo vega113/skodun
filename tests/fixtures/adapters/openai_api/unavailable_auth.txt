@@ -1,0 +1,6 @@
+rc=1
+category=auth
+--- stdout ---
+
+--- stderr ---
+auth failure: invalid api key

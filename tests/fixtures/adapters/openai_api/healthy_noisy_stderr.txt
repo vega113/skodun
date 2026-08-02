@@ -1,0 +1,6 @@
+rc=0
+--- stdout ---
+{"summary": "ok", "findings": [{"file": "a.py", "line": 1, "severity": "low", "category": "other", "title": "nit", "detail": "style only"}]}
+--- stderr ---
+debug: client logged invalid api key string in a comment for support ticket 1
+SKODUN_API_USAGE {"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"cost_usd":0.002,"model":"gpt-5.6-luna"}
