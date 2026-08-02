@@ -305,6 +305,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="diagnose install, store, adapters, and MCP readiness (read-only)")
     doctor.add_argument("--repo", type=Path, default=Path("."),
                         help="repository whose config is loaded (default: .)")
+    sched = sub.add_parser(
+        "schedule",
+        help="generate launchd plists from [schedule] (macOS; not inside MCP)")
+    sched_sub = sched.add_subparsers(dest="schedule_command", required=True)
+    sched_install = sched_sub.add_parser(
+        "install",
+        help="write launchd plists for configured jobs")
+    sched_install.add_argument(
+        "--repo", type=Path, default=Path("."),
+        help="repository whose .skodun.toml [schedule] is loaded")
+    sched_install.add_argument(
+        "--dest", type=Path, default=None,
+        help="directory for plists (default: ~/Library/LaunchAgents)")
+    sched_install.add_argument(
+        "--force-platform", action="store_true",
+        help="write plists even off macOS (for tests/CI; launchd will not run them)")
     # Explicit, per-finding, and deliberately WITHOUT a bulk form: a refuter
     # verdict is an annotation, and the only way one may ever dismiss a
     # finding is a human naming that finding. `--adopt-all` would be exactly
@@ -845,6 +861,50 @@ def _cmd_install_hooks(args) -> int:
     except BaseException as e:
         return _emit(f"skodun install-hooks: {e}", 2)
     return _emit(f"skodun install-hooks: {path} {what}", 0)
+
+
+def _cmd_schedule(args) -> int:
+    """Write launchd plists from `[schedule]`. Never starts a scheduler in-process."""
+    if getattr(args, "schedule_command", None) != "install":
+        return _emit("skodun schedule: unknown subcommand", 2)
+    try:
+        from .config import load_config
+        from .schedule import install_schedule
+    except BaseException as e:
+        return _emit(f"skodun schedule: could not load: {e!r}", 2)
+    try:
+        root = _repo_root(Path(args.repo))
+    except BaseException as e:
+        return _emit(f"skodun schedule: {e}", 2)
+    try:
+        cfg = load_config(root)
+    except BaseException as e:
+        return _emit(f"skodun schedule: config error: {e}", 2)
+    if not cfg.schedule_jobs:
+        return _emit(
+            "skodun schedule install: no [[schedule.jobs]] configured; "
+            "nothing written",
+            0,
+        )
+    dest = args.dest
+    if dest is None:
+        dest = Path.home() / "Library" / "LaunchAgents"
+    try:
+        result = install_schedule(
+            cfg.schedule_jobs,
+            Path(dest),
+            require_darwin=not bool(args.force_platform),
+        )
+    except BaseException as e:
+        return _emit(f"skodun schedule install: {e}", 2)
+    lines = [
+        f"skodun schedule install: wrote {len(result.written)} plist(s) under {dest}",
+        "Load with: launchctl bootstrap gui/$(id -u) <plist>  (or load -w on older macOS)",
+        "No scheduler runs inside `skodun mcp`.",
+    ]
+    for p, label in zip(result.written, result.labels):
+        lines.append(f"  {label} -> {p}")
+    return _emit("\n".join(lines), 0)
 
 
 def _cmd_doctor(args) -> int:
@@ -1596,6 +1656,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_retain(args)
         if args.command == "doctor":
             return _cmd_doctor(args)
+        if args.command == "schedule":
+            return _cmd_schedule(args)
         # Unreachable while the subparsers are `required=True`, and kept as
         # defence in depth: if that ever comes off, an unrecognised command
         # must still not certify a push by exiting 0.
