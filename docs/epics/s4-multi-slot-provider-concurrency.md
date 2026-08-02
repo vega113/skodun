@@ -71,7 +71,7 @@ Operators need:
 
 ### Phase A — multi-slot repo admission (true N concurrent FG)
 
-- [ ] **Optional legacy dual-hold** via env **`SKODUN_LEGACY_FG_LOCK`**
+- [x] **Optional legacy dual-hold** via env **`SKODUN_LEGACY_FG_LOCK`**
       (normative name — do not invent a second name):
   - unset / empty / **`1`** → **on** (default): dual-hold (store + mkdir lock)
   - **`0`** → **off**: store capacity only, no mkdir dual-hold
@@ -82,74 +82,74 @@ Operators need:
     `0` as invalid and fall back to a default, which would break
     `SKODUN_LEGACY_FG_LOCK=0` (off). Use a dedicated boolean-style reader
     with the exact semantics above.
-- [ ] With dual-hold **off** and `SKODUN_REVIEW_FG_CAPACITY=N` (N≥2), hermetic
+- [x] With dual-hold **off** and `SKODUN_REVIEW_FG_CAPACITY=N` (N≥2), hermetic
       tests prove **N concurrent** `run_review` (or admission+lock-free path)
       make progress without one waiter blocking forever behind a live peer that
       holds only a store slot.
-- [ ] With dual-hold **on**, behavior remains dual-hold / effective 1 physical
+- [x] With dual-hold **on**, behavior remains dual-hold / effective 1 physical
       mutex with legacy path (regression pin).
-- [ ] Defaults stay safe: capacity default **1**, dual-hold default **on**, so
+- [x] Defaults stay safe: capacity default **1**, dual-hold default **on**, so
       cutover clients are not surprised.
-- [ ] Docs: concurrency fragment + integrate guide + this epic seed describe
+- [x] Docs: concurrency fragment + integrate guide + this epic seed describe
       how to enable multi-slot and when to turn dual-hold off (after legacy
       scripts decommissioned — see cutover doc).
 
 ### Phase B — per-provider in-flight + 429 pressure
 
-- [ ] Resource class **`provider:<id>`** (e.g. `provider:xai`) with configurable
+- [x] Resource class **`provider:<id>`** (e.g. `provider:xai`) with configurable
       **max_in_flight** (default **1** per provider unless config/env raises).
-- [ ] Starting inference for a chain entry **acquires** that provider’s slot;
+- [x] Starting inference for a chain entry **acquires** that provider’s slot;
       terminal paths **release** it (including cancel, fail, hop).
-- [ ] Repo admit (`review-fg`) **and** provider slot both required before
+- [x] Repo admit (`review-fg`) **and** provider slot both required before
       provider process starts (order documented; no double-count leaks).
-- [ ] **429 / rate-limit / quota** from adapters continues to classify as
+- [x] **429 / rate-limit / quota** from adapters continues to classify as
       `unavailable` + category **`quota`** (or equivalent); must **not** be
       treated as a clean stop that finalizes a trustworthy pass.
-- [ ] On quota for provider P: update `provider_state` (existing TTL path) **and**
+- [x] On quota for provider P: update `provider_state` (existing TTL path) **and**
       **reduce pressure** on P for the TTL window by treating P as
       **max_in_flight effective = 0** (no new acquires) until TTL expires.
       (Simpler than partial decrement; document. Optional later: stepwise
       decrement.)
-- [ ] **Recovery so the review still completes** within existing budgets:
+- [x] **Recovery so the review still completes** within existing budgets:
   1. Prefer **next chain entry** with free slots and not in backoff, else
   2. **Wait** (bounded by admission/review wait budget) for any viable
       provider slot if no chain entry is free, then retry selection, else
   3. Fail closed with untrustworthy terminal (same fail-closed spirit as today).
   No infinite requeue of an **expired** `review-fg` admission ticket.
-- [ ] Hermetic tests: concurrent acquires on same provider honor max_in_flight;
+- [x] Hermetic tests: concurrent acquires on same provider honor max_in_flight;
       simulated 429 frees slot, shrinks pressure, allows hop/retry path to
       succeed with a fake second provider.
 
 ### Phase C — queue realism + reschedule UX
 
-- [ ] While waiting for **repo** and/or **provider** slots, **stderr progress**
+- [x] While waiting for **repo** and/or **provider** slots, **stderr progress**
       (and `progress_sink`) surfaces at least: **queue position** and
       **remaining wait budget**; when blocked on a provider, name the provider
       class (e.g. `provider:xai queue position 1; wait budget 30s remaining`).
-- [ ] **ETA (required for Done):** p50 of last K (K=20 or fewer if not enough
+- [x] **ETA (required for Done):** p50 of last K (K=20 or fewer if not enough
       rows) completed `wait_ms` for the same `resource_class`+`scope` among
       terminal admissions; if fewer than 3 samples, omit ETA (do not invent).
       Surface as `eta≈Xs` on progress lines when present.
-- [ ] **Pre-record wait** (before a review id exists): progress-only (stderr /
+- [x] **Pre-record wait** (before a review id exists): progress-only (stderr /
       sink). Do **not** require a store review row solely for queue display.
       After a `running` row exists, `review-status` continues to report
       lifecycle as today; no new required MCP tool.
-- [ ] `skodun providers` lists active `provider_state` backoff (already) and,
+- [x] `skodun providers` lists active `provider_state` backoff (already) and,
       when cheap, count of active `provider:<id>` holders (admitted/running).
-- [ ] Telemetry: **reuse** `capacity_admissions` for both `review-fg` and
+- [x] Telemetry: **reuse** `capacity_admissions` for both `review-fg` and
       `provider:<id>` (same table, different `resource_class`). No second queue
       table unless design proves need.
 
 ### Cross-cutting (all phases)
 
-- [ ] Design under `docs/superpowers/specs/` **before** large code (agent must
+- [x] Design under `docs/superpowers/specs/` **before** large code (agent must
       not skip). One atomic store version bump if DDL required.
-- [ ] Hermetic tests drive **shipped** `capacity` / `run_review` / chain paths
+- [x] Hermetic tests drive **shipped** `capacity` / `run_review` / chain paths
       (no test theater).
-- [ ] `examples/fragments/concurrency.md` + `docs/integrate-external-project.md`
+- [x] `examples/fragments/concurrency.md` + `docs/integrate-external-project.md`
       + this seed checklist updated when shipping.
-- [ ] **`gate.py` / `trust.py` unchanged** unless owner-approved.
-- [ ] PR `refs` this epic issue; epic **Done** = merged to `main` + issue closed
+- [x] **`gate.py` / `trust.py` unchanged** unless owner-approved.
+- [x] PR `refs` this epic issue; epic **Done** = merged to `main` + issue closed
       (see root `AGENTS.md`).
 
 ---

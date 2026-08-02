@@ -304,6 +304,118 @@ def test_a_non_utf8_prompt_is_still_FATAL(tmp_path, monkeypatch):
     assert "could not be invoked" in out.failure_reason
 
 
+# --------------------------------------------------------------------------
+# S4 Phase B — provider:<id> slot around inference
+# --------------------------------------------------------------------------
+
+
+def test_s4_provider_slot_held_during_inference_and_released(tmp_path,
+                                                             monkeypatch):
+    """Acquire provider:<id> before watchdog; release after the entry ends."""
+    from skodun import capacity, runner
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.store import Store
+
+    monkeypatch.setenv("SKODUN_GROK_BIN", "/bin/sh")
+    monkeypatch.setenv("SKODUN_ADMISSION_WAIT_SECONDS", "2")
+    holders_during = []
+    store = Store.open(tmp_path / "s.db")
+
+    def fake(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        n = store.capacity_holder_count(
+            capacity.provider_resource_class("xai"), "xai")
+        holders_during.append(n)
+        out.write_bytes(GROK_CLEAN)
+        return runner.RunResult(rc=0, timed_out=False, duration_sec=0.05,
+                                first_output_sec=0.01)
+
+    monkeypatch.setattr(chain.runner, "run_with_watchdog", fake)
+    reviewer = Reviewer(name="f", provider="xai", model="m", role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(reviewer,))
+    with store:
+        out = chain.run_chain(
+            reviewer, cfg, cfg.defaults, b"p", tmp_path, store, tmp_path, "t")
+        assert out.accepted is not None
+        assert holders_during == [1]
+        assert store.capacity_holder_count(
+            capacity.provider_resource_class("xai"), "xai") == 0
+
+
+def test_s4_quota_releases_slot_and_hops_to_fallback(tmp_path, monkeypatch):
+    """Quota on head → mark unavailable, release slot, hop succeeds."""
+    from skodun import capacity, runner
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.store import Store
+
+    monkeypatch.setenv("SKODUN_GROK_BIN", "/bin/sh")
+    monkeypatch.setenv("SKODUN_AGY_BIN", "/bin/sh")
+    monkeypatch.setenv("SKODUN_ADMISSION_WAIT_SECONDS", "2")
+    calls = []
+
+    def fake(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        calls.append(list(cmd))
+        if len(calls) == 1:
+            err.write_bytes(b"quota exceeded")
+            return runner.RunResult(rc=1, timed_out=False, duration_sec=0.05,
+                                    first_output_sec=None)
+        out.write_bytes(GROK_CLEAN)
+        return runner.RunResult(rc=0, timed_out=False, duration_sec=0.05,
+                                first_output_sec=0.01)
+
+    monkeypatch.setattr(chain.runner, "run_with_watchdog", fake)
+    head = Reviewer(name="f", provider="xai", model="m", role="finder",
+                    fallbacks=("backup",))
+    backup = Reviewer(name="backup", provider="google", model="m2",
+                      role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(head, backup))
+    store = Store.open(tmp_path / "s.db")
+    with store:
+        out = chain.run_chain(
+            head, cfg, cfg.defaults, b"p", tmp_path, store, tmp_path, "t")
+        assert out.accepted is not None
+        assert out.accepted["provider"] == "google"
+        assert store.capacity_holder_count(
+            capacity.provider_resource_class("xai"), "xai") == 0
+        assert store.capacity_holder_count(
+            capacity.provider_resource_class("google"), "google") == 0
+        assert chain._effective_provider_capacity(store, "xai") == 0
+        with pytest.raises(capacity.AdmissionTimeout):
+            capacity.acquire(
+                store, scope="xai",
+                resource_class=capacity.provider_resource_class("xai"),
+                capacity=chain._effective_provider_capacity(store, "xai"),
+                wait_sec=0.05, poll_sec=0.01)
+
+
+def test_s4_cancel_during_provider_wait_releases_ticket(tmp_path, monkeypatch):
+    """Cancel while waiting on a full provider slot does not leak a holder."""
+    from skodun import capacity
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.runner import ReviewCancelled
+    from skodun.store import Store
+
+    monkeypatch.setenv("SKODUN_GROK_BIN", "/bin/sh")
+    monkeypatch.setenv("SKODUN_ADMISSION_WAIT_SECONDS", "2")
+    store = Store.open(tmp_path / "s.db")
+    rc = capacity.provider_resource_class("xai")
+    with store:
+        holder = capacity.acquire(
+            store, scope="xai", resource_class=rc, capacity=1,
+            wait_sec=0.5, poll_sec=0.01)
+        assert holder.status == capacity.STATUS_RUNNING
+
+        token = threading.Event()
+        token.set()
+        reviewer = Reviewer(name="f", provider="xai", model="m", role="finder")
+        cfg = Config(defaults=Defaults(), reviewers=(reviewer,))
+        with pytest.raises(ReviewCancelled):
+            chain.run_chain(
+                reviewer, cfg, cfg.defaults, b"p", tmp_path, store,
+                tmp_path, "t", cancel=token)
+        assert store.capacity_holder_count(rc, "xai") == 1
+        capacity.finish(store, holder, status=capacity.STATUS_RELEASED)
+
+
 def test_a_too_large_prompt_is_never_cached_against_the_provider(tmp_path,
                                                                  monkeypatch):
     """One oversized prompt must not black-hole a provider for the TTL.

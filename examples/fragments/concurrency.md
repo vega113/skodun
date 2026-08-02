@@ -11,27 +11,48 @@ junie / codex).
 
 | Resource | Concurrency |
 |---|---|
-| Foreground `review` (CLI) | **FIFO review-fg capacity** (default **1** per repository) + legacy `grok-reviews-foreground.lock` dual-hold. Waiters are ordered; bounded wait then exit `3`. Progress reports **queue position** and **remaining wait budget**. |
+| Foreground `review` (CLI) | **FIFO `review-fg` capacity** (default **1** per repository). Default **dual-hold** also takes the legacy `grok-reviews-foreground.lock` (effective single physical mutex with tubescribes). Waiters are ordered; bounded wait then exit `3`. Progress reports **queue position**, **remaining wait budget**, and **ETA** (`eta≈Xs`) when ≥3 terminal samples exist. |
 | MCP `review` | **One per MCP server process.** Second call is **refused** (`"review already in flight"`), not queued (S3 choice: stale tree risk). |
-| Provider adapters | **Sequential fallback chain**, not parallel multi-provider voting. |
+| Provider adapters | **Sequential fallback chain** + per-provider **`provider:<id>` max_in_flight** (default **1**). Not parallel multi-provider voting on one diff. |
 | Background pre-push workers | One **running** reservation per branch+repo; newer push **supersedes**. |
 
-Having multiple providers configured does **not** mean N simultaneous reviews.
+Having multiple providers configured does **not** mean N simultaneous reviews
+of the same diff. Multi-slot FG is for **independent** reviews (separate
+processes / worktrees).
 
-### Fair capacity (epic S3 — shipped)
+### Fair capacity (epic S3 — shipped) + multi-slot / providers (S4)
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `SKODUN_REVIEW_FG_CAPACITY` | `1` | Max concurrent admitted+running `review-fg` holders per repo (store). Raising above 1 is allowed; the **legacy FG lock still serializes physical runs to 1** while tubescribes/legacy scripts coexist. |
-| `SKODUN_ADMISSION_WAIT_SECONDS` | same as lock wait | Bounded FIFO admission budget |
+| `SKODUN_REVIEW_FG_CAPACITY` | `1` | Max concurrent admitted+running `review-fg` holders per repo (store). |
+| `SKODUN_LEGACY_FG_LOCK` | on (`1`) | **on** (unset/empty/`1`/junk): dual-hold store + mkdir lock. **`0` only**: store capacity only (true multi-slot when capacity ≥2). Do **not** turn off until legacy scripts no longer share the repo (see cutover doc). |
+| `SKODUN_PROVIDER_MAX_IN_FLIGHT` | `1` | Max concurrent inference holders per `provider:<id>` (global default). |
+| `SKODUN_ADMISSION_WAIT_SECONDS` | same as lock wait | Shared budget for repo admit + provider-slot waits |
 | `SKODUN_LOCK_WAIT_SECONDS` | stale ceiling | Dual-hold lock wait (interop) |
 | `SKODUN_LOCK_POLL_SECONDS` | `10` | Poll cadence |
 | `SKODUN_LOCK_STALE_SECONDS` | ceiling | Waiter reclaim ceiling |
 
-Telemetry for each attempt is **persisted** in the store (`capacity_admissions`):
-`queued_at`, `admitted_at`, `started_at`, `ended_at`, `wait_ms`, and
-`expire_reason` when the attempt expired or was rejected. Expiry is durable —
-there is no blind infinite requeue of the same attempt id.
+**Enable multi-slot FG (after legacy decommissioned):**
+
+```bash
+export SKODUN_LEGACY_FG_LOCK=0
+export SKODUN_REVIEW_FG_CAPACITY=2   # or higher
+```
+
+**Provider slots:** each chain entry acquires `provider:<id>` before the
+provider process starts and releases on success, hop, cancel, or fail. On
+quota/429 the provider is marked in `provider_state` and effective
+max_in_flight becomes **0** for the TTL; the chain hops to the next free
+entry (or fails closed if none remain).
+
+Telemetry for each attempt is **persisted** in the store (`capacity_admissions`)
+for both `review-fg` and `provider:<id>`: `queued_at`, `admitted_at`,
+`started_at`, `ended_at`, `wait_ms`, and `expire_reason` when the attempt
+expired or was rejected. Expiry is durable — there is no blind infinite
+requeue of the same attempt id.
+
+**Diagnostics:** `skodun providers` shows active `provider_state` backoff and
+active holder counts for each `provider:<id>`.
 
 **Preflight:** if every provider in the finder fallback chain is known
 unavailable via cached `provider_state`, the run **fails fast** (exit 2) without

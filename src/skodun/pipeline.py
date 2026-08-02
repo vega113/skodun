@@ -1257,14 +1257,15 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     # waiter reading it inside that window would reclaim a live batched holder:
     # the exact overlap the sidecar exists to prevent.
     #
-    # --- 3b. review-fg capacity (FIFO) + legacy FG lock dual-hold (S3) ----
-    # Store FIFO orders skodun waiters; the mkdir lock keeps tubescribes /
-    # legacy scripts serializing against us. Admission budget defaults to the
-    # same wait figure as the lock (override: SKODUN_ADMISSION_WAIT_SECONDS).
+    # --- 3b. review-fg capacity (FIFO) + optional legacy dual-hold (S3/S4) --
+    # Store FIFO orders skodun waiters. Default dual-hold still takes the
+    # legacy mkdir lock (tubescribes shadow). SKODUN_LEGACY_FG_LOCK=0 drops
+    # the mkdir half so capacity N can truly run N concurrent FG reviews.
     common_dir = gitio.git_common_dir(repo)
     scope = str(common_dir)
     admission_wait = capacity.admission_wait_from_env(wait)
     cap_n = capacity.capacity_from_env()
+    dual_hold = capacity.legacy_fg_lock_from_env()
     lock_cell: dict = {"lock": None}
     capacity_ticket: capacity.Ticket | None = None
 
@@ -1288,11 +1289,19 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         return True
 
     try:
-        capacity_ticket = capacity.acquire_for_fg(
-            store, scope=scope, capacity=cap_n,
-            wait_sec=admission_wait, poll_sec=poll,
-            stale_sec=stale,
-            cancel=cancel, on_progress=_note, try_lock=_try_fg_lock)
+        if dual_hold:
+            capacity_ticket = capacity.acquire_for_fg(
+                store, scope=scope, capacity=cap_n,
+                wait_sec=admission_wait, poll_sec=poll,
+                stale_sec=stale,
+                cancel=cancel, on_progress=_note, try_lock=_try_fg_lock)
+        else:
+            # Multi-slot path: store capacity only (S4 dual-hold off).
+            capacity_ticket = capacity.acquire_for_fg(
+                store, scope=scope, capacity=cap_n,
+                wait_sec=admission_wait, poll_sec=poll,
+                stale_sec=stale,
+                cancel=cancel, on_progress=_note, try_lock=None)
     except capacity.AdmissionTimeout as e:
         if lock_cell["lock"] is not None:
             _release_fg_lock(lock_cell["lock"])
@@ -1309,8 +1318,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             lock_cell["lock"] = None
         raise
     lock = lock_cell["lock"]
-    if lock is None:
-        # Defensive: acquire_for_fg must not return without try_lock True.
+    if dual_hold and lock is None:
+        # Dual-hold must return with a held mkdir lock.
         if capacity_ticket is not None:
             capacity.finish(store, capacity_ticket,
                             status=capacity.STATUS_REJECTED,
@@ -1772,7 +1781,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                                 expire_reason=reason)
             except Exception:
                 pass
-        _release_fg_lock(lock)
+        if lock is not None:
+            _release_fg_lock(lock)
 
 
 def _finder_chain_unavailable(store: Store, cfg: Config,

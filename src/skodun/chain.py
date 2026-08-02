@@ -30,12 +30,18 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import runner
+from . import capacity, runner
 from .adapters import (PROMPT_TOO_LARGE_CATEGORY, REVIEW_CONTRACT,
                        UNAVAILABLE_RC, ClassifyResult, OutputContract,
                        ParseResult, PromptTooLarge, get_adapter)
 from .config import Config, Defaults, Reviewer
 from .store import Store, _TS_FORMAT
+
+#: Default provider-slot wait when ``SKODUN_ADMISSION_WAIT_SECONDS`` is unset.
+#: Pipeline uses the FG lock wait as the shared budget for review-fg; chain
+#: uses the same env with this floor when no override is set so hermetic
+#: tests and short local runs stay bounded.
+_DEFAULT_PROVIDER_WAIT_SEC = 30.0
 
 
 @dataclass
@@ -183,6 +189,57 @@ def _remember_unavailable(store: Store, provider: str, verdict) -> None:
     _note(f"marking provider {provider} unavailable until {until} ({reason})")
 
 
+def _effective_provider_capacity(store: Store, provider: str) -> int:
+    """max_in_flight for ``provider``, or 0 while quota backoff is active.
+
+    Cross-process: active ``provider_state`` (TTL) forces effective capacity
+    0 so no new inference admits for that provider until the TTL expires.
+    """
+    if _cached_unavailable(store, provider) is not None:
+        return 0
+    return capacity.provider_max_in_flight_from_env()
+
+
+def _release_provider_slot(store: Store,
+                           ticket: capacity.Ticket | None) -> None:
+    """Best-effort release of a provider capacity ticket (all terminals)."""
+    if ticket is None:
+        return
+    if ticket.status not in capacity.ACTIVE_STATUSES:
+        return
+    try:
+        capacity.finish(store, ticket, status=capacity.STATUS_RELEASED)
+    except Exception:  # pragma: no cover - never fail the review on release
+        pass
+
+
+def _acquire_provider_slot(
+        store: Store, provider: str, *,
+        cancel: "threading.Event | None",
+        on_progress,
+        slots: int | None = None) -> capacity.Ticket:
+    """Acquire ``provider:<id>`` under the shared admission wait budget.
+
+    Call only after review-fg is held (pipeline admit order). Pass ``slots=0``
+    when the provider is in quota backoff (no new admits until TTL ends).
+    When ``slots`` is omitted, uses ``provider_max_in_flight_from_env`` —
+    callers that already skipped via ``provider_state`` should not re-read
+    the cache here (avoids double-consulting per entry).
+    """
+    wait_sec = capacity.admission_wait_from_env(_DEFAULT_PROVIDER_WAIT_SEC)
+    cap = (capacity.provider_max_in_flight_from_env()
+           if slots is None else int(slots))
+    return capacity.acquire(
+        store,
+        scope=provider,
+        resource_class=capacity.provider_resource_class(provider),
+        capacity=cap,
+        wait_sec=wait_sec,
+        cancel=cancel,
+        on_progress=on_progress,
+    )
+
+
 def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
               cwd: Path, store: Store, scratch: Path, tag: str,
               contract: OutputContract = REVIEW_CONTRACT,
@@ -298,141 +355,170 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
             exhausted.append(f"{entry.name}/{entry.provider}: {verdict.detail}")
             continue
 
-        timeouts_used = 0
-        degraded_used = 0
-        entry_n = 0
-        while True:
-            n += 1
-            entry_n += 1
-            stem = f"{tag}.e{i}.a{n}"
-            prompt_file = scratch / f"{stem}.prompt.txt"
-            out_path = scratch / f"{stem}.out"
-            err_path = scratch / f"{stem}.err"
+        # S4 Phase B: hold provider:<id> for the whole entry (retries included).
+        # Repo review-fg is already held by pipeline before run_chain runs.
+        # Release on every terminal: hop, quota, cancel, success, fatal return.
+        provider_ticket: capacity.Ticket | None = None
+        try:
             try:
-                prompt_file.write_bytes(prompt)
-                cmd = adapter.build_cmd(prompt_file, entry, d, cwd, contract)
-            except PromptTooLarge as e:
-                # THIS PROVIDER cannot carry THIS PROMPT — which is what
-                # `unavailable` means, and what a fallback chain is for. So it
-                # takes the `unavailable` path below rather than the fatal one:
-                # an `agy`-headed chain with a `codex` fallback reviews a large
-                # change instead of dying on it.
-                #
-                # Fail-closed is untouched. Nothing becomes trustworthy that
-                # was not reviewed: this appends an attempt and BREAKS to the
-                # next entry, and a chain that runs out still returns
-                # `parsed=None` with a reason that names the size and the
-                # ceiling (both are in `e`'s message, and on `e.size`/`e.limit`
-                # for a caller that would rather not read prose).
-                #
-                # NOT cached against the provider: `_remember_unavailable` is
-                # not called, and the category is deliberately not `quota` —
-                # the only provider-wide-cacheable one. The next, smaller
-                # prompt will be accepted by the very same CLI.
-                verdict = ClassifyResult(
-                    "unavailable", PROMPT_TOO_LARGE_CATEGORY, str(e))
-                next_step = ("trying the next entry" if i + 1 < len(chain)
-                             else "no entries remain")
-                _note(f"{entry.name} ({entry.provider}) cannot take this "
-                      f"prompt ({e.size} bytes > {e.limit}); {next_step}")
+                provider_ticket = _acquire_provider_slot(
+                    store, entry.provider, cancel=cancel, on_progress=_note)
+            except capacity.AdmissionCancelled as e:
+                raise runner.ReviewCancelled(str(e)) from e
+            except capacity.AdmissionTimeout as e:
+                # Slot contention or effective capacity 0 (quota pressure):
+                # hop to the next chain entry rather than spinning forever.
+                n += 1
+                detail = str(e)
+                _note(f"{entry.name} ({entry.provider}): {detail}")
                 attempts.append(_attempt(
-                    n, entry, skipped=f"prompt too large for this provider: {e}",
-                    classification=_classification(verdict)))
-                exhausted.append(f"{entry.name}/{entry.provider}: {e}")
-                break
-            except Exception as e:
-                # An effort this CLI cannot express, an unwritable schema
-                # sidecar, a prompt that is not decodable text: a LOCAL failure,
-                # not an unavailable provider. It stops the chain rather than
-                # routing around it — silently reviewing somewhere else at some
-                # other default is exactly the unnoticed downgrade `build_cmd`
-                # raises to prevent, and the same bytes would fail the same way
-                # at every other entry anyway.
-                attempts.append(_attempt(
-                    n, entry,
-                    skipped=f"could not build the invocation: {e!r}"))
-                return _Outcome(None, attempts,
-                                f"reviewer {entry.name!r} could not be "
-                                f"invoked: {e!r}")
-
-            # The prompt travels as a FILE either way; this only decides who
-            # opens it. Without it, an adapter whose argv ends in the CLI's
-            # stdin marker hangs until the watchdog kills it.
-            stdin_path = (prompt_file
-                          if getattr(adapter, "stdin_from_prompt_file", False)
-                          else None)
-            try:
-                result = runner.run_with_watchdog(
-                    cmd, d.timeout_sec, cwd, out_path, err_path,
-                    stdin_path=stdin_path, cancel=cancel)
-            except FileNotFoundError:
-                # The binary existed when we looked and does not now, or the
-                # adapter's argv names something else that is missing. Same
-                # verdict as the pre-spawn check: nothing ran, so the execution
-                # fields stay null, and the chain advances.
-                verdict = adapter.classify(UNAVAILABLE_RC, b"", b"", contract)
-                attempts.append(_attempt(
-                    n, entry, skipped=f"binary not found: {cmd[0]}",
-                    classification=_classification(verdict)))
+                    n, entry, skipped=f"provider capacity: {detail}"))
                 exhausted.append(
-                    f"{entry.name}/{entry.provider}: {verdict.detail}")
-                break
-
-            if result.timed_out:
-                attempts.append(_attempt(
-                    n, entry, rc=result.rc, timed_out=True,
-                    duration_sec=round(result.duration_sec, 3),
-                    first_output_sec=_round(result.first_output_sec),
-                    classification=None))
-                if timeouts_used < d.timeout_retries:
-                    timeouts_used += 1
-                    _note(f"attempt {entry_n} timed out after {d.timeout_sec}s;"
-                          f" retrying in a fresh session "
-                          f"({timeouts_used}/{d.timeout_retries})")
-                    continue
-                # NEVER parsed, and never classified: the runner truncated
-                # stdout precisely so that a hung run's complete-looking
-                # envelope cannot become a review.
-                return _Outcome(None, attempts,
-                                f"timed out after {entry_n} attempts")
-
-            stdout, stderr = _read(out_path), _read(err_path)
-            verdict = adapter.classify(result.rc, stdout, stderr, contract)
-            attempts.append(_attempt(
-                n, entry, rc=result.rc, timed_out=False,
-                duration_sec=round(result.duration_sec, 3),
-                first_output_sec=_round(result.first_output_sec),
-                classification=_classification(verdict)))
-
-            if verdict.kind == "unavailable":
-                _remember_unavailable(store, entry.provider, verdict)
-                _note(f"{entry.name} ({entry.provider}) is unavailable "
-                      f"({verdict.category}): {verdict.detail}")
-                exhausted.append(
-                    f"{entry.name}/{entry.provider}: {verdict.detail}")
-                break
-
-            parsed = adapter.parse(stdout, stderr, contract)
-            if verdict.kind == "degraded" and not parsed.degraded:
-                # OR-ed, not preferred: a truncation only `classify` can see is
-                # still a truncation, and the record has to say so on the axis
-                # the gate reads.
-                parsed = replace(parsed, degraded=True,
-                                 degraded_reason=verdict.detail)
-            if parsed.degraded and degraded_used < d.degraded_retries:
-                degraded_used += 1
-                _note(f"attempt {entry_n} came back degraded "
-                      f"({parsed.degraded_reason}); retrying in a fresh "
-                      f"session ({degraded_used}/{d.degraded_retries})")
+                    f"{entry.name}/{entry.provider}: provider capacity wait")
                 continue
 
-            # `parse_ok`, not `kind`: `ok` only means nothing looked ill.
-            accepted = None
-            if parsed.parse_ok:
-                accepted = {"adapter_name": adapter.name,
-                            "provider": entry.provider, "model": entry.model,
-                            "effort": entry.effort}
-            return _Outcome(parsed, attempts, "", accepted)
+            timeouts_used = 0
+            degraded_used = 0
+            entry_n = 0
+            while True:
+                n += 1
+                entry_n += 1
+                stem = f"{tag}.e{i}.a{n}"
+                prompt_file = scratch / f"{stem}.prompt.txt"
+                out_path = scratch / f"{stem}.out"
+                err_path = scratch / f"{stem}.err"
+                try:
+                    prompt_file.write_bytes(prompt)
+                    cmd = adapter.build_cmd(prompt_file, entry, d, cwd, contract)
+                except PromptTooLarge as e:
+                    # THIS PROVIDER cannot carry THIS PROMPT — which is what
+                    # `unavailable` means, and what a fallback chain is for. So it
+                    # takes the `unavailable` path below rather than the fatal one:
+                    # an `agy`-headed chain with a `codex` fallback reviews a large
+                    # change instead of dying on it.
+                    #
+                    # Fail-closed is untouched. Nothing becomes trustworthy that
+                    # was not reviewed: this appends an attempt and BREAKS to the
+                    # next entry, and a chain that runs out still returns
+                    # `parsed=None` with a reason that names the size and the
+                    # ceiling (both are in `e`'s message, and on `e.size`/`e.limit`
+                    # for a caller that would rather not read prose).
+                    #
+                    # NOT cached against the provider: `_remember_unavailable` is
+                    # not called, and the category is deliberately not `quota` —
+                    # the only provider-wide-cacheable one. The next, smaller
+                    # prompt will be accepted by the very same CLI.
+                    verdict = ClassifyResult(
+                        "unavailable", PROMPT_TOO_LARGE_CATEGORY, str(e))
+                    next_step = ("trying the next entry" if i + 1 < len(chain)
+                                 else "no entries remain")
+                    _note(f"{entry.name} ({entry.provider}) cannot take this "
+                          f"prompt ({e.size} bytes > {e.limit}); {next_step}")
+                    attempts.append(_attempt(
+                        n, entry,
+                        skipped=f"prompt too large for this provider: {e}",
+                        classification=_classification(verdict)))
+                    exhausted.append(f"{entry.name}/{entry.provider}: {e}")
+                    break
+                except Exception as e:
+                    # An effort this CLI cannot express, an unwritable schema
+                    # sidecar, a prompt that is not decodable text: a LOCAL
+                    # failure, not an unavailable provider. It stops the chain
+                    # rather than routing around it — silently reviewing
+                    # somewhere else at some other default is exactly the
+                    # unnoticed downgrade `build_cmd` raises to prevent, and the
+                    # same bytes would fail the same way at every other entry.
+                    attempts.append(_attempt(
+                        n, entry,
+                        skipped=f"could not build the invocation: {e!r}"))
+                    return _Outcome(None, attempts,
+                                    f"reviewer {entry.name!r} could not be "
+                                    f"invoked: {e!r}")
+
+                # The prompt travels as a FILE either way; this only decides who
+                # opens it. Without it, an adapter whose argv ends in the CLI's
+                # stdin marker hangs until the watchdog kills it.
+                stdin_path = (prompt_file
+                              if getattr(adapter, "stdin_from_prompt_file", False)
+                              else None)
+                try:
+                    result = runner.run_with_watchdog(
+                        cmd, d.timeout_sec, cwd, out_path, err_path,
+                        stdin_path=stdin_path, cancel=cancel)
+                except FileNotFoundError:
+                    # The binary existed when we looked and does not now, or the
+                    # adapter's argv names something else that is missing. Same
+                    # verdict as the pre-spawn check: nothing ran, so the
+                    # execution fields stay null, and the chain advances.
+                    verdict = adapter.classify(
+                        UNAVAILABLE_RC, b"", b"", contract)
+                    attempts.append(_attempt(
+                        n, entry, skipped=f"binary not found: {cmd[0]}",
+                        classification=_classification(verdict)))
+                    exhausted.append(
+                        f"{entry.name}/{entry.provider}: {verdict.detail}")
+                    break
+
+                if result.timed_out:
+                    attempts.append(_attempt(
+                        n, entry, rc=result.rc, timed_out=True,
+                        duration_sec=round(result.duration_sec, 3),
+                        first_output_sec=_round(result.first_output_sec),
+                        classification=None))
+                    if timeouts_used < d.timeout_retries:
+                        timeouts_used += 1
+                        _note(f"attempt {entry_n} timed out after "
+                              f"{d.timeout_sec}s; retrying in a fresh session "
+                              f"({timeouts_used}/{d.timeout_retries})")
+                        continue
+                    # NEVER parsed, and never classified: the runner truncated
+                    # stdout precisely so that a hung run's complete-looking
+                    # envelope cannot become a review.
+                    return _Outcome(None, attempts,
+                                    f"timed out after {entry_n} attempts")
+
+                stdout, stderr = _read(out_path), _read(err_path)
+                verdict = adapter.classify(result.rc, stdout, stderr, contract)
+                attempts.append(_attempt(
+                    n, entry, rc=result.rc, timed_out=False,
+                    duration_sec=round(result.duration_sec, 3),
+                    first_output_sec=_round(result.first_output_sec),
+                    classification=_classification(verdict)))
+
+                if verdict.kind == "unavailable":
+                    # Quota shrinks effective max_in_flight to 0 via
+                    # provider_state; release this slot before hopping.
+                    _remember_unavailable(store, entry.provider, verdict)
+                    _note(f"{entry.name} ({entry.provider}) is unavailable "
+                          f"({verdict.category}): {verdict.detail}")
+                    exhausted.append(
+                        f"{entry.name}/{entry.provider}: {verdict.detail}")
+                    break
+
+                parsed = adapter.parse(stdout, stderr, contract)
+                if verdict.kind == "degraded" and not parsed.degraded:
+                    # OR-ed, not preferred: a truncation only `classify` can
+                    # see is still a truncation, and the record has to say so
+                    # on the axis the gate reads.
+                    parsed = replace(parsed, degraded=True,
+                                     degraded_reason=verdict.detail)
+                if parsed.degraded and degraded_used < d.degraded_retries:
+                    degraded_used += 1
+                    _note(f"attempt {entry_n} came back degraded "
+                          f"({parsed.degraded_reason}); retrying in a fresh "
+                          f"session ({degraded_used}/{d.degraded_retries})")
+                    continue
+
+                # `parse_ok`, not `kind`: `ok` only means nothing looked ill.
+                accepted = None
+                if parsed.parse_ok:
+                    accepted = {"adapter_name": adapter.name,
+                                "provider": entry.provider,
+                                "model": entry.model,
+                                "effort": entry.effort}
+                return _Outcome(parsed, attempts, "", accepted)
+        finally:
+            _release_provider_slot(store, provider_ticket)
 
     summary = "; ".join(exhausted) or "no chain entry could be attempted"
     return _Outcome(None, attempts, f"all providers unavailable: {summary}")

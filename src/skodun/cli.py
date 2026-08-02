@@ -1170,8 +1170,18 @@ def _cmd_providers(args) -> int:
             state = _fmt_provider_state(state_rows.get(provider), shown_field)
             shown_binary = _shown_binary(binary, shown_field,
                                          MAX_ANNOTATION_DISPLAY_CHARS)
+            # S4: cheap active holder count for provider:<id> (admitted+running).
+            try:
+                from . import capacity as capacity_mod
+                holders = store.capacity_holder_count(
+                    capacity_mod.provider_resource_class(provider), provider)
+            except Exception:
+                holders = None
+            holders_bit = (f" | holders={holders}"
+                           if holders is not None else "")
             _emit(f"{provider} | adapter={adapter.name} | "
-                  f"binary={shown_binary} ({status}) | state={state}", 0)
+                  f"binary={shown_binary} ({status}) | state={state}"
+                  f"{holders_bit}", 0)
 
         for provider, row in sorted(state_rows.items()):
             if provider not in _REGISTRY:

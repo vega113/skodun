@@ -665,14 +665,19 @@ def test_mid_chain_cache_expiry_is_honoured_without_sleep(tmp_path, monkeypatch,
                                                           capsys):
     """A cache entry that expires BETWEEN entries is honoured -- deterministically.
 
-    `_cached_unavailable` is consulted once per entry (`pipeline.py:718`), each
-    time with a fresh `_iso_now()`. A two-entry chain on the SAME provider
-    (`CFG_XAI_THEN_XAI`) checks the cache twice for `xai`; a spy on
-    `Store.provider_unavailable_reason` rewrites the `now_iso` the SECOND call
-    sees to a time past the TTL, simulating the clock advancing between
-    entries with no `sleep` and no flakiness. Entry 0 must be skipped (the
-    cache is still live at the first read) and entry 1 must run (the cache has
-    "expired" by the second read).
+    `run_chain` consults `_cached_unavailable` once per entry with a fresh
+    `_iso_now()`. A two-entry chain on the SAME provider (`CFG_XAI_THEN_XAI`)
+    therefore reads the cache twice for `xai` *during the chain*. Preflight
+    (`_finder_chain_unavailable`) also walks the chain first, so a spy sees
+    those earlier reads too.
+
+    Spy policy (call order):
+      1. preflight entry0 → LIVE (unavailable)
+      2. preflight entry1 → EXPIRED so preflight does not refuse the whole run
+      3. chain entry0 → LIVE → skipped
+      4+. chain entry1 (and any later reads) → EXPIRED → entry runs
+
+    No `sleep`, no flakiness.
     """
     _fake_cli(tmp_path, "grok", _emit(CLEAN))
     repo = _repo(tmp_path, CFG_XAI_THEN_XAI)
@@ -684,15 +689,16 @@ def test_mid_chain_cache_expiry_is_honoured_without_sleep(tmp_path, monkeypatch,
 
     def spy(self, provider, now_iso, env=os.environ):
         calls.append(now_iso)
-        if len(calls) >= 2:
-            now_iso = _iso(3600)   # simulate the clock advancing past the TTL
+        # Live only on 1st and 3rd consult (preflight e0 + chain e0).
+        if len(calls) not in (1, 3):
+            now_iso = _iso(3600)
         return real(self, provider, now_iso, env)
 
     monkeypatch.setattr(Store, "provider_unavailable_reason", spy)
 
     rec = _run(repo, st)
 
-    assert len(calls) == 2
+    assert len(calls) >= 4, calls
     assert rec["attempts"][0]["skipped"].startswith("provider marked unavailable")
     assert "skipped" not in rec["attempts"][1]
     assert _calls(tmp_path) == ["grok"]
