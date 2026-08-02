@@ -1500,6 +1500,38 @@ class Store:
         views = self.capacity_active_views(row["resource_class"], row["scope"])
         return queue_position_among(admission_id, views)
 
+    def capacity_terminal_wait_ms(self, resource_class: str, scope: str,
+                                  *, limit: int = 20) -> list[int]:
+        """Recent terminal ``wait_ms`` values (newest first), for ETA p50."""
+        resource_class = _require_text("resource_class", resource_class)
+        scope = _require_text("scope", scope)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            limit = 20
+        rows = self._c.execute(
+            """SELECT wait_ms FROM capacity_admissions
+               WHERE resource_class=? AND scope=?
+                 AND status IN ('released','expired','rejected')
+                 AND wait_ms IS NOT NULL
+               ORDER BY ended_at DESC, id DESC LIMIT ?""",
+            (resource_class, scope, limit)).fetchall()
+        out: list[int] = []
+        for r in rows:
+            try:
+                out.append(int(r["wait_ms"]))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def capacity_holder_count(self, resource_class: str, scope: str) -> int:
+        """Count of admitted+running holders for a class/scope."""
+        resource_class = _require_text("resource_class", resource_class)
+        scope = _require_text("scope", scope)
+        row = self._c.execute(
+            """SELECT COUNT(*) AS n FROM capacity_admissions
+               WHERE resource_class=? AND scope=? AND status IN (?,?)""",
+            (resource_class, scope, "admitted", "running")).fetchone()
+        return int(row["n"]) if row is not None else 0
+
     def capacity_reclaim_stale(
             self, resource_class: str, scope: str, *, stale_sec: float,
             now_epoch: float | None = None,

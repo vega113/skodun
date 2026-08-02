@@ -1,6 +1,6 @@
 # skodun S4 — multi-slot review-fg + per-provider concurrency + 429 backoff
 
-Date: 2026-08-02. Status: **design seed for implementation** (epic S4).  
+Date: 2026-08-02. Status: **implemented** (epic S4 phases A–C).  
 Parent seed: `docs/epics/s4-multi-slot-provider-concurrency.md`.  
 Prerequisites: S3 design `2026-08-02-s3-fair-capacity-design.md` (shipped),
 S1 status/cancel, cutover doc `docs/cutover-from-legacy-review.md`.

@@ -9,9 +9,10 @@ config, and agent instructions.
 
 - Status + cancel — **S1** [#41](https://github.com/vega113/skodun/issues/41)
 - Fair review capacity — **S3** [#42](https://github.com/vega113/skodun/issues/42)
+- Multi-slot FG + per-provider concurrency — **S4** [#56](https://github.com/vega113/skodun/issues/56)
 
-S1 (status/cancel) and S3 (fair capacity) are **shipped** — concurrency rules
-below match current product behaviour.
+S1, S3, and S4 are **shipped** — concurrency rules below match current product
+behaviour.
 
 | More detail | Path |
 |---|---|
@@ -207,24 +208,31 @@ printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocol
 ### Concurrency (agents must know)
 
 1. **CLI foreground reviews:** FIFO **review-fg** capacity (default **1** per
-   repository) dual-held with the legacy `grok-reviews-foreground.lock`.
-   Waiters are ordered; progress reports **queue position** and **remaining
-   wait budget**; bounded wait then exit **`3`**. Raise capacity with
-   `SKODUN_REVIEW_FG_CAPACITY` (legacy lock still serializes physical runs to
-   1 while shadow scripts coexist). Telemetry is persisted
-   (`capacity_admissions`).
-2. **MCP `review`:** **One per server process.** A second call returns
+   repository). Default **dual-hold** also takes the legacy
+   `grok-reviews-foreground.lock` (effective single physical mutex while
+   tubescribes/legacy scripts coexist). Waiters are ordered; progress reports
+   **queue position**, **remaining wait budget**, and **ETA** when enough
+   samples exist; bounded wait then exit **`3`**. Raise capacity with
+   `SKODUN_REVIEW_FG_CAPACITY`. For **true multi-slot** after legacy is gone:
+   `SKODUN_LEGACY_FG_LOCK=0` (exact `0` only) plus capacity ≥2. Telemetry is
+   persisted (`capacity_admissions`).
+2. **Provider concurrency (S4):** each chain entry acquires `provider:<id>`
+   (default max_in_flight **1**, override `SKODUN_PROVIDER_MAX_IN_FLIGHT`)
+   before inference and releases on every terminal. Quota/429 marks
+   `provider_state` and shrinks that provider to effective **0** slots for the
+   TTL; the chain hops or fails closed (never a silent trustworthy pass).
+3. **MCP `review`:** **One per server process.** A second call returns
    `"review already in flight"` — **not** queued (S3 policy: a queue would run
    against a moved tree).
-3. **Status / cancel (S1):** `skodun review-status` / `skodun review-cancel`
+4. **Status / cancel (S1):** `skodun review-status` / `skodun review-cancel`
    and MCP `review_status` / `review_cancel` observe or stop in-flight work
    without a second gate. Closing the MCP session still cancels the in-flight
    MCP review.
-4. **Do not poll** with full agent turns every 30–60s. Wait outside the model,
+5. **Do not poll** with full agent turns every 30–60s. Wait outside the model,
    then call `review-status` / `gate` / `log` / `surface`.
-5. Providers are a **fallback chain**, not parallel slots. If the **entire**
-   finder chain is known unavailable via `provider_state`, the run fails fast
-   (exit 2) without burning the full admission wait.
+6. Providers are a **fallback chain**, not parallel voting on one diff. If the
+   **entire** finder chain is known unavailable via `provider_state`, the run
+   fails fast (exit 2) without burning the full admission wait.
 
 ---
 
@@ -323,7 +331,8 @@ Last reviewed against skodun **0.4.x** / post-epic-#23 main:
 | Console script + `python3 -m skodun` | both documented |
 | Upgrade requires MCP restart | documented |
 | CLI-only ops list | doctor, providers, retain, schedule, install-hooks, … |
-| Links to #41 / #42 | present |
+| Links to #41 / #42 / #56 | present |
 
-S1 and S3 are shipped: §2 concurrency and `examples/fragments/concurrency.md`
-match the product (FIFO review-fg + MCP refuse-if-busy).
+S1, S3, and S4 are shipped: §2 concurrency and
+`examples/fragments/concurrency.md` match the product (FIFO review-fg,
+optional multi-slot, provider max_in_flight, MCP refuse-if-busy).

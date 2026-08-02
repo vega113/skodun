@@ -39,14 +39,21 @@ if TYPE_CHECKING:
 
     from .store import Store
 
-#: Foreground review capacity class (this epic).
+#: Foreground review capacity class (S3/S4).
 RESOURCE_REVIEW_FG = "review-fg"
-#: Optional name reserved for later; not wired by S3.
+#: Optional name reserved for later; not wired.
 RESOURCE_REVIEW_BG = "review-bg"
+#: Prefix for per-provider slots: ``provider:xai``, ``provider:openai``, …
+PROVIDER_CLASS_PREFIX = "provider:"
 
 DEFAULT_CAPACITY = 1
 CAPACITY_ENV = "SKODUN_REVIEW_FG_CAPACITY"
 ADMISSION_WAIT_ENV = "SKODUN_ADMISSION_WAIT_SECONDS"
+LEGACY_FG_LOCK_ENV = "SKODUN_LEGACY_FG_LOCK"
+PROVIDER_MAX_IN_FLIGHT_ENV = "SKODUN_PROVIDER_MAX_IN_FLIGHT"
+DEFAULT_PROVIDER_MAX_IN_FLIGHT = 1
+ETA_SAMPLE_K = 20
+ETA_MIN_SAMPLES = 3
 
 STATUS_QUEUED = "queued"
 STATUS_ADMITTED = "admitted"
@@ -121,6 +128,65 @@ def capacity_from_env(env: Mapping[str, str] | None = None) -> int:
     if value < 1:
         return DEFAULT_CAPACITY
     return value
+
+
+def legacy_fg_lock_from_env(env: Mapping[str, str] | None = None) -> bool:
+    """Whether dual-hold of the legacy mkdir FG lock is enabled.
+
+    Normative (epic S4): unset/empty/``1``/junk → **on** (True); exact ``0``
+    → **off** (False). Must **not** reuse duration helpers that reject ``0``.
+    """
+    env = os.environ if env is None else env
+    raw = env.get(LEGACY_FG_LOCK_ENV)
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip() != "0"
+
+
+def provider_max_in_flight_from_env(env: Mapping[str, str] | None = None) -> int:
+    """``SKODUN_PROVIDER_MAX_IN_FLIGHT`` ≥ 1; junk → default 1."""
+    env = os.environ if env is None else env
+    raw = env.get(PROVIDER_MAX_IN_FLIGHT_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_PROVIDER_MAX_IN_FLIGHT
+    try:
+        value = int(str(raw).strip(), 10)
+    except ValueError:
+        return DEFAULT_PROVIDER_MAX_IN_FLIGHT
+    if value < 1:
+        return DEFAULT_PROVIDER_MAX_IN_FLIGHT
+    return value
+
+
+def provider_resource_class(provider_id: str) -> str:
+    """``provider:<id>`` resource class for capacity admissions."""
+    pid = str(provider_id or "").strip()
+    if not pid:
+        raise ValueError("provider_id must be a non-empty string")
+    return f"{PROVIDER_CLASS_PREFIX}{pid}"
+
+
+def wait_eta_p50_ms(samples: Sequence[int], *, min_samples: int = ETA_MIN_SAMPLES,
+                    max_samples: int = ETA_SAMPLE_K) -> int | None:
+    """p50 of recent wait_ms samples, or None if fewer than ``min_samples``."""
+    cleaned = [int(x) for x in samples if isinstance(x, int) and not isinstance(x, bool) and x >= 0]
+    if len(cleaned) < min_samples:
+        return None
+    ordered = sorted(cleaned)[:max_samples]
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) // 2
+
+
+def format_wait_progress(resource_class: str, position: int, remaining_sec: float,
+                         *, eta_sec: float | None = None) -> str:
+    """One progress line: position, wait budget, optional ETA."""
+    msg = (f"{resource_class} queue position {position}; "
+           f"wait budget {max(remaining_sec, 0.0):g}s remaining")
+    if eta_sec is not None and eta_sec >= 0:
+        msg += f"; eta≈{int(eta_sec)}s"
+    return msg
 
 
 def admission_wait_from_env(default: float,
@@ -339,10 +405,17 @@ def acquire(store: "Store", *, scope: str,
     Each loop reclaims dead/stale peer rows (see ``should_reclaim_admission``)
     before the FIFO admit attempt so a SIGKILLed predecessor cannot poison
     the queue permanently.
+
+    ``capacity=0`` is valid and means **no admits** (S4 provider pressure
+    reduction while a provider is in quota backoff). ``None`` and negative
+    values fall back to ``DEFAULT_CAPACITY``.
     """
-    cap = DEFAULT_CAPACITY if capacity is None else int(capacity)
-    if cap < 1:
+    if capacity is None:
         cap = DEFAULT_CAPACITY
+    else:
+        cap = int(capacity)
+        if cap < 0:
+            cap = DEFAULT_CAPACITY
     now = time.monotonic if clock is None else clock
     pause = time.sleep if sleep is None else sleep
 
@@ -378,9 +451,9 @@ def acquire(store: "Store", *, scope: str,
             ticket.position = pos
             if on_progress is not None and pos is not None and pos != noted_pos:
                 noted_pos = pos
-                on_progress(
-                    f"{resource_class} queue position {pos}; "
-                    f"wait budget {max(remaining, 0.0):g}s remaining")
+                eta = _eta_seconds(store, resource_class, scope)
+                on_progress(format_wait_progress(
+                    resource_class, pos, max(remaining, 0.0), eta_sec=eta))
 
             attempted = True
             try_admit(store, ticket, capacity=cap)
@@ -407,6 +480,18 @@ def acquire(store: "Store", *, scope: str,
         raise
 
 
+def _eta_seconds(store: "Store", resource_class: str, scope: str) -> float | None:
+    try:
+        samples = store.capacity_terminal_wait_ms(
+            resource_class, scope, limit=ETA_SAMPLE_K)
+    except Exception:
+        return None
+    ms = wait_eta_p50_ms(samples)
+    if ms is None:
+        return None
+    return ms / 1000.0
+
+
 def acquire_for_fg(
         store: "Store", *, scope: str,
         capacity: int | None = None,
@@ -415,25 +500,25 @@ def acquire_for_fg(
         stale_sec: float = DEFAULT_STALE_SEC,
         cancel: "threading.Event | None" = None,
         on_progress: Callable[[str], None] | None = None,
-        try_lock: Callable[[float], bool],
+        try_lock: Callable[[float], bool] | None = None,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
         pid_alive_fn: Callable[[int], bool] | None = None) -> Ticket:
-    """FG dual-hold: FIFO eligibility, then ``try_lock``, then admit+start.
+    """FG admission: store FIFO, optionally dual-hold via ``try_lock``.
 
-    ``try_lock(slice_sec)`` returns True when this process holds the legacy
-    FG lock, False on ordinary contention. It may raise on cancel; the
-    caller maps that to ``AdmissionCancelled`` or lets it propagate after
-    this helper finishes the ticket in the bare ``except``.
+    When ``try_lock`` is ``None``, this is store-only multi-slot admit (S4
+    dual-hold off): same as :func:`acquire` for ``review-fg``.
 
-    Only the FIFO head calls ``try_lock``, so later waiters cannot overtake
-    on the mkdir race. After a successful lock, the ticket is force-admitted
-    and marked ``running``. One attempt is always made even when
-    ``wait_sec`` is 0 so a free lock path matches the legacy lock contract.
-
-    Dead or stale peer capacity rows are reclaimed each iteration before the
-    FIFO head is decided (``stale_sec`` should be the FG lock stale ceiling).
+    When ``try_lock`` is set, only the FIFO head may call it; success force-
+    admits and marks running (S3 dual-hold).
     """
+    if try_lock is None:
+        return acquire(
+            store, scope=scope, resource_class=RESOURCE_REVIEW_FG,
+            capacity=capacity, wait_sec=wait_sec, poll_sec=poll_sec,
+            stale_sec=stale_sec, cancel=cancel, on_progress=on_progress,
+            clock=clock, sleep=sleep, pid_alive_fn=pid_alive_fn)
+
     cap = DEFAULT_CAPACITY if capacity is None else int(capacity)
     if cap < 1:
         cap = DEFAULT_CAPACITY
@@ -470,9 +555,9 @@ def acquire_for_fg(
             ticket.position = pos
             if on_progress is not None and pos is not None and pos != noted_pos:
                 noted_pos = pos
-                on_progress(
-                    f"review-fg queue position {pos}; "
-                    f"wait budget {max(remaining, 0.0):g}s remaining")
+                eta = _eta_seconds(store, RESOURCE_REVIEW_FG, scope)
+                on_progress(format_wait_progress(
+                    RESOURCE_REVIEW_FG, pos, max(remaining, 0.0), eta_sec=eta))
 
             attempted = True
             active = store.capacity_active_views(RESOURCE_REVIEW_FG, scope)

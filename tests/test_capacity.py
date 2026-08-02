@@ -485,3 +485,204 @@ def test_acquire_store_only_reclaims_dead_holder(store):
     assert ticket.status == STATUS_RUNNING
     assert store.capacity_get("ca_h_dead")["status"] == STATUS_REJECTED
     finish(store, ticket, status=STATUS_RELEASED)
+
+
+# ---------------------------------------------------------------------------
+# S4 Phase A — dual-hold env + multi-slot store-only FG
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_fg_lock_from_env_normative_bool():
+    """Exact 0 → off; unset/empty/1/junk → on (not via duration helpers)."""
+    assert capacity.legacy_fg_lock_from_env({}) is True
+    assert capacity.legacy_fg_lock_from_env({"SKODUN_LEGACY_FG_LOCK": ""}) is True
+    assert capacity.legacy_fg_lock_from_env({"SKODUN_LEGACY_FG_LOCK": "1"}) is True
+    assert capacity.legacy_fg_lock_from_env({"SKODUN_LEGACY_FG_LOCK": "yes"}) is True
+    assert capacity.legacy_fg_lock_from_env({"SKODUN_LEGACY_FG_LOCK": "0"}) is False
+    # Duration helpers reject 0; this reader must not.
+    assert capacity.legacy_fg_lock_from_env({"SKODUN_LEGACY_FG_LOCK": " 0 "}) is False
+
+
+def test_provider_max_in_flight_from_env_defaults():
+    assert capacity.provider_max_in_flight_from_env({}) == 1
+    assert capacity.provider_max_in_flight_from_env(
+        {"SKODUN_PROVIDER_MAX_IN_FLIGHT": "2"}) == 2
+    assert capacity.provider_max_in_flight_from_env(
+        {"SKODUN_PROVIDER_MAX_IN_FLIGHT": "0"}) == 1
+    assert capacity.provider_max_in_flight_from_env(
+        {"SKODUN_PROVIDER_MAX_IN_FLIGHT": "nope"}) == 1
+
+
+def test_provider_resource_class_naming():
+    assert capacity.provider_resource_class("xai") == "provider:xai"
+    assert capacity.provider_resource_class("openai") == "provider:openai"
+    with pytest.raises(ValueError):
+        capacity.provider_resource_class("")
+
+
+def test_s4_dual_hold_off_two_concurrent_store_only_holders(store):
+    """T1: dual-hold off path (try_lock=None) admits N concurrent holders."""
+    t1 = acquire_for_fg(
+        store, scope="/repo", capacity=2, wait_sec=0.5, poll_sec=0.01,
+        try_lock=None)
+    t2 = acquire_for_fg(
+        store, scope="/repo", capacity=2, wait_sec=0.5, poll_sec=0.01,
+        try_lock=None)
+    assert t1.status == STATUS_RUNNING
+    assert t2.status == STATUS_RUNNING
+    assert t1.id != t2.id
+    assert store.capacity_holder_count(RESOURCE_REVIEW_FG, "/repo") == 2
+    finish(store, t1, status=STATUS_RELEASED)
+    finish(store, t2, status=STATUS_RELEASED)
+    assert store.capacity_holder_count(RESOURCE_REVIEW_FG, "/repo") == 0
+
+
+def test_s4_dual_hold_on_try_lock_still_required(store):
+    """T2: with try_lock set, only FIFO head may call it (S3 dual-hold pin)."""
+    held = []
+
+    def try_lock_hold(_slice: float) -> bool:
+        held.append("a")
+        return True
+
+    t1 = acquire_for_fg(
+        store, scope="/repo", capacity=2, wait_sec=1, poll_sec=0.01,
+        try_lock=try_lock_hold)
+    assert t1.status == STATUS_RUNNING
+    assert held == ["a"]
+
+    # Second waiter: dual-hold still serializes via try_lock gating even when
+    # store capacity would allow a second holder — only the head calls lock.
+    # With t1 running, FIFO head is still t1's holder slot; a new waiter is
+    # not head until free... actually with capacity=2, second CAN be admitted
+    # after try_lock. Dual-hold path: only FIFO head among *queued* may
+    # try_lock; holders don't block try_lock of next if under capacity?
+    # Looking at acquire_for_fg: it uses decide_admit style - holders count
+    # toward capacity. With capacity=2 and 1 holder, second queued becomes
+    # head of queue and may try_lock. So both can hold with capacity=2.
+    # T2 dual-hold ON with capacity=1 is the regression pin for single mutex.
+    finish(store, t1, status=STATUS_RELEASED)
+
+    t_block = enqueue(store, scope="/repo", admission_id="ca_hold")
+    try_admit(store, t_block, capacity=1)
+    capacity.mark_started(store, t_block)
+
+    lock_calls = []
+
+    def try_lock_b(_slice: float) -> bool:
+        lock_calls.append("b")
+        return True
+
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(
+            store, scope="/repo", capacity=1, wait_sec=0.08, poll_sec=0.02,
+            try_lock=try_lock_b)
+    # Not head while t_block holds sole capacity → no try_lock.
+    assert lock_calls == []
+    finish(store, t_block, status=STATUS_RELEASED)
+
+
+# ---------------------------------------------------------------------------
+# S4 Phase B — provider:<id> max_in_flight + capacity 0 pressure
+# ---------------------------------------------------------------------------
+
+
+def test_s4_provider_cap_one_second_waiter_blocks(store):
+    """T3: max_in_flight=1 — second concurrent acquire waits/expires."""
+    rc = capacity.provider_resource_class("xai")
+    t1 = acquire(
+        store, scope="xai", resource_class=rc, capacity=1,
+        wait_sec=0.5, poll_sec=0.01)
+    assert t1.status == STATUS_RUNNING
+    assert store.capacity_holder_count(rc, "xai") == 1
+
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire(
+            store, scope="xai", resource_class=rc, capacity=1,
+            wait_sec=0.05, poll_sec=0.01)
+    finish(store, t1, status=STATUS_RELEASED)
+    t2 = acquire(
+        store, scope="xai", resource_class=rc, capacity=1,
+        wait_sec=0.5, poll_sec=0.01)
+    assert t2.status == STATUS_RUNNING
+    finish(store, t2, status=STATUS_RELEASED)
+
+
+def test_s4_provider_cap_two_allows_two(store):
+    """T4: max_in_flight=2 — two concurrent holders both running."""
+    rc = capacity.provider_resource_class("xai")
+    t1 = acquire(
+        store, scope="xai", resource_class=rc, capacity=2,
+        wait_sec=0.5, poll_sec=0.01)
+    t2 = acquire(
+        store, scope="xai", resource_class=rc, capacity=2,
+        wait_sec=0.5, poll_sec=0.01)
+    assert t1.status == STATUS_RUNNING and t2.status == STATUS_RUNNING
+    assert store.capacity_holder_count(rc, "xai") == 2
+    finish(store, t1, status=STATUS_RELEASED)
+    finish(store, t2, status=STATUS_RELEASED)
+
+
+def test_s4_provider_capacity_zero_never_admits(store):
+    """T5: effective max_in_flight 0 (quota pressure) → no admit, timeout."""
+    rc = capacity.provider_resource_class("xai")
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire(
+            store, scope="xai", resource_class=rc, capacity=0,
+            wait_sec=0.05, poll_sec=0.01)
+    rows = store._c.execute(
+        "SELECT status FROM capacity_admissions WHERE resource_class=?",
+        (rc,)).fetchall()
+    assert rows and all(r["status"] == STATUS_EXPIRED for r in rows)
+
+
+def test_s4_wait_eta_p50_requires_min_samples():
+    """T8 helper: p50 only with ≥3 samples."""
+    assert capacity.wait_eta_p50_ms([]) is None
+    assert capacity.wait_eta_p50_ms([10, 20]) is None
+    assert capacity.wait_eta_p50_ms([10, 20, 30]) == 20
+    assert capacity.wait_eta_p50_ms([100, 200, 300, 400]) is not None
+
+
+def test_s4_format_wait_progress_includes_eta_when_present():
+    msg = capacity.format_wait_progress("provider:xai", 2, 12.5, eta_sec=4.0)
+    assert "provider:xai queue position 2" in msg
+    assert "wait budget 12.5s remaining" in msg
+    assert "eta≈4s" in msg
+    bare = capacity.format_wait_progress("review-fg", 1, 5.0)
+    assert "eta≈" not in bare
+
+
+def test_s4_progress_eta_from_terminal_samples(store):
+    """Progress lines include eta≈ when ≥3 terminal wait_ms exist."""
+    # Seed three released admissions with known wait_ms via finish path.
+    for i, ms in enumerate((1000, 2000, 3000), start=1):
+        t = enqueue(store, scope="/repo", admission_id=f"ca_seed_{i}")
+        try_admit(store, t, capacity=10)
+        capacity.mark_started(store, t)
+        finish(store, t, status=STATUS_RELEASED)
+        # Overwrite wait_ms so p50 is deterministic.
+        store._c.execute(
+            "UPDATE capacity_admissions SET wait_ms=? WHERE id=?",
+            (ms, t.id))
+        store._c.commit()
+
+    samples = store.capacity_terminal_wait_ms(RESOURCE_REVIEW_FG, "/repo")
+    assert len(samples) >= 3
+    assert capacity.wait_eta_p50_ms(samples) is not None
+
+    notes = []
+    holder = enqueue(store, scope="/repo", admission_id="ca_block")
+    try_admit(store, holder, capacity=1)
+    capacity.mark_started(store, holder)
+
+    def on_progress(msg: str) -> None:
+        notes.append(msg)
+        if holder.status == STATUS_RUNNING:
+            finish(store, holder, status=STATUS_RELEASED)
+
+    ticket = acquire(
+        store, scope="/repo", capacity=1, wait_sec=2.0, poll_sec=0.02,
+        on_progress=on_progress)
+    assert any("eta≈" in n for n in notes)
+    finish(store, ticket, status=STATUS_RELEASED)
