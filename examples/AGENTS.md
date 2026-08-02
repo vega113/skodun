@@ -131,8 +131,13 @@ converge on its own. Escalate rather than iterate when:
   the fix is riskier than the bug it fixed;
 - fixing a finding would touch more code than the change under review;
 - two rounds in a row produce only deferrable findings — file them and merge;
-- you disagree with a finding. Say so and stop; do not argue with the reviewer
-  by rewriting code.
+- you disagree with a finding. Record **non-gate** feedback
+  (`skodun feedback add --kind finding_judgment …` or MCP `feedback_add`) with
+  a substantive reason, tell the human, and stop — do not argue with the
+  reviewer by rewriting code. Do **not** `triage_dismiss` on your own (that
+  clears the gate). If you hit a **skodun product bug**, record
+  `skodun feedback add --kind product_bug …` so maintainers can inspect later
+  (see [`fragments/feedback.md`](fragments/feedback.md)).
 
 ### What you must not do
 
@@ -140,7 +145,8 @@ converge on its own. Escalate rather than iterate when:
   `--defer` and `--adopt-refuter` all record a *human's* decision in an audit
   ledger and all move the gate; none of them is a way to tidy a report. Present
   the findings and let a human decide — including which ones may be deferred and
-  under what reference.
+  under what reference. You **may** use `feedback add` / `feedback_add` to
+  record your judgment or a skodun product bug without moving the gate.
 - **Never push with `SKODUN_PREPUSH_SKIP=1`** or by disabling the hook to get a
   green run. If the gate refuses, that is the product working.
 - **Never treat `surface` output as a verdict.** It reports history. Only `gate`

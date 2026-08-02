@@ -53,7 +53,7 @@ RUNNING = "running"
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 #: Set to anything other than "0", unset, or blank to ignore `provider_state`
 #: entirely.
@@ -269,6 +269,29 @@ CREATE INDEX IF NOT EXISTS ix_capacity_scope_status
   ON capacity_admissions(resource_class, scope, status, queued_at, id);
 """
 
+# --- v7: agent/human feedback ledger (non-gate) -----------------------------
+#
+# Append-only notes from agents or humans about findings, review quality, or
+# skodun product bugs. Deliberately separate from `triage_events`: feedback
+# never clears the gate. Replay-idempotent (`IF NOT EXISTS`).
+_MIGRATION_V7 = """
+CREATE TABLE IF NOT EXISTS feedback_events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  body TEXT NOT NULL,
+  review_id TEXT,
+  finding_index INTEGER,
+  provider TEXT,
+  repo TEXT,
+  source TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_feedback_at ON feedback_events(at DESC, seq DESC);
+CREATE INDEX IF NOT EXISTS ix_feedback_kind ON feedback_events(kind, at DESC);
+CREATE INDEX IF NOT EXISTS ix_feedback_review ON feedback_events(review_id, seq);
+"""
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -294,6 +317,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (4, _MIGRATION_V4),
     (5, _MIGRATION_V5),
     (6, _MIGRATION_V6),
+    (7, _MIGRATION_V7),
 )
 
 
@@ -1812,3 +1836,73 @@ class Store:
                        ORDER BY reviewed_at DESC LIMIT 1"""
                 ).fetchone()
         return json.loads(row["artifact_json"]) if row else None
+
+    # --- feedback ledger (v7; non-gate) ------------------------------------
+
+    def feedback_append(
+            self, *, at: str, actor: str, kind: str, body: str,
+            review_id: str | None = None,
+            finding_index: int | None = None,
+            provider: str | None = None,
+            repo: str | None = None,
+            source: str | None = None) -> dict:
+        """Append one feedback event. Returns the stored row (with ``seq``).
+
+        Does **not** affect triage or the gate. Callers validate actor/kind/body
+        before this method (see ``skodun.feedback``).
+        """
+        at = _require_ts("at", at)
+        actor = _require_text("actor", actor)
+        kind = _require_text("kind", kind)
+        body = _require_text("body", body)
+        if review_id is not None:
+            review_id = _require_text("review_id", review_id)
+        if finding_index is not None:
+            if (not isinstance(finding_index, int)
+                    or isinstance(finding_index, bool)
+                    or finding_index < 0):
+                raise ValueError(
+                    f"finding_index must be a non-negative int, "
+                    f"got {finding_index!r}")
+        if provider is not None:
+            provider = _require_text("provider", provider)
+        if repo is not None:
+            repo = _require_text("repo", repo)
+        if source is not None:
+            source = _require_text("source", source)
+        cur = self._c.execute(
+            """INSERT INTO feedback_events
+               (at, actor, kind, body, review_id, finding_index,
+                provider, repo, source)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (at, actor, kind, body, review_id, finding_index,
+             provider, repo, source))
+        seq = int(cur.lastrowid)
+        row = self._c.execute(
+            "SELECT * FROM feedback_events WHERE seq=?", (seq,)).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def feedback_list(self, *, kind: str | None = None,
+                      review_id: str | None = None,
+                      limit: int = 50) -> list[dict]:
+        """Newest feedback first. Optional filters on kind and/or review_id."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            limit = 50
+        if limit > 500:
+            limit = 500
+        clauses: list[str] = []
+        args: list = []
+        if kind is not None:
+            clauses.append("kind=?")
+            args.append(_require_text("kind", kind))
+        if review_id is not None:
+            clauses.append("review_id=?")
+            args.append(_require_text("review_id", review_id))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        args.append(limit)
+        rows = self._c.execute(
+            f"SELECT * FROM feedback_events{where}"
+            f" ORDER BY at DESC, seq DESC LIMIT ?",
+            tuple(args)).fetchall()
+        return [dict(r) for r in rows]

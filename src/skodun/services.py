@@ -1127,3 +1127,61 @@ def _pid_is_live_skodun_fg(pid) -> bool:
             and WORKER_RECORD_FLAG in args):
         return False
     return True
+
+
+# --- feedback ledger (non-gate; agents + humans) -----------------------------
+
+
+def svc_feedback_add(
+        store, *, kind, body, actor="agent",
+        review_id=None, finding_index=None, provider=None,
+        repo=None, source=None) -> tuple[int, str]:
+    """Record one feedback note. ``(0, text)`` / ``(1, refused)`` / ``(2, err)``.
+
+    Never clears the gate. Preferred path for agents to record finding
+    judgment or skodun product bugs for later human inspection.
+    """
+    from . import feedback as feedback_mod
+
+    try:
+        row = feedback_mod.record(
+            store,
+            kind=kind,
+            body=body,
+            actor=actor if actor is not None else "agent",
+            review_id=review_id,
+            finding_index=finding_index,
+            provider=provider,
+            repo=repo,
+            source=source or "service",
+        )
+    except feedback_mod.FeedbackError as e:
+        return 1, f"skodun feedback: refused: {e}"
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:
+        return 2, f"skodun feedback: could not record: {e!r}"
+    return 0, (
+        f"skodun feedback: recorded #{row['seq']} "
+        f"kind={row['kind']} actor={row['actor']}"
+    )
+
+
+def svc_feedback_list(
+        store, *, kind=None, review_id=None, limit=50) -> tuple[int, str]:
+    """List feedback newest first. ``(0, text)`` or ``(2, err)``."""
+    from . import feedback as feedback_mod
+
+    try:
+        rows = feedback_mod.list_feedback(
+            store, kind=kind, review_id=review_id, limit=limit)
+    except feedback_mod.FeedbackError as e:
+        return 1, f"skodun feedback: refused: {e}"
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:
+        return 2, f"skodun feedback: could not list: {e!r}"
+    if not rows:
+        return 0, "skodun feedback: (none)"
+    lines = [feedback_mod.format_row(r) for r in rows]
+    return 0, "\n".join(lines)

@@ -210,7 +210,7 @@ cover **that worktree’s** diff identity; FG capacity for those worktrees is
 **pooled per repository** (see concurrency below). Full scenario table:
 [`mcp-review-topology.md`](../examples/fragments/mcp-review-topology.md).
 
-### Tools (today) — 11 tools, 2 prompts
+### Tools (today) — 13 tools, 2 prompts
 
 | MCP tool | CLI analogue | Notes |
 |---|---|---|
@@ -221,10 +221,12 @@ cover **that worktree’s** diff identity; FG capacity for those worktrees is
 | `review_status` | `skodun review-status` | Lifecycle observe; not a gate |
 | `review_cancel` | `skodun review-cancel` | Cancel in-flight by id |
 | `triage_list` | `triage --list` | Needs `review_id` |
-| `triage_dismiss` | default triage dismiss | `review_id`, `index`, `reason` |
+| `triage_dismiss` | default triage dismiss | `review_id`, `index`, `reason` — **human** gate decision |
 | `triage_defer` | `triage --defer` | + mandatory `tracking_ref` |
 | `triage_reopen` | `triage --reopen` | |
 | `adopt_refuter` | `triage --adopt-refuter` | |
+| `feedback_add` | `skodun feedback add` | Non-gate agent/human judgment or product bug note |
+| `feedback_list` | `skodun feedback list` | Inspect feedback for later issues |
 
 **Not** MCP tools (shell / human ops): `doctor`, `providers`, `retain`,
 `schedule`, `install-hooks`, `dispatch`, `worker`, `import-legacy`,
@@ -329,6 +331,7 @@ skodun surface --repo "$ROOT"
 | [`examples/fragments/mcp-review-topology.md`](../examples/fragments/mcp-review-topology.md) | MCP process vs repo vs worktree |
 | [`examples/fragments/concurrency.md`](../examples/fragments/concurrency.md) | Multi-agent / multi-provider capacity |
 | [`examples/fragments/mcp-server-config.md`](../examples/fragments/mcp-server-config.md) | Operator MCP JSON |
+| [`examples/fragments/feedback.md`](../examples/fragments/feedback.md) | Agent judgment + product-bug feedback (non-gate) |
 
 Edit bracketed project bits (tracker URL for deferrals, etc.).
 
