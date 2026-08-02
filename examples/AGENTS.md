@@ -38,11 +38,20 @@ trustworthy review must cover it.
   review.
 - `skodun surface` — background rounds nobody has seen yet (from the pre-push
   hook). Reports history; it never certifies the current change.
+- `skodun doctor` — install/MCP readiness (config, store schema, adapters,
+  binaries). Read-only; does not move the gate. **CLI-only** (not an MCP tool).
+- `skodun retain [--dry-run]` — prune worker logs per `[retention]`. Never
+  deletes gate artifacts. **CLI-only.**
+- `skodun schedule install` — write launchd plists from `[[schedule.jobs]]`.
+  No scheduler runs inside `skodun mcp`. **CLI-only** (macOS launchd).
 
-If skodun is wired in over MCP, the same operations are the `gate`, `review`,
-`log`, `surface`, `triage_list`, `triage_dismiss`, `adopt_refuter`,
+If skodun is wired in over MCP, the review-loop operations are the `gate`,
+`review`, `log`, `surface`, `triage_list`, `triage_dismiss`, `adopt_refuter`,
 `triage_reopen` and `triage_defer` tools, with identical wording and identical
-refusals. There is no `deferrals` tool: reviewing the backlog is a human's job.
+refusals via the shared service path. There is no `deferrals`, `doctor`,
+`retain`, or `schedule` tool: backlog review is a human's job, and ops verbs
+are shell-out CLI commands so the stdio MCP server stays free of schedulers and
+mutators that are not part of the agent review loop.
 
 ### The loop
 
@@ -117,8 +126,22 @@ converge on its own. Escalate rather than iterate when:
 - **Never treat `surface` output as a verdict.** It reports history. Only `gate`
   answers whether the current change is covered.
 
+### Providers, R2/R3 presentation, ops
+
+- Registered providers include `xai` (grok), `openai` (codex), `google` (agy),
+  and **`junie`** (macOS-only, confined empty capsule + Seatbelt). Off macOS a
+  junie reviewer is `unavailable` and the chain advances.
+- `triage --list` / `log` / `surface` may show **round ordinal** and **churn**
+  marks (findings in files changed since the previous trustworthy review). That
+  is presentation only — it never narrows the model prompt or the gate unit of
+  trust (still the full outgoing diff).
+- If install looks broken, run `skodun doctor` before inventing a second review
+  system. For disk growth of worker logs, use `skodun retain` (or a launchd job
+  from `skodun schedule install`).
+
 ### If skodun is unavailable
 
 A missing or unauthenticated model CLI makes reviews fail, and a failed review
-is not a passed one — the gate answers `2` and the change is not covered. Say so
-and stop; do not work around it.
+is not a passed one — the gate answers `2` and the change is not covered. Run
+`skodun doctor` to see which adapter/binary/config is wrong. Say so and stop;
+do not work around it.

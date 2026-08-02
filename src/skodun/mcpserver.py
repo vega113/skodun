@@ -819,6 +819,11 @@ review. Tell me to decide rather than starting another round when a round \
 raises a must-fix finding in code the previous round's fix wrote, when fixing \
 a finding would touch more code than the change under review, or when you \
 think a finding is wrong -- escalate, do not iterate.
+
+Install/ops (doctor, retain, schedule) are CLI-only: if review cannot start, \
+ask the operator to run `skodun doctor` in a shell. Do not invent a second \
+review system. Round/churn annotations on triage list and log are presentation \
+only; the gate still keys on the full outgoing diff.
 """
 
 _GATE_CHECK_TEXT = """\
