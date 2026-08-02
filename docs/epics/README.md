@@ -1,11 +1,18 @@
 # Product epics (post #23)
 
-| Epic | Issue | Seed |
-|---|---|---|
-| **S1** Status + cancel | [#41](https://github.com/vega113/skodun/issues/41) | [s1-status-cancel.md](s1-status-cancel.md) |
-| **S3** Fair review capacity | [#42](https://github.com/vega113/skodun/issues/42) | [s3-fair-capacity.md](s3-fair-capacity.md) |
+## Done definition (agents)
 
-Children (initial):
+**Epic / issue complete = merged to `main` + GitHub issues closed.**  
+Not: tests pass only on a branch. See repository root [`AGENTS.md`](../../AGENTS.md).
+
+## Status
+
+| Epic | Issue | Seed | Status |
+|---|---|---|---|
+| **S1** Status + cancel | [#41](https://github.com/vega113/skodun/issues/41) | [s1-status-cancel.md](s1-status-cancel.md) | **Shipped** — [PR #49](https://github.com/vega113/skodun/pull/49) |
+| **S3** Fair review capacity | [#42](https://github.com/vega113/skodun/issues/42) | [s3-fair-capacity.md](s3-fair-capacity.md) | **Shipped** — [PR #50](https://github.com/vega113/skodun/pull/50) |
+
+Children (closed with parents):
 
 | Issue | Parent |
 |---|---|
