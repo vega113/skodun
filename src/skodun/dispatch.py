@@ -1450,7 +1450,8 @@ if command -v mktemp >/dev/null 2>&1; then
 fi
 if [ -z "$_sk_tmp" ]; then
   # No temp file means stdin cannot be shared. The chained hook is the one that
-  # can legitimately BLOCK the push, so it gets the bytes and skodun is skipped.
+  # can legitimately BLOCK the push, so it gets the live bytes and skodun is
+  # skipped. (This path has not consumed stdin yet.)
   echo "skodun: could not buffer the pre-push ref list; skipping the review" >&2
   if [ -n "$SKODUN_SHIM_CHAIN" ] && [ -x "$SKODUN_SHIM_CHAIN" ]; then
     exec "$SKODUN_SHIM_CHAIN" "$@"
@@ -1458,7 +1459,18 @@ if [ -z "$_sk_tmp" ]; then
   exit 0
 fi
 trap 'rm -f "$_sk_tmp"' EXIT HUP INT TERM
-cat > "$_sk_tmp"
+# Buffer must succeed completely. A partial/truncated write would feed the
+# chained foreign hook a wrong ref list (inventing a push decision). Fail
+# closed: never chain or dispatch from an incomplete buffer. Once `cat`
+# starts, live stdin is gone — if a chain exists we must refuse the push
+# rather than run it on truncated bytes; if not, skip skodun and exit 0.
+if ! cat > "$_sk_tmp"; then
+  echo "skodun: failed to buffer the pre-push ref list; refusing truncated stdin" >&2
+  if [ -n "$SKODUN_SHIM_CHAIN" ]; then
+    exit 1
+  fi
+  exit 0
+fi
 
 if [ -n "$SKODUN_SHIM_CHAIN" ] && [ -x "$SKODUN_SHIM_CHAIN" ]; then
   "$SKODUN_SHIM_CHAIN" "$@" < "$_sk_tmp" || exit $?

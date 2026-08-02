@@ -689,12 +689,7 @@ property everything here is arranged around — but each is a real rough edge.
   beside the store (`<db>.logs/<record-id>.log`) and nothing deletes them. They
   are small, but they accumulate for as long as you use skodun. Retention is a
   later phase; deleting them by hand is safe (nothing reads them back).
-- **The pre-push shim does not check that buffering stdin succeeded.** It tees
-  git's ref list to a temp file so the chained hook and skodun read the same
-  bytes; if that write fails (a full disk), the chained hook gets a truncated or
-  empty ref list rather than the live stdin. Only the "no temp file at all" case
-  is currently handled — that one correctly skips skodun and hands the chained
-  hook the original stdin.
+
 - **Round context and churn attribution are presentation-only.** `skodun triage
   --list` and `skodun log` report which review round this is on the branch and
   whether findings land in files changed since the previous trustworthy review
