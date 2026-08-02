@@ -54,7 +54,7 @@ python3 -m pip install -e .          # installs the `skodun` console script
 skodun --version                     # should match pyproject.toml (e.g. 0.4.0)
 ```
 
-Without an install, you can still run:
+Without an install, you can still run for many commands:
 
 ```bash
 cd /path/to/skodun
@@ -63,6 +63,14 @@ PYTHONPATH=src python3 -m skodun --version
 #   claude mcp add skodun -- python3 -m skodun mcp
 # with cwd/env so `python3 -m skodun` resolves (see README MCP section).
 ```
+
+**Prefer `pip install -e .` (or pipx) for real reviews**, especially **junie**.
+The junie path spawns an isolated Python child (`python -I`); that mode ignores
+ambient `PYTHONPATH`. skodun re-injects its package root into that child, but
+hosts that pin another interpreter still need skodun **installed** on that
+interpreter. Instant junie failures with “no parseable review” almost always
+mean install/import mismatch — see
+[`examples/fragments/review-troubleshooting.md`](../examples/fragments/review-troubleshooting.md).
 
 There is no requirement that skodun live *inside* the client monorepo.
 
@@ -74,7 +82,9 @@ skodun providers --repo /path/to/your/project
 ```
 
 `doctor` is read-only. Fix missing binaries / config before expecting `review`
-to succeed.
+to succeed. **`providers` lists adapters** (xai/openai/google/junie), not your
+named `[[reviewers]]` table — configure reviewers in TOML; pass
+`--reviewer <name>` / MCP `reviewer` to select one.
 
 ### Config
 
@@ -291,6 +301,11 @@ Do not conflate layers (see also
 6. Providers are a **fallback chain**, not parallel voting on one diff. If the
    **entire** finder chain is known unavailable via `provider_state`, the run
    fails fast (exit 2) without burning the full admission wait.
+7. **Skeptic on a clean finder** may call your `role = "refuter"` provider. If
+   that provider is on quota, the extra pass **demotes** an otherwise clean
+   review. Temporarily set `SKODUN_SKEPTIC_PASS=0` / `SKODUN_REFUTER_PASS=0`, or
+   point refuter at a healthy provider. Details:
+   [`review-troubleshooting.md`](../examples/fragments/review-troubleshooting.md).
 
 ---
 
@@ -332,6 +347,7 @@ skodun surface --repo "$ROOT"
 | [`examples/fragments/concurrency.md`](../examples/fragments/concurrency.md) | Multi-agent / multi-provider capacity |
 | [`examples/fragments/mcp-server-config.md`](../examples/fragments/mcp-server-config.md) | Operator MCP JSON |
 | [`examples/fragments/feedback.md`](../examples/fragments/feedback.md) | Agent judgment + product-bug feedback (non-gate) |
+| [`examples/fragments/review-troubleshooting.md`](../examples/fragments/review-troubleshooting.md) | Failed reviews, junie, skeptic/quota, reviewers vs providers |
 
 Edit bracketed project bits (tracker URL for deferrals, etc.).
 

@@ -88,7 +88,10 @@ def test_build_cmd_uses_isolated_python_module_runner(tmp_path):
     cmd = JunieAdapter().build_cmd(prompt, R, D, tmp_path)
     assert cmd[0] == sys.executable
     assert "-I" in cmd
-    assert cmd[cmd.index("-m") + 1] == "skodun.adapters.junie_runner"
+    # Bootstrap re-injects the skodun import root under -I (which drops
+    # PYTHONPATH). Still isolated; not a bare ambient -m without path fix.
+    assert "-c" in cmd
+    assert "junie_runner" in cmd[cmd.index("-c") + 1]
     assert "--prompt" in cmd
     assert str(prompt) in cmd
     assert "--model" in cmd and MODEL in cmd
@@ -97,6 +100,25 @@ def test_build_cmd_uses_isolated_python_module_runner(tmp_path):
     assert "review this change" not in cmd
     joined = " ".join(cmd)
     assert "review this change" not in joined
+
+
+def test_classify_modulenotfound_is_unavailable_not_ok():
+    """PYTHONPATH-only parent + python -I child used to look like empty ok."""
+    stderr = (
+        b"Error while finding module specification for "
+        b"'skodun.adapters.junie_runner' "
+        b"(ModuleNotFoundError: No module named 'skodun')\n"
+    )
+    v = JunieAdapter().classify(1, b"", stderr)
+    assert v.kind == "unavailable"
+    assert v.category == "other"
+    assert "skodun" in v.detail.lower()
+
+
+def test_classify_empty_stdout_nonzero_rc_is_unavailable():
+    v = JunieAdapter().classify(1, b"", b"")
+    assert v.kind == "unavailable"
+    assert "no review payload" in v.detail
 
 
 def test_build_cmd_does_not_embed_prompt_body(tmp_path):

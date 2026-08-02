@@ -91,6 +91,12 @@ _INVOCATION_SIGNALS: tuple[bytes, ...] = (
     b"managed junie shim",
     b"could not write sandbox profile",
     b"spawn failed",
+    # Outer runner is `python -I -m skodun.adapters.junie_runner`. When clients
+    # run skodun only via PYTHONPATH (no install), -I hides PYTHONPATH and the
+    # child fails immediately — must not look like a clean empty parse.
+    b"no module named 'skodun'",
+    b"no module named skodun",
+    b"modulenotfounderror",
 )
 
 
@@ -101,6 +107,35 @@ def resolve_junie_bin() -> str:
     is not a path anyone meant.
     """
     return os.environ.get("SKODUN_JUNIE_BIN") or "junie"
+
+
+def _import_root_for_isolated_runner() -> str:
+    """Directory to put on ``sys.path`` so ``import skodun`` works under ``-I``.
+
+    ``…/src`` for a source checkout / editable layout; the parent of the
+    ``skodun`` package for a normal install (site-packages).
+    """
+    # adapters/junie.py → package dir → parent on sys.path
+    pkg_dir = Path(__file__).resolve().parents[1]
+    return str(pkg_dir.parent)
+
+
+def _isolated_runner_argv(runner_flags: list[str]) -> list[str]:
+    """``python -I`` + bootstrap that imports ``junie_runner`` with a fixed path.
+
+    Avoids plain ``-m skodun.adapters.junie_runner`` failing when the parent
+    process only had skodun via ``PYTHONPATH`` (which ``-I`` discards).
+    """
+    root = _import_root_for_isolated_runner()
+    # sys.argv after -c is ['-c', ...flags]; rewrite before runpy so argparse
+    # in junie_runner sees a normal module argv.
+    bootstrap = (
+        "import runpy, sys; "
+        f"sys.path.insert(0, {root!r}); "
+        "sys.argv = ['skodun.adapters.junie_runner'] + sys.argv[1:]; "
+        "runpy.run_module('skodun.adapters.junie_runner', run_name='__main__')"
+    )
+    return [sys.executable, "-I", "-c", bootstrap, *runner_flags]
 
 
 class JunieAdapter:
@@ -151,11 +186,13 @@ class JunieAdapter:
             raise ValueError(f"adapter {self.name!r}: model is required")
 
         timeout_ms = max(1, int(d.timeout_sec) * 1000)
-        cmd = [
-            sys.executable,
-            "-I",
-            "-m",
-            "skodun.adapters.junie_runner",
+        # Isolated interpreter (-I) so user-site / ambient PYTHONPATH cannot
+        # leak into the confined runner. -I also *ignores* PYTHONPATH, so a
+        # client that only set PYTHONPATH=src (no install) would fail with
+        # ModuleNotFoundError unless we re-inject the import root that loaded
+        # this adapter. When skodun is properly installed, that root is already
+        # on the isolated interpreter's site path and the inject is harmless.
+        runner_flags = [
             "--prompt",
             str(prompt_file),
             "--binary",
@@ -168,8 +205,8 @@ class JunieAdapter:
             contract.json_schema,
         ]
         if cli_effort is not None:
-            cmd.extend(["--effort", cli_effort])
-        return cmd
+            runner_flags.extend(["--effort", cli_effort])
+        return _isolated_runner_argv(runner_flags)
 
     def parse(
         self,
@@ -205,7 +242,8 @@ class JunieAdapter:
                 f"binary not found (rc {UNAVAILABLE_RC})",
             )
         payload = _extract(stdout, contract.eligible)
-        if not _ask(contract.validate, payload):
+        parse_ok = _ask(contract.validate, payload)
+        if not parse_ok:
             diagnostics = stderr.lower()
             for category, signals in (
                 ("auth", _AUTH_SIGNALS),
@@ -222,11 +260,22 @@ class JunieAdapter:
                             f"({sig.decode()}) with no usable "
                             f"{contract.name} payload",
                         )
-        degraded, reason = _detect_degraded(
-            stderr, parse_ok=_ask(contract.validate, payload)
-        )
+        # Degradation (truncated / refused envelope) is not unavailability —
+        # check before inventing an empty-rc unavailable.
+        degraded, reason = _detect_degraded(stderr, parse_ok=parse_ok)
         if degraded:
             return ClassifyResult("degraded", "", reason)
+        if (not parse_ok and rc != 0
+                and not (stdout or b"").strip()):
+            # Hard fail with silence (e.g. old ModuleNotFoundError paths with
+            # empty stderr capture): hop/fail closed, do not look "ok".
+            return ClassifyResult(
+                "unavailable",
+                "other",
+                f"junie runner exited rc={rc} with no review payload "
+                f"(install skodun into this Python, or see "
+                f"examples/fragments/review-troubleshooting.md)",
+            )
         return ClassifyResult("ok", "", "")
 
 

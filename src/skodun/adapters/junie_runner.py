@@ -1,7 +1,9 @@
 """Outer process: stage a junie capsule, spawn confined junie, normalize output.
 
-The chain's runner spawns this module (`python -I -m skodun.adapters.junie_runner`)
-as a normal child. On success it prints a single REVIEW_CONTRACT- or
+The chain's runner spawns this module via an isolated interpreter
+(``python -I -c`` bootstrap that ``runpy``-loads this module) as a normal
+child. The bootstrap re-injects the skodun import root because ``-I`` drops
+``PYTHONPATH``. On success it prints a single REVIEW_CONTRACT- or
 REFUTER_CONTRACT-shaped JSON object on stdout; on failure it prints a
 sanitized reason on stderr and exits non-zero. That keeps chain/runner free
 of junie-specific knowledge.
