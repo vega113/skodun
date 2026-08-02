@@ -2463,6 +2463,49 @@ def test_the_shim_leaves_no_temp_file_behind(tmp_path, hermetic_git):
     assert after <= before, "the shim's buffered ref list was not cleaned up"
 
 
+def test_shim_buffer_write_failure_with_chain_fails_closed_not_truncated(
+        tmp_path, hermetic_git):
+    """If teeing the ref list fails, never feed a truncated file to a foreign hook.
+
+    Simulate a full-disk-style failure: the temp file path is made unwritable
+    after mktemp by pointing the shim's write at a directory path (so `cat >`
+    fails). The chained hook must NOT run, and the shim must exit non-zero so
+    the push is not approved on incomplete stdin.
+    """
+    seen = tmp_path / "foreign_ran"
+    foreign = ("#!/bin/sh\n"
+               f"echo ran > {seen}\n"
+               "exit 0\n")
+    repo, hook = _shim_repo(tmp_path, foreign=foreign, force=True)
+    text = hook.read_text(encoding="utf-8")
+    # Force `cat > "$_sk_tmp"` to fail: replace the buffer write with a path
+    # that cannot be opened for writing (a directory).
+    bad = tmp_path / "not-a-file"
+    bad.mkdir()
+    text = text.replace('cat > "$_sk_tmp"', f'cat > "{bad}"')
+    hook.write_text(text, encoding="utf-8")
+    cp = _run_hook(hook)
+    assert cp.returncode == 1, (cp.returncode, cp.stderr)
+    assert b"refusing truncated stdin" in cp.stderr
+    assert not seen.exists(), "chained hook must not run on a failed buffer"
+    assert not (tmp_path / "dispatch_argv.txt").exists()
+
+
+def test_shim_buffer_write_failure_without_chain_skips_skodun_exits_0(
+        tmp_path, hermetic_git):
+    """No foreign hook: a failed buffer must skip skodun, not invent a block."""
+    repo, hook = _shim_repo(tmp_path)
+    text = hook.read_text(encoding="utf-8")
+    bad = tmp_path / "not-a-file"
+    bad.mkdir()
+    text = text.replace('cat > "$_sk_tmp"', f'cat > "{bad}"')
+    hook.write_text(text, encoding="utf-8")
+    cp = _run_hook(hook)
+    assert cp.returncode == 0, (cp.returncode, cp.stderr)
+    assert b"refusing truncated stdin" in cp.stderr
+    assert not (tmp_path / "dispatch_argv.txt").exists()
+
+
 def test_the_shim_is_syntactically_valid_posix_sh(tmp_path):
     script = tmp_path / "shim.sh"
     script.write_text(shim_text("/some/where/pre-push.pre-skodun",
