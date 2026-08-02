@@ -3,22 +3,38 @@
 Use on machines with **several agents** or **several providers** (grok / agy /
 junie / codex).
 
+**Definitions first** (MCP process vs repo vs worktree):  
+[`mcp-review-topology.md`](mcp-review-topology.md). Capacity below is **not**
+“slots on this MCP server.”
+
 ---
 
 ## skodun concurrency (read this)
+
+### Three layers (do not conflate)
+
+| Layer | Scope | Limit |
+|---|---|---|
+| MCP process | One `skodun mcp` process | **1** in-flight `review` tool call (**refuse-if-busy**, not queued) |
+| `review-fg` | **Per repository** (`git_common_dir`; all worktrees of that clone share it) | `SKODUN_REVIEW_FG_CAPACITY` (default **1**) |
+| `provider:<id>` | **Store-wide** (all repos on that DB) | `SKODUN_PROVIDER_MAX_IN_FLIGHT` (default **1** per provider) |
+
+Env knobs are process-wide **defaults**; **counting** for FG is per repo, for
+providers is global to the store. “3 providers × 2 = 6 concurrent reviews” is
+**not** how skodun multiplies slots.
 
 ### What is concurrent today
 
 | Resource | Concurrency |
 |---|---|
 | Foreground `review` (CLI) | **FIFO `review-fg` capacity** (default **1** per repository). Default **dual-hold** also takes the legacy `grok-reviews-foreground.lock` (effective single physical mutex with tubescribes). Waiters are ordered; bounded wait then exit `3`. Progress reports **queue position**, **remaining wait budget**, and **ETA** (`eta≈Xs`) when ≥3 terminal samples exist. |
-| MCP `review` | **One per MCP server process.** Second call is **refused** (`"review already in flight"`), not queued (S3 choice: stale tree risk). |
+| MCP `review` | **One per MCP server process.** Second call is **refused** (`"review already in flight"`), not queued (S3 choice: stale tree risk). Same process can still target many repos/worktrees **sequentially** via `repo`. |
 | Provider adapters | **Sequential fallback chain** + per-provider **`provider:<id>` max_in_flight** (default **1**). Not parallel multi-provider voting on one diff. |
 | Background pre-push workers | One **running** reservation per branch+repo; newer push **supersedes**. |
 
 Having multiple providers configured does **not** mean N simultaneous reviews
 of the same diff. Multi-slot FG is for **independent** reviews (separate
-processes / worktrees).
+processes / worktrees), subject to the layers above.
 
 ### Fair capacity (epic S3 — shipped) + multi-slot / providers (S4)
 

@@ -9,8 +9,10 @@ wrong without being told — **when to stop reviewing**.
 Everything here is behaviour skodun already enforces or that its design
 documents; nothing needs a plugin.
 
-**Smaller paste-ins** (MCP-only loop, concurrency, operator MCP JSON):
-[`fragments/`](fragments/).  
+**Smaller paste-ins** (MCP-only loop, MCP topology, concurrency, operator MCP
+JSON): [`fragments/`](fragments/) — start with
+[`fragments/mcp-review-topology.md`](fragments/mcp-review-topology.md) if agents
+confuse MCP process, repository, and worktree.  
 **Full client integration** (install, MCP, gate wiring):  
 [`../docs/integrate-external-project.md`](../docs/integrate-external-project.md).
 
