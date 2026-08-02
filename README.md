@@ -688,7 +688,6 @@ property everything here is arranged around — but each is a real rough edge.
   `skodun surface`. The alternative was to guess which tree an old row belonged
   to, and a wrong guess retires that tree's round and kills its worker. See "One
   store per repository, or one store for all of them" above.
-
 - **Round context and churn attribution are presentation-only.** `skodun triage
   --list` and `skodun log` report which review round this is on the branch and
   whether findings land in files changed since the previous trustworthy review
@@ -698,6 +697,13 @@ property everything here is arranged around — but each is a real rough edge.
   any other platform a junie reviewer classifies `unavailable` and the chain
   advances (or the review fails closed if junie is alone). There is no
   unconfined soft fallback.
+- **Ops verbs `doctor` / `retain` / `schedule` are CLI-only.** The stdio MCP
+  server exposes the review loop (`gate`, `review`, triage, `log`, `surface`)
+  through the shared service path. Maintenance commands stay out of MCP so no
+  scheduler runs inside the MCP process (see `docs/skill-decision-epic-23.md`).
+
+Agent protocol template: `examples/AGENTS.md`. Epic close-out start prompt:
+`docs/agent-start-epic-23.md`.
 
 ## Requirements
 
