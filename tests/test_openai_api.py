@@ -173,6 +173,7 @@ def test_call_chat_completions_mocked(monkeypatch):
 
 def test_runner_missing_key(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("SKODUN_OPENAI_API_KEY", raising=False)
     p = tmp_path / "p.txt"
     p.write_text("x", encoding="utf-8")
     rc = runner_main([
@@ -184,3 +185,56 @@ def test_runner_missing_key(tmp_path, monkeypatch, capsys):
     assert rc != 0
     err = capsys.readouterr().err
     assert "OPENAI_API_KEY" in err or "api key" in err.lower()
+
+
+def test_runner_accepts_skodun_openai_api_key_alias(tmp_path, monkeypatch, capsys):
+    """BYOK alias for MCP env blocks that prefer a skodun-prefixed name."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("SKODUN_OPENAI_API_KEY", "sk-test-alias-not-used-live")
+
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return json.dumps({
+                "id": "chatcmpl-alias",
+                "choices": [{
+                    "message": {
+                        "content": json.dumps({
+                            "summary": "alias key worked",
+                            "findings": [],
+                        }),
+                    },
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2,
+                          "total_tokens": 5},
+            }).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(
+        "skodun.adapters.openai_api_runner.urllib.request.urlopen",
+        lambda *a, **k: _Resp())
+    p = tmp_path / "p.txt"
+    p.write_text("review", encoding="utf-8")
+    schema = json.dumps({
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "findings": {"type": "array"},
+        },
+        "required": ["summary", "findings"],
+    })
+    rc = runner_main([
+        "--prompt", str(p),
+        "--model", MODEL,
+        "--schema", schema,
+        "--timeout-ms", "5000",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "alias key worked" in out

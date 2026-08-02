@@ -2,7 +2,14 @@
 
 Provider id: ``openai-api`` (distinct from ``openai`` / Codex subscription CLI).
 
-Requires ``OPENAI_API_KEY``. Optional:
+Requires an API key in the **process environment** (never in repo TOML):
+
+* ``OPENAI_API_KEY`` (standard), or
+* ``SKODUN_OPENAI_API_KEY`` (skodun-namespaced alias, useful in MCP ``env`` blocks)
+
+Clients bring their own key via shell export or MCP server ``env`` (BYOK).
+
+Optional:
 
 * ``SKODUN_OPENAI_API_BASE`` — endpoint override (tests / proxies)
 * ``SKODUN_OPENAI_API_SPEND_LIMIT_USD`` — daily USD ceiling (default 10)
@@ -32,6 +39,8 @@ from .base import (
 
 PROVIDER_ID = "openai-api"
 API_KEY_ENV = "OPENAI_API_KEY"
+#: Alias for hosts that prefer a skodun-prefixed secret name in MCP env.
+API_KEY_ENV_ALT = "SKODUN_OPENAI_API_KEY"
 USAGE_PREFIX = "SKODUN_API_USAGE "
 
 _EFFORT_MAP = {
