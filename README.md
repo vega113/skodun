@@ -704,9 +704,12 @@ property everything here is arranged around — but each is a real rough edge.
 
 Agent protocol template: `examples/AGENTS.md`. Pasteable fragments:
 `examples/fragments/`. **Client MCP + gate wiring (start here for other
-repos):** [`docs/integrate-external-project.md`](docs/integrate-external-project.md).
+repos):** [`docs/integrate-external-project.md`](docs/integrate-external-project.md).  
+**Legacy scripts → skodun cutover checklist:**
+[`docs/cutover-from-legacy-review.md`](docs/cutover-from-legacy-review.md)
+(skodun readiness supersession stamp 2026-08-02).  
 Epic close-out start prompt: `docs/agent-start-epic-23.md`. Post-#23 product
-epics (status/cancel, fair capacity): `docs/epics/`.
+epics (status/cancel, fair capacity — shipped): `docs/epics/`.
 
 ## Requirements
 

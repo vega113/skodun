@@ -153,6 +153,7 @@ Do not turn this file into a ship log or issue index (IDs rot). Use:
 | Designs | `docs/superpowers/specs/` |
 | Epic seeds | `docs/epics/` |
 | Client integrate | `docs/integrate-external-project.md` |
+| Legacy → skodun cutover | `docs/cutover-from-legacy-review.md` |
 | Client agent paste | `examples/AGENTS.md`, `examples/fragments/` |
 | Operator/human detail | `README.md` |
 | Live issue/PR status | GitHub |
