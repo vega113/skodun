@@ -9,6 +9,11 @@ wrong without being told — **when to stop reviewing**.
 Everything here is behaviour skodun already enforces or that its design
 documents; nothing needs a plugin.
 
+**Smaller paste-ins** (MCP-only loop, concurrency, operator MCP JSON):
+[`fragments/`](fragments/).  
+**Full client integration** (install, MCP, gate wiring):  
+[`../docs/integrate-external-project.md`](../docs/integrate-external-project.md).
+
 ---
 
 ## Code review with skodun
@@ -131,6 +136,9 @@ converge on its own. Escalate rather than iterate when:
 - Registered providers include `xai` (grok), `openai` (codex), `google` (agy),
   and **`junie`** (macOS-only, confined empty capsule + Seatbelt). Off macOS a
   junie reviewer is `unavailable` and the chain advances.
+- Multiple providers are a **fallback chain**, not parallel review slots. Prefer
+  **one** finder chain → gate. Do not also run legacy grok-review scripts and
+  every cloud bot for ordinary changes unless policy says so.
 - `triage --list` / `log` / `surface` may show **round ordinal** and **churn**
   marks (findings in files changed since the previous trustworthy review). That
   is presentation only — it never narrows the model prompt or the gate unit of
@@ -138,6 +146,15 @@ converge on its own. Escalate rather than iterate when:
 - If install looks broken, run `skodun doctor` before inventing a second review
   system. For disk growth of worker logs, use `skodun retain` (or a launchd job
   from `skodun schedule install`).
+
+### Concurrency (today)
+
+- **One** foreground review per repository (repo lock). CLI waiters may exit `3`.
+- **One** MCP `review` per server process; a second call is refused
+  (`review already in flight`), not queued.
+- Do **not** burn agent turns polling every 30–60s. Wait outside the model, then
+  call `gate` / `log` / `surface`.
+- Deeper notes: [`fragments/concurrency.md`](fragments/concurrency.md).
 
 ### If skodun is unavailable
 
