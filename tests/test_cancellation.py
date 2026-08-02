@@ -488,7 +488,7 @@ def test_cancellation_during_an_extra_pass_never_finalizes_the_primary(tmp_path,
     # The record on disk is the `running` shell the run persisted before the
     # first model call, demoted -- the foreground saves the finished record ONCE,
     # at the end, and that save never happened.
-    assert rec["failure_reason"] == pipeline.UNFINISHED_REASON, rec
+    assert rec["failure_reason"] == pipeline.UNFINISHED_CANCEL_REASON, rec
     _wait_for(lambda: not _group_alive(pgid), timeout=30,
               what="the skeptic provider's process group to die")
 
@@ -517,7 +517,7 @@ def test_cancellation_during_the_refuter_pass_never_finalizes_the_primary(
     # The finder answered on xai and the refuter was under way on openai: this is
     # the refuter window, not an earlier failure.
     assert _calls(tmp_path) == ["grok", "codex"], _calls(tmp_path)
-    assert rec["failure_reason"] == pipeline.UNFINISHED_REASON, rec
+    assert rec["failure_reason"] == pipeline.UNFINISHED_CANCEL_REASON, rec
     _wait_for(lambda: not _group_alive(pgid), timeout=30,
               what="the refuter provider's process group to die")
 
@@ -668,11 +668,14 @@ def test_a_cancelled_review_never_satisfies_the_gate(tmp_path):
 # ==========================================================================
 
 def test_run_review_without_a_token_is_the_shipped_call(tmp_path, monkeypatch):
-    """`cancel=None` must not even add a keyword to the calls below it.
+    """`cancel=None` at the lock still omits the keyword; the chain always gets one.
 
-    `_run_chain` and `_acquire_fg_lock` are monkeypatched BY NAME all over the
-    suite, against the shipped signatures. `pipeline._cancel_kw` is what keeps
-    those stand-ins working, and this is the test that says so.
+    `_acquire_fg_lock` is spied by name with the shipped signature, so a caller
+    that did not pass a token must still call it without `cancel=`. After the
+    lock, S1 synthesises an Event so cancel-by-id can reach the provider
+    watchdog -- so `_run_chain` always sees `cancel` once under the lock.
+    `pipeline._cancel_kw` is still the seam that keeps those two postures
+    distinct.
     """
     seen: dict = {}
     real_chain = pipeline._run_chain
@@ -693,7 +696,7 @@ def test_run_review_without_a_token_is_the_shipped_call(tmp_path, monkeypatch):
 
     run_review(repo, load_config(repo), _store(tmp_path))
 
-    assert "cancel" not in seen["chain_kw"], seen
+    assert "cancel" in seen["chain_kw"], seen
     assert "cancel" not in seen["lock_kw"], seen
     assert pipeline._cancel_kw(None) == {}
     token = threading.Event()

@@ -17,21 +17,21 @@ has SIGTERM → cancel token; FG/MCP must match that product contract.
 
 ## Done when
 
-- [ ] CLI: `skodun review-status` (or `skodun status`) by `review-id` and/or
+- [x] CLI: `skodun review-status` (or `skodun status`) by `review-id` and/or
       “current for `--repo`”
-- [ ] CLI: `skodun review-cancel <id>` (or `skodun cancel`)
-- [ ] MCP tools: `review_status`, `review_cancel` (read/mutate only in-flight /
+- [x] CLI: `skodun review-cancel <id>` (or `skodun cancel`)
+- [x] MCP tools: `review_status`, `review_cancel` (read/mutate only in-flight /
       terminal metadata — not a second gate)
-- [ ] Cancel: sets cancel token, terminates provider process group, durable
+- [x] Cancel: sets cancel token, terminates provider process group, durable
       terminal record (`cancelled` / failed with reason), releases FG lock
-- [ ] Status reports: `queued|running|cancelled|failed|clean|findings` (+ ages,
+- [x] Status reports: `queued|running|cancelled|failed|clean|findings` (+ ages,
       provider, model when known)
-- [ ] Stale recovery for FG `running` rows aligned with prepush `recover_stale`
-- [ ] Tests: hermetic cancel mid-fake-provider; status after terminal; MCP parity
+- [x] Stale recovery for FG `running` rows aligned with prepush `recover_stale`
+- [x] Tests: hermetic cancel mid-fake-provider; status after terminal; MCP parity
       via `services`
-- [ ] Docs: `examples/AGENTS.md` + `examples/fragments/concurrency.md` +
+- [x] Docs: `examples/AGENTS.md` + `examples/fragments/concurrency.md` +
       `docs/integrate-external-project.md` updated for shipped verbs
-- [ ] `gate.py` / `trust.py` unchanged unless owner-approved pin change
+- [x] `gate.py` / `trust.py` unchanged unless owner-approved pin change
 
 ## Non-goals
 

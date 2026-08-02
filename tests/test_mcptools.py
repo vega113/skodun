@@ -58,7 +58,7 @@ _SRC = str(Path(skodun.__file__).resolve().parents[1])
 #: reordering the shipped eight would move every one of them for no reason.
 EXPECTED_TOOLS = ["gate", "review", "log", "surface", "triage_list",
                   "triage_dismiss", "adopt_refuter", "triage_reopen",
-                  "triage_defer"]
+                  "triage_defer", "review_status", "review_cancel"]
 
 TRACKING_REF = "GH-412"
 DEFER_REASON = "in-bounds for this surface; the hot path is the batcher upstream"

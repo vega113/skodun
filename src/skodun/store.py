@@ -1444,3 +1444,38 @@ class Store:
             " WHERE status=?", (RUNNING,)).fetchall()
         return [{"id": r["id"], "reviewed_at": r["reviewed_at"],
                  "worst_runtime_sec": r["worst_runtime_sec"]} for r in rows]
+
+    def current_review(self, repo: str | None = None) -> dict | None:
+        """The review status/cancel want by default: live first, else newest.
+
+        Prefer the newest `running` row (optionally scoped to `repo`). When none
+        is running, the newest terminal row for that scope. `repo=None` is the
+        host-wide view -- same unscoped posture as `list_reviews(branch=None)`.
+
+        Decodes one artifact (the winner), not the whole store. Status is a
+        read surface; it must not pay for every historical row.
+        """
+        if repo is not None:
+            row = self._c.execute(
+                """SELECT artifact_json FROM reviews
+                   WHERE status=? AND repo=?
+                   ORDER BY reviewed_at DESC LIMIT 1""",
+                (RUNNING, repo)).fetchone()
+            if row is None:
+                row = self._c.execute(
+                    """SELECT artifact_json FROM reviews
+                       WHERE repo=?
+                       ORDER BY reviewed_at DESC LIMIT 1""",
+                    (repo,)).fetchone()
+        else:
+            row = self._c.execute(
+                """SELECT artifact_json FROM reviews
+                   WHERE status=?
+                   ORDER BY reviewed_at DESC LIMIT 1""",
+                (RUNNING,)).fetchone()
+            if row is None:
+                row = self._c.execute(
+                    """SELECT artifact_json FROM reviews
+                       ORDER BY reviewed_at DESC LIMIT 1"""
+                ).fetchone()
+        return json.loads(row["artifact_json"]) if row else None

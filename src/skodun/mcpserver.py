@@ -626,6 +626,43 @@ def _handle_triage_defer(call: "HandlerCall") -> "HandlerResult":
     return HandlerResult(status=status, text=text)
 
 
+def _handle_review_status(call: "HandlerCall") -> "HandlerResult":
+    """Read-only lifecycle observation. Same service the CLI calls."""
+    from . import gitio, services
+    review_id, refusal = _opt_string_arg(call.params, "review_id",
+                                         "review_status")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    repo_path, refusal = _repo_arg(call.params, "review_status")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    scope = None
+    # Only resolve repo when the caller is asking for "current for repo"
+    # (no review_id). An id alone must not require a worktree.
+    if not review_id:
+        try:
+            scope = str(gitio.git_common_dir(repo_path))
+        except BaseException as e:
+            return HandlerResult(
+                status=2,
+                text=f"skodun review-status: could not resolve repo: {e!r}")
+    with call.store_factory() as store:
+        status, text = services.svc_review_status(
+            store, review_id=review_id, repo=scope)
+    return HandlerResult(status=status, text=text)
+
+
+def _handle_review_cancel(call: "HandlerCall") -> "HandlerResult":
+    """Cancel-by-id. Same service the CLI calls."""
+    from . import services
+    review_id, refusal = _string_arg(call.params, "review_id", "review_cancel")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    with call.store_factory() as store:
+        status, text = services.svc_review_cancel(store, review_id)
+    return HandlerResult(status=status, text=text)
+
+
 def default_registry() -> tuple[HandlerSpec, ...]:
     """The tools `skodun mcp` serves: the CLI's review loop, mirrored exactly.
 
@@ -776,6 +813,35 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                         "reason that fails the audit floor); 2 = no such review "
                         "or finding. Like every triage tool, it carries out a "
                         "decision a human already made."),
+        # Epic S1: observe + cancel. Appended (not reordered) so the existing
+        # tool list snapshot only grows at the end — same discipline as
+        # triage_defer.
+        HandlerSpec(
+            name="review_status", long_running=False,
+            input_schema=_schema({
+                **_REPO_PROPERTY,
+                "review_id": {
+                    "type": "string",
+                    "description": "id of the review to inspect; when omitted, "
+                                   "reports the current review for `repo` "
+                                   "(newest running, else newest terminal)"},
+            }),
+            handler=_handle_review_status,
+            description="Observe a review's lifecycle state without gating. "
+                        "Reports one of queued|running|cancelled|failed|clean|"
+                        "findings plus age, provider, and model when known. "
+                        "Same words as `skodun review-status`. Not a second "
+                        "gate — use `gate` for coverage of the current change."),
+        HandlerSpec(
+            name="review_cancel", long_running=False,
+            input_schema=_schema(_REVIEW_ID_PROPERTY, ("review_id",)),
+            handler=_handle_review_cancel,
+            description="Cancel an in-flight review by id: sets the cancel "
+                        "token when this process holds it, signals a confirmed "
+                        "worker/FG process, and leaves a durable untrustworthy "
+                        "terminal when the holder is gone. Same words as "
+                        "`skodun review-cancel`. Refuses missing ids and "
+                        "already-terminal rows."),
     )
 
 

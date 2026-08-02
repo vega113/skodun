@@ -43,6 +43,13 @@ trustworthy review must cover it.
   review.
 - `skodun surface` — background rounds nobody has seen yet (from the pre-push
   hook). Reports history; it never certifies the current change.
+- `skodun review-status [REVIEW-ID] [--repo PATH]` — observe a review's
+  lifecycle (`queued|running|cancelled|failed|clean|findings`) plus age,
+  provider, and model when known. By id, or current for `--repo`. **Not a
+  gate** — use `gate` for coverage of the current change.
+- `skodun review-cancel <REVIEW-ID>` — cancel an in-flight review (token and/or
+  process signal, durable untrustworthy terminal, FG lock released). Refuses
+  missing ids and already-terminal rows.
 - `skodun doctor` — install/MCP readiness (config, store schema, adapters,
   binaries). Read-only; does not move the gate. **CLI-only** (not an MCP tool).
 - `skodun retain [--dry-run]` — prune worker logs per `[retention]`. Never
@@ -52,14 +59,15 @@ trustworthy review must cover it.
 
 If skodun is wired in over MCP, the review-loop operations are the `gate`,
 `review`, `log`, `surface`, `triage_list`, `triage_dismiss`, `adopt_refuter`,
-`triage_reopen` and `triage_defer` tools, with identical wording and identical
-refusals via the shared service path. Pass **`repo` as an absolute project
-path** on `gate` / `review` / `log` / `surface` when the MCP server’s cwd may
-not be this repository. Optional `reviewer` on `review` is a configured entry
-**name**, not a provider id. There is no `deferrals`, `doctor`, `retain`, or
-`schedule` tool: backlog review is a human's job, and ops verbs are shell-out
-CLI commands so the stdio MCP server stays free of schedulers and mutators that
-are not part of the agent review loop.
+`triage_reopen`, `triage_defer`, `review_status`, and `review_cancel` tools,
+with identical wording and identical refusals via the shared service path.
+Pass **`repo` as an absolute project path** on `gate` / `review` / `log` /
+`surface` / `review_status` when the MCP server’s cwd may not be this
+repository. Optional `reviewer` on `review` is a configured entry **name**,
+not a provider id. There is no `deferrals`, `doctor`, `retain`, or `schedule`
+tool: backlog review is a human's job, and ops verbs are shell-out CLI commands
+so the stdio MCP server stays free of schedulers and mutators that are not part
+of the agent review loop.
 
 Setup for external projects: [`../docs/integrate-external-project.md`](../docs/integrate-external-project.md).
 
@@ -157,8 +165,11 @@ converge on its own. Escalate rather than iterate when:
 - **One** foreground review per repository (repo lock). CLI waiters may exit `3`.
 - **One** MCP `review` per server process; a second call is refused
   (`review already in flight`), not queued.
+- **Status / cancel (S1):** use `review-status` / `review-cancel` (MCP:
+  `review_status` / `review_cancel`) instead of abandoning a hung provider.
+  Closing the MCP session still cancels the in-flight MCP `review`.
 - Do **not** burn agent turns polling every 30–60s. Wait outside the model, then
-  call `gate` / `log` / `surface`.
+  call `review-status` / `gate` / `log` / `surface`.
 - Deeper notes: [`fragments/concurrency.md`](fragments/concurrency.md).
 
 ### If skodun is unavailable

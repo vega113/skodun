@@ -965,12 +965,13 @@ def test_a_broken_refuter_chain_never_demotes_the_review(tmp_path, capsys,
     real = pipeline._run_chain
 
     def only_the_refuter_explodes(head, cfg, d, prompt, cwd, store, scratch,
-                                  tag, contract=None):
+                                  tag, contract=None, **kw):
         if tag == "refuter":
             raise RuntimeError("adapter exploded mid-pass")
         if contract is None:
-            return real(head, cfg, d, prompt, cwd, store, scratch, tag)
-        return real(head, cfg, d, prompt, cwd, store, scratch, tag, contract)
+            return real(head, cfg, d, prompt, cwd, store, scratch, tag, **kw)
+        return real(head, cfg, d, prompt, cwd, store, scratch, tag, contract,
+                    **kw)
 
     monkeypatch.setattr(pipeline, "_run_chain", only_the_refuter_explodes)
     rec = _run(repo, _store(tmp_path))
