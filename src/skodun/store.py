@@ -53,7 +53,7 @@ RUNNING = "running"
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 #: Set to anything other than "0", unset, or blank to ignore `provider_state`
 #: entirely.
@@ -244,6 +244,31 @@ _MIGRATION_V5: tuple[str, ...] = (
     " ON reviews(repo, branch, reviewed_at)",
 )
 
+# --- v6: fair review capacity (epic S3) --------------------------------------
+#
+# Cross-process FIFO waiters and durable queue telemetry for `review-fg`.
+# Replay-idempotent (`IF NOT EXISTS`): a crash before the version stamp simply
+# recreates the empty table/index. Scoped by `git_common_dir` string, the same
+# definition the FG lock uses for "one repository".
+_MIGRATION_V6 = """
+CREATE TABLE IF NOT EXISTS capacity_admissions (
+  id TEXT PRIMARY KEY,
+  resource_class TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  status TEXT NOT NULL,
+  queued_at TEXT NOT NULL,
+  admitted_at TEXT,
+  started_at TEXT,
+  ended_at TEXT,
+  wait_ms INTEGER,
+  expire_reason TEXT,
+  pid INTEGER,
+  review_id TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_capacity_scope_status
+  ON capacity_admissions(resource_class, scope, status, queued_at, id);
+"""
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -268,6 +293,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (3, _MIGRATION_V3),
     (4, _MIGRATION_V4),
     (5, _MIGRATION_V5),
+    (6, _MIGRATION_V6),
 )
 
 
@@ -304,6 +330,23 @@ def _require_text(label: str, value: object) -> str:
 
 def _iso_now() -> str:
     return time.strftime(_TS_FORMAT, time.gmtime())
+
+
+def _wait_ms(queued_at: object, ended_at: object) -> int | None:
+    """Milliseconds between two canonical store timestamps, or None if junk."""
+    import calendar
+
+    if not isinstance(queued_at, str) or not isinstance(ended_at, str):
+        return None
+    if not _is_canonical_ts(queued_at) or not _is_canonical_ts(ended_at):
+        return None
+    try:
+        q = time.strptime(queued_at, _TS_FORMAT)
+        e = time.strptime(ended_at, _TS_FORMAT)
+    except ValueError:
+        return None
+    delta = int((calendar.timegm(e) - calendar.timegm(q)) * 1000)
+    return max(0, delta)
 
 
 def _opt_positive_int(value: object) -> int | None:
@@ -1401,6 +1444,264 @@ class Store:
                  "reason": r["reason"], "category": r["category"],
                  "active": _still_unavailable(r["unavailable_until"], now_iso)}
                 for r in rows]
+
+    # --- capacity admissions (epic S3) -------------------------------------
+
+    #: Active statuses for FIFO position / holder counts.
+    _CAPACITY_ACTIVE = ("queued", "admitted", "running")
+    _CAPACITY_HOLDERS = ("admitted", "running")
+    _CAPACITY_TERMINAL = ("released", "expired", "rejected")
+
+    def capacity_enqueue(self, *, admission_id: str, resource_class: str,
+                         scope: str, pid: int | None = None) -> dict:
+        """Insert a new ``queued`` capacity row. Returns the row as a dict."""
+        admission_id = _require_text("admission_id", admission_id)
+        resource_class = _require_text("resource_class", resource_class)
+        scope = _require_text("scope", scope)
+        queued_at = _iso_now()
+        self._c.execute(
+            """INSERT INTO capacity_admissions
+                 (id, resource_class, scope, status, queued_at, pid)
+               VALUES (?,?,?,?,?,?)""",
+            (admission_id, resource_class, scope, "queued", queued_at, pid))
+        row = self.capacity_get(admission_id)
+        assert row is not None
+        return row
+
+    def capacity_get(self, admission_id: str) -> dict | None:
+        """One admission row, or None."""
+        admission_id = _require_text("admission_id", admission_id)
+        row = self._c.execute(
+            "SELECT * FROM capacity_admissions WHERE id=?",
+            (admission_id,)).fetchone()
+        return None if row is None else dict(row)
+
+    def capacity_active_views(self, resource_class: str, scope: str) -> list:
+        """Active waiters as ``capacity.WaiterView`` for pure FIFO decisions."""
+        from .capacity import WaiterView
+
+        resource_class = _require_text("resource_class", resource_class)
+        scope = _require_text("scope", scope)
+        rows = self._c.execute(
+            """SELECT id, status, queued_at FROM capacity_admissions
+               WHERE resource_class=? AND scope=? AND status IN (?,?,?)
+               ORDER BY queued_at, id""",
+            (resource_class, scope, *self._CAPACITY_ACTIVE)).fetchall()
+        return [WaiterView(id=r["id"], status=r["status"],
+                           queued_at=r["queued_at"]) for r in rows]
+
+    def capacity_position(self, admission_id: str) -> int | None:
+        """1-based FIFO position among active peers, or None if terminal/missing."""
+        from .capacity import queue_position_among
+
+        row = self.capacity_get(admission_id)
+        if row is None or row["status"] not in self._CAPACITY_ACTIVE:
+            return None
+        views = self.capacity_active_views(row["resource_class"], row["scope"])
+        return queue_position_among(admission_id, views)
+
+    def capacity_reclaim_stale(
+            self, resource_class: str, scope: str, *, stale_sec: float,
+            now_epoch: float | None = None,
+            pid_alive_fn=None) -> list[str]:
+        """Finish active rows that a dead peer left behind; return reclaimed ids.
+
+        Uses :func:`skodun.capacity.should_reclaim_admission` under a write
+        transaction so multi-process waiters agree on the same cleanup. Rows
+        reclaimed this way land as ``rejected`` with a durable expire reason
+        (``stale_pid_dead`` / ``stale_age``) and never re-enter the queue.
+        """
+        from .capacity import should_reclaim_admission
+
+        resource_class = _require_text("resource_class", resource_class)
+        scope = _require_text("scope", scope)
+        reclaimed: list[str] = []
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self._c.execute(
+                """SELECT * FROM capacity_admissions
+                   WHERE resource_class=? AND scope=? AND status IN (?,?,?)
+                   ORDER BY queued_at, id""",
+                (resource_class, scope, *self._CAPACITY_ACTIVE)).fetchall()
+            ended_at = _iso_now()
+            for row in rows:
+                reason = should_reclaim_admission(
+                    status=row["status"],
+                    pid=row["pid"],
+                    queued_at=row["queued_at"],
+                    stale_sec=stale_sec,
+                    now_epoch=now_epoch,
+                    pid_alive_fn=pid_alive_fn,
+                )
+                if reason is None:
+                    continue
+                wait_ms = _wait_ms(row["queued_at"], ended_at)
+                self._c.execute(
+                    """UPDATE capacity_admissions
+                       SET status='rejected', ended_at=?, wait_ms=?,
+                           expire_reason=?
+                       WHERE id=? AND status IN (?,?,?)""",
+                    (ended_at, wait_ms, reason, row["id"],
+                     *self._CAPACITY_ACTIVE))
+                if self._c.execute("SELECT changes()").fetchone()[0]:
+                    reclaimed.append(row["id"])
+            self._c.execute("COMMIT")
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        return reclaimed
+
+    def capacity_try_admit(self, admission_id: str, *, capacity: int) -> dict | None:
+        """Transactionally admit if FIFO-eligible. Returns row or None."""
+        from .capacity import WaiterView, decide_admit
+
+        admission_id = _require_text("admission_id", admission_id)
+        if capacity < 1:
+            return None
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._c.execute(
+                "SELECT * FROM capacity_admissions WHERE id=?",
+                (admission_id,)).fetchone()
+            if row is None or row["status"] != "queued":
+                self._c.execute("COMMIT")
+                return None if row is None else dict(row)
+            peers = self._c.execute(
+                """SELECT id, status, queued_at FROM capacity_admissions
+                   WHERE resource_class=? AND scope=? AND status IN (?,?,?)""",
+                (row["resource_class"], row["scope"],
+                 *self._CAPACITY_ACTIVE)).fetchall()
+            views = [WaiterView(id=p["id"], status=p["status"],
+                                queued_at=p["queued_at"]) for p in peers]
+            if not decide_admit(admission_id, views, capacity):
+                self._c.execute("COMMIT")
+                return None
+            admitted_at = _iso_now()
+            self._c.execute(
+                """UPDATE capacity_admissions
+                   SET status='admitted', admitted_at=?
+                   WHERE id=? AND status='queued'""",
+                (admitted_at, admission_id))
+            self._c.execute("COMMIT")
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        return self.capacity_get(admission_id)
+
+    def capacity_force_admit(self, admission_id: str) -> dict | None:
+        """Mark ``queued`` → ``admitted`` after the dual-hold lock is held.
+
+        Used when the caller already serializes via the legacy FG lock and
+        only needs the durable telemetry transition. Still refuses if the row
+        is missing or already terminal.
+        """
+        admission_id = _require_text("admission_id", admission_id)
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._c.execute(
+                "SELECT * FROM capacity_admissions WHERE id=?",
+                (admission_id,)).fetchone()
+            if row is None:
+                self._c.execute("COMMIT")
+                return None
+            if row["status"] in ("admitted", "running"):
+                self._c.execute("COMMIT")
+                return dict(row)
+            if row["status"] != "queued":
+                self._c.execute("COMMIT")
+                return None
+            admitted_at = _iso_now()
+            self._c.execute(
+                """UPDATE capacity_admissions
+                   SET status='admitted', admitted_at=?
+                   WHERE id=? AND status='queued'""",
+                (admitted_at, admission_id))
+            self._c.execute("COMMIT")
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        return self.capacity_get(admission_id)
+
+    def capacity_mark_started(self, admission_id: str,
+                              review_id: str | None = None) -> dict:
+        """``admitted`` (or ``queued``) → ``running``; set ``started_at``."""
+        admission_id = _require_text("admission_id", admission_id)
+        started_at = _iso_now()
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._c.execute(
+                "SELECT * FROM capacity_admissions WHERE id=?",
+                (admission_id,)).fetchone()
+            if row is None:
+                self._c.execute("COMMIT")
+                raise ValueError(f"capacity admission {admission_id!r} not found")
+            if row["status"] in self._CAPACITY_TERMINAL:
+                self._c.execute("COMMIT")
+                return dict(row)
+            admitted_at = row["admitted_at"] or started_at
+            self._c.execute(
+                """UPDATE capacity_admissions
+                   SET status='running', admitted_at=?, started_at=?,
+                       review_id=COALESCE(?, review_id)
+                   WHERE id=?""",
+                (admitted_at, started_at, review_id, admission_id))
+            self._c.execute("COMMIT")
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        out = self.capacity_get(admission_id)
+        assert out is not None
+        return out
+
+    def capacity_finish(self, admission_id: str, *, status: str,
+                        expire_reason: str | None = None) -> dict:
+        """Terminal transition with ``ended_at`` and ``wait_ms``."""
+        admission_id = _require_text("admission_id", admission_id)
+        status = _require_text("status", status)
+        if status not in self._CAPACITY_TERMINAL:
+            raise ValueError(
+                f"capacity finish status must be one of "
+                f"{sorted(self._CAPACITY_TERMINAL)}, got {status!r}")
+        ended_at = _iso_now()
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._c.execute(
+                "SELECT * FROM capacity_admissions WHERE id=?",
+                (admission_id,)).fetchone()
+            if row is None:
+                self._c.execute("COMMIT")
+                raise ValueError(f"capacity admission {admission_id!r} not found")
+            if row["status"] in self._CAPACITY_TERMINAL:
+                self._c.execute("COMMIT")
+                return dict(row)
+            wait_ms = _wait_ms(row["queued_at"], ended_at)
+            self._c.execute(
+                """UPDATE capacity_admissions
+                   SET status=?, ended_at=?, wait_ms=?, expire_reason=?
+                   WHERE id=?""",
+                (status, ended_at, wait_ms, expire_reason, admission_id))
+            self._c.execute("COMMIT")
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        out = self.capacity_get(admission_id)
+        assert out is not None
+        return out
 
     def list_reviews(self, branch: str | None, limit: int = 30,
                      repo: str | None = None) -> list[dict]:

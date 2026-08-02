@@ -26,8 +26,9 @@ Everything else here follows from three more facts about the transport:
     review learns its client is gone. So the single tool registered
     `long_running=True` runs on one background thread, capacity 1: a second
     call while it is busy is answered "review already in flight" rather than
-    queued behind it, because the queued one would review a working tree that
-    has moved by the time it starts.
+    queued behind it (epic S3 MCP policy: refuse-if-busy). A queue would review
+    a working tree that has usually moved by the time it starts; CLI reviews
+    use FIFO ``review-fg`` capacity instead.
 
 The tools do not implement anything. They arrive through the registry seam
 (`HandlerSpec`/`HandlerCall`/`HandlerResult`) and every one of them is four lines
@@ -711,13 +712,15 @@ def default_registry() -> tuple[HandlerSpec, ...]:
             handler=_handle_review,
             description="Review the outgoing change NOW, in the foreground, and "
                         "record the verdict. LONG-RUNNING: it takes minutes and "
-                        "spends model calls, holds the foreground review lock, "
-                        "and only ONE may be in flight per server -- a second "
-                        "call while one is running is refused, not queued. "
-                        "Closing the session cancels the review in flight. "
-                        "Status 0 = clean, 1 = findings open, 2 = nothing ran, "
-                        "3 = gave up waiting for the lock, 4 = no trustworthy "
-                        "review exists."),
+                        "spends model calls. MCP policy (epic S3): only ONE may "
+                        "be in flight per server -- a second call while one is "
+                        "running is refused, not queued (a queue would review a "
+                        "moved tree). CLI uses FIFO review-fg capacity + the "
+                        "legacy FG lock instead. Closing the session cancels "
+                        "the review in flight. Status 0 = clean, 1 = findings "
+                        "open, 2 = nothing ran (including busy refusal), "
+                        "3 = gave up waiting for capacity/lock, 4 = no "
+                        "trustworthy review exists."),
         HandlerSpec(
             name="log", long_running=False,
             input_schema=_schema({

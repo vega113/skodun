@@ -11,19 +11,31 @@ junie / codex).
 
 | Resource | Concurrency |
 |---|---|
-| Foreground `review` (CLI) | **One per repository** (repo lock). Others wait, then may exit `3`. |
-| MCP `review` | **One per MCP server process.** Second call is **refused**, not queued. |
+| Foreground `review` (CLI) | **FIFO review-fg capacity** (default **1** per repository) + legacy `grok-reviews-foreground.lock` dual-hold. Waiters are ordered; bounded wait then exit `3`. Progress reports **queue position** and **remaining wait budget**. |
+| MCP `review` | **One per MCP server process.** Second call is **refused** (`"review already in flight"`), not queued (S3 choice: stale tree risk). |
 | Provider adapters | **Sequential fallback chain**, not parallel multi-provider voting. |
 | Background pre-push workers | One **running** reservation per branch+repo; newer push **supersedes**. |
 
 Having multiple providers configured does **not** mean N simultaneous reviews.
 
-### Capacity work (epic S3 — when shipped)
+### Fair capacity (epic S3 — shipped)
 
-Fair machine-local admission (FIFO waiters, explicit capacity, queue
-telemetry) will replace blind multi-hour waits. Until then: **serialize
-foreground reviews**; do not start competing full suites + reviews on the same
-repo without coordination.
+| Knob | Default | Meaning |
+|---|---|---|
+| `SKODUN_REVIEW_FG_CAPACITY` | `1` | Max concurrent admitted+running `review-fg` holders per repo (store). Raising above 1 is allowed; the **legacy FG lock still serializes physical runs to 1** while tubescribes/legacy scripts coexist. |
+| `SKODUN_ADMISSION_WAIT_SECONDS` | same as lock wait | Bounded FIFO admission budget |
+| `SKODUN_LOCK_WAIT_SECONDS` | stale ceiling | Dual-hold lock wait (interop) |
+| `SKODUN_LOCK_POLL_SECONDS` | `10` | Poll cadence |
+| `SKODUN_LOCK_STALE_SECONDS` | ceiling | Waiter reclaim ceiling |
+
+Telemetry for each attempt is **persisted** in the store (`capacity_admissions`):
+`queued_at`, `admitted_at`, `started_at`, `ended_at`, `wait_ms`, and
+`expire_reason` when the attempt expired or was rejected. Expiry is durable —
+there is no blind infinite requeue of the same attempt id.
+
+**Preflight:** if every provider in the finder fallback chain is known
+unavailable via cached `provider_state`, the run **fails fast** (exit 2) without
+spending the full admission wait budget.
 
 ### Cancel / status (epic S1 — shipped)
 
