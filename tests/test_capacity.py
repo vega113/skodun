@@ -636,6 +636,32 @@ def test_s4_provider_capacity_zero_never_admits(store):
     assert rows and all(r["status"] == STATUS_EXPIRED for r in rows)
 
 
+def test_s4_capacity_fn_recheck_zero_blocks_mid_wait_admit(store):
+    """capacity_fn re-evaluated each poll: pressure drop to 0 mid-wait denies admit."""
+    rc = capacity.provider_resource_class("xai")
+    holder = acquire(
+        store, scope="xai", resource_class=rc, capacity=1,
+        wait_sec=0.5, poll_sec=0.01)
+    assert holder.status == STATUS_RUNNING
+    state = {"cap": 1}
+    notes = []
+
+    def on_progress(msg: str) -> None:
+        notes.append(msg)
+        # Free the physical holder, but drop effective capacity so the waiter
+        # must not take the slot (quota pressure arrived mid-wait).
+        if holder.status == STATUS_RUNNING:
+            finish(store, holder, status=STATUS_RELEASED)
+            state["cap"] = 0
+
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire(
+            store, scope="xai", resource_class=rc, wait_sec=0.2, poll_sec=0.02,
+            capacity_fn=lambda: state["cap"], on_progress=on_progress)
+    assert store.capacity_holder_count(rc, "xai") == 0
+    assert notes  # waited long enough to see progress / re-check
+
+
 def test_s4_wait_eta_p50_requires_min_samples():
     """T8 helper: p50 only with ≥3 samples."""
     assert capacity.wait_eta_p50_ms([]) is None

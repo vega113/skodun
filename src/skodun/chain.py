@@ -27,6 +27,7 @@ from __future__ import annotations
 import shutil
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -215,35 +216,39 @@ def _release_provider_slot(store: Store,
 
 def _acquire_provider_slot(
         store: Store, provider: str, *,
+        wait_sec: float,
         cancel: "threading.Event | None",
-        on_progress,
-        slots: int | None = None) -> capacity.Ticket:
-    """Acquire ``provider:<id>`` under the shared admission wait budget.
+        on_progress) -> capacity.Ticket:
+    """Acquire ``provider:<id>`` under the remaining shared admission budget.
 
-    Call only after review-fg is held (pipeline admit order). Pass ``slots=0``
-    when the provider is in quota backoff (no new admits until TTL ends).
-    When ``slots`` is omitted, uses ``provider_max_in_flight_from_env`` —
-    callers that already skipped via ``provider_state`` should not re-read
-    the cache here (avoids double-consulting per entry).
+    Call only after review-fg is held (pipeline admit order). Capacity is
+    re-read every poll via :func:`_effective_provider_capacity` so a concurrent
+    quota mark (effective 0) stops waiters already in the queue from admitting.
     """
-    wait_sec = capacity.admission_wait_from_env(_DEFAULT_PROVIDER_WAIT_SEC)
-    cap = (capacity.provider_max_in_flight_from_env()
-           if slots is None else int(slots))
     return capacity.acquire(
         store,
         scope=provider,
         resource_class=capacity.provider_resource_class(provider),
-        capacity=cap,
-        wait_sec=wait_sec,
+        # capacity_fn re-checks provider_state each poll (pressure reduction).
+        capacity_fn=lambda: _effective_provider_capacity(store, provider),
+        wait_sec=float(wait_sec),
         cancel=cancel,
         on_progress=on_progress,
     )
 
 
+def _remaining_admission_sec(deadline_mono: float,
+                             clock: Callable[[], float] | None = None) -> float:
+    """Seconds left on the shared admit+bind wall-clock deadline (≥ 0)."""
+    now = time.monotonic if clock is None else clock
+    return max(0.0, float(deadline_mono) - float(now()))
+
+
 def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
               cwd: Path, store: Store, scratch: Path, tag: str,
               contract: OutputContract = REVIEW_CONTRACT,
-              cancel: "threading.Event | None" = None) -> _Outcome:
+              cancel: "threading.Event | None" = None,
+              admission_deadline: float | None = None) -> _Outcome:
     """Run a reviewer chain to a verdict: entry by entry, retry by retry.
 
     Every retry is a FRESH run of the same prompt — never a resumed session —
@@ -311,6 +316,12 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
     changes nothing. `ReviewCancelled` propagates out of here uncaught, by
     design: it is a `BaseException` precisely so the `except Exception` guards
     between here and the worker cannot turn a killed run into a degraded review.
+
+    ``admission_deadline`` is a ``time.monotonic()`` absolute end for the
+    shared admit+bind budget (review-fg wait already spent by the pipeline
+    before this call, plus every provider wait/hop here). When omitted, a
+    fresh budget is started for this chain so standalone callers and tests
+    still get one wall-clock bound that is **not** reset per hop.
     """
     from .pipeline import _chain_for, _note
     chain = _chain_for(cfg, head)
@@ -320,6 +331,11 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
     # `attempts[]` list has a unique ordinal; the per-entry count below is what
     # the retry budgets and the timeout message talk about.
     n = 0
+    # One wall-clock deadline for all provider waits/hops in this chain.
+    if admission_deadline is None:
+        admission_deadline = (
+            time.monotonic()
+            + capacity.admission_wait_from_env(_DEFAULT_PROVIDER_WAIT_SEC))
 
     for i, entry in enumerate(chain):
         if runner._cancelled(cancel):
@@ -358,11 +374,14 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
         # S4 Phase B: hold provider:<id> for the whole entry (retries included).
         # Repo review-fg is already held by pipeline before run_chain runs.
         # Release on every terminal: hop, quota, cancel, success, fatal return.
+        # Remaining shared admit+bind budget — not a fresh full wait per hop.
+        wait_sec = _remaining_admission_sec(admission_deadline)
         provider_ticket: capacity.Ticket | None = None
         try:
             try:
                 provider_ticket = _acquire_provider_slot(
-                    store, entry.provider, cancel=cancel, on_progress=_note)
+                    store, entry.provider, wait_sec=wait_sec,
+                    cancel=cancel, on_progress=_note)
             except capacity.AdmissionCancelled as e:
                 raise runner.ReviewCancelled(str(e)) from e
             except capacity.AdmissionTimeout as e:
