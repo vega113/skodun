@@ -795,7 +795,7 @@ def report_state(rec: dict) -> str:
         return "findings"
     if status == "clean" or rec.get("parse_ok") is True:
         return "clean"
-    return "failed" if status else "failed"
+    return "failed"
 
 
 def _looks_cancelled(rec: dict) -> bool:
@@ -806,19 +806,39 @@ def _looks_cancelled(rec: dict) -> bool:
     return False
 
 
+def _status_field(label: str, val) -> str:
+    """One ``key=value`` token; quote values that would break space-splitting."""
+    import json
+
+    if val is None:
+        return f"{label}="
+    if isinstance(val, bool):
+        return f"{label}={str(val).lower()}"
+    if isinstance(val, int) and not isinstance(val, bool):
+        return f"{label}={val}"
+    text = str(val)
+    # Unquoted only when a single shell-like token; otherwise JSON-string form
+    # so `branch=feature one` cannot inject a phantom field.
+    if text and all(c.isalnum() or c in "._:@/+-" for c in text):
+        return f"{label}={text}"
+    return f"{label}={json.dumps(text)}"
+
+
 def format_status_line(rec: dict, *, now: float | None = None) -> str:
     """One machine-readable status line for CLI and MCP.
 
     Always includes `id=` and `state=` (the S1 vocabulary). Age, provider,
     model, mode, and branch are appended when known — absence is omission, not
-    a second guess.
+    a second guess. Values with whitespace or special characters are emitted
+    as JSON strings so space-splitting consumers stay safe.
     """
     import time as _time
 
     from .pipeline import _epoch
 
     state = report_state(rec)
-    parts = [f"id={rec.get('id')}", f"state={state}"]
+    parts = [_status_field("id", rec.get("id")),
+             _status_field("state", state)]
     started = _epoch(rec.get("reviewed_at"))
     if started is not None:
         age = int(max(0.0, (now if now is not None else _time.time()) - started))
@@ -832,7 +852,7 @@ def format_status_line(rec: dict, *, now: float | None = None) -> str:
     ):
         val = rec.get(key)
         if val is not None and val != "":
-            parts.append(f"{label}={val}")
+            parts.append(_status_field(label, val))
     return " ".join(parts)
 
 
@@ -1098,11 +1118,12 @@ def _pid_is_live_skodun_fg(pid) -> bool:
     if "skodun" not in args:
         return False
     # Never treat a background worker as FG: workers have their own path.
-    # Match the same conjunction `pid_is_skodun_worker` uses (`all` of the
-    # tokens), not `any` — `WORKER_ARGV_TOKENS` is `("skodun", "worker")` and
-    # every FG/MCP argv already contains `skodun`, so `any` would refuse to
-    # signal every live holder and leave cancel on the dead-pid demote path.
-    from .dispatch import WORKER_ARGV_TOKENS
-    if all(tok in args for tok in WORKER_ARGV_TOKENS):
+    # Require BOTH the worker argv tokens AND `--record-id` so a generic
+    # path that happens to contain the substring "worker" does not strip
+    # FG liveness. `any` of the tokens alone would refuse every FG argv
+    # (they all contain `skodun`) and leave cancel on the dead-pid path.
+    from .dispatch import WORKER_ARGV_TOKENS, WORKER_RECORD_FLAG
+    if (all(tok in args for tok in WORKER_ARGV_TOKENS)
+            and WORKER_RECORD_FLAG in args):
         return False
     return True

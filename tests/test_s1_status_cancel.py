@@ -307,21 +307,25 @@ def test_mcp_review_status_and_cancel_parity(tmp_path):
                     adapter="grok", worst_runtime_sec=86_400)
     db = _db_with(tmp_path, rec)
 
+    def _sans_age(line: str) -> str:
+        # age=Ns is wall-clock; parity must not depend on it.
+        return " ".join(p for p in line.split() if not p.startswith("age="))
+
     res = _tool("review_status", db, review_id="sk_mcp")
     assert res.status == 0
     assert "id=sk_mcp" in res.text and "state=running" in res.text
 
     with Store.open(db) as st:
         code, text = services.svc_review_status(st, review_id="sk_mcp")
-    assert code == res.status and text == res.text
+    assert code == res.status
+    assert _sans_age(text) == _sans_age(res.text)
 
     res = _tool("review_cancel", db, review_id="sk_mcp")
     assert res.status == 0
     assert "sk_mcp" in res.text
 
-    with Store.open(db) as st:
-        code, text = services.svc_review_cancel(st, "sk_mcp")
-    # second cancel: terminal refusal — compare MCP vs service
+    # second cancel: terminal refusal — compare MCP vs service (no intervening
+    # cancel that would change shared state between the two surfaces).
     res2 = _tool("review_cancel", db, review_id="sk_mcp")
     with Store.open(db) as st:
         code2, text2 = services.svc_review_cancel(st, "sk_mcp")
@@ -390,6 +394,26 @@ def test_cross_process_review_cancel_of_mcp_held_review(tmp_path):
         [sys.executable, "-m", "skodun", "mcp"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env=env, start_new_session=True)
+    # Drain pipes so a long-running review cannot block on a full buffer.
+    drained: dict[str, list[bytes]] = {"out": [], "err": []}
+
+    def _drain(stream, key: str) -> None:
+        try:
+            for chunk in iter(lambda: stream.read(4096), b""):
+                drained[key].append(chunk)
+        except Exception:
+            pass
+
+    readers = [
+        threading.Thread(target=_drain, args=(proc.stdout, "out"), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, "err"), daemon=True),
+    ]
+    for t in readers:
+        t.start()
+
+    def _err_text() -> str:
+        return b"".join(drained["err"]).decode("utf-8", "replace")
+
     try:
         proc.stdin.write(_HANDSHAKE)
         proc.stdin.write(_rpc("tools/call", 1, name="review",
@@ -419,7 +443,7 @@ def test_cross_process_review_cancel_of_mcp_held_review(tmp_path):
 
         while time.monotonic() < deadline and not _ready():
             assert proc.poll() is None, (
-                f"MCP exited before reviewing: {proc.stderr.read()!r}")
+                f"MCP exited before reviewing: {_err_text()!r}")
             time.sleep(0.05)
         assert pgid_file.exists(), "the provider never started"
         assert "id" in rid_box, "no running review row was recorded"
@@ -473,7 +497,7 @@ def test_cross_process_review_cancel_of_mcp_held_review(tmp_path):
         if proc.poll() is not None:
             assert proc.returncode == 0, (
                 f"MCP crashed on cancel: rc={proc.returncode} "
-                f"err={proc.stderr.read()!r}")
+                f"err={_err_text()!r}")
     finally:
         if proc.poll() is None:
             try:

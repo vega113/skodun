@@ -164,7 +164,7 @@ Most tools accept optional `repo`: a path **inside** the git worktree.
 - **Best practice for external projects:** always pass an absolute project root
   as `repo` on `gate`, `review`, `log`, and `surface`.
 
-### Tools (today) — 9 tools, 2 prompts
+### Tools (today) — 11 tools, 2 prompts
 
 | MCP tool | CLI analogue | Notes |
 |---|---|---|

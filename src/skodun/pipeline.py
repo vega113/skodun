@@ -1694,12 +1694,18 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         _release_fg_lock(lock)
 
 
+#: Returned by ``_install_fg_sigterm`` when install is impossible. Distinct
+#: from ``None`` (a valid previous disposition from ``signal.signal``).
+_SIGTERM_INSTALL_FAILED = object()
+
+
 def _install_fg_sigterm(cancel: "threading.Event"):
     """Make SIGTERM set the FG cancel token. Same posture as the worker.
 
-    Returns the previous handler (or None when install is impossible -- not the
-    main thread). Restored in `run_review`'s finally so a long-lived process
-    (MCP) does not keep a review-scoped handler after the review ends.
+    Returns the previous handler, or ``_SIGTERM_INSTALL_FAILED`` when install
+    is impossible (not the main thread). Restored in `run_review`'s finally so
+    a long-lived process (MCP) does not keep a review-scoped handler after the
+    review ends.
     """
     import signal
 
@@ -1708,15 +1714,16 @@ def _install_fg_sigterm(cancel: "threading.Event"):
     try:
         return signal.signal(signal.SIGTERM, handler)
     except (ValueError, OSError, RuntimeError):
-        return None
+        return _SIGTERM_INSTALL_FAILED
 
 
 def _restore_fg_sigterm(previous) -> None:
-    if previous is None:
+    if previous is _SIGTERM_INSTALL_FAILED:
         return
     import signal
     try:
-        signal.signal(signal.SIGTERM, previous)
+        signal.signal(signal.SIGTERM,
+                      signal.SIG_DFL if previous is None else previous)
     except (ValueError, OSError, RuntimeError):
         pass
 

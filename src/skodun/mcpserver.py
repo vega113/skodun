@@ -103,6 +103,11 @@ NOT_INITIALIZED_MESSAGE = "server not initialized"
 #: "not now", which it can read, retry, and reason about.
 BUSY_TEXT = "review already in flight"
 
+#: Returned by ``_install_sigterm_forwarder`` when install is impossible.
+#: Distinct from ``None`` (a valid previous disposition from ``signal.signal``)
+#: so restore does not leave a review-scoped handler installed forever.
+_SIGTERM_INSTALL_FAILED = object()
+
 #: The status a busy refusal and a failed handler report. 2 is the gate
 #: contract's "no trustworthy review covers this content" -- the conservative
 #: reading of every outcome where nothing ran to completion.
@@ -1081,19 +1086,27 @@ class McpServer:
     def _install_sigterm_forwarder(self):
         """Main-thread SIGTERM → set the long-running cancel token(s).
 
-        Returns the previous handler (or None when install is impossible).
-        Restored when `serve` returns so a process that reuses the
-        interpreter does not keep a stale forwarder.
+        Returns the previous handler, or `_SIGTERM_INSTALL_FAILED` when
+        install is impossible. Restored when `serve` returns so a process
+        that reuses the interpreter does not keep a stale forwarder.
+
+        The handler must not take ``_slot_lock``: it runs on the main thread
+        between bytecodes, and that lock is held on the main thread in
+        ``_start_long_running`` / ``_shutdown`` — a non-reentrant lock would
+        deadlock cross-process cancel. A bare attribute read of
+        ``_worker_cancel`` is enough (only ever rebound to an Event or None).
+        ``pipeline`` is imported before install so the handler never blocks
+        on the import lock.
         """
         import signal
 
+        from . import pipeline
+
         def handler(signum, frame):         # pragma: no cover - driven by signal
-            with self._slot_lock:
-                cancel = self._worker_cancel
+            cancel = self._worker_cancel
             if cancel is not None:
                 cancel.set()
             try:
-                from . import pipeline
                 pipeline.request_cancel_all()
             except BaseException:
                 pass
@@ -1104,14 +1117,17 @@ class McpServer:
             self._note("could not install the SIGTERM forwarder; cross-process "
                        "review-cancel of a review held by this server may kill "
                        "the process without demoting the row")
-            return None
+            return _SIGTERM_INSTALL_FAILED
 
     def _restore_sigterm_forwarder(self, previous) -> None:
-        if previous is None:
+        if previous is _SIGTERM_INSTALL_FAILED:
             return
         import signal
         try:
-            signal.signal(signal.SIGTERM, previous)
+            # signal.signal returns None when the prior disposition was not a
+            # Python handler; restore the platform default in that case.
+            signal.signal(signal.SIGTERM,
+                          signal.SIG_DFL if previous is None else previous)
         except (ValueError, OSError, RuntimeError):
             pass
 

@@ -36,11 +36,11 @@ repo without coordination.
 
 Status reports one of `queued|running|cancelled|failed|clean|findings` plus
 age / provider / model when known. Cancel sets the in-process token (same MCP
-process), signals a confirmed worker or FG process, and leaves a durable
-untrustworthy terminal when the holder is gone — releasing the FG lock so
-nothing stays forever-`running`. Closing the MCP session still cancels the
-in-flight MCP `review`. Do not leave a second agent waiting on the same repo
-lock without a human timeout; prefer cancel-by-id over abandon.
+process) or signals a confirmed worker or FG process; that live holder then
+demotes the row and releases the FG lock. If the holder is already gone,
+cancel writes a durable untrustworthy terminal so nothing stays forever-
+`running`, and the stale sweep reclaims the FG lock. Closing the MCP session
+still cancels the in-flight MCP `review`. Prefer cancel-by-id over abandon.
 
 ### Cost policy
 
