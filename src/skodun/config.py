@@ -412,6 +412,8 @@ class Config:
     dispatch: Dispatch = Dispatch()
     #: The `[retention]` table. Same defaulting posture as `dispatch`.
     retention: Retention = Retention()
+    #: The `[schedule]` table (launchd job specs). Empty by default.
+    schedule_jobs: tuple = ()
 
 def _read(path: Path | None) -> dict:
     if path is None or not path.exists():
@@ -653,9 +655,19 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
         reviewers.append(_validate(Reviewer(**e)))
     reviewers = tuple(reviewers)
     _validate_fallbacks(reviewers)
+    # Schedule jobs are validated in schedule.parse_schedule_table; keep the
+    # raw table merge simple (last layer wins for the whole jobs list).
+    schedule_raw = {}
+    for layer in layers:
+        if "schedule" in layer:
+            schedule_raw = layer["schedule"]
+    from .schedule import parse_schedule_table
+    schedule_cfg = parse_schedule_table(schedule_raw if schedule_raw else None)
+
     return Config(defaults=Defaults(**dvals), reviewers=reviewers,
                   dispatch=Dispatch(**pvals),
-                  retention=Retention(**retvals))
+                  retention=Retention(**retvals),
+                  schedule_jobs=schedule_cfg.jobs)
 
 
 def _bounded_retention_int(key: str, value: object, minimum: int) -> int:
