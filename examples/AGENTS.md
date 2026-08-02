@@ -53,10 +53,15 @@ trustworthy review must cover it.
 If skodun is wired in over MCP, the review-loop operations are the `gate`,
 `review`, `log`, `surface`, `triage_list`, `triage_dismiss`, `adopt_refuter`,
 `triage_reopen` and `triage_defer` tools, with identical wording and identical
-refusals via the shared service path. There is no `deferrals`, `doctor`,
-`retain`, or `schedule` tool: backlog review is a human's job, and ops verbs
-are shell-out CLI commands so the stdio MCP server stays free of schedulers and
-mutators that are not part of the agent review loop.
+refusals via the shared service path. Pass **`repo` as an absolute project
+path** on `gate` / `review` / `log` / `surface` when the MCP server’s cwd may
+not be this repository. Optional `reviewer` on `review` is a configured entry
+**name**, not a provider id. There is no `deferrals`, `doctor`, `retain`, or
+`schedule` tool: backlog review is a human's job, and ops verbs are shell-out
+CLI commands so the stdio MCP server stays free of schedulers and mutators that
+are not part of the agent review loop.
+
+Setup for external projects: [`../docs/integrate-external-project.md`](../docs/integrate-external-project.md).
 
 ### The loop
 

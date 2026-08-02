@@ -703,10 +703,10 @@ property everything here is arranged around — but each is a real rough edge.
   scheduler runs inside the MCP process (see `docs/skill-decision-epic-23.md`).
 
 Agent protocol template: `examples/AGENTS.md`. Pasteable fragments:
-`examples/fragments/`. Client MCP + gate wiring:
-`docs/integrate-external-project.md`. Epic close-out start prompt:
-`docs/agent-start-epic-23.md`. Post-#23 product epics (status/cancel, fair
-capacity): `docs/epics/`.
+`examples/fragments/`. **Client MCP + gate wiring (start here for other
+repos):** [`docs/integrate-external-project.md`](docs/integrate-external-project.md).
+Epic close-out start prompt: `docs/agent-start-epic-23.md`. Post-#23 product
+epics (status/cancel, fair capacity): `docs/epics/`.
 
 ## Requirements
 
