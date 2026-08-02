@@ -22,4 +22,5 @@ Children (closed with parents):
 | [#46](https://github.com/vega113/skodun/issues/46) admission into `run_review` | S3 |
 
 Client wiring for external projects: [../integrate-external-project.md](../integrate-external-project.md).  
+Legacy → skodun cutover (shadow → gate → decommission → policy): [../cutover-from-legacy-review.md](../cutover-from-legacy-review.md).  
 Agent paste-ins: [../../examples/fragments/](../../examples/fragments/).

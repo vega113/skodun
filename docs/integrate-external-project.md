@@ -19,6 +19,7 @@ below match current product behaviour.
 | Pasteable fragments | [`examples/fragments/`](../examples/fragments/) |
 | MCP deep dive (tools, upgrade) | [README — MCP server](../README.md#mcp-server) |
 | Epic seeds | [`docs/epics/`](epics/) |
+| Legacy → skodun cutover | [`cutover-from-legacy-review.md`](cutover-from-legacy-review.md) |
 
 ---
 
