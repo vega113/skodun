@@ -33,6 +33,7 @@ from .codex import CodexAdapter
 from .grok import _STOP_REASON_OK as _GROK_NORMAL_STOP
 from .grok import GrokAdapter
 from .junie import JunieAdapter
+from .openai_api import OpenAIAPIAdapter
 
 __all__ = [
     "Adapter",
@@ -41,6 +42,7 @@ __all__ = [
     "CodexAdapter",
     "GrokAdapter",
     "JunieAdapter",
+    "OpenAIAPIAdapter",
     "NORMAL_STOP_REASONS",
     "OutputContract",
     "PROMPT_TOO_LARGE_CATEGORY",
@@ -85,6 +87,8 @@ _REGISTRY: dict[str, type[Adapter]] = {
     "openai": CodexAdapter,
     "google": AgyAdapter,
     "junie": JunieAdapter,
+    # Metered HTTP (not the codex subscription CLI). Requires OPENAI_API_KEY.
+    "openai-api": OpenAIAPIAdapter,
 }
 
 

@@ -167,3 +167,17 @@ role     = "refuter"
 # model    = "gpt-5.6-luna"   # must be an id this junie install serves
 # effort   = "high"           # low | medium | high; `max` is refused
 # role     = "finder"
+
+# --- openai-api (metered HTTP; NOT the codex CLI) --------------------------
+#
+# Distinct provider id: `openai-api`. Requires OPENAI_API_KEY. Any model id the
+# OpenAI API accepts. Daily spend ceiling default $10 (SKODUN_OPENAI_API_SPEND_LIMIT_USD).
+# See examples/fragments/openai-api.md.
+#
+# [[reviewers]]
+# name     = "finder-openai-api"
+# provider = "openai-api"
+# model    = "gpt-5.6-luna"
+# effort   = "medium"
+# role     = "finder"
+# max_cost_usd = 0.50

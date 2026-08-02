@@ -12,6 +12,7 @@ Or paste only what you need:
 | [`concurrency.md`](concurrency.md) | Multi-agent / multi-provider capacity knobs |
 | [`feedback.md`](feedback.md) | Agent/human non-gate feedback (judgment + product bugs) |
 | [`review-troubleshooting.md`](review-troubleshooting.md) | Failed reviews, junie install, skeptic/quota, reviewers |
+| [`openai-api.md`](openai-api.md) | Metered OpenAI HTTP API reviews + spend limits |
 
 Long-form integration: [`../../docs/integrate-external-project.md`](../../docs/integrate-external-project.md).
 

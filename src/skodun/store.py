@@ -53,7 +53,7 @@ RUNNING = "running"
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 #: Set to anything other than "0", unset, or blank to ignore `provider_state`
 #: entirely.
@@ -292,6 +292,24 @@ CREATE INDEX IF NOT EXISTS ix_feedback_kind ON feedback_events(kind, at DESC);
 CREATE INDEX IF NOT EXISTS ix_feedback_review ON feedback_events(review_id, seq);
 """
 
+# --- v8: metered API spend ledger (openai-api first) ------------------------
+_MIGRATION_V8 = """
+CREATE TABLE IF NOT EXISTS api_spend_events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT,
+  review_id TEXT,
+  prompt_tokens INTEGER NOT NULL,
+  completion_tokens INTEGER NOT NULL,
+  total_tokens INTEGER NOT NULL,
+  cost_usd REAL NOT NULL,
+  request_id TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_api_spend_provider_day
+  ON api_spend_events(provider, at);
+"""
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -318,6 +336,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (5, _MIGRATION_V5),
     (6, _MIGRATION_V6),
     (7, _MIGRATION_V7),
+    (8, _MIGRATION_V8),
 )
 
 
@@ -1906,3 +1925,46 @@ class Store:
             f" ORDER BY at DESC, seq DESC LIMIT ?",
             tuple(args)).fetchall()
         return [dict(r) for r in rows]
+
+    # --- API spend ledger (v8; metered adapters) ---------------------------
+
+    def api_spend_append(
+            self, *, at: str, provider: str, model: str | None,
+            prompt_tokens: int, completion_tokens: int, total_tokens: int,
+            cost_usd: float, review_id: str | None = None,
+            request_id: str | None = None) -> dict:
+        """Append one metered API spend event."""
+        at = _require_ts("at", at)
+        provider = _require_text("provider", provider)
+        if model is not None:
+            model = _require_text("model", model)
+        if review_id is not None:
+            review_id = _require_text("review_id", review_id)
+        if request_id is not None:
+            request_id = _require_text("request_id", request_id)
+        cur = self._c.execute(
+            """INSERT INTO api_spend_events
+               (at, provider, model, review_id, prompt_tokens,
+                completion_tokens, total_tokens, cost_usd, request_id)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (at, provider, model, review_id,
+             int(prompt_tokens), int(completion_tokens), int(total_tokens),
+             float(cost_usd), request_id))
+        seq = int(cur.lastrowid)
+        row = self._c.execute(
+            "SELECT * FROM api_spend_events WHERE seq=?", (seq,)).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def api_spend_sum_usd(self, provider: str, *, day_prefix: str) -> float:
+        """Sum ``cost_usd`` for ``provider`` with ``at`` starting with day_prefix.
+
+        ``day_prefix`` is ``YYYY-MM-DD`` (UTC day of the store timestamps).
+        """
+        provider = _require_text("provider", provider)
+        day_prefix = _require_text("day_prefix", day_prefix)
+        row = self._c.execute(
+            """SELECT COALESCE(SUM(cost_usd), 0) AS s FROM api_spend_events
+               WHERE provider=? AND at LIKE ?""",
+            (provider, day_prefix + "%")).fetchone()
+        return float(row["s"]) if row is not None else 0.0
