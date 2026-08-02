@@ -702,8 +702,11 @@ property everything here is arranged around — but each is a real rough edge.
   through the shared service path. Maintenance commands stay out of MCP so no
   scheduler runs inside the MCP process (see `docs/skill-decision-epic-23.md`).
 
-Agent protocol template: `examples/AGENTS.md`. Epic close-out start prompt:
-`docs/agent-start-epic-23.md`.
+Agent protocol template: `examples/AGENTS.md`. Pasteable fragments:
+`examples/fragments/`. Client MCP + gate wiring:
+`docs/integrate-external-project.md`. Epic close-out start prompt:
+`docs/agent-start-epic-23.md`. Post-#23 product epics (status/cancel, fair
+capacity): `docs/epics/`.
 
 ## Requirements
 
