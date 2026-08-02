@@ -71,12 +71,14 @@ Operators need:
 
 ### Phase A — multi-slot repo admission (true N concurrent FG)
 
-- [ ] **Optional legacy dual-hold.** Env (name bikeshed OK if documented), e.g.
-      `SKODUN_LEGACY_FG_LOCK`:
-  - default **`1` / on** — today’s dual-hold (store + mkdir lock); capacity N
-    still serializes physical runs under the lock (S3 compatibility).
-  - **`0` / off** — admit and run under store capacity only; **no** mkdir
-    dual-hold. Required for true multi-slot concurrency.
+- [ ] **Optional legacy dual-hold** via env **`SKODUN_LEGACY_FG_LOCK`**
+      (normative name — do not invent a second name):
+  - unset / empty / **`1`** → **on** (default): dual-hold (store + mkdir lock)
+  - **`0`** → **off**: store capacity only, no mkdir dual-hold
+  - any other non-empty value → treat as **on** (safe default; optional
+    stderr note once per process)
+  - read **per process** from the environment at admit time (same style as
+    other `SKODUN_*` lock knobs)
 - [ ] With dual-hold **off** and `SKODUN_REVIEW_FG_CAPACITY=N` (N≥2), hermetic
       tests prove **N concurrent** `run_review` (or admission+lock-free path)
       make progress without one waiter blocking forever behind a live peer that
@@ -225,18 +227,71 @@ on the artifact as today (`attempts[]` / answering provider).
 
 ---
 
-## Suggested knobs (names indicative; document finals)
+## Normative config and semantics (pin these — do not leave open)
 
-| Knob | Default | Phase |
+### Knobs
+
+| Knob | Default | Invalid / junk |
 |---|---|---|
-| `SKODUN_REVIEW_FG_CAPACITY` | 1 | A (exists) |
-| `SKODUN_LEGACY_FG_LOCK` | 1 (on) | A |
-| `SKODUN_PROVIDER_MAX_IN_FLIGHT` or per-provider config | 1 | B |
-| `SKODUN_PROVIDER_BACKOFF_*` / reuse quota TTL | align with `PROVIDER_UNAVAILABLE_TTL_SEC` | B |
-| Admission wait envs | S3 defaults | A–C |
+| `SKODUN_REVIEW_FG_CAPACITY` | `1` (exists S3) | non-int or &lt;1 → **1** |
+| `SKODUN_LEGACY_FG_LOCK` | on (`1`) | see Phase A |
+| `SKODUN_PROVIDER_MAX_IN_FLIGHT` | `1` global default for every `provider:<id>` | non-int or &lt;1 → **1** |
+| Optional TOML later | e.g. `[providers.xai] max_in_flight = 2` | if absent, use global env default |
+| Quota TTL | reuse `PROVIDER_UNAVAILABLE_TTL_SEC` / existing mark path | do not invent a second TTL clock |
+| Admission wait | S3: `SKODUN_ADMISSION_WAIT_SECONDS` / lock wait | same degrade-to-default as S3 |
 
-Config file shape for per-provider caps is preferred over only global env when
-multiple providers differ (design decides).
+**Precedence:** explicit per-provider config (if implemented) &gt; global
+`SKODUN_PROVIDER_MAX_IN_FLIGHT` &gt; default 1.
+
+### Shared wait budget
+
+One wall-clock budget for the whole admit+bind phase of a run (the S3
+admission wait / lock wait figure). It covers:
+
+- waiting for `review-fg`
+- waiting for `provider:<id>`
+- waits during hop/retry selection after quota
+
+When the budget expires: durable expire/reject of outstanding capacity tickets
+for this attempt + `LockTimeout` / untrustworthy fail as appropriate — **no**
+infinite spin. Entry-level timeout/degraded **retries** remain the existing
+chain budgets and do **not** reset the admission wait budget.
+
+### Queue position
+
+- Position is **per `resource_class` + scope**, 1-based among active
+  (`queued`/`admitted`/`running`) rows for that class, ordered by
+  `(queued_at, id)` (S3 rule).
+- A review waiting only on `review-fg` reports that class’s position.
+- A review holding `review-fg` and waiting on `provider:xai` reports the
+  **provider** class position (and may still mention repo slot held).
+- Cadence: at least on each poll / progress note (same as S3).
+
+### Quota classification
+
+- Reuse adapter `classify` → `unavailable` + category **`quota`** (existing
+  signals in adapters; do not parse model prose for this).
+- On that path: existing `mark_provider_unavailable` + effective provider
+  slots **0** for TTL.
+- HTTP status / body mapping stays **inside adapters**; this epic does not
+  re-specify per-provider stderr strings beyond “quota classification must
+  keep working and be tested with a fake.”
+
+### Slot ownership and reclaim
+
+- Ownership = `capacity_admissions` row in `admitted`/`running` with `pid`.
+- Release is idempotent finish → terminal status.
+- **Reclaim** dead/stale rows for **all** resource classes using the S3
+  `should_reclaim_admission` / `capacity_reclaim_stale` rules (dead pid;
+  holder age).
+- On quota mid-entry: release that provider slot before hop/wait.
+
+### Acquisition failure rollback
+
+If `review-fg` is held and provider acquire fails permanently within budget:
+release `review-fg`, durable terminal untrustworthy (or expire) — **no**
+leaked repo slot. If provider acquire is still waiting and budget remains,
+keep `review-fg` (already normative order).
 
 ---
 
