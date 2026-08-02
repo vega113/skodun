@@ -10,6 +10,7 @@ Or paste only what you need:
 | [`mcp-loop.md`](mcp-loop.md) | Agents: gate/review/triage loop over MCP |
 | [`mcp-review-topology.md`](mcp-review-topology.md) | MCP process vs repo vs worktree (definitions) |
 | [`concurrency.md`](concurrency.md) | Multi-agent / multi-provider capacity knobs |
+| [`feedback.md`](feedback.md) | Agent/human non-gate feedback (judgment + product bugs) |
 
 Long-form integration: [`../../docs/integrate-external-project.md`](../../docs/integrate-external-project.md).
 

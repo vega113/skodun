@@ -185,6 +185,53 @@ def build_parser() -> argparse.ArgumentParser:
     dfr.add_argument("-n", type=int, default=50, dest="limit",
                      help="maximum rows to show, newest first (default: 50)")
 
+    # Non-gate feedback ledger: agent/human judgment + skodun product notes.
+    fb = sub.add_parser(
+        "feedback",
+        help="record or list non-gate feedback (agent judgment, product bugs)")
+    fb_sub = fb.add_subparsers(dest="feedback_cmd", required=True)
+    fb_add = fb_sub.add_parser(
+        "add",
+        help="append one feedback note (does not clear the gate)")
+    fb_add.add_argument(
+        "--kind", required=True,
+        choices=["finding_judgment", "review_quality", "product_bug",
+                 "product_note"],
+        help="finding_judgment / review_quality / product_bug / product_note")
+    fb_add.add_argument(
+        "--actor", default="agent", choices=["agent", "human", "unknown"],
+        help="who wrote this note (default: agent)")
+    fb_add.add_argument(
+        "--review-id", default=None, dest="review_id",
+        help="review id (required for finding_judgment and review_quality)")
+    fb_add.add_argument(
+        "--index", type=int, default=None, dest="finding_index",
+        help="finding index as triage --list prints [n] "
+             "(required for finding_judgment)")
+    fb_add.add_argument(
+        "--provider", default=None,
+        help="optional provider id (e.g. xai) for later filtering")
+    fb_add.add_argument(
+        "--repo", type=Path, default=None,
+        help="optional path/repo context string")
+    fb_add.add_argument(
+        "body",
+        help="substantive note (≥20 chars after whitespace collapse)")
+    fb_list = fb_sub.add_parser(
+        "list",
+        help="list feedback notes, newest first")
+    fb_list.add_argument(
+        "--kind", default=None,
+        choices=["finding_judgment", "review_quality", "product_bug",
+                 "product_note"],
+        help="restrict to one kind")
+    fb_list.add_argument(
+        "--review-id", default=None, dest="review_id",
+        help="restrict to one review id")
+    fb_list.add_argument(
+        "-n", type=int, default=50, dest="limit",
+        help="maximum rows (default: 50)")
+
     tri = sub.add_parser(
         "triage",
         help="dismiss, defer or reopen a finding with an audited reason, or "
@@ -1514,6 +1561,42 @@ def _cmd_deferrals(args) -> int:
     return _warn("skodun deferrals: no open deferrals", code) if code == 0 else code
 
 
+def _cmd_feedback(args) -> int:
+    """Record or list non-gate feedback (agent judgment / product bugs)."""
+    from .services import svc_feedback_add, svc_feedback_list
+    from .store import Store
+
+    try:
+        store = Store.open(_store_path())
+    except BaseException as e:
+        return _emit(f"skodun feedback: could not open the store: {e!r}", 2)
+
+    with store:
+        if args.feedback_cmd == "add":
+            repo = str(args.repo) if args.repo is not None else None
+            code, text = svc_feedback_add(
+                store,
+                kind=args.kind,
+                body=args.body,
+                actor=args.actor,
+                review_id=args.review_id,
+                finding_index=args.finding_index,
+                provider=args.provider,
+                repo=repo,
+                source="cli",
+            )
+            return _emit(text, code)
+        if args.feedback_cmd == "list":
+            code, text = svc_feedback_list(
+                store,
+                kind=args.kind,
+                review_id=args.review_id,
+                limit=args.limit,
+            )
+            return _emit(text, code)
+    return _emit("skodun feedback: unknown subcommand", 2)
+
+
 def _cmd_triage(args) -> int:
     """Dismiss, defer or reopen one finding with an audited reason, or list.
 
@@ -1714,6 +1797,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_triage(args)
         if args.command == "deferrals":
             return _cmd_deferrals(args)
+        if args.command == "feedback":
+            return _cmd_feedback(args)
         if args.command == "surface":
             return _cmd_surface(args)
         if args.command == "dispatch":

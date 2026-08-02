@@ -632,6 +632,65 @@ def _handle_triage_defer(call: "HandlerCall") -> "HandlerResult":
     return HandlerResult(status=status, text=text)
 
 
+def _handle_feedback_add(call: "HandlerCall") -> "HandlerResult":
+    """Non-gate feedback: judgment / product bugs for later inspection."""
+    from . import services
+    kind, refusal = _string_arg(call.params, "kind", "feedback_add")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    body, refusal = _string_arg(call.params, "body", "feedback_add")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    actor, refusal = _opt_string_arg(call.params, "actor", "feedback_add")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    if not actor:
+        actor = "agent"
+    review_id, refusal = _opt_string_arg(call.params, "review_id",
+                                         "feedback_add")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    index = None
+    if "index" in call.params and call.params["index"] is not None:
+        index, refusal = _int_arg(call.params, "index", "feedback_add")
+        if refusal:
+            return HandlerResult(status=2, text=refusal)
+    provider, refusal = _opt_string_arg(call.params, "provider",
+                                        "feedback_add")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    repo_path, refusal = _repo_arg(call.params, "feedback_add")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    repo = str(repo_path) if repo_path is not None else None
+    with call.store_factory() as store:
+        status, text = services.svc_feedback_add(
+            store, kind=kind, body=body, actor=actor,
+            review_id=review_id, finding_index=index,
+            provider=provider, repo=repo, source="mcp")
+    return HandlerResult(status=status, text=text)
+
+
+def _handle_feedback_list(call: "HandlerCall") -> "HandlerResult":
+    from . import services
+    kind, refusal = _opt_string_arg(call.params, "kind", "feedback_list")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    review_id, refusal = _opt_string_arg(call.params, "review_id",
+                                         "feedback_list")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    limit = 50
+    if "limit" in call.params and call.params["limit"] is not None:
+        limit, refusal = _int_arg(call.params, "limit", "feedback_list")
+        if refusal:
+            return HandlerResult(status=2, text=refusal)
+    with call.store_factory() as store:
+        status, text = services.svc_feedback_list(
+            store, kind=kind, review_id=review_id, limit=limit)
+    return HandlerResult(status=status, text=text)
+
+
 def _handle_review_status(call: "HandlerCall") -> "HandlerResult":
     """Read-only lifecycle observation. Same service the CLI calls."""
     from . import gitio, services
@@ -850,6 +909,59 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                         "terminal when the holder is gone. Same words as "
                         "`skodun review-cancel`. Refuses missing ids and "
                         "already-terminal rows."),
+        # Non-gate feedback: agent/human judgment + product bugs. Appended
+        # (not reordered) so the tool-list snapshot only grows at the end.
+        HandlerSpec(
+            name="feedback_add", long_running=False,
+            input_schema=_schema({
+                "kind": {
+                    "type": "string",
+                    "enum": ["finding_judgment", "review_quality",
+                             "product_bug", "product_note"],
+                    "description": "finding_judgment (needs review_id+index), "
+                                   "review_quality (needs review_id), "
+                                   "product_bug / product_note for skodun "
+                                   "product feedback"},
+                "body": {
+                    "type": "string",
+                    "description": "substantive note (≥20 chars); stored "
+                                   "verbatim for later human inspection"},
+                "actor": {
+                    "type": "string",
+                    "enum": ["agent", "human", "unknown"],
+                    "description": "who wrote this (default agent)"},
+                **_REVIEW_ID_PROPERTY,
+                **_INDEX_PROPERTY,
+                "provider": {
+                    "type": "string",
+                    "description": "optional provider id for filtering"},
+                **_REPO_PROPERTY,
+            }, ("kind", "body")),
+            handler=_handle_feedback_add,
+            description="Record non-gate feedback: agent judgment on a finding, "
+                        "review quality, or a skodun product bug/note for "
+                        "maintainers to inspect later. Does NOT clear the gate "
+                        "— use triage_* only after a human decision. "
+                        "Same store as `skodun feedback add`."),
+        HandlerSpec(
+            name="feedback_list", long_running=False,
+            input_schema=_schema({
+                "kind": {
+                    "type": "string",
+                    "enum": ["finding_judgment", "review_quality",
+                             "product_bug", "product_note"],
+                    "description": "restrict to one kind"},
+                "review_id": {
+                    "type": "string",
+                    "description": "restrict to one review id"},
+                "limit": {
+                    "type": "integer", "minimum": 1,
+                    "description": "maximum rows, newest first (default 50)"},
+            }),
+            handler=_handle_feedback_list,
+            description="List non-gate feedback notes, newest first. Use to "
+                        "inspect agent judgment and product_bug notes before "
+                        "filing issues. Same words as `skodun feedback list`."),
     )
 
 

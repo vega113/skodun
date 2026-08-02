@@ -30,6 +30,9 @@ separate MCP processes or CLI — definitions in
   `adopt_refuter` — audited human decisions only; never bulk-clear.
   `triage_defer` requires a **filed** `tracking_ref`.
 - `log` / `surface` — history / undelivered background rounds; **not** a gate.
+- `feedback_add` / `feedback_list` — **non-gate** agent judgment or skodun
+  product-bug notes for later human inspection (does **not** clear the gate).
+  See [`feedback.md`](feedback.md).
 
 CLI-only when needed: `skodun doctor`, `skodun providers` (shell).
 
