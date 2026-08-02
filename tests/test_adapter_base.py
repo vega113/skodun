@@ -321,26 +321,19 @@ def test_json_scan_is_hard_bounded_on_brace_noise():
     assert _first_eligible_object(too_many + good, _review_eligible) is None
 
 
-def test_json_scan_skips_interior_braces_of_ineligible_objects():
-    """After decoding an ineligible object, do not re-scan its interior `{`s.
+def test_json_scan_still_finds_nested_envelope_inside_ineligible_wrapper():
+    """Wrappers like grok `structuredOutput` must remain extractable.
 
-    A findings array of hollow objects must not burn the attempt budget or
-    lock onto a nested finding-shaped dict as a top-level envelope.
+    The outer object is not `_review_eligible` (no top-level summary/findings);
+    the nested envelope is. The hard bound must not skip past nested braces
+    of ineligible wrappers or every CLI envelope parse breaks.
     """
-    # Outer object has findings but no summary — still eligible via findings.
-    # Nested finding objects are not top-level candidates once we advance past
-    # the outer object.
-    outer = (
-        '{"summary": "s", "findings": ['
-        + ",".join('{"title": "x", "body": "{not json"}' for _ in range(50))
-        + "]}"
+    text = (
+        '{"structuredOutput": {"summary": "s", "findings": []}, '
+        '"stopReason": "EndTurn"}'
     )
-    # Noise object first (eligible? no — empty), then the real one.
-    text = '{"noise": true} ' + outer
     found = _first_eligible_object(text, _review_eligible)
-    assert found is not None
-    assert found.get("summary") == "s"
-    assert len(found.get("findings") or []) == 50
+    assert found == {"summary": "s", "findings": []}
 
 
 def _explode(obj: object) -> bool:

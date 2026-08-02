@@ -244,10 +244,13 @@ def _first_eligible_object(
     fence, and grok sometimes emits the object twice. All of those make a bare
     `loads` die with "Extra data" and lose the answer entirely.
 
-    Advancement is **past the whole candidate** on a successful decode (use
-    the end index), and past the decoder's reported error position when one
-    is available — never only `pos + 1` when that would re-enter the same
-    broken span. Attempts are hard-capped by `JSON_SCAN_MAX_ATTEMPTS`.
+    Advancement on a failed decode uses the decoder's reported error
+    position when available (skips re-parsing a broken span). On a successful
+    but ineligible decode we still advance only one character: wrappers such
+    as grok's ``{"structuredOutput": {…}}`` keep the real envelope nested
+    inside an outer object that is not itself eligible, and the scan must
+    still find that nested object. Attempts are hard-capped by
+    `JSON_SCAN_MAX_ATTEMPTS` so brace-noise cannot go quadratic.
 
     `transform` is applied to each decoded candidate BEFORE `eligible` sees it,
     and is how an adapter translates its CLI's spelling of a payload into the
@@ -283,13 +286,13 @@ def _first_eligible_object(
                 # transform is caller-supplied code over untrusted-shaped
                 # data, so it gets the same fail-closed treatment `_ask`
                 # gives contract predicates, not just `_DECODE_FAILURES`.
-                pos = text.find("{", end if end > pos else pos + 1)
+                pos = text.find("{", pos + 1)
                 continue
         if _ask(eligible, obj):
             return obj
-        # Skip the whole decoded value so we do not re-scan its interior `{`s
-        # (findings arrays, nested objects) as false top-level candidates.
-        pos = text.find("{", end if end > pos else pos + 1)
+        # Ineligible (wrapper / hollow / wrong shape): keep scanning from the
+        # next brace so nested eligible envelopes remain findable.
+        pos = text.find("{", pos + 1)
     return None
 
 
