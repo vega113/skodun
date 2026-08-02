@@ -47,7 +47,8 @@ def test_cli_doctor_exit_codes(tmp_path, monkeypatch, capsys):
     db = tmp_path / "s.db"
     monkeypatch.setenv("SKODUN_DB", str(db))
     monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "nope.toml"))
-    Store.open(db).close()
+    with Store.open(db) as st:
+        st.log_dir()  # ensure schema exists without leaking the connection
     code = main(["doctor", "--repo", str(tmp_path)])
     # Missing provider binaries may yield exit 1; store/config should still report.
     assert code in (0, 1)

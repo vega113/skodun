@@ -1536,7 +1536,8 @@ def test_the_review_tool_returns_the_verdict_banner_the_cli_prints(tmp_path,
     assert last.startswith("SKODUN VERDICT: trustworthy=true findings=0")
 
 
-def test_a_malformed_repo_is_refused_rather_than_defaulted_to_the_cwd(tmp_path):
+def test_a_malformed_repo_is_refused_rather_than_defaulted_to_the_cwd(
+        tmp_path, monkeypatch):
     """The asymmetry is the point, and it is a fail-closed argument.
 
     An ABSENT `repo` means "here", which for a client-spawned server is the
@@ -1554,6 +1555,13 @@ def test_a_malformed_repo_is_refused_rather_than_defaulted_to_the_cwd(tmp_path):
             res = _tool(name, db, repo=bad)
             assert res.status == 2, (name, bad, res)
             assert "repo must be a path" in res.text, (name, bad, res.text)
-    # ...while an absent repo really does mean the cwd, on every one of them.
-    assert _tool("gate", db).status == 2      # the cwd is not reviewed either
-    assert "repo must be a path" not in _tool("gate", db).text
+    # Absent repo means cwd. Pin cwd to a non-git directory so the gate's
+    # fail-closed "nothing covers this" answer is 2 regardless of whether the
+    # developer's checkout happens to be clean (which would otherwise be 0
+    # "no outgoing change" and make this assertion environment-dependent).
+    bare = tmp_path / "not-a-git-worktree"
+    bare.mkdir()
+    monkeypatch.chdir(bare)
+    absent = _tool("gate", db)
+    assert absent.status == 2, absent
+    assert "repo must be a path" not in absent.text
