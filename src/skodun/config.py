@@ -281,6 +281,27 @@ class Reviewer:
     fallbacks: tuple[str, ...] = ()
 
 @dataclass(frozen=True)
+class Retention:
+    """The `[retention]` table: bounds on durable junk the gate never re-reads.
+
+    Worker logs live at ``<db>.logs/*.log``. ``0`` on an axis disables that
+    bound. Defaults keep multi-week machine use from unbounded growth without
+    requiring every operator to invent a policy.
+    """
+
+    #: Delete worker logs older than this many days (0 = no age prune).
+    worker_log_max_age_days: int = 30
+    #: Keep at most this many newest worker logs (0 = no count prune).
+    worker_log_max_count: int = 500
+
+
+_RETENTION_MINIMUMS: dict[str, int] = {
+    "worker_log_max_age_days": 0,
+    "worker_log_max_count": 0,
+}
+
+
+@dataclass(frozen=True)
 class Dispatch:
     """The `[dispatch]` table of `.skodun.toml`: the BACKGROUND worker's budget.
 
@@ -389,6 +410,8 @@ class Config:
     #: that build one by hand -- keeps working unchanged, and so a config file
     #: with no `[dispatch]` table gets the documented defaults rather than None.
     dispatch: Dispatch = Dispatch()
+    #: The `[retention]` table. Same defaulting posture as `dispatch`.
+    retention: Retention = Retention()
 
 def _read(path: Path | None) -> dict:
     if path is None or not path.exists():
@@ -569,6 +592,7 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
 
     dvals: dict = {}
     pvals: dict = {}
+    retvals: dict = {}
     rmap: dict[str, dict] = {}
     order: list[str] = []
     for layer in layers:
@@ -576,6 +600,7 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
         # Per-KEY merge, exactly like `[defaults]`: a project file that sets one
         # dispatch key keeps the global file's answer for the others.
         pvals.update(layer.get("dispatch", {}))
+        retvals.update(layer.get("retention", {}))
         for entry in layer.get("reviewers", []):
             if "name" not in entry:
                 raise ValueError("reviewer entry is missing its required 'name' key")
@@ -607,6 +632,13 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     for key, minimum in _DISPATCH_MINIMUMS.items():
         if key in pvals:
             pvals[key] = _bounded_dispatch_int(key, pvals[key], minimum)
+    rknown_ret = {f.name for f in fields(Retention)}
+    runknown = set(retvals) - rknown_ret
+    if runknown:
+        raise ValueError(f"unknown [retention] keys: {sorted(runknown)}")
+    for key, minimum in _RETENTION_MINIMUMS.items():
+        if key in retvals:
+            retvals[key] = _bounded_retention_int(key, retvals[key], minimum)
     rknown = {f.name for f in fields(Reviewer)}
     reviewers = []
     for name in order:
@@ -622,4 +654,16 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     reviewers = tuple(reviewers)
     _validate_fallbacks(reviewers)
     return Config(defaults=Defaults(**dvals), reviewers=reviewers,
-                  dispatch=Dispatch(**pvals))
+                  dispatch=Dispatch(**pvals),
+                  retention=Retention(**retvals))
+
+
+def _bounded_retention_int(key: str, value: object, minimum: int) -> int:
+    """`_bounded_int` for `[retention]`, naming that table in the message."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"[retention] {key}: expected an integer, got {type(value).__name__}")
+    if value < minimum:
+        raise ValueError(
+            f"[retention] {key}: must be >= {minimum}, got {value}")
+    return value

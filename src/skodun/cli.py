@@ -293,6 +293,13 @@ def build_parser() -> argparse.ArgumentParser:
     hooks.add_argument("--force", action="store_true",
                        help="back up a foreign pre-push hook and chain it "
                             "(never discards it)")
+    retain = sub.add_parser(
+        "retain",
+        help="prune worker logs per [retention] (never deletes gate artifacts)")
+    retain.add_argument("--repo", type=Path, default=Path("."),
+                        help="repository whose config is loaded (default: .)")
+    retain.add_argument("--dry-run", action="store_true",
+                        help="report what would be deleted without deleting")
     # Explicit, per-finding, and deliberately WITHOUT a bulk form: a refuter
     # verdict is an annotation, and the only way one may ever dismiss a
     # finding is a human naming that finding. `--adopt-all` would be exactly
@@ -833,6 +840,59 @@ def _cmd_install_hooks(args) -> int:
     except BaseException as e:
         return _emit(f"skodun install-hooks: {e}", 2)
     return _emit(f"skodun install-hooks: {path} {what}", 0)
+
+
+def _cmd_retain(args) -> int:
+    """Prune worker logs per `[retention]`. Never mutates gate artifacts.
+
+    Exit 0 on a successful pass (including dry-run and nothing-to-do). Exit 2
+    when the store/config/log dir cannot be used. Partial delete errors are
+    reported and still exit 2 so a schedule job notices.
+    """
+    try:
+        from .config import load_config
+        from .retention import retain_worker_logs
+        from .store import Store
+    except BaseException as e:
+        return _emit(f"skodun retain: could not load retention: {e!r}", 2)
+    try:
+        root = _repo_root(Path(args.repo))
+    except BaseException as e:
+        return _emit(f"skodun retain: {e}", 2)
+    try:
+        cfg = load_config(root)
+    except BaseException as e:
+        return _emit(f"skodun retain: config error: {e}", 2)
+    try:
+        with Store.open(_store_path()) as store:
+            log_dir = store.log_dir()
+            # Snapshot that gate artifacts still exist after prune: we never
+            # open or delete review rows here; this only proves the store path
+            # is the real one and remains usable.
+            report = retain_worker_logs(
+                log_dir,
+                max_age_days=cfg.retention.worker_log_max_age_days,
+                max_count=cfg.retention.worker_log_max_count,
+                dry_run=bool(args.dry_run),
+            )
+    except BaseException as e:
+        return _emit(f"skodun retain: {e}", 2)
+    mode = "dry-run" if report.dry_run else "deleted"
+    count = report.would_delete if report.dry_run else report.deleted_count
+    lines = [
+        f"skodun retain: {mode} {count} worker log(s) under {log_dir}",
+        f"  policy: max_age_days={cfg.retention.worker_log_max_age_days} "
+        f"max_count={cfg.retention.worker_log_max_count}",
+    ]
+    for p in report.candidates[:20]:
+        lines.append(f"  - {p.name}")
+    if len(report.candidates) > 20:
+        lines.append(f"  ... and {len(report.candidates) - 20} more")
+    if report.errors:
+        for path, err in report.errors:
+            lines.append(f"  error {path.name}: {err}")
+        return _emit("\n".join(lines), 2)
+    return _emit("\n".join(lines), 0)
 
 
 def _fmt_binary(binary: str) -> str:
@@ -1507,6 +1567,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_mcp(args)
         if args.command == "install-hooks":
             return _cmd_install_hooks(args)
+        if args.command == "retain":
+            return _cmd_retain(args)
         # Unreachable while the subparsers are `required=True`, and kept as
         # defence in depth: if that ever comes off, an unrecognised command
         # must still not certify a push by exiting 0.
