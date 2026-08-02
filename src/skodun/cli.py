@@ -300,6 +300,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="repository whose config is loaded (default: .)")
     retain.add_argument("--dry-run", action="store_true",
                         help="report what would be deleted without deleting")
+    doctor = sub.add_parser(
+        "doctor",
+        help="diagnose install, store, adapters, and MCP readiness (read-only)")
+    doctor.add_argument("--repo", type=Path, default=Path("."),
+                        help="repository whose config is loaded (default: .)")
     # Explicit, per-finding, and deliberately WITHOUT a bulk form: a refuter
     # verdict is an annotation, and the only way one may ever dismiss a
     # finding is a human naming that finding. `--adopt-all` would be exactly
@@ -840,6 +845,26 @@ def _cmd_install_hooks(args) -> int:
     except BaseException as e:
         return _emit(f"skodun install-hooks: {e}", 2)
     return _emit(f"skodun install-hooks: {path} {what}", 0)
+
+
+def _cmd_doctor(args) -> int:
+    """Read-only install/MCP readiness report. Does not mutate the store.
+
+    Exit 0 all checks ok · 1 problems found · 2 doctor failed to run.
+    CLI-only for epic #23: agents can shell out; MCP tool deferred (comment on #23).
+    """
+    try:
+        from .doctor import run_doctor
+    except BaseException as e:
+        return _emit(f"skodun doctor: could not load doctor: {e!r}", 2)
+    try:
+        report = run_doctor(
+            repo=Path(args.repo),
+            store_path=_store_path(),
+        )
+    except BaseException as e:
+        return _emit(f"skodun doctor: {e!r}", 2)
+    return _emit(report.render(), report.exit_code)
 
 
 def _cmd_retain(args) -> int:
@@ -1569,6 +1594,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_install_hooks(args)
         if args.command == "retain":
             return _cmd_retain(args)
+        if args.command == "doctor":
+            return _cmd_doctor(args)
         # Unreachable while the subparsers are `required=True`, and kept as
         # defence in depth: if that ever comes off, an unrecognised command
         # must still not certify a push by exiting 0.
