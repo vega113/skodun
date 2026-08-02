@@ -154,7 +154,23 @@ expand `${workspaceFolder}`):
 }
 ```
 
-Operator fragment: [`examples/fragments/mcp-server-config.md`](../examples/fragments/mcp-server-config.md).
+Operator fragment: [`examples/fragments/mcp-server-config.md`](../examples/fragments/mcp-server-config.md).  
+Topology (MCP vs repo vs worktree):
+[`examples/fragments/mcp-review-topology.md`](../examples/fragments/mcp-review-topology.md).
+
+### What an MCP server is
+
+A skodun MCP server is **one long-lived stdio process** (`skodun mcp`):
+
+| Property | Behaviour |
+|---|---|
+| Transport | stdin/stdout JSON-RPC only (no network port) |
+| Role | Transport over the **same** `services` path as the CLI |
+| Lifetime | One host MCP session/connection; restart client → new process |
+| Default cwd | Whatever the host set when spawning the server |
+| Store | Shared SQLite (default under home, or `SKODUN_DB`) — usually one per machine |
+
+It is **not** a per-repository daemon and **not** a multi-review job queue.
 
 ### `repo` argument (easy to get wrong)
 
@@ -165,7 +181,34 @@ Most tools accept optional `repo`: a path **inside** the git worktree.
 - **Wrong type** (array, number, blank) → refused (`repo must be a path…`),
   never silently remapped to cwd.
 - **Best practice for external projects:** always pass an absolute project root
-  as `repo` on `gate`, `review`, `log`, and `surface`.
+  (or linked **worktree** root) as `repo` on `gate`, `review`, `log`, and
+  `surface`.
+
+Each `review` / `gate` call selects **one worktree’s** current tree for that
+call. The same MCP process may target **different repos or worktrees on later
+calls** by changing `repo`.
+
+### Review requests: one process, many trees, one at a time
+
+```text
+Host agent  →  tools/call review { repo? }  →  skodun mcp
+                 │
+                 ├─ if a review is already running in this process
+                 │     → refuse: "review already in flight"  (not queued)
+                 └─ else → svc_review → run_review(that worktree)
+```
+
+| Situation | What happens |
+|---|---|
+| Second `review` while first is in flight (**same** MCP process) | Refused immediately |
+| Sequential `review` for repo A, then repo B (same process) | OK |
+| Two agents, two worktrees, **one** shared MCP | Second agent refused while first runs |
+| Two agents, two worktrees, **two** MCP processes (or CLI) | Both may run if capacity allows |
+
+**Linked worktrees** of the same clone share one `git_common_dir`. Reviews always
+cover **that worktree’s** diff identity; FG capacity for those worktrees is
+**pooled per repository** (see concurrency below). Full scenario table:
+[`mcp-review-topology.md`](../examples/fragments/mcp-review-topology.md).
 
 ### Tools (today) — 11 tools, 2 prompts
 
@@ -207,6 +250,16 @@ printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocol
 
 ### Concurrency (agents must know)
 
+Do not conflate layers (see also
+[`examples/fragments/concurrency.md`](../examples/fragments/concurrency.md) and
+[`mcp-review-topology.md`](../examples/fragments/mcp-review-topology.md)):
+
+| Layer | Scope | Limit |
+|---|---|---|
+| MCP process | One `skodun mcp` | **1** in-flight `review` (refuse-if-busy) |
+| `review-fg` | Per repository (`git_common_dir`; all worktrees share it) | `SKODUN_REVIEW_FG_CAPACITY` (default 1) |
+| `provider:<id>` | Whole store (all repos) | `SKODUN_PROVIDER_MAX_IN_FLIGHT` (default 1) |
+
 1. **CLI foreground reviews:** FIFO **review-fg** capacity (default **1** per
    repository). Default **dual-hold** also takes the legacy
    `grok-reviews-foreground.lock` (effective single physical mutex while
@@ -215,15 +268,18 @@ printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocol
    samples exist; bounded wait then exit **`3`**. Raise capacity with
    `SKODUN_REVIEW_FG_CAPACITY`. For **true multi-slot** after legacy is gone:
    `SKODUN_LEGACY_FG_LOCK=0` (exact `0` only) plus capacity ≥2. Telemetry is
-   persisted (`capacity_admissions`).
+   persisted (`capacity_admissions`). Env is a global default; **counting** is
+   still per repo.
 2. **Provider concurrency (S4):** each chain entry acquires `provider:<id>`
    (default max_in_flight **1**, override `SKODUN_PROVIDER_MAX_IN_FLIGHT`)
    before inference and releases on every terminal. Quota/429 marks
    `provider_state` and shrinks that provider to effective **0** slots for the
    TTL; the chain hops or fails closed (never a silent trustworthy pass).
+   Provider pools are **store-wide**, not per MCP and not per worktree.
 3. **MCP `review`:** **One per server process.** A second call returns
    `"review already in flight"` — **not** queued (S3 policy: a queue would run
-   against a moved tree).
+   against a moved tree). Multiple repos/worktrees on one MCP are fine
+   **sequentially**; parallel agents need **separate** MCP processes or CLI.
 4. **Status / cancel (S1):** `skodun review-status` / `skodun review-cancel`
    and MCP `review_status` / `review_cancel` observe or stop in-flight work
    without a second gate. Closing the MCP session still cancels the in-flight
@@ -270,7 +326,8 @@ skodun surface --repo "$ROOT"
 |---|---|
 | [`examples/AGENTS.md`](../examples/AGENTS.md) | Full template (first paste) |
 | [`examples/fragments/mcp-loop.md`](../examples/fragments/mcp-loop.md) | MCP loop only |
-| [`examples/fragments/concurrency.md`](../examples/fragments/concurrency.md) | Multi-agent / multi-provider |
+| [`examples/fragments/mcp-review-topology.md`](../examples/fragments/mcp-review-topology.md) | MCP process vs repo vs worktree |
+| [`examples/fragments/concurrency.md`](../examples/fragments/concurrency.md) | Multi-agent / multi-provider capacity |
 | [`examples/fragments/mcp-server-config.md`](../examples/fragments/mcp-server-config.md) | Operator MCP JSON |
 
 Edit bracketed project bits (tracker URL for deferrals, etc.).
@@ -332,7 +389,10 @@ Last reviewed against skodun **0.4.x** / post-epic-#23 main:
 | Upgrade requires MCP restart | documented |
 | CLI-only ops list | doctor, providers, retain, schedule, install-hooks, … |
 | Links to #41 / #42 / #56 | present |
+| MCP topology fragment | `examples/fragments/mcp-review-topology.md` |
 
-S1, S3, and S4 are shipped: §2 concurrency and
-`examples/fragments/concurrency.md` match the product (FIFO review-fg,
-optional multi-slot, provider max_in_flight, MCP refuse-if-busy).
+S1, S3, and S4 are shipped: §2 concurrency,
+`examples/fragments/concurrency.md`, and
+`examples/fragments/mcp-review-topology.md` match the product (FIFO review-fg,
+optional multi-slot, provider max_in_flight, MCP refuse-if-busy; MCP process ≠
+per-repo queue).

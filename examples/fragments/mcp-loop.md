@@ -16,6 +16,12 @@ Pass **`repo`** as an **absolute path** to this project root on `gate`,
 `review`, `log`, and `surface` (if omitted, skodun uses the MCP server cwd,
 which may not be this repo).
 
+**MCP process ≠ one repo.** One `skodun mcp` can act on any worktree you pass as
+`repo`, but only **one** `review` runs at a time in that process (second call →
+`review already in flight`). Multi-worktree / multi-repo parallel agents need
+separate MCP processes or CLI — definitions in
+[`mcp-review-topology.md`](mcp-review-topology.md).
+
 - `gate` — does a trustworthy review cover **this** tree? Status **0** = clean
   or all findings triaged. **Stop when status is 0.**
 - `review` — one foreground review (minutes, model cost). Optional `reviewer` =

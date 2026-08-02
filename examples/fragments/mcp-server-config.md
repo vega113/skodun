@@ -51,6 +51,14 @@ Use a **real absolute path** unless your host expands workspace placeholders:
 3. Confirm tools: `gate`, `review`, `log`, `surface`, triage family.
 4. Prefer agents pass absolute `repo` on tool calls (server cwd may differ).
 
+### Topology (operators)
+
+- One `skodun mcp` process is **not** “owned by” one repository: each tool call
+  may pass a different absolute `repo` (any worktree).
+- That process still allows only **one** in-flight `review` (refuse-if-busy).
+- Parallel agents → parallel MCP sessions (or CLI), not a queue inside one
+  server. Full definitions: [`mcp-review-topology.md`](mcp-review-topology.md).
+
 ### What is *not* an MCP tool
 
 Shell out if needed: `skodun doctor`, `skodun providers`, `skodun retain`,
