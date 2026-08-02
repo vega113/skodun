@@ -77,8 +77,11 @@ Operators need:
   - **`0`** → **off**: store capacity only, no mkdir dual-hold
   - any other non-empty value → treat as **on** (safe default; optional
     stderr note once per process)
-  - read **per process** from the environment at admit time (same style as
-    other `SKODUN_*` lock knobs)
+  - read **per process** from the environment at admit time
+  - **Do not** parse this via `_env_seconds` / duration helpers: those treat
+    `0` as invalid and fall back to a default, which would break
+    `SKODUN_LEGACY_FG_LOCK=0` (off). Use a dedicated boolean-style reader
+    with the exact semantics above.
 - [ ] With dual-hold **off** and `SKODUN_REVIEW_FG_CAPACITY=N` (N≥2), hermetic
       tests prove **N concurrent** `run_review` (or admission+lock-free path)
       make progress without one waiter blocking forever behind a live peer that

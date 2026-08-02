@@ -341,3 +341,48 @@ def test_normalize_clean_markdown_no_findings(tmp_path: Path):
         env, project=project, capsule=capsule, configured_model="gpt-5.6-luna"
     )
     assert got == {"summary": "No findings.", "findings": []}
+
+
+def test_normalize_partial_markdown_with_embedded_json(tmp_path: Path):
+    """Live junie sometimes wraps valid JSON under ### Summary only.
+
+    Reproduced under the confined harness: result was
+    ``### Summary\\n- {"summary":"ping","findings":[]}`` without
+    ### Changes / ### Verification. That used to raise ``not a review
+    payload`` and force a degraded retry even though the model paid for
+    a complete answer.
+    """
+    capsule = tmp_path / "capsule"
+    project = capsule / "project"
+    project.mkdir(parents=True)
+    payload = {"summary": "ping", "findings": []}
+    env = _envelope(result="### Summary\n- " + json.dumps(payload))
+    got = jr.normalize_envelope(
+        env, project=project, capsule=capsule, configured_model="gpt-5.6-luna"
+    )
+    assert got == payload
+
+
+def test_normalize_embedded_json_with_nested_findings(tmp_path: Path):
+    capsule = tmp_path / "capsule"
+    project = capsule / "project"
+    project.mkdir(parents=True)
+    payload = {
+        "summary": "one",
+        "findings": [
+            {
+                "file": "a.py",
+                "line": 2,
+                "severity": "low",
+                "category": "docs",
+                "title": "t",
+                "detail": "d",
+            }
+        ],
+    }
+    # prose before the object — raw_decode scan must still find it
+    env = _envelope(result="Here is the review:\n" + json.dumps(payload) + "\n")
+    got = jr.normalize_envelope(
+        env, project=project, capsule=capsule, configured_model="gpt-5.6-luna"
+    )
+    assert got == payload
