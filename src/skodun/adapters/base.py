@@ -213,6 +213,13 @@ def _ask(pred: Callable[[object], bool], obj: object) -> bool:
 # that silently misses the others. Four adapters are planned; one tuple.
 _DECODE_FAILURES = (ValueError, RecursionError)
 
+#: Hard bound on how many `{`-start decode attempts `_first_eligible_object`
+#: will make. Without this, a hostile/noisy stdout full of open braces is
+#: quadratic: each failed `raw_decode` is O(n) and is retried from every
+#: subsequent brace. The bound keeps the hot path linear in practice and
+#: fail-closed (no eligible object → parse_ok=False) rather than hanging.
+JSON_SCAN_MAX_ATTEMPTS: int = 256
+
 
 def _first_eligible_object(
     text: str,
@@ -237,6 +244,11 @@ def _first_eligible_object(
     fence, and grok sometimes emits the object twice. All of those make a bare
     `loads` die with "Extra data" and lose the answer entirely.
 
+    Advancement is **past the whole candidate** on a successful decode (use
+    the end index), and past the decoder's reported error position when one
+    is available — never only `pos + 1` when that would re-enter the same
+    broken span. Attempts are hard-capped by `JSON_SCAN_MAX_ATTEMPTS`.
+
     `transform` is applied to each decoded candidate BEFORE `eligible` sees it,
     and is how an adapter translates its CLI's spelling of a payload into the
     contract's. The codex adapter passes `_strip_nulls` (OpenAI strict mode
@@ -252,11 +264,17 @@ def _first_eligible_object(
     """
     decoder = json.JSONDecoder()
     pos = text.find("{")
-    while pos != -1:
+    attempts = 0
+    while pos != -1 and attempts < JSON_SCAN_MAX_ATTEMPTS:
+        attempts += 1
         try:
-            obj, _ = decoder.raw_decode(text, pos)
-        except _DECODE_FAILURES:
-            pos = text.find("{", pos + 1)
+            obj, end = decoder.raw_decode(text, pos)
+        except _DECODE_FAILURES as exc:
+            nxt = pos + 1
+            err_pos = getattr(exc, "pos", None)
+            if isinstance(err_pos, int) and err_pos > pos:
+                nxt = err_pos
+            pos = text.find("{", nxt)
             continue
         if transform is not None:
             try:
@@ -265,11 +283,13 @@ def _first_eligible_object(
                 # transform is caller-supplied code over untrusted-shaped
                 # data, so it gets the same fail-closed treatment `_ask`
                 # gives contract predicates, not just `_DECODE_FAILURES`.
-                pos = text.find("{", pos + 1)
+                pos = text.find("{", end if end > pos else pos + 1)
                 continue
         if _ask(eligible, obj):
             return obj
-        pos = text.find("{", pos + 1)
+        # Skip the whole decoded value so we do not re-scan its interior `{`s
+        # (findings arrays, nested objects) as false top-level candidates.
+        pos = text.find("{", end if end > pos else pos + 1)
     return None
 
 

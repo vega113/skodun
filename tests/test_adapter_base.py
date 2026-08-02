@@ -21,6 +21,7 @@ import pytest
 
 from skodun.adapters import ParseResult, REVIEW_CONTRACT, REFUTER_CONTRACT, get_adapter
 from skodun.adapters.base import (
+    JSON_SCAN_MAX_ATTEMPTS,
     UNAVAILABLE_RC,
     OutputContract,
     _first_eligible_object,
@@ -293,6 +294,53 @@ def test_a_transform_that_raises_a_non_decode_exception_is_survived(exc):
     text = '{"summary": "s", "findings": []}'
     assert _first_eligible_object(text, _review_eligible,
                                   transform=_boom) is None
+
+
+def test_json_scan_is_hard_bounded_on_brace_noise():
+    """Regression for the deferred Phase 3 quadratic scan (issue #28).
+
+    A long run of open braces used to force one `raw_decode` per brace, each
+    O(n) over the remainder — quadratic and unbounded. The scan must:
+    * finish without hanging on far more braces than the attempt cap, and
+    * still find an eligible object that appears within the attempt budget.
+    """
+    assert JSON_SCAN_MAX_ATTEMPTS >= 8
+    # Far more candidate starts than the hard cap: must return None, not hang.
+    noise = "{" * (JSON_SCAN_MAX_ATTEMPTS * 20)
+    assert _first_eligible_object(noise, _review_eligible) is None
+
+    # Eligible payload after fewer failed starts than the cap is still found.
+    prefix = "{ " * (JSON_SCAN_MAX_ATTEMPTS // 4)
+    good = '{"summary": "ok", "findings": []}'
+    found = _first_eligible_object(prefix + good, _review_eligible)
+    assert found == {"summary": "ok", "findings": []}
+
+    # Payload only after more failed starts than the cap is NOT found — the
+    # bound is real (fail-closed), not merely advisory.
+    too_many = "{ " * (JSON_SCAN_MAX_ATTEMPTS + 5)
+    assert _first_eligible_object(too_many + good, _review_eligible) is None
+
+
+def test_json_scan_skips_interior_braces_of_ineligible_objects():
+    """After decoding an ineligible object, do not re-scan its interior `{`s.
+
+    A findings array of hollow objects must not burn the attempt budget or
+    lock onto a nested finding-shaped dict as a top-level envelope.
+    """
+    # Outer object has findings but no summary — still eligible via findings.
+    # Nested finding objects are not top-level candidates once we advance past
+    # the outer object.
+    outer = (
+        '{"summary": "s", "findings": ['
+        + ",".join('{"title": "x", "body": "{not json"}' for _ in range(50))
+        + "]}"
+    )
+    # Noise object first (eligible? no — empty), then the real one.
+    text = '{"noise": true} ' + outer
+    found = _first_eligible_object(text, _review_eligible)
+    assert found is not None
+    assert found.get("summary") == "s"
+    assert len(found.get("findings") or []) == 50
 
 
 def _explode(obj: object) -> bool:
