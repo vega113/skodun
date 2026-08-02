@@ -24,6 +24,7 @@ from skodun import spend as spend_mod
 
 API_URL_DEFAULT = "https://api.openai.com/v1/chat/completions"
 API_KEY_ENV = "OPENAI_API_KEY"
+API_KEY_ENV_ALT = "SKODUN_OPENAI_API_KEY"
 API_BASE_ENV = "SKODUN_OPENAI_API_BASE"  # override for proxies/tests
 USAGE_PREFIX = "SKODUN_API_USAGE "
 
@@ -142,10 +143,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--api-key-env", default=API_KEY_ENV)
     args = p.parse_args(argv)
 
-    key = os.environ.get(args.api_key_env) or os.environ.get(API_KEY_ENV) or ""
+    key = (
+        os.environ.get(args.api_key_env)
+        or os.environ.get(API_KEY_ENV)
+        or os.environ.get(API_KEY_ENV_ALT)
+        or ""
+    )
     if not str(key).strip():
         return _fail(
-            f"missing API key: set {args.api_key_env} (or {API_KEY_ENV})",
+            f"missing API key: set {API_KEY_ENV} or {API_KEY_ENV_ALT} "
+            f"(or {args.api_key_env}) in the process environment "
+            f"(CLI export or MCP server env — never in repo TOML)",
             rc=2)
 
     try:
@@ -197,18 +205,21 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _strictify_schema(schema: dict) -> dict:
-    """Best-effort additionalProperties:false walk for OpenAI strict mode."""
+    """Best-effort additionalProperties:false walk for OpenAI strict mode.
+
+    OpenAI requires every object under ``json_schema.strict`` to list
+    ``required`` containing **all** property keys (nested ``items`` too).
+    """
     def walk(node: object) -> object:
         if not isinstance(node, dict):
             return node
         out = {k: walk(v) for k, v in node.items()}
         if out.get("type") == "object":
-            out.setdefault("additionalProperties", False)
+            out["additionalProperties"] = False
             props = out.get("properties")
-            if isinstance(props, dict):
-                # strict mode often wants required = all property keys
-                if "required" not in out:
-                    out["required"] = list(props.keys())
+            if isinstance(props, dict) and props:
+                # Always overwrite: partial required arrays fail strict mode.
+                out["required"] = list(props.keys())
         if out.get("type") == "array" and "items" in out:
             out["items"] = walk(out["items"])
         return out

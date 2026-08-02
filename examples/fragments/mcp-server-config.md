@@ -44,12 +44,43 @@ Use a **real absolute path** unless your host expands workspace placeholders:
 }
 ```
 
+### Optional: bring-your-own OpenAI API key (metered `openai-api`)
+
+skodun does **not** store API keys in TOML. Put the key on the **MCP process**
+so tool `review` with `reviewer` → `provider = "openai-api"` can bill that
+client’s key (BYOK). Prefer host secret expansion, not a committed literal:
+
+```json
+{
+  "mcpServers": {
+    "skodun": {
+      "type": "stdio",
+      "command": "skodun",
+      "args": ["mcp"],
+      "env": {
+        "OPENAI_API_KEY": "${OPENAI_API_KEY}",
+        "SKODUN_OPENAI_API_SPEND_LIMIT_USD": "10"
+      }
+    }
+  }
+}
+```
+
+Alias accepted: `SKODUN_OPENAI_API_KEY` (same value). If the host already
+inherits the user environment and `OPENAI_API_KEY` is set there, an explicit
+`env` block is optional. **Restart MCP** after changing env.
+
+Reviewer entry still lives in config TOML (`provider = "openai-api"`, any
+model id). Full notes: [`openai-api.md`](openai-api.md).
+
 ### After installing or upgrading skodun
 
-1. Restart the MCP client (stdio servers do not hot-reload code).
+1. Restart the MCP client (stdio servers do not hot-reload code or env).
 2. Run `skodun doctor --repo <project>` in a shell.
-3. Confirm tools: `gate`, `review`, `log`, `surface`, triage family.
+3. Confirm tools: `gate`, `review`, `log`, `surface`, triage, `feedback_*`.
 4. Prefer agents pass absolute `repo` on tool calls (server cwd may differ).
+5. For metered reviews: confirm the MCP process can see `OPENAI_API_KEY`
+   (or `SKODUN_OPENAI_API_KEY`) without printing it.
 
 ### Topology (operators)
 
