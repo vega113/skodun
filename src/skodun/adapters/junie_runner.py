@@ -129,7 +129,35 @@ def _walk_project_for_trust(project: Path, review_path: Path) -> None:
             raise ValueError(f"unexpected project file: {rel_s}/{filename}")
 
 
+def _review_dict_or_none(value: object) -> dict | None:
+    """True review payload shape, else None."""
+    if (
+        isinstance(value, dict)
+        and "summary" in value
+        and "findings" in value
+        and isinstance(value.get("findings"), list)
+    ):
+        return value
+    return None
+
+
 def _load_review_from_result(result: str) -> dict:
+    """Parse junie's free-text ``result`` field into a review dict.
+
+    Junie is not perfectly disciplined about the result string. Observed live
+    shapes (same harness, same prompt):
+
+    * bare JSON: ``{"summary":"...","findings":[]}``
+    * fenced JSON: `` ```json ... ``` ``
+    * partial markdown with embedded JSON: ``### Summary\\n- {...}``
+      (without the full ### Changes / ### Verification trio)
+    * full markdown with ``- No findings.`` under Summary
+
+    Rejecting the partial-markdown form caused intermittent ``envelope
+    refused`` / degraded retries even when llmUsage showed a successful
+    model call. Scan for the first decodable JSON object with the review
+    shape before giving up.
+    """
     if len(result) > 32768:
         raise ValueError("junie result exceeds the normalization limit")
     direct_text = result.strip()
@@ -142,12 +170,10 @@ def _load_review_from_result(result: str) -> dict:
         direct_review = json.loads(direct_text)
     except json.JSONDecodeError:
         direct_review = None
-    if (
-        isinstance(direct_review, dict)
-        and "summary" in direct_review
-        and "findings" in direct_review
-    ):
-        return direct_review
+    got = _review_dict_or_none(direct_review)
+    if got is not None:
+        return got
+
     # Markdown form with ### Summary / ### Changes / ### Verification
     if all(
         heading in result
@@ -164,18 +190,34 @@ def _load_review_from_result(result: str) -> dict:
                 candidate = json.loads(embedded.group(1))
             except json.JSONDecodeError:
                 candidate = None
-            if (
-                isinstance(candidate, dict)
-                and "summary" in candidate
-                and "findings" in candidate
-            ):
-                return candidate
+            got = _review_dict_or_none(candidate)
+            if got is not None:
+                return got
         # Clean review: "- No findings." under Summary
         if re.search(r"-\s*No findings\.", summary_payload):
             return {
                 "summary": "No findings.",
                 "findings": [],
             }
+
+    # Partial markdown / prose with an embedded review object somewhere in
+    # the string (live: "### Summary\n- {\"summary\":\"...\",\"findings\":[]}").
+    decoder = json.JSONDecoder()
+    idx = 0
+    while True:
+        start = result.find("{", idx)
+        if start < 0:
+            break
+        try:
+            candidate, end = decoder.raw_decode(result, start)
+        except json.JSONDecodeError:
+            idx = start + 1
+            continue
+        got = _review_dict_or_none(candidate)
+        if got is not None:
+            return got
+        idx = start + 1
+
     raise ValueError("junie result is not a review payload")
 
 

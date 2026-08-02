@@ -24,7 +24,7 @@ HTTP providers; MCP fingerprint queue (keep refuse-if-busy unless amended).
 |---|---|
 | Goal | Throughput of **independent** reviews |
 | Repo concurrency | `review-fg` capacity N; FIFO retained from S3 |
-| Physical multi-slot | Only when `SKODUN_LEGACY_FG_LOCK=0` (default **1**/on; junk→on) |
+| Physical multi-slot | Only when `SKODUN_LEGACY_FG_LOCK=0` (default **1**/on; junk→on). Parse with a dedicated bool reader — **not** `_env_seconds` (which rejects `0`). |
 | Provider concurrency | Class `provider:<provider_id>`; default max_in_flight **1** (junk→1) |
 | 429 handling | `unavailable` + `quota` → `provider_state` + effective slots **0** for TTL |
 | Shared wait budget | One admission wait covers repo + provider waits + hop selection |
