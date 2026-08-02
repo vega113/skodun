@@ -948,8 +948,11 @@ def svc_review_cancel(store, review_id) -> tuple[int, str]:
             except (OSError, ProcessLookupError, ValueError, TypeError):
                 pass
         elif _pid_is_live_skodun_fg(pid) and int(pid) != os.getpid():
-            # Foreground / MCP in another process: SIGTERM hits the handler
-            # installed in run_review. Never signal ourselves.
+            # Foreground CLI or MCP server in another process. MCP installs its
+            # SIGTERM forwarder on the MAIN thread (reviews run on a worker
+            # thread where signal handlers cannot be installed); that forwarder
+            # sets the cancel token so the review's finally demotes cleanly.
+            # Never signal ourselves.
             try:
                 os.kill(int(pid), signal.SIGTERM)
                 signalled = True
@@ -968,17 +971,107 @@ def svc_review_cancel(store, review_id) -> tuple[int, str]:
         except BaseException as e:
             return 2, (f"skodun review-cancel: could not demote review {rid}: "
                        f"{e!r}")
+    elif signalled:
+        # Wait briefly for the holder to demote via its cancel path. If the
+        # process died without demoting (no SIGTERM handler — the MCP bug this
+        # poll closes), finish the row here so it is not forever-running.
+        outcome = _await_cancel_or_demote(store, rid, pid)
+        if outcome == "done":
+            return 0, f"skodun review-cancel: cancel completed for {rid}"
+        if outcome == "demoted":
+            return 0, (f"skodun review-cancel: cancelled {rid} "
+                       f"(durable terminal; holder exited without demoting)")
+        # Still running: cancel was requested; the holder is finishing.
+        return 0, f"skodun review-cancel: cancel requested for {rid}"
 
     if demoted:
         return 0, (f"skodun review-cancel: cancelled {rid} "
                    f"(durable terminal; holder was not reachable)")
-    if token_set or signalled:
+    if token_set:
         return 0, f"skodun review-cancel: cancel requested for {rid}"
     # Live but unconfirmable pid: do not SIGTERM a stranger. Operator can
     # re-run after the process dies, or recover_stale will sweep by age.
     return 0, (f"skodun review-cancel: cancel noted for {rid}; "
                f"holder pid {pid!r} could not be confirmed — "
                f"re-check with review-status")
+
+
+#: How long cross-process cancel waits for the holder to demote before either
+#: demoting a dead unclean exit or returning "cancel requested". Short enough
+#: for CLI UX; long enough for a token-driven demotion + provider SIGKILL grace.
+_CANCEL_AWAIT_SEC = 8.0
+
+
+def _await_cancel_or_demote(store, review_id: str, pid) -> str:
+    """After signalling: wait for terminal, or demote if the holder died dirty.
+
+    Returns ``"done"`` when the row left ``running`` on its own, ``"demoted"``
+    when this function applied `fail_if_running`, or ``"pending"`` when the
+    holder is still alive and still running (cancel requested; re-check later).
+    """
+    import time as _time
+
+    from .store import RUNNING
+
+    deadline = _time.monotonic() + _CANCEL_AWAIT_SEC
+    while _time.monotonic() < deadline:
+        try:
+            rec = store.get_review(review_id)
+        except KeyboardInterrupt:
+            raise
+        except BaseException:
+            return "pending"
+        if rec is None or rec.get("status") != RUNNING:
+            return "done"
+        if not _pid_alive(pid):
+            try:
+                if store.fail_if_running(review_id, REVIEW_CANCEL_DURABLE_REASON):
+                    return "demoted"
+            except KeyboardInterrupt:
+                raise
+            except BaseException:
+                return "pending"
+            # Race: another transition already terminalised the row.
+            try:
+                rec = store.get_review(review_id)
+            except BaseException:
+                return "pending"
+            if rec is None or rec.get("status") != RUNNING:
+                return "done"
+            return "pending"
+        _time.sleep(0.05)
+    # Still running and (if we can tell) still alive.
+    try:
+        rec = store.get_review(review_id)
+    except BaseException:
+        return "pending"
+    if rec is None or rec.get("status") != RUNNING:
+        return "done"
+    if not _pid_alive(pid):
+        try:
+            if store.fail_if_running(review_id, REVIEW_CANCEL_DURABLE_REASON):
+                return "demoted"
+        except BaseException:
+            pass
+        return "pending"
+    return "pending"
+
+
+def _pid_alive(pid) -> bool:
+    """Whether `pid` still exists. False when unknown / dead / invalid."""
+    import os as _os
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        _os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:                 # pragma: no cover - not ours
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _pid_is_live_skodun_fg(pid) -> bool:
@@ -1005,7 +1098,11 @@ def _pid_is_live_skodun_fg(pid) -> bool:
     if "skodun" not in args:
         return False
     # Never treat a background worker as FG: workers have their own path.
+    # Match the same conjunction `pid_is_skodun_worker` uses (`all` of the
+    # tokens), not `any` — `WORKER_ARGV_TOKENS` is `("skodun", "worker")` and
+    # every FG/MCP argv already contains `skodun`, so `any` would refuse to
+    # signal every live holder and leave cancel on the dead-pid demote path.
     from .dispatch import WORKER_ARGV_TOKENS
-    if any(tok in args for tok in WORKER_ARGV_TOKENS):
+    if all(tok in args for tok in WORKER_ARGV_TOKENS):
         return False
     return True

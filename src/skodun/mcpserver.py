@@ -1057,12 +1057,63 @@ class McpServer:
         client closed stdin, or the client went away. A non-zero exit is how
         every MCP client harness reports "your server crashed", which is a
         different thing and must stay distinguishable.
+
+        SIGTERM is installed HERE, on the main thread, deliberately: the
+        long-running review runs on a worker thread where `signal.signal` cannot
+        install a handler (`ValueError: signal only works in main thread of the
+        main interpreter`). Cross-process `review-cancel` SIGTERMs this pid; if
+        the default disposition stayed in force the process would die without
+        setting the cancel token, orphaning the provider process group and a
+        `running` row. The handler only sets the cancel token(s) — the review
+        thread's own finally demotes the row, kills the provider group, and
+        releases the FG lock.
         """
+        previous_sigterm = self._install_sigterm_forwarder()
         try:
-            self._read_loop()
-        except BaseException as e:          # never a traceback out of a server
-            self._note(f"the read loop stopped unexpectedly: {e!r}")
-        return self._shutdown()
+            try:
+                self._read_loop()
+            except BaseException as e:      # never a traceback out of a server
+                self._note(f"the read loop stopped unexpectedly: {e!r}")
+            return self._shutdown()
+        finally:
+            self._restore_sigterm_forwarder(previous_sigterm)
+
+    def _install_sigterm_forwarder(self):
+        """Main-thread SIGTERM → set the long-running cancel token(s).
+
+        Returns the previous handler (or None when install is impossible).
+        Restored when `serve` returns so a process that reuses the
+        interpreter does not keep a stale forwarder.
+        """
+        import signal
+
+        def handler(signum, frame):         # pragma: no cover - driven by signal
+            with self._slot_lock:
+                cancel = self._worker_cancel
+            if cancel is not None:
+                cancel.set()
+            try:
+                from . import pipeline
+                pipeline.request_cancel_all()
+            except BaseException:
+                pass
+
+        try:
+            return signal.signal(signal.SIGTERM, handler)
+        except (ValueError, OSError, RuntimeError):
+            self._note("could not install the SIGTERM forwarder; cross-process "
+                       "review-cancel of a review held by this server may kill "
+                       "the process without demoting the row")
+            return None
+
+    def _restore_sigterm_forwarder(self, previous) -> None:
+        if previous is None:
+            return
+        import signal
+        try:
+            signal.signal(signal.SIGTERM, previous)
+        except (ValueError, OSError, RuntimeError):
+            pass
 
     def _read_loop(self) -> None:
         # `_stdout_lost` is read without the write lock on purpose: it is only

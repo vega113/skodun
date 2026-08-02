@@ -337,3 +337,156 @@ def test_tool_registry_includes_s1_tools():
     assert "review_status" in names
     assert "review_cancel" in names
     assert names.index("review_status") > names.index("triage_defer")
+
+
+# ==========================================================================
+# MCP worker-thread + cross-process cancel (the S1 bug the skeptic found)
+# ==========================================================================
+
+def test_cross_process_review_cancel_of_mcp_held_review(tmp_path):
+    """CLI review-cancel against a real skodun mcp process mid-provider.
+
+    MCP runs `review` on a worker thread where `signal.signal` cannot install a
+    handler. Without a main-thread SIGTERM forwarder, cross-process cancel would
+    SIGTERM the MCP pid with SIG_DFL, kill the process without setting the cancel
+    token, and leave: orphan provider (start_new_session), forever-running row,
+    FG lock until reclaim. This drill is the regression lock for that path.
+    """
+    import json
+    import subprocess
+    import sys
+
+    import skodun
+    from tests.test_mcptools import _HANDSHAKE, _env, _rpc
+    from tests.test_pipeline import _fake_grok
+
+    hang = (
+        'python3 -c "import os; open(\'$D/started.pgid\',\'w\')'
+        '.write(str(os.getpgid(0)))"\n'
+        "trap '' TERM\n"
+        "sleep 300\n"
+    )
+    _fake_grok(tmp_path, hang)
+    repo = _mkrepo(tmp_path)
+    (repo / ".skodun.toml").write_text(CFG, encoding="utf-8")
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+
+    env = _env(tmp_path)
+    env["SKODUN_GROK_BIN"] = str(tmp_path / "bin" / "grok")
+    env["SKODUN_CODEX_BIN"] = str(tmp_path / "bin" / "codex")
+    env["SKODUN_ALLOW_MAIN"] = "1"
+    env["SKODUN_SECURITY_PASS"] = "0"
+    env["SKODUN_SKEPTIC_PASS"] = "0"
+    env["SKODUN_LOCK_WAIT_SECONDS"] = "5"
+    env["SKODUN_LOCK_POLL_SECONDS"] = "0.05"
+    src = str(Path(skodun.__file__).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join(
+        [src] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+
+    db = Path(env["SKODUN_DB"])
+    pgid_file = tmp_path / "bin" / "started.pgid"
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "skodun", "mcp"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env, start_new_session=True)
+    try:
+        proc.stdin.write(_HANDSHAKE)
+        proc.stdin.write(_rpc("tools/call", 1, name="review",
+                              arguments={"repo": str(repo)}))
+        proc.stdin.flush()
+
+        # Wait for the hanging provider AND a durable running row with an id.
+        rid_box: dict = {}
+        deadline = time.monotonic() + 120
+
+        def _ready():
+            if not pgid_file.exists():
+                return False
+            if not db.exists():
+                return False
+            try:
+                with Store.open(db) as st:
+                    rows = [r for r in st.list_reviews(None, 20)
+                            if r.get("status") == "running"]
+            except Exception:
+                return False
+            if not rows:
+                return False
+            rid_box["id"] = rows[0]["id"]
+            rid_box["pid"] = rows[0].get("pid")
+            return True
+
+        while time.monotonic() < deadline and not _ready():
+            assert proc.poll() is None, (
+                f"MCP exited before reviewing: {proc.stderr.read()!r}")
+            time.sleep(0.05)
+        assert pgid_file.exists(), "the provider never started"
+        assert "id" in rid_box, "no running review row was recorded"
+        rid = rid_box["id"]
+        pgid = int(pgid_file.read_text(encoding="utf-8").strip())
+        # The stored pid must be the MCP process (FG attach), not the provider.
+        assert rid_box["pid"] == proc.pid, (
+            f"expected FG pid={proc.pid}, got {rid_box['pid']!r}")
+
+        # Cross-process cancel via the SHIPPED CLI entry point (not request_cancel).
+        cancel = subprocess.run(
+            [sys.executable, "-m", "skodun", "review-cancel", rid],
+            env=env, capture_output=True, text=True, timeout=60)
+        assert cancel.returncode == 0, (
+            f"review-cancel failed: out={cancel.stdout!r} err={cancel.stderr!r}")
+        assert rid in cancel.stdout
+
+        # Durable terminal + free lock + dead provider group.
+        deadline = time.monotonic() + 60
+        terminal = None
+        while time.monotonic() < deadline:
+            with Store.open(db) as st:
+                terminal = st.get_review(rid)
+            if terminal is not None and terminal.get("status") != "running":
+                break
+            time.sleep(0.05)
+        assert terminal is not None and terminal.get("status") != "running", (
+            f"row still running after cancel: {terminal!r}")
+        assert terminal.get("trustworthy") is False
+        assert services.report_state(terminal) == "cancelled"
+        # "cancel completed" / demote via the holder's finally: not the dead-pid
+        # "holder was not reachable" path, which would leave the FG lock behind.
+        assert "not reachable" not in cancel.stdout, cancel.stdout
+
+        lock = git_common_dir(repo) / "grok-reviews-foreground.lock"
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and lock.exists():
+            time.sleep(0.05)
+        assert not lock.exists(), (
+            "the cancelled MCP review kept the foreground lock")
+
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and _group_alive(pgid):
+            time.sleep(0.05)
+        assert not _group_alive(pgid), (
+            "the model CLI outlived the cross-process cancelled review")
+
+        # MCP should still be alive: SIGTERM was forwarded to the cancel token,
+        # not left as SIG_DFL process death. (If it already exited 0 after the
+        # tool result, that is also fine — just not a crash mid-hang.)
+        if proc.poll() is not None:
+            assert proc.returncode == 0, (
+                f"MCP crashed on cancel: rc={proc.returncode} "
+                f"err={proc.stderr.read()!r}")
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except Exception:
+                pass

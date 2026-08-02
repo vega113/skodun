@@ -295,6 +295,24 @@ def request_cancel(review_id: str) -> bool:
     return True
 
 
+def request_cancel_all() -> int:
+    """Set every in-process cancel token. Used by the MCP main-thread SIGTERM
+    forwarder: long-running reviews run on a worker thread where
+    `signal.signal` cannot install a handler, so the process handler must fan
+    out to every registered Event (and the server's own `_worker_cancel`).
+
+    Returns how many tokens were set.
+    """
+    with _ACTIVE_CANCELS_LOCK:
+        tokens = list(_ACTIVE_CANCELS.values())
+    for cancel in tokens:
+        try:
+            cancel.set()
+        except Exception:                   # pragma: no cover - defensive
+            pass
+    return len(tokens)
+
+
 def _note(message: str) -> None:
     """One progress line. To this thread's sink if it has one, else to stderr.
 
