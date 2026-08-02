@@ -2,14 +2,19 @@
 
 CLI subscription providers do not use this module. HTTP adapters record each
 call's token usage and an **estimated** USD cost, then refuse new calls when
-a configurable per-provider daily ceiling is reached.
+a configurable **per-provider per-UTC-day** ceiling is reached.
 
-Limits (first match wins for the default ceiling number):
+The budget **resets every UTC midnight**. It is not a lifetime cap — users do
+not need to raise the limit as spend accumulates over weeks.
 
-* ``SKODUN_<PROVIDER>_SPEND_LIMIT_USD`` with provider uppercased and ``-`` → ``_``
-  (e.g. ``SKODUN_OPENAI_API_SPEND_LIMIT_USD``)
-* ``SKODUN_API_SPEND_LIMIT_USD`` (shared default for all API providers)
-* built-in default **10.0** USD per UTC day
+Limits (first match wins):
+
+* ``SKODUN_<PROVIDER>_SPEND_LIMIT_USD_PER_DAY`` (preferred), e.g.
+  ``SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY``
+* ``SKODUN_<PROVIDER>_SPEND_LIMIT_USD`` (alias, same meaning: **daily**)
+* ``SKODUN_API_SPEND_LIMIT_USD_PER_DAY`` / ``SKODUN_API_SPEND_LIMIT_USD``
+  (shared default for all API providers)
+* built-in default **10.0** USD **per UTC day**
 
 Costs are estimates from a rate table (USD per 1M tokens). Override rates via
 ``SKODUN_OPENAI_API_INPUT_USD_PER_1M`` / ``SKODUN_OPENAI_API_OUTPUT_USD_PER_1M``
@@ -27,7 +32,9 @@ from .store import _TS_FORMAT
 if TYPE_CHECKING:
     from .store import Store
 
-DEFAULT_SPEND_LIMIT_USD = 10.0
+DEFAULT_SPEND_LIMIT_USD_PER_DAY = 10.0
+# Preferred names say PER_DAY; unsuffixed aliases mean the same (daily, not lifetime).
+API_SPEND_LIMIT_ENV_PER_DAY = "SKODUN_API_SPEND_LIMIT_USD_PER_DAY"
 API_SPEND_LIMIT_ENV = "SKODUN_API_SPEND_LIMIT_USD"
 
 # Approximate USD per 1_000_000 tokens (input, output). Conservative defaults
@@ -56,16 +63,23 @@ def _utc_day_prefix(now_iso: str | None = None) -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
-def provider_limit_env_name(provider: str) -> str:
+def provider_limit_env_names(provider: str) -> tuple[str, str]:
+    """``(…_PER_DAY, …_USD)`` env names for one provider (both mean daily)."""
     key = str(provider or "").strip().upper().replace("-", "_")
-    return f"SKODUN_{key}_SPEND_LIMIT_USD"
+    base = f"SKODUN_{key}_SPEND_LIMIT_USD"
+    return (f"{base}_PER_DAY", base)
 
 
 def spend_limit_usd(provider: str,
                     env: Mapping[str, str] | None = None) -> float:
-    """Per-provider daily ceiling in USD (≥ 0). Junk → default 10."""
+    """Per-provider **UTC-day** ceiling in USD (≥ 0). Junk → default 10/day."""
     env = os.environ if env is None else env
-    for name in (provider_limit_env_name(provider), API_SPEND_LIMIT_ENV):
+    names = (
+        *provider_limit_env_names(provider),
+        API_SPEND_LIMIT_ENV_PER_DAY,
+        API_SPEND_LIMIT_ENV,
+    )
+    for name in names:
         raw = env.get(name)
         if raw is None or not str(raw).strip():
             continue
@@ -76,7 +90,7 @@ def spend_limit_usd(provider: str,
         if value < 0 or value != value:  # NaN
             continue
         return value
-    return DEFAULT_SPEND_LIMIT_USD
+    return DEFAULT_SPEND_LIMIT_USD_PER_DAY
 
 
 def rates_for_model(model: str,
