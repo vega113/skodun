@@ -1264,6 +1264,9 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     common_dir = gitio.git_common_dir(repo)
     scope = str(common_dir)
     admission_wait = capacity.admission_wait_from_env(wait)
+    # Shared admit+bind wall-clock deadline: review-fg wait + provider waits
+    # and hops consume the same budget (S4). Not reset per hop or phase.
+    admission_deadline = time.monotonic() + float(admission_wait)
     cap_n = capacity.capacity_from_env()
     dual_hold = capacity.legacy_fg_lock_from_env()
     lock_cell: dict = {"lock": None}
@@ -1625,8 +1628,11 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 persisted = True
                 _note(f"reviewing {len(diff.files)} file(s) vs {base.ref} as "
                       f"{rid} ...")
-                outcome = _run_chain(finder, cfg, d, prompt.text, root, store,
-                                     scratch, "primary", **_cancel_kw(cancel))
+                outcome = _run_chain(
+                    finder, cfg, d, prompt.text, root, store,
+                    scratch, "primary",
+                    admission_deadline=admission_deadline,
+                    **_cancel_kw(cancel))
                 rec["attempts"] = outcome.attempts
                 _apply(rec, outcome)
                 # Whoever ACTUALLY answered, not whoever was asked: after a
@@ -2190,6 +2196,8 @@ def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
     )
     _checkpoint(cancel, rec, "before the reviewer was invoked")
     _note(f"reviewing {len(diff.files)} file(s) vs {base.ref} as {record_id} ...")
+    # Standalone chain budget: pre-push is not on the FG admit path, so
+    # run_chain starts its own shared provider wait deadline (not reset per hop).
     outcome = _run_chain(finder, cfg,
                          _escalated(d, prompt.prompt_bytes, large_prompt),
                          prompt.text, root, store, scratch, "primary",

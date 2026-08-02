@@ -14,6 +14,7 @@ pins the import-level contract the move must preserve.
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -379,12 +380,101 @@ def test_s4_quota_releases_slot_and_hops_to_fallback(tmp_path, monkeypatch):
         assert store.capacity_holder_count(
             capacity.provider_resource_class("google"), "google") == 0
         assert chain._effective_provider_capacity(store, "xai") == 0
+        # Shipped path: _acquire_provider_slot must honor effective 0 via
+        # capacity_fn — not a hand-built capacity=0 acquire.
         with pytest.raises(capacity.AdmissionTimeout):
-            capacity.acquire(
-                store, scope="xai",
-                resource_class=capacity.provider_resource_class("xai"),
-                capacity=chain._effective_provider_capacity(store, "xai"),
-                wait_sec=0.05, poll_sec=0.01)
+            chain._acquire_provider_slot(
+                store, "xai", wait_sec=0.05, cancel=None, on_progress=None)
+        assert store.capacity_holder_count(
+            capacity.provider_resource_class("xai"), "xai") == 0
+
+
+def test_s4_post_quota_run_chain_does_not_hold_provider_slot(tmp_path,
+                                                             monkeypatch):
+    """After mark_provider_unavailable, a new run_chain must not hold provider:id.
+
+    Drives the real skip + effective-capacity path: cache skip avoids inference,
+    and a direct _acquire_provider_slot after the mark still cannot admit.
+    """
+    from skodun import capacity, runner
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.store import Store
+    from skodun.store import _TS_FORMAT
+    import time as time_mod
+
+    monkeypatch.setenv("SKODUN_GROK_BIN", "/bin/sh")
+    monkeypatch.setenv("SKODUN_ADMISSION_WAIT_SECONDS", "1")
+    spawned = []
+
+    def fake(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        spawned.append(1)
+        out.write_bytes(GROK_CLEAN)
+        return runner.RunResult(rc=0, timed_out=False, duration_sec=0.01,
+                                first_output_sec=0.01)
+
+    monkeypatch.setattr(chain.runner, "run_with_watchdog", fake)
+    reviewer = Reviewer(name="f", provider="xai", model="m", role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(reviewer,))
+    store = Store.open(tmp_path / "s.db")
+    until = time_mod.strftime(
+        _TS_FORMAT, time_mod.gmtime(time_mod.time() + 1800))
+    with store:
+        store.mark_provider_unavailable(
+            "xai", "rate limited", "quota", until)
+        out = chain.run_chain(
+            reviewer, cfg, cfg.defaults, b"p", tmp_path, store, tmp_path, "t")
+        assert out.accepted is None
+        assert spawned == [], "inference must not start on a quota-backed-off provider"
+        assert store.capacity_holder_count(
+            capacity.provider_resource_class("xai"), "xai") == 0
+        # Real admit path after mark (bypass skip by calling acquire helper):
+        with pytest.raises(capacity.AdmissionTimeout):
+            chain._acquire_provider_slot(
+                store, "xai", wait_sec=0.05, cancel=None, on_progress=None)
+        assert store.capacity_holder_count(
+            capacity.provider_resource_class("xai"), "xai") == 0
+
+
+def test_s4_provider_hops_share_one_admission_deadline(tmp_path, monkeypatch):
+    """Provider waits/hops use remaining shared budget — not a full reset each hop."""
+    from skodun import capacity
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.store import Store
+
+    monkeypatch.setenv("SKODUN_GROK_BIN", "/bin/sh")
+    monkeypatch.setenv("SKODUN_AGY_BIN", "/bin/sh")
+    waits: list[float] = []
+    real = capacity.acquire
+
+    def spy(store, *, scope, resource_class, wait_sec, **kwargs):
+        waits.append(float(wait_sec))
+        if len(waits) == 1:
+            # Consume part of the shared budget, then fail so the chain hops.
+            time.sleep(0.08)
+            raise capacity.AdmissionTimeout(
+                f"gave up after {wait_sec:g}s waiting for {resource_class}")
+        # Second hop: still fail; we only need wait_sec remaining.
+        raise capacity.AdmissionTimeout(
+            f"gave up after {wait_sec:g}s waiting for {resource_class}")
+
+    monkeypatch.setattr(capacity, "acquire", spy)
+    head = Reviewer(name="f", provider="xai", model="m", role="finder",
+                    fallbacks=("backup",))
+    backup = Reviewer(name="backup", provider="google", model="m2",
+                      role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(head, backup))
+    store = Store.open(tmp_path / "s.db")
+    budget = 0.25
+    deadline = time.monotonic() + budget
+    with store:
+        chain.run_chain(
+            head, cfg, cfg.defaults, b"p", tmp_path, store, tmp_path, "t",
+            admission_deadline=deadline)
+    assert len(waits) == 2, waits
+    assert waits[0] <= budget + 0.05
+    # Second hop must see a smaller remaining budget (shared deadline).
+    assert waits[1] < waits[0]
+    assert waits[1] <= waits[0] - 0.05
 
 
 def test_s4_cancel_during_provider_wait_releases_ticket(tmp_path, monkeypatch):

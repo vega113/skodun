@@ -386,6 +386,21 @@ def _cancelled(cancel: "threading.Event | None") -> bool:
     return cancel is not None and cancel.is_set()
 
 
+def _resolve_capacity(capacity: int | None,
+                      capacity_fn: Callable[[], int] | None) -> int:
+    """Resolve admit capacity for one poll; ``0`` is valid (no admits)."""
+    if capacity_fn is not None:
+        try:
+            value = int(capacity_fn())
+        except Exception:
+            value = DEFAULT_CAPACITY
+        return value if value >= 0 else DEFAULT_CAPACITY
+    if capacity is None:
+        return DEFAULT_CAPACITY
+    value = int(capacity)
+    return DEFAULT_CAPACITY if value < 0 else value
+
+
 def acquire(store: "Store", *, scope: str,
             resource_class: str = RESOURCE_REVIEW_FG,
             capacity: int | None = None,
@@ -394,6 +409,7 @@ def acquire(store: "Store", *, scope: str,
             stale_sec: float = DEFAULT_STALE_SEC,
             cancel: "threading.Event | None" = None,
             on_progress: Callable[[str], None] | None = None,
+            capacity_fn: Callable[[], int] | None = None,
             clock: Callable[[], float] | None = None,
             sleep: Callable[[float], None] | None = None,
             pid_alive_fn: Callable[[int], bool] | None = None) -> Ticket:
@@ -408,19 +424,18 @@ def acquire(store: "Store", *, scope: str,
 
     ``capacity=0`` is valid and means **no admits** (S4 provider pressure
     reduction while a provider is in quota backoff). ``None`` and negative
-    values fall back to ``DEFAULT_CAPACITY``.
+    static values fall back to ``DEFAULT_CAPACITY``.
+
+    When ``capacity_fn`` is set it is re-evaluated **every poll** before
+    ``try_admit`` so cross-process pressure reduction (e.g. quota → effective
+    0) takes effect for waiters already queued, not only for new acquires.
     """
-    if capacity is None:
-        cap = DEFAULT_CAPACITY
-    else:
-        cap = int(capacity)
-        if cap < 0:
-            cap = DEFAULT_CAPACITY
     now = time.monotonic if clock is None else clock
     pause = time.sleep if sleep is None else sleep
 
     ticket = enqueue(store, scope=scope, resource_class=resource_class)
-    deadline = now() + float(wait_sec)
+    budget = float(wait_sec)
+    deadline = now() + budget
     noted_pos: int | None = None
     # Always allow one attempt even when wait_sec is 0 (tests + free path).
     attempted = False
@@ -439,7 +454,7 @@ def acquire(store: "Store", *, scope: str,
                 finish(store, ticket, status=STATUS_EXPIRED,
                        expire_reason=REASON_ADMISSION_TIMEOUT)
                 raise AdmissionTimeout(
-                    f"gave up after {wait_sec:g}s waiting for {resource_class} "
+                    f"gave up after {budget:g}s waiting for {resource_class} "
                     f"capacity (scope={scope})")
 
             # Drop dead/stale peers before position/admit so FIFO is honest.
@@ -456,6 +471,7 @@ def acquire(store: "Store", *, scope: str,
                     resource_class, pos, max(remaining, 0.0), eta_sec=eta))
 
             attempted = True
+            cap = _resolve_capacity(capacity, capacity_fn)
             try_admit(store, ticket, capacity=cap)
             if ticket.status in HOLDER_STATUSES:
                 mark_started(store, ticket)
@@ -466,7 +482,7 @@ def acquire(store: "Store", *, scope: str,
                 finish(store, ticket, status=STATUS_EXPIRED,
                        expire_reason=REASON_ADMISSION_TIMEOUT)
                 raise AdmissionTimeout(
-                    f"gave up after {wait_sec:g}s waiting for {resource_class} "
+                    f"gave up after {budget:g}s waiting for {resource_class} "
                     f"capacity (scope={scope})")
             slice_sleep = min(float(poll_sec), remaining)
             if slice_sleep > 0:
