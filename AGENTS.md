@@ -147,18 +147,16 @@ Keep `main` green. Prefer short-lived branches over long-lived feature branches 
 
 ## Product intent pointers
 
+Point agents at durable docs; do **not** maintain issue/PR number lists here
+(they rot). Ship status lives in GitHub and, when useful, in `docs/epics/`.
+
 | Kind | Path |
 |---|---|
-| Epic seeds + ship status | [`docs/epics/`](docs/epics/) |
+| Epic seeds | [`docs/epics/`](docs/epics/) |
 | Designs | [`docs/superpowers/specs/`](docs/superpowers/specs/) |
 | Client integrate guide | [`docs/integrate-external-project.md`](docs/integrate-external-project.md) |
 | Client agent paste | [`examples/AGENTS.md`](examples/AGENTS.md), [`examples/fragments/`](examples/fragments/) |
 | Known limitations | [`README.md`](README.md) § Known limitations |
-
-Shipped post-#23 epics (do not re-open without owner intent):
-
-- **S1** status + cancel — PR #49  
-- **S3** fair `review-fg` capacity — PR #50  
 
 ---
 
