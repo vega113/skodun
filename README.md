@@ -103,7 +103,7 @@ wins per key, reviewers merge by `name`). The store lives at
 # ~/.config/skodun/config.toml
 [[reviewers]]
 name     = "finder"
-provider = "xai"        # xai | openai | google | junie are registered -- run `skodun providers`
+provider = "xai"        # xai | openai | openai-api | google | junie — run `skodun providers`
 model    = "grok-4.5"   # must be an id your CLI offers -- run `grok models`
 effort   = "high"
 role     = "finder"     # finder | refuter | security | triager | integrator
@@ -140,18 +140,68 @@ $ skodun providers
 google | adapter=agy | binary=agy (executable) | state=none
 junie | adapter=junie | binary=junie (executable) | state=none
 openai | adapter=codex | binary=codex (executable) | state=none
+openai-api | adapter=openai-api | binary=… (executable) | state=none
 xai | adapter=grok | binary=/home/you/.grok/bin/grok (executable) | state=none
 ```
 
-Four providers are registered: `xai` (the `grok` CLI), `openai` (the `codex`
-CLI), `google` (the `agy` CLI), and `junie` (the JetBrains `junie` CLI, macOS
-only — see below). **`anthropic` is not registered** — there is
-no shipped adapter for it. A reviewer entry naming `provider = "anthropic"` (or
-any other unregistered name) loads fine — `load_config` only requires `provider`
-and `model` to be non-empty strings, it does not check the name against the
-adapter registry — but `skodun providers` reports it `FAILED ... has no
-registered adapter` and exits `1`, and an actual review or gate run against it
-fails closed the same way any unresolvable provider does.
+Registered providers:
+
+| Provider id | Surface | Notes |
+|---|---|---|
+| `xai` | `grok` CLI | Subscription CLI |
+| `openai` | `codex` CLI | Subscription CLI — **not** HTTP API |
+| `google` | `agy` CLI | Subscription multi-model CLI |
+| `junie` | JetBrains `junie` CLI | macOS Seatbelt capsule only |
+| `openai-api` | OpenAI **HTTP** Chat Completions | Metered; **bring your own** `OPENAI_API_KEY` |
+
+**`anthropic` is not registered** — there is no shipped adapter for it. A
+reviewer entry naming `provider = "anthropic"` (or any other unregistered name)
+loads fine — `load_config` only requires `provider` and `model` to be non-empty
+strings, it does not check the name against the adapter registry — but
+`skodun providers` reports it `FAILED ... has no registered adapter` and exits
+`1`, and an actual review or gate run against it fails closed the same way any
+unresolvable provider does.
+
+#### Metered OpenAI HTTP (`openai-api`) — client BYOK
+
+Optional pay-per-token path, separate from the Codex CLI (`provider = "openai"`).
+
+1. **Reviewer in TOML** (global and/or repo `.skodun.toml`):
+
+```toml
+[[reviewers]]
+name     = "finder-openai-api"
+provider = "openai-api"
+model    = "gpt-5.6-luna"   # any model id the OpenAI API accepts
+effort   = "medium"
+role     = "finder"
+```
+
+2. **API key in process env only** (never in TOML or git):
+
+| Variable | Role |
+|---|---|
+| `OPENAI_API_KEY` | Standard OpenAI key (preferred) |
+| `SKODUN_OPENAI_API_KEY` | Alias (handy in MCP `env` blocks) |
+
+3. **Daily spend ceiling** (UTC day, **not** lifetime; default **$10/day**):
+
+```bash
+export SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY=10
+# alias (same meaning): SKODUN_OPENAI_API_SPEND_LIMIT_USD=10
+```
+
+4. **MCP clients** inject the key into the **skodun mcp** process, then restart MCP:
+
+```json
+"env": {
+  "OPENAI_API_KEY": "${OPENAI_API_KEY}",
+  "SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY": "10"
+}
+```
+
+Full client notes: [`examples/fragments/openai-api.md`](examples/fragments/openai-api.md),
+[`examples/fragments/mcp-server-config.md`](examples/fragments/mcp-server-config.md).
 
 #### Why there is no `anthropic` adapter
 
@@ -317,11 +367,11 @@ ceiling, and nothing becomes trustworthy that was not reviewed.
 
 A reviewer may set `max_cost_usd` (a finite, strictly positive number — `true`,
 `0`, negative, `nan`, and `inf` are all rejected at load time, with a message
-naming the reviewer). This validates today, but **no currently shipped adapter
-(`xai`/`openai`/`google`) reads it** — it was added for an `anthropic` adapter that
-is deliberately not shipped (see above), and is kept because a budget cap is a
-provider-neutral idea any future metered adapter would want. Setting it today is
-harmless and has no effect.
+naming the reviewer). For **`openai-api`**, an attempt that exceeds this value
+is noted on stderr after the call (the daily provider ceiling is the hard
+gate — see metered OpenAI section above). CLI subscription adapters do not
+meter dollars; setting `max_cost_usd` on them is still validated and otherwise
+harmless.
 
 ### Provider-state cache
 

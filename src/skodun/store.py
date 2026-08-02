@@ -1927,6 +1927,10 @@ class Store:
         return [dict(r) for r in rows]
 
     # --- API spend ledger (v8; metered adapters) ---------------------------
+    # Rows are append-only. Daily ceilings sum cost_usd WHERE at LIKE 'YYYY-MM-DD%'
+    # (UTC day of the timestamp). Limits are enforced in skodun.spend — default
+    # $10 per provider per UTC day (SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY).
+    # Not a lifetime total: clients need not raise the cap as history grows.
 
     def api_spend_append(
             self, *, at: str, provider: str, model: str | None,

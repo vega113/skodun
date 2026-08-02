@@ -100,7 +100,7 @@ Minimal shape (edit models to what your CLIs actually serve):
 ```toml
 [[reviewers]]
 name = "finder"
-provider = "xai"          # or openai | google | junie
+provider = "xai"          # or openai | openai-api | google | junie
 model = "grok-4.20-0309-reasoning"
 role = "finder"
 effort = "medium"
@@ -108,6 +108,37 @@ effort = "medium"
 
 Worked examples: `examples/multi-provider.toml`,
 `examples/scala-angular-monorepo.toml`.
+
+### Optional: OpenAI HTTP API (client brings their own key)
+
+Use when you want metered Chat Completions instead of (or as fallback to) the
+Codex subscription CLI. Full fragment:
+[`examples/fragments/openai-api.md`](../examples/fragments/openai-api.md).
+
+| Piece | Where |
+|---|---|
+| Reviewer | TOML `provider = "openai-api"`, any OpenAI **model** id |
+| API key | Process env only: `OPENAI_API_KEY` or `SKODUN_OPENAI_API_KEY` — **never** TOML/git |
+| Daily spend cap | Env `SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY` (default **$10 per UTC day**, not lifetime) |
+| MCP | Put the key (and optional daily cap) in the MCP server `env` block; restart MCP |
+
+```toml
+[[reviewers]]
+name     = "finder-openai-api"
+provider = "openai-api"
+model    = "gpt-5.6-luna"
+effort   = "medium"
+role     = "finder"
+```
+
+```bash
+export OPENAI_API_KEY=sk-...   # client secret; not committed
+skodun review --repo /abs/worktree --reviewer finder-openai-api
+```
+
+MCP hosts that do not inherit the user env must inject the key (secret expansion
+preferred over a committed literal) — see
+[`examples/fragments/mcp-server-config.md`](../examples/fragments/mcp-server-config.md).
 
 ### Store
 
@@ -168,7 +199,9 @@ expand `${workspaceFolder}`):
 
 Operator fragment: [`examples/fragments/mcp-server-config.md`](../examples/fragments/mcp-server-config.md).  
 Topology (MCP vs repo vs worktree):
-[`examples/fragments/mcp-review-topology.md`](../examples/fragments/mcp-review-topology.md).
+[`examples/fragments/mcp-review-topology.md`](../examples/fragments/mcp-review-topology.md).  
+Metered OpenAI BYOK (API key in MCP `env`):
+[`examples/fragments/openai-api.md`](../examples/fragments/openai-api.md).
 
 ### What an MCP server is
 
@@ -350,6 +383,7 @@ skodun surface --repo "$ROOT"
 | [`examples/fragments/mcp-server-config.md`](../examples/fragments/mcp-server-config.md) | Operator MCP JSON |
 | [`examples/fragments/feedback.md`](../examples/fragments/feedback.md) | Agent judgment + product-bug feedback (non-gate) |
 | [`examples/fragments/review-troubleshooting.md`](../examples/fragments/review-troubleshooting.md) | Failed reviews, junie, skeptic/quota, reviewers vs providers |
+| [`examples/fragments/openai-api.md`](../examples/fragments/openai-api.md) | Metered OpenAI HTTP: BYOK API key, MCP env, daily spend |
 
 Edit bracketed project bits (tracker URL for deferrals, etc.).
 

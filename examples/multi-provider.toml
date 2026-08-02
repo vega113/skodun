@@ -11,11 +11,12 @@
 # deliberately out of scope (`anthropic`) or carry sharp edges worth reading
 # about before you turn them on (`google`/`agy`).
 #
-# Registered providers, and the CLI each one drives, as of this file:
-#   xai    -> grok
-#   openai -> codex
-#   google -> agy
-#   junie  -> junie (macOS Seatbelt-confined empty capsule only)
+# Registered providers as of this file:
+#   xai        -> grok CLI (subscription)
+#   openai     -> codex CLI (subscription) — NOT the HTTP API
+#   openai-api -> OpenAI Chat Completions HTTPS (metered; OPENAI_API_KEY)
+#   google     -> agy CLI
+#   junie      -> junie CLI (macOS Seatbelt-confined empty capsule only)
 # `anthropic` is NOT registered -- see the commented `security` block below.
 # Run `skodun providers` to check what THIS machine actually has.
 
@@ -170,14 +171,17 @@ role     = "refuter"
 
 # --- openai-api (metered HTTP; NOT the codex CLI) --------------------------
 #
-# Distinct provider id: `openai-api`. Requires OPENAI_API_KEY. Any model id the
-# OpenAI API accepts. Daily spend ceiling default $10 (SKODUN_OPENAI_API_SPEND_LIMIT_USD).
-# See examples/fragments/openai-api.md.
+# Distinct provider id: `openai-api`. Key from process env only (BYOK):
+#   export OPENAI_API_KEY=sk-...          # or SKODUN_OPENAI_API_KEY
+# MCP clients: put the same vars on the skodun mcp server `env` block
+# (never commit the key). Spend is capped **per UTC day** (default $10), not
+# lifetime: SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY=10
+# Full client notes: examples/fragments/openai-api.md
 #
 # [[reviewers]]
 # name     = "finder-openai-api"
 # provider = "openai-api"
-# model    = "gpt-5.6-luna"
+# model    = "gpt-5.6-luna"    # any model id the OpenAI API accepts
 # effort   = "medium"
 # role     = "finder"
 # max_cost_usd = 0.50

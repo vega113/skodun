@@ -1,11 +1,23 @@
 """HTTP runner for provider ``openai-api``: Chat Completions → contract JSON.
 
 Spawned like the junie outer runner (``python -I -c`` bootstrap). Reads the
-prompt file, calls OpenAI's HTTP API with the API key from the environment,
-writes a contract-shaped JSON object on stdout, and emits a single machine
-line on stderr for usage/cost accounting:
+prompt file, calls OpenAI's HTTP API with the **client's** API key from the
+process environment (bring-your-own-key), writes a contract-shaped JSON object
+on stdout, and emits a single machine line on stderr for usage/cost accounting:
 
 ``SKODUN_API_USAGE {json}``
+
+**API key (required, never from TOML):**
+
+* ``OPENAI_API_KEY`` (preferred), or
+* ``SKODUN_OPENAI_API_KEY`` (alias for MCP ``env`` blocks)
+
+CLI: ``export OPENAI_API_KEY=…`` then ``skodun review --reviewer …``.  
+MCP: put the same variable on the ``skodun mcp`` server ``env`` and restart the
+session. See ``examples/fragments/openai-api.md``.
+
+**Spend:** estimated cost is recorded by the parent process; the **daily**
+(UTC) ceiling is enforced in ``skodun.spend`` (default $10/day per provider).
 
 Never prints secrets. Failures exit non-zero with a short stderr reason.
 """
