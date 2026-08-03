@@ -690,6 +690,11 @@ def test_quota_wording_is_unavailable_quota():
     pytest.param(b"Quota exhausted\n", id="quota-exhausted"),
     pytest.param(b"request failed: 402 Payment Required\n",
                  id="payment-required"),
+    pytest.param(
+        b"Individual quota reached. Please upgrade your subscription "
+        b"to increase your limits. Resets in 53h1m59s.\n",
+        id="individual-quota-reached"),
+    pytest.param(b"quota reached\n", id="quota-reached"),
 ])
 def test_budget_wording_this_cli_can_emit_is_unavailable_quota(err):
     """The audit half of Task 14's quota defect, on this adapter's own words.
@@ -701,9 +706,44 @@ def test_budget_wording_this_cli_can_emit_is_unavailable_quota(err):
     fall through every table to `ok`: `quota exceeded` does not match it, and
     neither does `resource_exhausted`. Both of the first two strings are
     present verbatim in the installed agy 1.1.8 binary.
+
+    `Individual quota reached` is a LIVE envelope `error` (agy 1.1.10,
+    2026-08-03). Without it, status ERROR + empty payload classified only as
+    degraded, so the chain retried google and never hopped fallbacks.
     """
     res = AgyAdapter().classify(1, b"", err, REVIEW_CONTRACT)
     assert res.kind == "unavailable" and res.category == "quota"
+
+
+def test_live_individual_quota_envelope_is_unavailable_quota_not_degraded():
+    """Reproduce the 2026-08-03 capture: ERROR envelope, empty response.
+
+    Pre-fix: classified `degraded` (status != SUCCESS) and never
+    `unavailable`/`quota`, so provider_state was not written and fallbacks
+    did not hop. Post-fix: envelope `error` is scanned and matches.
+    """
+    envelope = json.dumps({
+        "conversation_id": "9c4b5b5d-4f32-4497-b6eb-85e76da68a5d",
+        "status": "ERROR",
+        "response": "",
+        "error": (
+            "Individual quota reached. Please upgrade your subscription "
+            "to increase your limits. Resets in 53h1m59s."
+        ),
+        "duration_seconds": 3.65785,
+        "num_turns": 1,
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "thinking_tokens": 0,
+            "cache_read_tokens": 0,
+            "total_tokens": 0,
+        },
+    }).encode("utf-8")
+    res = AgyAdapter().classify(0, envelope, b"", REVIEW_CONTRACT)
+    assert res.kind == "unavailable", res
+    assert res.category == "quota", res
+    assert "individual quota reached" in res.detail.lower()
 
 
 @pytest.mark.parametrize("err", [
