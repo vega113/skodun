@@ -323,6 +323,31 @@ def pick_finder(pool: Sequence[Reviewer],
     return Route(reviewer=chosen, reason=reason)
 
 
+def _warn_inert_client_family(cfg: Config, pool: Sequence[Reviewer],
+                              client_family: str | None) -> None:
+    """Say so when a declared `client_family` cannot affect anything.
+
+    A family is free-form by design: `provider_family` maps an unlisted provider
+    to its own id, so a new adapter's family is a legitimate value and there is
+    no closed set to validate against. A TYPO is therefore accepted -- and it
+    cannot misroute, which is worth being precise about: the bonus goes to every
+    candidate whose family differs, so a value matching NONE of them adds the
+    same +20 everywhere, the ordering is unchanged, and `pick_finder`'s
+    counterfactual correctly declines to label the pick `+cross`.
+
+    What it does do is nothing at all, silently, while the operator believes
+    cross-model review is on. That is the failure worth a line on the progress
+    stream: not a wrong route, an inert setting.
+    """
+    if client_family is None or not cfg.routing.cross_model:
+        return
+    families = {provider_family(entry.provider) for entry in pool}
+    if client_family not in families:
+        _note(f"routing: client_family {client_family!r} matches no configured "
+              f"finder family ({', '.join(sorted(families))}); the cross-model "
+              f"preference cannot change this pick")
+
+
 def _argmax(pool: Sequence[Reviewer], loads: Mapping[str, ProviderLoad], *,
             client_family: str | None,
             cross_model: bool) -> tuple[Reviewer, ProviderLoad] | None:
@@ -481,6 +506,7 @@ def auto_route(cfg: Config, store, *,
         pool = resolve_pool(cfg)
         if not pool:
             return None
+        _warn_inert_client_family(cfg, pool, client_family)
         loads = provider_loads(store, pool)
         return pick_finder(pool, loads, client_family=client_family,
                            cross_model=cfg.routing.cross_model)

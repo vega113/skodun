@@ -177,8 +177,13 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
     and "nothing" is a perfectly good answer: the router then scores on
     availability alone. Passed through unvalidated for the same reason
     `reviewer` is: `routing.normalize_family` owns what counts as a family, and
-    a value it cannot read is a tie-break skodun declines to apply, never a
-    review it refuses to run.
+    that vocabulary is deliberately OPEN -- an unlisted provider's family is its
+    own id, so a new adapter's family is a legitimate value and there is no
+    closed set to check against. A family this install has no finder from cannot
+    misroute (the bonus lands on every candidate at once, leaving the order
+    untouched) but it also cannot do anything, so the router names the families
+    it actually has rather than leave an operator believing cross-model review
+    is on. Never a review it refuses to run.
 
     The banner is DERIVED here, from the record `run_review` returns, through
     `trust.banner` — the one definition of it. The pipeline itself prints

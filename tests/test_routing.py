@@ -545,3 +545,33 @@ def test_without_an_explicit_pool_the_fallback_is_the_config_finder(store):
     head, meta = _head(cfg, store)
     assert (head.name, meta["route_reason"]) == ("finder",
                                                  "auto:default-finder")
+
+
+def test_a_client_family_matching_no_configured_provider_cannot_misroute(store,
+                                                                         capsys):
+    """A typo adds the same bonus to every candidate, so the ORDER is untouched
+    and the counterfactual correctly declines to call the pick `+cross`. What
+    it does is nothing, silently, while the operator believes cross-model
+    review is on -- so it says so."""
+    cfg = _cfg(_entry("finder-a", "xai"), _entry("finder-b", "openai"))
+    typo = auto_route(cfg, store, client_family="opneai")
+    plain = auto_route(cfg, store, client_family=None)
+    assert (typo.reviewer.name, typo.reason) == (plain.reviewer.name,
+                                                 plain.reason)
+    err = capsys.readouterr().err
+    assert "client_family 'opneai' matches no configured finder family" in err
+    assert "openai, xai" in err
+
+
+def test_a_family_that_does_match_is_not_warned_about(store, capsys):
+    cfg = _cfg(_entry("finder-a", "xai"), _entry("finder-b", "openai"))
+    auto_route(cfg, store, client_family="xai")
+    assert "matches no configured" not in capsys.readouterr().err
+
+
+def test_no_inert_warning_when_the_operator_turned_cross_model_off(store,
+                                                                   capsys):
+    """Nothing is inert that was never switched on."""
+    cfg = _cfg(_entry("finder-a", "xai"), cross_model=False)
+    auto_route(cfg, store, client_family="opneai")
+    assert "matches no configured" not in capsys.readouterr().err
