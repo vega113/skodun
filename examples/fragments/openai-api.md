@@ -87,7 +87,8 @@ if [ -z "${SKODUN_OPENAI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] \
     # BOTH documented names -- a secrets file may well use the preferred
     # OPENAI_API_KEY, and looking only for the alias exports nothing.
     for name in SKODUN_OPENAI_API_KEY OPENAI_API_KEY; do
-        key=$(sed -n "s/^${name}=//p" "$SECRETS" | head -n 1)
+        key=$(sed -n "s/^${name}=//p" "$SECRETS" | head -n 1 \
+              | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/")
         [ -n "$key" ] && export SKODUN_OPENAI_API_KEY="$key" && break
     done
     unset key name
@@ -111,9 +112,19 @@ The same launcher is the right home for the spend ceiling, since it applies
 however skodun was started:
 
 ```sh
-SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY="${SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY:-5}"
+# Your ceiling. `:-` so an explicit value from the caller still wins. Pick the
+# number deliberately -- skodun's own default is 10, so a launcher that sets
+# anything else means `skodun` started through it and `skodun` started directly
+# do not agree.
+SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY="${SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY:-10}"
 export SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY
 ```
+
+**What that extraction handles:** a plain `NAME=value` line, optionally wrapped
+in single or double quotes. It is not a dotenv parser -- a trailing inline
+comment (`NAME=value # note`) ends up in the key and authentication fails with
+the secret sitting right there in the file. Keep the line plain, or extend the
+`sed` if your file needs more.
 
 A shell rc is not equivalent, and neither is a shell *env* file. Know what each
 one actually covers before relying on it:
