@@ -115,10 +115,18 @@ SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY="${SKODUN_OPENAI_API_SPEND_LIMIT_USD_P
 export SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY
 ```
 
-A shell rc is NOT equivalent for that: `~/.zshrc` is sourced only by
-interactive shells, so a script, a CI step or an agent tool running `skodun`
-in a non-interactive shell silently gets the default ceiling instead. Use
-`~/.zshenv` (or the launcher) if you want one number everywhere.
+A shell rc is not equivalent, and neither is a shell *env* file. Know what each
+one actually covers before relying on it:
+
+| Where | Applies to |
+|---|---|
+| the launcher | every `skodun` started through it, **whatever the shell, or none** |
+| `~/.zshenv` | every **zsh**, interactive or not — but not bash, and not a process spawned directly |
+| `~/.zshrc` | **interactive zsh only** — a script, a CI step or an agent tool silently gets the default ceiling |
+
+Only the launcher is shell-independent, because it sets the variable itself
+rather than relying on something having sourced a file first. A shell file is a
+useful complement for `skodun` typed at a prompt; it is not a substitute.
 
 After changing MCP env — or the launcher — **restart** the MCP connection
 (stdio servers do not hot-reload env).
