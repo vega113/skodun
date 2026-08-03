@@ -86,11 +86,13 @@ SECRETS="${SKODUN_SECRETS_FILE:-$HOME/.secrets/.env}"
 # this often has a minimal PATH, and `exec skodun` would reintroduce exactly
 # the dependency the absolute `command` was there to avoid.
 SKODUN_BIN="${SKODUN_BIN:-$HOME/.local/bin/skodun}"
-# PATH first: a host may spawn this with a minimal one, which is the same
-# reason SKODUN_BIN is absolute below. `sed` and `head` are used to read the
-# key, and there is no `set -e` here -- if they were missing, extraction would
-# yield an empty key silently and skodun would exec without the secret.
-PATH="/usr/bin:/bin:$PATH"
+# APPENDED, never prepended: a host may spawn this with a minimal PATH -- the
+# same reason SKODUN_BIN is absolute below -- and `sed`/`head` read the key with
+# no `set -e` to catch their absence, so a missing utility would yield an empty
+# key silently. Appending guarantees they resolve without changing precedence
+# for anything already on PATH; prepending could shadow a provider CLI that
+# skodun goes on to spawn by bare name.
+PATH="$PATH:/usr/bin:/bin"
 export PATH
 
 # An unexpanded "${OPENAI_API_KEY}" -- what a host that does not expand its env
@@ -102,8 +104,11 @@ case "${OPENAI_API_KEY:-}" in '${'*) unset OPENAI_API_KEY ;; esac
 case "${SKODUN_OPENAI_API_KEY:-}" in '${'*) unset SKODUN_OPENAI_API_KEY ;; esac
 
 # Only consult the file when neither variable survived that.
+# `-f` as well as `-r`: a readable DIRECTORY passes `-r`, extraction then yields
+# an empty key, and skodun execs without a secret -- auth failing with no hint
+# that the path was never a file.
 if [ -z "${SKODUN_OPENAI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] \
-        && [ -r "$SECRETS" ]; then
+        && [ -f "$SECRETS" ] && [ -r "$SECRETS" ]; then
     # BOTH documented names -- a secrets file may well use the preferred
     # OPENAI_API_KEY, and looking only for the alias exports nothing.
     for name in SKODUN_OPENAI_API_KEY OPENAI_API_KEY; do
