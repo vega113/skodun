@@ -325,6 +325,22 @@ def pick_finder(pool: Sequence[Reviewer],
 # state, and it needs no schema.
 
 
+def _note(message: str) -> None:
+    """Say something on the operator's progress stream, or say nothing.
+
+    `pipeline._note` is the ONE progress channel (stderr, or the caller's sink);
+    imported lazily because `pipeline` imports this module. Guarded because this
+    is only ever called from an `except` that must not acquire a second failure
+    mode of its own.
+    """
+    try:
+        from .pipeline import _note as pipeline_note
+
+        pipeline_note(message)
+    except Exception:   # pragma: no cover - a note is never worth a raise
+        pass
+
+
 def _provider_blackout(store, entry: Reviewer) -> bool:
     """Whether `entry`'s provider cannot serve a review right now.
 
@@ -367,6 +383,15 @@ def provider_loads(store, pool: Sequence[Reviewer], *,
     conservative direction, and if that leaves nothing routable the caller falls
     back to the config's finder, which is what a pre-S5 install would have done
     anyway.
+
+    Best-effort is not SILENT, and the difference matters: swallowing a failure
+    here degrades routing to pre-S5 head selection, which looks exactly like a
+    working install and would hide a real defect (a broken store query, a bug in
+    the blackout predicate) behind reviews that keep succeeding. Every guard
+    below therefore says what it swallowed, on the same progress stream the
+    chain reports quota outages on. Fail-closed is untouched either way -- what
+    degrades is which reviewer is chosen, never whether the review is trusted --
+    but a degradation nobody can see is a defect nobody can fix.
     """
     from . import capacity
     from .adapters import _REGISTRY
@@ -400,7 +425,9 @@ def provider_loads(store, pool: Sequence[Reviewer], *,
                 free_slots=max(0, int(max_in_flight) - int(holders)),
                 queue_depth=queued,
             )
-        except Exception:   # pragma: no cover - defensive; see the docstring
+        except Exception as e:
+            _note(f"routing: could not read load for provider {provider}: "
+                  f"{e!r}; excluding it from this run's candidates")
             out[provider] = ProviderLoad(unavailable=True)
     return out
 
@@ -412,7 +439,8 @@ def auto_route(cfg: Config, store, *,
     The one call the pipeline makes. Guarded end to end for the reason
     `provider_loads` gives: auto-routing is an optimisation over the shipped
     head selection, and an optimisation that can fail a review is worse than no
-    optimisation.
+    optimisation. Loudly, for the reason `provider_loads` gives too -- a router
+    that fell back in silence would be indistinguishable from one that decided.
     """
     try:
         pool = resolve_pool(cfg)
@@ -421,5 +449,7 @@ def auto_route(cfg: Config, store, *,
         loads = provider_loads(store, pool)
         return pick_finder(pool, loads, client_family=client_family,
                            cross_model=cfg.routing.cross_model)
-    except Exception:       # pragma: no cover - defensive
+    except Exception as e:
+        _note(f"routing: auto-route failed ({e!r}); falling back to this "
+              f"config's default head")
         return None

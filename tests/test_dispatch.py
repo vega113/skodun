@@ -35,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from skodun import contextpack, dispatch, promptbuild, runner
+from skodun import capacity, contextpack, dispatch, promptbuild, runner
 from skodun.config import Defaults
 from skodun.dispatch import (
     CONTEXT_AMBIGUOUS,
@@ -2556,6 +2556,40 @@ def test_run_prepush_review_persists_nothing_of_its_own(tmp_path):
         after = json.dumps(st.get_review(rid), sort_keys=True)
     assert after == before, "run_prepush_review wrote to the store"
     assert rec["status"] == "clean" and rec["id"] == rid
+
+
+def test_the_background_worker_does_not_auto_route(tmp_path):
+    """Phase A scope (epic S5): auto-routing is the FOREGROUND loop's.
+
+    The worker's record is reserved and identity-pinned before it starts, and
+    it is not the surface the routing design covers -- so `mode = "auto"` must
+    change nothing here. Driven through the shipped entry point with a config
+    that WOULD route (the config finder's provider is fully held, an idle peer
+    is configured, and the foreground path picks the peer for exactly this
+    picture): the worker still heads the config's own finder.
+    """
+    repo = _bg_repo(tmp_path, '\n[routing]\nmode = "auto"\n' + """
+[[reviewers]]
+name = "finder-codex"
+provider = "openai"
+model = "gpt-5.4-codex"
+role = "finder"
+""")
+    db = tmp_path / "s.db"
+    with Store.open(db) as st:
+        st.capacity_enqueue(
+            admission_id="held",
+            resource_class=capacity.provider_resource_class("xai"), scope="xai")
+        st.capacity_force_admit("held")
+
+    rec = _prepush(db, repo)
+
+    # The xai fake answered, so the routed-away-from provider is the one that
+    # ran: model and adapter are the config finder's, not the idle peer's.
+    assert rec["model"] == "grok-4.20-0309-reasoning"
+    assert rec["adapter"] == "grok"
+    # ...and the worker records no route audit at all, because it does not route.
+    assert "route_reason" not in rec
 
 
 def test_the_background_prompt_shows_the_PUSHED_OID_not_the_working_tree(tmp_path):

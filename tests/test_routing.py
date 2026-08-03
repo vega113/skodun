@@ -355,6 +355,35 @@ def test_a_store_that_cannot_answer_marks_the_provider_unavailable(store):
     assert loads["xai"].unavailable is True
 
 
+def test_a_swallowed_routing_failure_is_reported_not_hidden(store, capsys):
+    """Degrading to pre-S5 head selection looks exactly like a working install.
+
+    A guard that fell back in silence would hide a real defect -- a broken store
+    query, a bug in the blackout predicate -- behind reviews that keep
+    succeeding, so every guard says what it swallowed on the progress stream the
+    chain already reports quota outages on.
+    """
+    def boom(_store, _entry):
+        raise RuntimeError("store is on fire")
+
+    provider_loads(store, [_entry("a", "xai")], blackout_fn=boom)
+    err = capsys.readouterr().err
+    assert "routing: could not read load for provider xai" in err
+    assert "store is on fire" in err
+
+
+def test_a_failed_auto_route_says_it_fell_back(store, capsys, monkeypatch):
+    """The other guard, and the one that decides the whole run's head."""
+    monkeypatch.setattr("skodun.routing.provider_loads",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("scoring exploded")))
+    cfg = _cfg(_entry("finder", "xai"))
+    assert auto_route(cfg, store) is None
+    err = capsys.readouterr().err
+    assert "routing: auto-route failed" in err
+    assert "scoring exploded" in err
+
+
 # --- end to end against a real store ----------------------------------------
 
 
@@ -508,18 +537,21 @@ def test_without_an_explicit_pool_the_fallback_is_the_config_finder(store):
                                                  "auto:default-finder")
 
 
-# --- the Phase A boundary, proved rather than asserted in a docstring -------
+# --- the Phase A boundary ---------------------------------------------------
 
 
-def test_run_review_is_the_only_production_caller_of_head_resolution():
-    """`resolve_review_head` reaches production through ONE door.
+def test_head_resolution_reaches_production_through_services_only():
+    """AGENTS.md invariant 3: review-loop verbs go through `services.py`.
 
-    The Phase A boundary is that auto-routing applies to the foreground review
-    loop and not to the background pre-push worker. That claim is only worth
-    anything if it is a fact about the call graph rather than a sentence in a
-    docstring, so this pins both halves: `run_review` has exactly one caller
-    (`services.svc_review`, which is what both the CLI and the MCP tool go
-    through), and the worker's own entry point does not route at all.
+    Auto-routing is scoped to the foreground loop, and that scoping is only
+    meaningful if `run_review` -- the function that resolves a head -- is
+    reachable from one place. A second production caller would be a second
+    review surface with its own routing behaviour, which is exactly the drift
+    the invariant exists to prevent.
+
+    Modules, deliberately, not line numbers: WHERE in `services.py` the call
+    sits is layout, and pinning it would fail on an unrelated edit above it.
+    WHICH module may call it is the architecture.
     """
     import re
     from pathlib import Path
@@ -527,26 +559,11 @@ def test_run_review_is_the_only_production_caller_of_head_resolution():
     import skodun
 
     src = Path(skodun.__file__).resolve().parent
-    callers = sorted(
-        f"{path.name}:{i}"
+    callers = {
+        path.name
         for path in src.rglob("*.py")
-        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        for line in path.read_text(encoding="utf-8").splitlines()
         if re.search(r"(?<![_\w])run_review\(", line)
         and not re.match(r"\s*(def|#)", line)
-    )
-    assert callers == ["services.py:240"], callers
-
-
-def test_the_background_prepush_worker_does_not_auto_route():
-    """The worker keeps config-finder selection in Phase A: its record is
-    reserved and identity-pinned, and it is not the surface the design's
-    diagram covers. Read off the source so a refactor that quietly routed it
-    has to change this test on purpose."""
-    import inspect
-
-    from skodun import pipeline
-
-    body = inspect.getsource(pipeline.run_prepush_review)
-    assert '_reviewer_for(cfg, "finder")' in body
-    assert "resolve_review_head" not in body
-    assert "routing." not in body
+    }
+    assert callers == {"services.py"}, callers
