@@ -67,6 +67,17 @@ __all__ = [
 #: read, in the verdict banner, as a success). This is a REPORTING vocabulary
 #: only: no trust axis is computed from it. An adapter still judges its OWN
 #: run's health itself, on its own terms, in `parse`/`classify` — this is the
+def _normal_words(value: "str | frozenset[str]") -> frozenset[str]:
+    """One adapter's normal terminal word(s), as a flat set either way.
+
+    A bare `str` is iterable, so `frozenset(value)` on one would silently
+    explode it into its LETTERS -- which is the failure this helper exists to
+    make impossible, not a hypothetical: it would put `E`, `n`, `d`... in the
+    cross-adapter set and quietly accept nonsense as a normal terminal word.
+    """
+    return frozenset({value}) if isinstance(value, str) else frozenset(value)
+
+
 #: one place that has to compare terminal words ACROSS adapters, because a
 #: single batched review can be answered by several of them.
 #:
@@ -74,8 +85,17 @@ __all__ = [
 #: with no harness completion word equivalent to EndTurn/SUCCESS, so
 #: `stop_reason` stays None rather than inventing a token the CLI does not
 #: produce.
-NORMAL_STOP_REASONS: frozenset[str] = frozenset(
-    {_GROK_NORMAL_STOP, _AGY_NORMAL_STOP, _CODEX_NORMAL_STOP})
+#: Each adapter contributes EVERY word it calls normal, flattened. An adapter
+#: may export one word or a set of them -- grok accepts both `EndTurn` and the
+#: `end_turn` newer CLIs emit -- and the two shapes have to end up as peers
+#: here. Building this with a set literal put grok's set INSIDE as a single
+#: element, so `"EndTurn" in NORMAL_STOP_REASONS` was False and a perfectly
+#: normal grok batch published its own clean terminal word as the round's first
+#: ABNORMAL one. `_normal_words` is what keeps a future adapter switching from
+#: a word to a set from re-introducing that silently.
+NORMAL_STOP_REASONS: frozenset[str] = frozenset().union(
+    *(_normal_words(v) for v in
+      (_GROK_NORMAL_STOP, _AGY_NORMAL_STOP, _CODEX_NORMAL_STOP)))
 
 
 # Keyed by PROVIDER, not by adapter name: config names a provider, and one

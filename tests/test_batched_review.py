@@ -587,9 +587,23 @@ def test_every_adapters_own_normal_terminal_value_is_in_the_set():
     from skodun.adapters import codex as codex_mod
     from skodun.adapters import grok as grok_mod
 
-    assert NORMAL_STOP_REASONS == frozenset(
-        {grok_mod._STOP_REASON_OK, agy_mod._STATUS_OK,
-         codex_mod._TURN_COMPLETED})
+    # FLAT, and that is the property with teeth. An adapter may export one
+    # normal word or a set of them, and building this set with a literal put
+    # grok's set inside as a single element -- so `"EndTurn" in
+    # NORMAL_STOP_REASONS` was False and a clean grok batch published its own
+    # terminal word as the round's first ABNORMAL one.
+    assert all(isinstance(word, str) for word in NORMAL_STOP_REASONS), (
+        NORMAL_STOP_REASONS)
+    # Every word each adapter calls normal is IN the set, whichever shape that
+    # adapter exports. Membership rather than a re-derived union: rebuilding
+    # the union here would make this test agree with the production code by
+    # construction, including when both are wrong.
+    for own in (grok_mod._STOP_REASON_OK, agy_mod._STATUS_OK,
+                codex_mod._TURN_COMPLETED):
+        words = {own} if isinstance(own, str) else set(own)
+        assert words <= NORMAL_STOP_REASONS, (own, NORMAL_STOP_REASONS)
+    # ...and nothing else is, so a stray word cannot be waved through as normal.
+    assert len(NORMAL_STOP_REASONS) == 4
     assert "EndTurn" in NORMAL_STOP_REASONS
     assert "SUCCESS" in NORMAL_STOP_REASONS
 
