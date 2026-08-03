@@ -113,15 +113,21 @@ the whole file hands every one of those secrets to every model subprocess.
 `SKODUN_OPENAI_API_KEY` is the only one that is skodun's business.
 
 The same launcher is the right home for the spend ceiling, since it applies
-however skodun was started:
+however skodun was started. **These two lines go in the script above**, on the
+line before `exec` -- not in a file of their own, and not in the MCP `env`
+block, which the launcher deliberately leaves empty:
 
 ```sh
+# ...key extraction above...
+
 # Your ceiling. `:-` so an explicit value from the caller still wins. Pick the
 # number deliberately -- skodun's own default is 10, so a launcher that sets
 # anything else means `skodun` started through it and `skodun` started directly
 # do not agree.
 SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY="${SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY:-10}"
 export SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY
+
+exec "$SKODUN_BIN" "$@"
 ```
 
 **What that extraction handles:** a plain `NAME=value` line, optionally wrapped
