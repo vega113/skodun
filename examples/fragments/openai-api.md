@@ -84,9 +84,13 @@ set -u
 SECRETS="${SKODUN_SECRETS_FILE:-$HOME/.secrets/.env}"
 if [ -z "${SKODUN_OPENAI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] \
         && [ -r "$SECRETS" ]; then
-    key=$(sed -n 's/^SKODUN_OPENAI_API_KEY=//p' "$SECRETS" | head -n 1)
-    [ -n "$key" ] && export SKODUN_OPENAI_API_KEY="$key"
-    unset key
+    # BOTH documented names -- a secrets file may well use the preferred
+    # OPENAI_API_KEY, and looking only for the alias exports nothing.
+    for name in SKODUN_OPENAI_API_KEY OPENAI_API_KEY; do
+        key=$(sed -n "s/^${name}=//p" "$SECRETS" | head -n 1)
+        [ -n "$key" ] && export SKODUN_OPENAI_API_KEY="$key" && break
+    done
+    unset key name
 fi
 exec skodun "$@"
 ```
