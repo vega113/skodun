@@ -156,7 +156,7 @@ block, which the launcher deliberately leaves empty:
 # anything else means `skodun` started through it and `skodun` started directly
 # do not agree.
 case "${SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY:-}" in
-    '\${'*) unset SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY ;;
+    '${'*) unset SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY ;;
 esac
 SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY="${SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY:-10}"
 export SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY
