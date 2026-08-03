@@ -225,6 +225,15 @@ _MODEL_SIGNALS: tuple[bytes, ...] = (
 #   is reachable wherever the CLI renders a status line, and it is the exact
 #   wording xAI's CLI was live-captured emitting. SPECULATIVE for THIS
 #   provider: no agy run has been observed emitting it.
+# * `individual quota reached` — LIVE envelope `error` from agy 1.1.10
+#   (2026-08-03): `{"status":"ERROR","error":"Individual quota reached.
+#   Please upgrade your subscription to increase your limits. Resets in
+#   …"}`. Without this phrase the run classified as generic degraded
+#   (status ERROR, empty payload), so the chain *retried google* and never
+#   hopped fallbacks or wrote `provider_state` for quota. Not a bare
+#   `quota` match — that still over-fires on Google protos.
+# * `quota reached` — shorter form of the same product wording; kept
+#   distinct so a future CLI that drops "Individual" still caches.
 #
 # A bare `exhausted` was considered and rejected: this binary exhausts
 # iterators, counters, read limits and retry budgets, and reading any of those
@@ -244,6 +253,8 @@ _QUOTA_SIGNALS: tuple[bytes, ...] = (
     b"exhausted your quota",
     b"quota exhausted",
     b"payment required",
+    b"individual quota reached",
+    b"quota reached",
 )
 
 # The CLI refusing our own argv. Attempt-local and caches nothing, hence
