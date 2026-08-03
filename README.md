@@ -310,6 +310,46 @@ different providers, and both facts are worth having.
 `--reviewer` is a *foreground* flag. Background pre-push reviews use the configured
 chain; `dispatch` and `worker` take no such argument.
 
+### Auto-routing an un-pinned review
+
+With more than one finder configured, "the first enabled `finder`" makes head
+selection sticky: several agents on one machine all queue behind the same
+`provider:<id>` FIFO while the other providers sit idle. The `[routing]` table
+lets skodun choose instead, for runs that pass no `--reviewer`:
+
+```toml
+[routing]
+mode        = "auto"    # off (the default) | auto
+pool        = []        # reviewer NAMES; empty means every enabled role=finder
+cross_model = true      # soft preference for a different provider family
+```
+
+`mode` defaults to **`off`**, which is exactly pre-S5 behaviour, and
+`SKODUN_ROUTING_MODE=off|auto` overrides both config layers for one machine.
+With `auto`, candidates are scored once, at head resolution, from what the
+store can see: `+100` per free provider slot, or `−10` per queued waiter when
+there are none, plus `+20` when the provider's family differs from the caller's
+(`--client-family xai`, the MCP `client_family` argument, or
+`SKODUN_CLIENT_FAMILY`). A provider in quota blackout, out of daily API budget,
+or with no adapter is excluded outright; ties break by reviewer name so two
+processes reading the same picture agree.
+
+The properties that make this safe to turn on:
+
+- **A pin still wins**, in every mode, unchanged.
+- **Cross-model is a preference, not a filter.** `+20` reorders two providers
+  that are equally free; it never outranks a free slot, and never excludes the
+  last available family, so a one-provider machine still gets reviewed.
+- **Nothing downstream changes.** The chosen entry's `fallbacks` chain, the
+  `provider:<id>` FIFO and the extra passes' role-based selection are all as
+  they were. Routing decides which queue to join, not what happens next.
+- **Background pre-push reviews are not routed** in this phase.
+
+Every artifact records `requested_reviewer`, `routed_reviewer`, `route_reason`
+(`pinned`, `config-finder`, `auto:free`, `auto:free+cross`, `auto:wait`,
+`auto:wait+cross`, `auto:default-finder`) and `client_family`, so why a given
+review went where it did is answerable afterwards.
+
 ### The refuter
 
 A reviewer with `role = "refuter"` adds a pass, scheduled only when the finder

@@ -86,7 +86,8 @@ skodun providers --repo /path/to/your/project
 `doctor` is read-only. Fix missing binaries / config before expecting `review`
 to succeed. **`providers` lists adapters** (xai/openai/google/junie), not your
 named `[[reviewers]]` table — configure reviewers in TOML; pass
-`--reviewer <name>` / MCP `reviewer` to select one.
+`--reviewer <name>` / MCP `reviewer` to select one, or omit it and let
+`[routing] mode = "auto"` pick a finder with a free provider slot.
 
 ### Config
 
@@ -314,6 +315,13 @@ Do not conflate layers (see also
 | MCP process | One `skodun mcp` | **1** in-flight `review` (refuse-if-busy) |
 | `review-fg` | Per repository (`git_common_dir`; all worktrees share it) | `SKODUN_REVIEW_FG_CAPACITY` (default 1) |
 | `provider:<id>` | Whole store (all repos) | `SKODUN_PROVIDER_MAX_IN_FLIGHT` (default 1) |
+
+**Which provider an un-pinned review joins** is a separate question from how
+many may run: by default it is always the first enabled `finder`. Set
+`[routing] mode = "auto"` (or `SKODUN_ROUTING_MODE=auto`) to have skodun pick a
+finder with a free slot instead. A pin (`--reviewer` / MCP `reviewer`) still
+wins, and agents should **omit** it so routing has something to choose. Full
+knobs and scoring: [`examples/fragments/concurrency.md`](../examples/fragments/concurrency.md).
 
 1. **CLI foreground reviews:** FIFO **review-fg** capacity (default **1** per
    repository). Default **dual-hold** also takes the legacy

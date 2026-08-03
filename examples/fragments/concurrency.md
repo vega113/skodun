@@ -74,6 +74,62 @@ active holder counts for each `provider:<id>`.
 unavailable via cached `provider_state`, the run **fails fast** (exit 2) without
 spending the full admission wait budget.
 
+### Auto-route the finder (epic S5 — shipped, default off)
+
+Provider slots let several reviews run at once; they do **not** decide *which*
+provider a review joins. Without routing, every un-pinned review starts at the
+first enabled `finder`, so N agents pile into one `provider:<id>` FIFO while
+the others idle. `[routing]` picks the queue instead.
+
+```toml
+[routing]
+mode        = "auto"    # off (default) | auto
+pool        = []        # reviewer NAMES; empty = every enabled role=finder
+cross_model = true      # soft preference for a different provider family
+```
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `[routing] mode` | `off` | `auto` scores the pool at head resolution |
+| `SKODUN_ROUTING_MODE` | unset | `off`\|`auto`; **overrides both config layers** |
+| `--client-family` / MCP `client_family` | unset | the CALLER's family (`xai`, `openai`, `google`, `junie`) |
+| `SKODUN_CLIENT_FAMILY` | unset | same, per machine |
+
+**Scoring** (once, at the start of the run — never re-scored while waiting):
+
+| Signal | Contribution |
+|---|---|
+| Free slots (`max_in_flight − holders`) | `+100 × free_slots` |
+| No free slot | `−10 × (queue_depth + 1)` |
+| Different family from `client_family` | `+20`, only when `cross_model` |
+| Tie | reviewer name ascending (two peers must agree) |
+
+Excluded outright: `provider_state` quota blackout, a metered provider out of
+daily budget, a provider with no adapter, anything outside the pool.
+
+**Rules that do not bend:**
+
+- **A pin always wins.** `--reviewer NAME` / `{"reviewer": "NAME"}` is absolute
+  in every mode — use it for a deliberate second opinion.
+- **Cross-model is soft.** `+20` breaks a tie between two equally free
+  providers. It never outranks a free slot, and never excludes the last
+  available family: a single-provider machine still gets reviewed.
+- **Failure handling is unchanged.** After a head is chosen, that entry's own
+  `fallbacks` chain runs exactly as before.
+- **Extra passes are not routed.** Security / skeptic / refuter / integration
+  still pick by ROLE.
+- **Background pre-push reviews are not routed** in this phase; they use the
+  configured finder.
+
+**Audit.** Every review records `requested_reviewer`, `routed_reviewer`,
+`route_reason` (`pinned`, `config-finder`, `auto:free`, `auto:free+cross`,
+`auto:wait`, `auto:wait+cross`, `auto:default-finder`) and `client_family` on
+its artifact. `auto:default-finder` means auto was on but nothing was routable
+— an empty pool, or every candidate blacked out.
+
+**Agents: prefer omitting `reviewer`.** Auto-routing can only spread load over
+callers that let it choose. Pin for a second opinion, not by habit.
+
 ### Cancel / status (epic S1 — shipped)
 
 | Surface | Verb |
