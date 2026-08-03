@@ -1813,6 +1813,45 @@ def test_a_pid_that_ps_confirms_as_a_worker_is_signalled(tmp_path):
         proc.wait(timeout=30)
 
 
+def test_a_worker_whose_argv_is_longer_than_a_terminal_is_still_confirmed(
+        tmp_path):
+    """The guard must ask `ps` for UNLIMITED-width output.
+
+    Linux procps truncates `-o args=` to the terminal width, and with no tty
+    that is 80 columns -- which is every context skodun runs in. BSD `ps` on
+    macOS does not truncate at all. A real worker argv carries `--repo
+    <absolute path>` after `--record-id <id>`, so it clears 80 columns easily,
+    and the truncated line drops exactly the flag the guard binds on. The guard
+    then refuses to confirm a live worker of this very record, the SIGTERM is
+    withheld, and nothing complains: that is the fail-closed direction, so the
+    only symptom is superseded workers running to completion.
+
+    Honest limitation: on macOS this passes with or without the fix, because
+    BSD `ps` has nothing to truncate. It is load-bearing on procps only -- it
+    fails on Linux without `-ww`, which is where the defect was found and where
+    CI runs. The failure message carries both `ps` readings so a future break
+    diagnoses itself rather than sending the next person back to first
+    principles.
+    """
+    deep = tmp_path.joinpath(*(["a-padding-directory-name"] * 6))
+    proc = _fake_worker_process(deep, record_id="sk_wide")
+    try:
+        wide = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(proc.pid)],
+                              capture_output=True, text=True).stdout
+        assert len(wide.strip()) > 80, (
+            f"the padding no longer clears a terminal width, so this test "
+            f"would pass for the wrong reason: {wide!r}")
+        narrow = subprocess.run(["ps", "-o", "args=", "-p", str(proc.pid)],
+                                capture_output=True, text=True).stdout
+        assert pid_is_skodun_worker(proc.pid, "sk_wide") is True, (
+            f"the guard refused a live worker of this record.\n"
+            f"  ps -ww -o args=: {wide!r}\n"
+            f"  ps     -o args=: {narrow!r}")
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+
 def test_a_worker_for_a_DIFFERENT_record_is_never_signalled(tmp_path):
     """The pid-reuse guard is bound to the RESERVATION, not just to "a skodun
     worker".

@@ -1708,10 +1708,20 @@ _KNOWN_PROVIDERS = ("google", "openai", "xai")   # the registry, Task 6's
 
 
 def _no_such_binaries(monkeypatch, tmp_path):
+    """Point every PATH-resolved provider binary at a path that cannot exist.
+
+    `junie` is in here for the same reason as the other three, and its absence
+    was a hole: `resolve_junie_bin` falls back to bare `junie` on PATH, so the
+    answer this helper produced depended on whether the machine running the
+    suite happened to have the junie CLI installed. It does on the developer's
+    Mac, so the count below read 3 there and 4 everywhere else -- a test that
+    passed for a reason having nothing to do with the code under test.
+    """
     missing = tmp_path / "does-not-exist"
     monkeypatch.setenv("SKODUN_GROK_BIN", str(missing / "grok"))
     monkeypatch.setenv("SKODUN_CODEX_BIN", str(missing / "codex"))
     monkeypatch.setenv("SKODUN_AGY_BIN", str(missing / "agy"))
+    monkeypatch.setenv("SKODUN_JUNIE_BIN", str(missing / "junie"))
 
 
 def test_providers_lists_every_registered_adapter_even_with_missing_binaries(
@@ -1722,7 +1732,12 @@ def test_providers_lists_every_registered_adapter_even_with_missing_binaries(
     for provider in _KNOWN_PROVIDERS:
         assert provider in out, out
     assert "anthropic" not in out, "Task 6's unregistered provider must not appear"
-    assert out.count("NOT FOUND") == 3
+    # Four of the five registered adapters resolve to a binary, and
+    # `_no_such_binaries` has pointed all four at nothing: google/agy,
+    # openai/codex, xai/grok and junie. `openai-api` is the fifth and is never
+    # counted here -- it is the HTTP adapter, and the "binary" it reports is the
+    # running interpreter, which is by definition executable.
+    assert out.count("NOT FOUND") == 4
 
 
 def test_providers_shows_a_found_executable_binary(tmp_path, monkeypatch, capsys):
