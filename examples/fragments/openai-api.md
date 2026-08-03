@@ -81,18 +81,21 @@ and execs skodun. The key stays in whatever file already holds your secrets:
 #!/bin/sh
 # ~/.local/bin/skodun-with-secrets   (chmod 700)
 set -u
-SECRETS="${SKODUN_SECRETS_FILE:-$HOME/.secrets/.env}"
+SECRETS="${SKODUN_SECRETS_FILE:-${HOME:-}/.secrets/.env}"
 # ABSOLUTE, for the same reason `command` below must be: the host that spawns
 # this often has a minimal PATH, and `exec skodun` would reintroduce exactly
 # the dependency the absolute `command` was there to avoid.
-SKODUN_BIN="${SKODUN_BIN:-$HOME/.local/bin/skodun}"
+SKODUN_BIN="${SKODUN_BIN:-${HOME:-}/.local/bin/skodun}"
 # APPENDED, never prepended: a host may spawn this with a minimal PATH -- the
 # same reason SKODUN_BIN is absolute below -- and `sed`/`head` read the key with
 # no `set -e` to catch their absence, so a missing utility would yield an empty
 # key silently. Appending guarantees they resolve without changing precedence
 # for anything already on PATH; prepending could shadow a provider CLI that
 # skodun goes on to spawn by bare name.
-PATH="$PATH:/usr/bin:/bin"
+# `:+` not `:-`: an EMPTY element in PATH means the current directory, so
+# `"${PATH:-}:/usr/bin"` on a stripped environment would silently put CWD on
+# the search path of every provider CLI skodun spawns.
+PATH="${PATH:+$PATH:}/usr/bin:/bin"
 export PATH
 
 # An unexpanded "${OPENAI_API_KEY}" -- what a host that does not expand its env
@@ -152,6 +155,9 @@ block, which the launcher deliberately leaves empty:
 # number deliberately -- skodun's own default is 10, so a launcher that sets
 # anything else means `skodun` started through it and `skodun` started directly
 # do not agree.
+case "${SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY:-}" in
+    '\${'*) unset SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY ;;
+esac
 SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY="${SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY:-10}"
 export SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY
 
@@ -235,6 +241,9 @@ export SKODUN_OPENAI_API_OUTPUT_USD_PER_1M=4.0
 
 1. Install skodun (`pip` / pipx); `skodun providers` lists `openai-api`.
 2. Add `[[reviewers]]` with `provider = "openai-api"` and the model you want.
-3. Put `OPENAI_API_KEY` (or alias) in **MCP server env** and/or the user shell.
+3. Get the key into the skodun **process**: the user shell for CLI use, and for
+   MCP either an `env` block your host really expands **or** the launcher above
+   with `env: {}`. Do not leave a half-migrated `"${OPENAI_API_KEY}"` behind —
+   see the launcher section for why a leftover literal is worse than nothing.
 4. Restart MCP; call `review` with absolute `repo` + `reviewer` name.
 5. Watch spend notes on stderr / store; raise or lower the daily limit as needed.
