@@ -264,19 +264,23 @@ def pick_finder(pool: Sequence[Reviewer],
     `loads` for the providers it could actually reach, so a missing key is a
     provider this run must not join the queue of.
 
-    Ties break by NAME ascending, not by config order, and that is deliberate:
-    two peers scoring the same picture must reach the same answer, and config
-    order is the one input two installs of the same reviewer table can disagree
-    about after an edit. Deterministic ties are not fairness -- spreading load is
-    the free-slot term's job, and once one peer is admitted the next one sees a
-    different picture.
+    Ties break by the ORDER THE OPERATOR WROTE -- `[routing] pool` as listed,
+    else the reviewer table's own order -- and that choice does real work.
+    `provider_loads` keys by provider, so two entries on ONE provider always
+    score identically, and those two entries can carry different models, efforts
+    and `fallbacks`. Breaking that tie alphabetically would let a rename decide
+    which model reviews, for a reason that has nothing to do with load. First-
+    listed is the operator's own stated preference, it is equally deterministic
+    for two peers reading the same config, and it gives the property that makes
+    `auto` safe to turn on: while nothing is busy, auto-routing picks exactly
+    what `off` would have picked, and only deviates once load actually differs.
 
     None means "the caller decides", which for the pipeline is today's first
     enabled finder recorded as `auto:default-finder`. It is NOT a refusal: an
     empty pool and a fully blacked-out one both still deserve the ordinary
     fail-fast the finder chain already performs, in its own words.
     """
-    best: tuple[int, str] | None = None
+    best: int | None = None
     chosen: Reviewer | None = None
     chosen_load: ProviderLoad | None = None
     for entry in pool:
@@ -285,11 +289,11 @@ def pick_finder(pool: Sequence[Reviewer],
             continue
         score = score_candidate(entry, load, client_family=client_family,
                                 cross_model=cross_model)
-        # Ascending name breaks a score tie, so the comparison key negates the
-        # score and compares names forward: a LOWER key wins.
-        key = (-score, entry.name)
-        if best is None or key < best:
-            best, chosen, chosen_load = key, entry, load
+        # STRICTLY greater, so an equal score leaves the earlier candidate in
+        # place: that is the first-listed tie-break, and it is one comparison
+        # rather than a sort key nobody would read the same way twice.
+        if best is None or score > best:
+            best, chosen, chosen_load = score, entry, load
     if chosen is None or chosen_load is None:
         return None
     cross = cross_bonus_applies(chosen, client_family, cross_model)

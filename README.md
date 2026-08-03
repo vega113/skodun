@@ -330,9 +330,16 @@ With `auto`, candidates are scored once, at head resolution, from what the
 store can see: `+100` per free provider slot, or `−10` per queued waiter when
 there are none, plus `+20` when the provider's family differs from the caller's
 (`--client-family xai`, the MCP `client_family` argument, or
-`SKODUN_CLIENT_FAMILY`). A provider in quota blackout, out of daily API budget,
-or with no adapter is excluded outright; ties break by reviewer name so two
-processes reading the same picture agree.
+`SKODUN_CLIENT_FAMILY`). A provider in quota blackout or out of daily API budget
+is excluded; a pooled entry whose provider has no adapter is a config error and
+is refused outright, naming the entry, rather than quietly routed around.
+
+Ties go to the entry you listed first — `[routing] pool` as written, else the
+reviewer table's own order. Two entries on one provider always score
+identically, so an alphabetical tie-break would let a rename decide which model
+reviews. It also gives the property that makes `auto` safe to turn on: **while
+nothing is busy, it picks exactly what `off` would have picked**, and only
+deviates once load actually differs.
 
 The properties that make this safe to turn on:
 
@@ -344,6 +351,9 @@ The properties that make this safe to turn on:
   `provider:<id>` FIFO and the extra passes' role-based selection are all as
   they were. Routing decides which queue to join, not what happens next.
 - **Background pre-push reviews are not routed** in this phase.
+- **An explicit `pool` is an exclusion.** When nothing in it is routable, the
+  run still starts inside the pool (`route_reason` `auto:default-finder`) — a
+  finder you kept out of the pool never heads an automatic run.
 
 Every artifact records `requested_reviewer`, `routed_reviewer`, `route_reason`
 (`pinned`, `config-finder`, `auto:free`, `auto:free+cross`, `auto:wait`,

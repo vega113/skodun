@@ -1539,3 +1539,50 @@ def test_a_pin_beats_auto_routing(tmp_path, capsys, monkeypatch):
     # ...and it really did join the busy queue rather than the idle one the
     # router would have chosen. A pin is a decision, including a costly one.
     assert "finder/xai" in rec["failure_reason"]
+
+
+def test_a_pooled_entry_with_no_adapter_is_refused_not_routed_around(
+        tmp_path, capsys):
+    """Fail closed on a config error the router would otherwise hide.
+
+    `provider_loads` marks a provider with no adapter unavailable, so without
+    the preflight the router would quietly pick the healthy finder and the typo
+    would surface only on the runs where that one happened to be busy. A
+    misconfiguration found by luck of the load is not found at all.
+    """
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path, '\n[routing]\nmode = "auto"\n' + """
+[[reviewers]]
+name = "finder-typo"
+provider = "opeani"
+model = "gpt-5.4"
+role = "finder"
+""")
+    st = _store(tmp_path)
+
+    with pytest.raises(PreflightRefused) as e:
+        _run(repo, st)
+
+    assert "finder-typo" in str(e.value)
+    assert "no adapter for provider 'opeani'" in str(e.value)
+    assert "no review ran" in str(e.value)
+
+
+def test_mode_off_does_not_preflight_the_pool(tmp_path, capsys):
+    """The pool is only a set of candidates when the router may use it. With
+    routing off nothing can reach that entry, so it is not this run's graph and
+    refusing on it would refuse configs that worked before S5."""
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path, """
+[[reviewers]]
+name = "finder-typo"
+provider = "opeani"
+model = "gpt-5.4"
+role = "finder"
+""")
+    st = _store(tmp_path)
+
+    rec = _run(repo, st)
+
+    assert rec["trustworthy"] is True
+    assert rec["routed_reviewer"] == "finder"

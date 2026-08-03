@@ -1057,6 +1057,33 @@ def _default_head(cfg: Config) -> Reviewer:
     return finder
 
 
+def _auto_fallback_head(cfg: Config) -> Reviewer:
+    """The head for an `auto` run the router could not decide.
+
+    An EXPLICIT `[routing] pool` is an exclusion as much as it is a list: the
+    way an operator keeps a finder configured for pinning while keeping it out
+    of automatic selection is to leave it out of the pool. So the fallback for
+    "nothing was routable" is the first entry the operator POOLED, not
+    `_reviewer_for(cfg, "finder")` -- which is very likely the entry they
+    excluded, and sending an automatic run there would be the one thing the
+    pool exists to prevent.
+
+    A blacked-out pool entry heading the chain is the honest outcome, not a
+    problem this function should route around: `_finder_chain_unavailable`
+    fails the run fast and names the outage, which is what an operator whose
+    whole pool is out of quota needs to be told.
+
+    With no explicit pool (the default), every enabled finder IS the pool, so
+    the config's finder is already the first candidate and this is exactly
+    `_default_head`.
+    """
+    if cfg.routing.pool:
+        pooled = routing.resolve_pool(cfg)
+        if pooled:
+            return pooled[0]
+    return _default_head(cfg)
+
+
 def resolve_review_head(cfg: Config, store: Store, *,
                         requested: str | None = None,
                         client_family: str | None = None,
@@ -1100,11 +1127,12 @@ def resolve_review_head(cfg: Config, store: Store, *,
         route = routing.auto_route(cfg, store, client_family=client_family)
         if route is None:
             # Nothing routable: an empty pool, every candidate blacked out, or a
-            # store that could not answer. The config's finder still heads the
-            # run and `_finder_chain_unavailable` below still fails fast in its
-            # own words if the outage is real -- a router that refused here would
+            # store that could not answer. A configured head still runs and
+            # `_finder_chain_unavailable` below still fails fast in its own
+            # words if the outage is real -- a router that refused here would
             # replace a diagnosis with a shrug.
-            head, reason = _default_head(cfg), routing.ROUTE_DEFAULT_FINDER
+            head, reason = (_auto_fallback_head(cfg),
+                            routing.ROUTE_DEFAULT_FINDER)
         else:
             head, reason = route.reviewer, route.reason
         _note(f"routing: {reason} -> {head.name} ({head.provider})")
@@ -1265,8 +1293,16 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     # mid-chain would mean discovering it only on the runs where the head
     # happened to fail — a config error found by luck of the outage.
     adapter = _adapter_for(finder)
-    for reviewer in (finder, *(_pass_reviewer(cfg, p, finder)
-                               for p in _EXTRA_PASS_ROLES)):
+    # The ROUTING POOL joins the graph too, and for exactly the reason the
+    # comment above gives for fallbacks: an entry the router may choose is an
+    # entry this run may execute, so a typo on one has to be refused here. Left
+    # out, it would instead be silently ROUTED AROUND -- `provider_loads` marks
+    # a provider with no adapter unavailable -- and the config error would then
+    # surface only on the runs where every other provider happened to be busy.
+    # A misconfiguration found by luck of the load is not found at all.
+    pool = (routing.resolve_pool(cfg) if cfg.routing.mode == "auto" else ())
+    for reviewer in (finder, *pool, *(_pass_reviewer(cfg, p, finder)
+                                      for p in _EXTRA_PASS_ROLES)):
         for entry in _chain_for(cfg, reviewer):
             _adapter_for(entry)
 

@@ -102,10 +102,15 @@ cross_model = true      # soft preference for a different provider family
 | Free slots (`max_in_flight − holders`) | `+100 × free_slots` |
 | No free slot | `−10 × (queue_depth + 1)` |
 | Different family from `client_family` | `+20`, only when `cross_model` |
-| Tie | reviewer name ascending (two peers must agree) |
+| Tie | the order **you** wrote (`pool`, else the reviewer table) |
 
 Excluded outright: `provider_state` quota blackout, a metered provider out of
-daily budget, a provider with no adapter, anything outside the pool.
+daily budget, anything outside the pool. A pooled entry whose provider has **no
+adapter** is a config error and is *refused* (exit `2`, naming the entry) rather
+than routed around.
+
+Because ties go to the first-listed entry, **while nothing is busy `auto` picks
+exactly what `off` would have picked** — it only deviates once load differs.
 
 **Rules that do not bend:**
 
@@ -125,7 +130,9 @@ daily budget, a provider with no adapter, anything outside the pool.
 `route_reason` (`pinned`, `config-finder`, `auto:free`, `auto:free+cross`,
 `auto:wait`, `auto:wait+cross`, `auto:default-finder`) and `client_family` on
 its artifact. `auto:default-finder` means auto was on but nothing was routable
-— an empty pool, or every candidate blacked out.
+— an empty pool, or every candidate blacked out. With an explicit `pool` that
+fallback stays *inside* the pool, so leaving a finder out really does keep
+automatic runs off it.
 
 **Agents: prefer omitting `reviewer`.** Auto-routing can only spread load over
 callers that let it choose. Pin for a second opinion, not by habit.

@@ -211,9 +211,10 @@ def test_cross_model_breaks_a_tie_between_two_equally_free_providers():
              "openai": ProviderLoad(free_slots=1)}
     route = pick_finder(pool, loads, client_family="xai")
     assert (route.reviewer.name, route.reason) == ("other", ROUTE_FREE_CROSS)
-    # ...and the same picture with the preference off falls back to name order.
+    # ...and the same picture with the preference off falls back to the order
+    # the operator wrote, which here is the same-family entry.
     plain = pick_finder(pool, loads, client_family="xai", cross_model=False)
-    assert (plain.reviewer.name, plain.reason) == ("other", ROUTE_FREE)
+    assert (plain.reviewer.name, plain.reason) == ("same", ROUTE_FREE)
 
 
 def test_cross_model_never_outranks_a_free_slot():
@@ -241,13 +242,35 @@ def test_a_busy_cross_family_pick_says_so_in_its_reason():
     assert (route.reviewer.name, route.reason) == ("other", ROUTE_WAIT_CROSS)
 
 
-def test_ties_break_by_name_ascending_not_by_config_order():
-    """Two peers scoring the same picture must reach the same answer."""
+def test_ties_break_by_the_order_the_operator_wrote():
+    """Not alphabetically: two entries on ONE provider always score the same,
+    and they can carry different models and fallbacks. A rename must not be
+    what decides which model reviews."""
     loads = {"xai": ProviderLoad(free_slots=1),
              "openai": ProviderLoad(free_slots=1)}
-    forward = pick_finder([_entry("aaa", "xai"), _entry("zzz", "openai")], loads)
-    reverse = pick_finder([_entry("zzz", "openai"), _entry("aaa", "xai")], loads)
-    assert forward.reviewer.name == reverse.reviewer.name == "aaa"
+    assert pick_finder([_entry("zzz", "xai"), _entry("aaa", "openai")],
+                       loads).reviewer.name == "zzz"
+    assert pick_finder([_entry("aaa", "openai"), _entry("zzz", "xai")],
+                       loads).reviewer.name == "aaa"
+
+
+def test_two_entries_on_one_provider_tie_to_the_first_listed():
+    """The same load view by construction, so only the tie-break can choose."""
+    loads = {"xai": ProviderLoad(free_slots=1)}
+    pool = [_entry("finder-grok-high", "xai"), _entry("finder-grok-fast", "xai")]
+    assert pick_finder(pool, loads).reviewer.name == "finder-grok-high"
+
+
+def test_while_nothing_is_busy_auto_picks_what_mode_off_would():
+    """The property that makes `auto` safe to switch on: it deviates only once
+    load actually differs."""
+    pool = [_entry("finder", "xai"), _entry("finder-codex", "openai")]
+    idle = {"xai": ProviderLoad(free_slots=1),
+            "openai": ProviderLoad(free_slots=1)}
+    assert pick_finder(pool, idle).reviewer.name == "finder"
+    busy = {"xai": ProviderLoad(free_slots=0, queue_depth=1),
+            "openai": ProviderLoad(free_slots=1)}
+    assert pick_finder(pool, busy).reviewer.name == "finder-codex"
 
 
 def test_an_empty_pool_and_a_fully_excluded_one_both_hand_the_choice_back():
@@ -371,8 +394,8 @@ def test_auto_route_passes_the_operators_cross_model_switch_through(store):
     cfg = _cfg(_entry("finder-a-xai", "xai"), _entry("finder-b-openai", "openai"),
                cross_model=False)
     route = auto_route(cfg, store, client_family="xai")
-    # With the preference off, the tie falls to name order rather than to the
-    # other family.
+    # With the preference off, the tie falls to the order the operator wrote
+    # rather than to the other family.
     assert route.reviewer.name == "finder-a-xai"
     assert route.reason == ROUTE_FREE
 
@@ -460,3 +483,26 @@ def test_a_pin_still_runs_when_the_config_names_no_finder_at_all(store):
     head, meta = _head(cfg, store, requested="second-opinion")
     assert head.name == "second-opinion"
     assert meta["route_reason"] == "pinned"
+
+
+def test_an_explicit_pool_is_honoured_even_when_nothing_in_it_is_routable(store):
+    """Leaving a finder OUT of the pool is how an operator excludes it from
+    automatic selection. A "nothing routable" fallback that then picked it
+    would be the one thing the pool exists to prevent."""
+    until = time.strftime(_TS_FORMAT, time.gmtime(time.time() + 600))
+    store.mark_provider_unavailable("openai", "rate limited", "quota", until)
+    cfg = _cfg(_entry("finder-pin-only", "xai"), _entry("finder-codex", "openai"),
+               pool=("finder-codex",))
+    head, meta = _head(cfg, store)
+    assert head.name == "finder-codex"          # the pooled entry, blackout and all
+    assert meta["route_reason"] == "auto:default-finder"
+
+
+def test_without_an_explicit_pool_the_fallback_is_the_config_finder(store):
+    """The implicit pool already contains it, so this is `_default_head`."""
+    until = time.strftime(_TS_FORMAT, time.gmtime(time.time() + 600))
+    store.mark_provider_unavailable("xai", "rate limited", "quota", until)
+    cfg = _cfg(_entry("finder", "xai"))
+    head, meta = _head(cfg, store)
+    assert (head.name, meta["route_reason"]) == ("finder",
+                                                 "auto:default-finder")
