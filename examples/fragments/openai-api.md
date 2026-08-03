@@ -67,8 +67,57 @@ Some hosts want a skodun-only name:
 }
 ```
 
-After changing MCP env: **restart** the MCP connection (stdio servers do not
-hot-reload env).
+### When the host does not expand `${VARS}`
+
+Some hosts (Claude Code among them) take the `env` block as **literals** — a
+`"${OPENAI_API_KEY}"` there is passed through verbatim and skodun reports
+`missing api key`. That leaves a bad choice: paste the key into a config file
+that is plaintext on disk and often synced, or go without.
+
+There is a third option — point `command` at a launcher that exports the key
+and execs skodun. The key stays in whatever file already holds your secrets:
+
+```sh
+#!/bin/sh
+# ~/.local/bin/skodun-with-secrets   (chmod 700)
+set -u
+SECRETS="${SKODUN_SECRETS_FILE:-$HOME/.secrets/.env}"
+if [ -z "${SKODUN_OPENAI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] \
+        && [ -r "$SECRETS" ]; then
+    key=$(sed -n 's/^SKODUN_OPENAI_API_KEY=//p' "$SECRETS" | head -n 1)
+    [ -n "$key" ] && export SKODUN_OPENAI_API_KEY="$key"
+    unset key
+fi
+exec skodun "$@"
+```
+
+```json
+"skodun": { "type": "stdio",
+            "command": "/absolute/path/to/skodun-with-secrets",
+            "args": ["mcp"], "env": {} }
+```
+
+**Extract the one variable; do not source the file.** A secrets file usually
+holds credentials for unrelated systems — databases, cloud accounts — and
+skodun spawns third-party provider CLIs that inherit its environment. Sourcing
+the whole file hands every one of those secrets to every model subprocess.
+`SKODUN_OPENAI_API_KEY` is the only one that is skodun's business.
+
+The same launcher is the right home for the spend ceiling, since it applies
+however skodun was started:
+
+```sh
+SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY="${SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY:-5}"
+export SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY
+```
+
+A shell rc is NOT equivalent for that: `~/.zshrc` is sourced only by
+interactive shells, so a script, a CI step or an agent tool running `skodun`
+in a non-interactive shell silently gets the default ceiling instead. Use
+`~/.zshenv` (or the launcher) if you want one number everywhere.
+
+After changing MCP env — or the launcher — **restart** the MCP connection
+(stdio servers do not hot-reload env).
 
 Agent tool call (absolute `repo`):
 
