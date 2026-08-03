@@ -1,30 +1,42 @@
-# skodun reviewing skodun. The finder is `agy` (google) rather than `codex`
-# because it is the provider that is reliably available here; codex remains in
-# the chain so a quota outage on either one costs an attempt, not the review.
+# skodun reviewing skodun. The head is `grok` (xai): agy and codex both hit
+# quota repeatedly on this machine while the chain was headed by agy, and a
+# head that is regularly blacked out spends the whole admission budget before a
+# fallback ever runs. Both stay in the chain behind it, so a quota outage on
+# any one of the three costs an attempt rather than the review.
 #
 # `agy` passes its prompt on the command line and refuses above ~120 KB, and
 # the prompt is much bigger than the diff -- context packing adds the full text
 # of every changed file, so a 53 KB diff once built a 338 KB prompt.
-# `max_diff_bytes` is what bounds that whole envelope, not just the diff.
+# `max_diff_bytes` is what bounds that whole envelope, not just the diff. That
+# ceiling still matters now that agy is a fallback rather than the head: a
+# chain can span providers, and a prompt sized for a file-fed head reaches agy
+# as an argv word.
 #
 # This file used to carry `max_diff_bytes = 100000` for exactly that reason,
-# which shrank the review for `codex` too -- its prompt travels as a file and
-# has no such ceiling. It no longer has to: the planner takes the SMALLER of
-# this number and the head adapter's own declared limit, per reviewer
-# (`budget.prompt_budget`), so `agy` is budgeted to what it can carry and
-# `codex` gets the whole envelope. A change too big for agy simply splits into
-# more, smaller batches; one too big even after that is `unavailable` for agy
-# and the codex fallback reviews it.
+# which shrank the review for `grok` and `codex` too -- their prompts travel as
+# files and have no such ceiling. It no longer has to: the planner takes the
+# SMALLER of this number and the head adapter's own declared limit, per
+# reviewer (`budget.prompt_budget`), so `agy` is budgeted to what it can carry
+# while the others get the whole envelope. A change too big for agy simply
+# splits into more, smaller batches; one too big even after that is
+# `unavailable` for agy and the next entry reviews it.
 
 [defaults]
 max_diff_bytes = 400000
 
 [[reviewers]]
 name      = "finder"
-provider  = "google"
-model     = "gemini-3.6-flash-high"
+provider  = "xai"
+model     = "grok-4.5"
+effort    = "high"
 role      = "finder"
-fallbacks = ["finder-openai"]
+fallbacks = ["finder-gemini", "finder-openai"]
+
+[[reviewers]]
+name     = "finder-gemini"
+provider = "google"
+model    = "gemini-3.6-flash-high"
+role     = "finder"
 
 [[reviewers]]
 name     = "finder-openai"

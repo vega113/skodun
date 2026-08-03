@@ -134,6 +134,20 @@ its artifact. `auto:default-finder` means auto was on but nothing was routable
 fallback stays *inside* the pool, so leaving a finder out really does keep
 automatic runs off it.
 
+**Seeing the distribution.** `skodun providers` reports the effective routing
+config and, per provider, how many reviews it *served* in a window, split by how
+the head was chosen:
+
+```bash
+skodun providers --since-days 7
+```
+
+`served=` counts who actually answered; the `routed head` footer counts who the
+router *chose*. After a fallback those differ, and the gap is the fallback rate.
+`unrouted` covers background pre-push reviews and records written before S5 —
+both consumed a provider slot without being a routing decision. Reviews imported
+by `import-legacy` are excluded entirely; they never touched a skodun slot.
+
 **Agents: prefer omitting `reviewer`.** Auto-routing can only spread load over
 callers that let it choose. Pin for a second opinion, not by habit.
 

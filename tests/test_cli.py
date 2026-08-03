@@ -3258,3 +3258,185 @@ def test_review_help_documents_the_flag_and_its_env_fallback(capsys):
     out = capsys.readouterr().out
     assert "--client-family" in out
     assert "SKODUN_CLIENT_FAMILY" in out
+
+
+# --- providers: routing telemetry (S5) --------------------------------------
+
+
+def _providers_out(tmp_path, monkeypatch, capsys, *argv) -> str:
+    """`skodun providers` stdout, against a repo with two finders configured."""
+    repo = tmp_path / "r"; repo.mkdir(exist_ok=True)
+    (repo / ".skodun.toml").write_text("""
+[routing]
+mode = "auto"
+[[reviewers]]
+name = "finder-grok"
+provider = "xai"
+model = "m"
+role = "finder"
+[[reviewers]]
+name = "finder-codex"
+provider = "openai"
+model = "m"
+role = "finder"
+""", encoding="utf-8")
+    monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "no-global.toml"))
+    main(["providers", "--repo", str(repo), *argv])
+    return capsys.readouterr().out
+
+
+def _seed_routing(db, rows):
+    """rows: (id, reviewed_at, adapter, route_reason|None, routed_reviewer|None)."""
+    from skodun.store import Store
+
+    with Store.open(db) as st:
+        for rid, at, adapter, reason, routed in rows:
+            rec = {
+                "id": rid, "reviewed_at": at, "source": "skodun",
+                "branch": "feat", "head": "a" * 40, "base_ref": "main",
+                "base_sha": "b" * 40, "diff_hash": rid, "mode": "now",
+                "model": "m", "adapter": adapter, "status": "clean",
+                "parse_ok": True, "degraded": False, "diff_truncated": False,
+                "trustworthy": True, "stop_reason": None, "findings": [],
+                "findings_total": 0, "summary": "",
+            }
+            if reason is not None:
+                rec["route_reason"] = reason
+                rec["routed_reviewer"] = routed
+            st.save_review(rec)
+
+
+def _recent(hours_ago: int) -> str:
+    import time
+
+    from skodun.store import _TS_FORMAT
+
+    return time.strftime(_TS_FORMAT, time.gmtime(time.time() - hours_ago * 3600))
+
+
+def test_providers_reports_the_effective_routing_config(tmp_path, monkeypatch,
+                                                        capsys):
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    out = _providers_out(tmp_path, monkeypatch, capsys)
+    assert "routing: mode=auto" in out
+    assert "pool=all-enabled-finders" in out
+    assert "cross_model=on" in out
+    assert "window=7d" in out
+
+
+def test_providers_splits_served_counts_by_how_the_head_was_chosen(
+        tmp_path, monkeypatch, capsys):
+    """A provider at 80% because agents keep pinning it is a docs problem, not
+    a weights problem, and an undifferentiated count cannot tell them apart."""
+    db = tmp_path / "s.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    _seed_routing(db, [
+        ("a", _recent(1), "grok", "auto:free", "finder-grok"),
+        ("b", _recent(2), "grok", "pinned", "finder-grok"),
+        ("c", _recent(3), "grok", None, None),
+        ("d", _recent(4), "codex", "auto:wait", "finder-codex"),
+    ])
+    out = _providers_out(tmp_path, monkeypatch, capsys)
+    assert "served=3/4 (auto 1, pinned 1, unrouted 1)" in out
+    assert "served=1/4 (auto 1)" in out
+
+
+def test_providers_footer_reports_exact_reasons_and_routed_heads(
+        tmp_path, monkeypatch, capsys):
+    db = tmp_path / "s.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    _seed_routing(db, [
+        ("a", _recent(1), "grok", "auto:free", "finder-grok"),
+        ("b", _recent(2), "grok", "auto:free", "finder-grok"),
+        ("c", _recent(3), "codex", "auto:wait", "finder-codex"),
+        ("d", _recent(4), "codex", None, None),
+    ])
+    out = _providers_out(tmp_path, monkeypatch, capsys)
+    assert "routing decisions (7d): auto:free 2, auto:wait 1, unrouted 1" in out
+    assert "routed head (7d): finder-grok 2, finder-codex 1" in out
+
+
+def test_providers_honours_since_days(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "s.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    _seed_routing(db, [
+        ("recent", _recent(1), "grok", "auto:free", "finder-grok"),
+        ("old", _recent(72), "grok", "auto:free", "finder-grok"),
+    ])
+    assert "served=2/2" in _providers_out(tmp_path, monkeypatch, capsys)
+    out = _providers_out(tmp_path, monkeypatch, capsys, "--since-days", "1")
+    assert "window=1d" in out and "served=1/1" in out
+
+
+def test_providers_says_nothing_per_line_when_the_window_is_empty(
+        tmp_path, monkeypatch, capsys):
+    """`served=0/0` on every line is noise; say it once instead."""
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    out = _providers_out(tmp_path, monkeypatch, capsys)
+    assert "served=" not in out
+    assert "no reviews in the last 7d" in out
+
+
+def test_providers_output_is_ascii_only(tmp_path, monkeypatch, capsys):
+    """`_emit` guards a UnicodeEncodeError from an ASCII-only locale for a
+    reason; new output must not be the thing that trips it."""
+    db = tmp_path / "s.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    _seed_routing(db, [("a", _recent(1), "grok", "auto:free", "finder-grok")])
+    out = _providers_out(tmp_path, monkeypatch, capsys)
+    out.encode("ascii")            # raises UnicodeEncodeError if it is not
+
+
+def test_a_routing_query_that_fails_omits_the_bit_and_keeps_exit_0(
+        tmp_path, monkeypatch, capsys):
+    """The `holders=` precedent: an operator running a diagnostic because
+    something is wrong must not be refused the parts that still work."""
+    from skodun.store import Store
+
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+
+    def boom(self, *, since_iso):
+        raise RuntimeError("store is on fire")
+
+    monkeypatch.setattr(Store, "routing_counts", boom)
+    repo = tmp_path / "r"; repo.mkdir(exist_ok=True)
+    (repo / ".skodun.toml").write_text(
+        '[[reviewers]]\nname = "f"\nprovider = "xai"\nmodel = "m"\n',
+        encoding="utf-8")
+    monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "no-global.toml"))
+    assert main(["providers", "--repo", str(repo)]) == 0
+    out = capsys.readouterr().out
+    assert "served=" not in out
+    assert "adapter=grok" in out          # the rest of the listing still ran
+
+
+def test_routing_lines_cannot_forge_or_rewrite_terminal_rows(tmp_path,
+                                                              monkeypatch,
+                                                              capsys):
+    """`artifact_json` is a file on disk somebody can edit, so a stored
+    `routed_reviewer` is not trusted for having come out of the store.
+
+    A raw newline would forge an extra row in this listing and an ESC sequence
+    would rewrite the rows already printed -- the same reason this command
+    already sanitizes `provider_state.reason`.
+    """
+    db = tmp_path / "s.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    _seed_routing(db, [
+        ("a", _recent(1), "grok", "auto:free",
+         "evil\nxai | adapter=grok | FORGED\x1b[2K"),
+    ])
+    out = _providers_out(tmp_path, monkeypatch, capsys)
+    assert "FORGED" in out, "the value should still be shown, just defanged"
+    assert "\x1b" not in out
+    forged = [ln for ln in out.splitlines() if ln.startswith("xai | adapter")]
+    assert len(forged) == 1, f"a stored value forged a row: {forged}"
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "lots"])
+def test_since_days_must_be_a_positive_integer(tmp_path, bad, capsys):
+    """argparse owns the refusal, and `main` turns its SystemExit into the 2
+    every other usage error reports -- with the verdict banner intact, which is
+    the invariant that makes the last line of stdout always a verdict."""
+    assert main(["providers", "--repo", str(tmp_path), "--since-days", bad]) == 2
+    assert capsys.readouterr().out.strip().startswith(BANNER)

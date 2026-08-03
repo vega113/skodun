@@ -360,6 +360,24 @@ Every artifact records `requested_reviewer`, `routed_reviewer`, `route_reason`
 `auto:wait+cross`, `auto:default-finder`) and `client_family`, so why a given
 review went where it did is answerable afterwards.
 
+`skodun providers` reads those back in aggregate: the effective routing config,
+then per provider how many reviews it *served* in the last 7 days
+(`--since-days N`) split by how the head was chosen, then footer lines breaking
+down exact `route_reason` values and routed entries.
+
+```
+routing: mode=auto pool=all-enabled-finders cross_model=on window=7d
+xai | adapter=grok | … | holders=0 | served=53/191 (auto 2, pinned 1, unrouted 50)
+routing decisions (7d): unrouted 170, pinned 18, auto:free 2, config-finder 1
+routed head (7d): finder-openai-api 15, finder 3, finder-codex 2
+```
+
+`served=` is who *answered*; `routed head` is who was *chosen*, and after a
+fallback they differ — that gap is the fallback rate. `unrouted` is a review
+with no routing audit: a background pre-push review, or a record written before
+routing existed. Reviews imported by `import-legacy` are excluded; they never
+took a skodun provider slot.
+
 ### The refuter
 
 A reviewer with `role = "refuter"` adds a pass, scheduled only when the finder

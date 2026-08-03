@@ -1989,3 +1989,71 @@ class Store:
                WHERE provider=? AND at LIKE ?""",
             (provider, day_prefix + "%")).fetchone()
         return float(row["s"]) if row is not None else 0.0
+
+    def routing_counts(self, *, since_iso: str) -> list[dict]:
+        """Routing decisions since `since_iso`, grouped. Read-only, no schema.
+
+        `(adapter, route_reason, routed_reviewer)` with a count each, where
+        `adapter` is WHO SERVED (rewritten by the pipeline to whoever actually
+        answered) and `routed_reviewer` is who the router CHOSE. After a
+        fallback those name different providers, and the gap between them is
+        the fallback rate -- see the S5 telemetry design.
+
+        The routing fields live inside `artifact_json` rather than in columns,
+        so they are read with `json_extract`, and the grouping happens in SQL:
+        `list_reviews` decodes every artifact it returns, which for a whole
+        window would be megabytes of findings and attempts to answer a question
+        about four scalars. `json_valid` guards the extract so one malformed
+        row -- an artifact written by something other than `json.dumps` -- costs
+        its own row's attribution rather than blinding the whole query.
+
+        A record with no routing audit yields `route_reason IS NULL`: it is
+        either pre-S5 or a background pre-push review, and both consumed a
+        provider slot without being a routing decision. The caller decides how
+        to present that; this method does not hide it.
+
+        Two exclusions, and both are about the same invariant: the caller
+        prints a per-provider share, so every row counted has to be a row some
+        provider line can own.
+
+        `adapter IS NOT NULL` drops skodun's own rows that never reached a
+        provider -- a `reserve_prepush` row exists before the worker runs, and
+        a superseded or fail-if-running row can terminate without one. They are
+        real reviews-in-progress, but nothing attributes them, so counting them
+        would put a numerator sum below its own denominator on every listing
+        that had one.
+
+        Scoped to `source = 'skodun'`, which is load-bearing rather than tidy.
+        A store that has run `import-legacy` holds the old grok-reviews
+        archive, and those rows never touched a skodun provider slot -- they
+        have no adapter at all. Counting them would put a four-figure
+        denominator under a three-figure numerator and report a provider
+        carrying 28% of the real load as carrying 5%, which is precisely the
+        number this method exists to get right.
+
+        The window is a string comparison, correct only because store
+        timestamps are fixed-width canonical UTC -- hence `_require_ts`.
+        `reviewed_at` carries no index of its own (only `(branch,
+        reviewed_at)`), so this is a table scan. That is the right trade for a
+        read-only diagnostic at these row counts, and it is cheaper than the
+        index would be to maintain on every write.
+        """
+        since_iso = _require_ts("since_iso", since_iso)
+        rows = self._c.execute(
+            """SELECT adapter,
+                      CASE WHEN json_valid(artifact_json)
+                           THEN json_extract(artifact_json, '$.route_reason')
+                      END AS route_reason,
+                      CASE WHEN json_valid(artifact_json)
+                           THEN json_extract(artifact_json, '$.routed_reviewer')
+                      END AS routed_reviewer,
+                      COUNT(*) AS n
+                 FROM reviews
+                WHERE reviewed_at >= ? AND source = ?
+                      AND adapter IS NOT NULL
+             GROUP BY adapter, route_reason, routed_reviewer
+             ORDER BY adapter, route_reason, routed_reviewer""",
+            (since_iso, SKODUN_SOURCE)).fetchall()
+        return [{"adapter": r["adapter"], "route_reason": r["route_reason"],
+                 "routed_reviewer": r["routed_reviewer"], "n": int(r["n"])}
+                for r in rows]

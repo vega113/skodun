@@ -3519,3 +3519,126 @@ def test_set_status_is_gone(tmp_path):
     """
     st = Store.open(tmp_path / "s.db")
     assert not hasattr(st, "set_status")
+
+
+# --- routing telemetry (S5 Phase A read-back) -------------------------------
+
+
+def _routing_review(st, rid, *, at, adapter, reason=None, routed=None):
+    """One persisted review with (or without) a routing audit."""
+    rec = {
+        "id": rid, "reviewed_at": at, "source": "skodun", "branch": "feat",
+        "head": "a" * 40, "base_ref": "main", "base_sha": "b" * 40,
+        "diff_hash": rid, "mode": "now", "model": "m", "adapter": adapter,
+        "status": "clean", "parse_ok": True, "degraded": False,
+        "diff_truncated": False, "trustworthy": True, "stop_reason": None,
+        "findings": [], "findings_total": 0, "summary": "",
+    }
+    if reason is not None:
+        rec["route_reason"] = reason
+        rec["routed_reviewer"] = routed
+    st.save_review(rec)
+
+
+def test_routing_counts_groups_by_adapter_reason_and_head(tmp_path):
+    with Store.open(tmp_path / "s.db") as st:
+        _routing_review(st, "r1", at="2026-08-02T00:00:00Z", adapter="grok",
+                        reason="auto:free", routed="finder-grok")
+        _routing_review(st, "r2", at="2026-08-02T01:00:00Z", adapter="grok",
+                        reason="auto:free", routed="finder-grok")
+        _routing_review(st, "r3", at="2026-08-02T02:00:00Z", adapter="codex",
+                        reason="pinned", routed="finder-codex")
+        rows = st.routing_counts(since_iso="2026-08-01T00:00:00Z")
+    assert {(r["adapter"], r["route_reason"], r["routed_reviewer"], r["n"])
+            for r in rows} == {
+        ("grok", "auto:free", "finder-grok", 2),
+        ("codex", "pinned", "finder-codex", 1),
+    }
+
+
+def test_routing_counts_excludes_reviews_before_the_window(tmp_path):
+    """The boundary is inclusive: a review AT the cutoff is in the window."""
+    with Store.open(tmp_path / "s.db") as st:
+        _routing_review(st, "old", at="2026-07-30T23:59:59Z", adapter="grok",
+                        reason="auto:free", routed="finder-grok")
+        _routing_review(st, "edge", at="2026-08-01T00:00:00Z", adapter="grok",
+                        reason="auto:free", routed="finder-grok")
+        rows = st.routing_counts(since_iso="2026-08-01T00:00:00Z")
+    assert [(r["adapter"], r["n"]) for r in rows] == [("grok", 1)]
+
+
+def test_routing_counts_reports_unrouted_records_as_their_own_group(tmp_path):
+    """Pre-S5 records and background pre-push reviews have no route audit.
+
+    Both consumed a provider slot, so they belong in the total; neither was a
+    routing decision, so neither may be counted as one.
+    """
+    with Store.open(tmp_path / "s.db") as st:
+        _routing_review(st, "legacy", at="2026-08-02T00:00:00Z", adapter="grok")
+        _routing_review(st, "routed", at="2026-08-02T01:00:00Z", adapter="grok",
+                        reason="auto:free", routed="finder-grok")
+        rows = st.routing_counts(since_iso="2026-08-01T00:00:00Z")
+    by_reason = {r["route_reason"]: r["n"] for r in rows}
+    assert by_reason == {None: 1, "auto:free": 1}
+
+
+def test_routing_counts_ignores_the_imported_legacy_archive(tmp_path):
+    """`import-legacy` rows never touched a skodun provider slot.
+
+    Not a tidiness rule: on a real store the legacy archive outnumbers skodun's
+    own reviews five to one, so counting it puts a four-figure denominator
+    under a three-figure numerator and reports a provider carrying 28% of the
+    load as carrying 5% -- the exact number this query exists to get right.
+    """
+    with Store.open(tmp_path / "s.db") as st:
+        _routing_review(st, "mine", at="2026-08-02T00:00:00Z", adapter="grok",
+                        reason="auto:free", routed="finder-grok")
+        st.save_review({
+            "id": "imported", "reviewed_at": "2026-08-02T01:00:00Z",
+            "source": "legacy", "branch": "feat", "head": "c" * 40,
+            "base_ref": "main", "base_sha": "b" * 40, "diff_hash": "imported",
+            "mode": "now", "model": "m", "adapter": None, "status": "clean",
+            "parse_ok": True, "degraded": False, "diff_truncated": False,
+            "trustworthy": True, "stop_reason": None, "findings": [],
+            "findings_total": 0, "summary": "",
+        })
+        rows = st.routing_counts(since_iso="2026-08-01T00:00:00Z")
+    assert [(r["adapter"], r["n"]) for r in rows] == [("grok", 1)]
+
+
+def test_routing_counts_ignores_rows_no_provider_can_own(tmp_path):
+    """skodun's OWN rows can have no adapter: a `reserve_prepush` row exists
+    before the worker runs, and a superseded or fail-if-running row can
+    terminate without one.
+
+    They are real reviews-in-progress, but nothing attributes them to a
+    provider -- so counting them would put the sum of the printed per-provider
+    numerators below their shared denominator on every listing that had one.
+    """
+    with Store.open(tmp_path / "s.db") as st:
+        _routing_review(st, "served", at="2026-08-02T00:00:00Z", adapter="grok",
+                        reason="auto:free", routed="finder-grok")
+        st.save_review({
+            "id": "reserved", "reviewed_at": "2026-08-02T01:00:00Z",
+            "source": "skodun", "branch": "feat", "head": "c" * 40,
+            "base_ref": "main", "base_sha": "b" * 40, "diff_hash": "reserved",
+            "mode": "now", "model": "m", "adapter": None, "status": "clean",
+            "parse_ok": True, "degraded": False, "diff_truncated": False,
+            "trustworthy": True, "stop_reason": None, "findings": [],
+            "findings_total": 0, "summary": "",
+        })
+        rows = st.routing_counts(since_iso="2026-08-01T00:00:00Z")
+    assert [(r["adapter"], r["n"]) for r in rows] == [("grok", 1)]
+    assert sum(r["n"] for r in rows) == 1, "the denominator counted a row no line owns"
+
+
+def test_routing_counts_on_an_empty_store_is_an_empty_list(tmp_path):
+    with Store.open(tmp_path / "s.db") as st:
+        assert st.routing_counts(since_iso="2026-08-01T00:00:00Z") == []
+
+
+def test_routing_counts_refuses_a_timestamp_it_cannot_order_by(tmp_path):
+    """String comparison is only correct for the canonical fixed-width shape."""
+    with Store.open(tmp_path / "s.db") as st:
+        with pytest.raises(ValueError, match="since_iso"):
+            st.routing_counts(since_iso="last tuesday")
