@@ -1,0 +1,60 @@
+#  The suite is the gate. skodun is stdlib-only at runtime (see AGENTS.md), so
+#  there is nothing to install but pytest itself and nothing to build: pytest
+#  reads `pythonpath = ["src", "."]` out of `pyproject.toml`, so `src/skodun`
+#  imports without `pip install -e .`.
+#
+#  Why this file exists: PRs #83 and #85 both landed while
+#  `tests/test_store.py` was red, each recording the failures as
+#  "pre-existing". Nothing disagreed with them, because nothing ran the suite.
+#  A red `main` is only survivable when no one is watching.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only: this workflow proves the tree, it never writes to it.
+permissions:
+  contents: read
+
+# A superseded push has nothing left to prove -- the suite is long, so let a
+# newer commit on the same ref cancel the run it replaces. Never cancel `main`:
+# its runs are the record of what was green when it landed.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    # The suite drives real child processes (fake CLIs under a watchdog) and
+    # re-runs its store-touching subset in a subprocess, which alone takes
+    # minutes. This is a net against a HUNG run, not a performance budget.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          # `requires-python = ">=3.12"`; this pins the version the suite is
+          # actually developed against. Widening to a 3.12/3.14 matrix is a
+          # separate change -- the floor has never been exercised in CI, so
+          # proving it belongs in its own PR rather than in the one that
+          # introduces the gate.
+          python-version: "3.14"
+
+      - name: Install pytest
+        run: python3 -m pip install --upgrade pip pytest
+
+      - name: Record the environment under test
+        run: |
+          python3 --version
+          python3 -m pytest --version
+          git --version
+          python3 -c 'import sqlite3; print("sqlite3", sqlite3.sqlite_version)'
+
+      - name: Run the suite
+        run: python3 -m pytest -q --tb=short
