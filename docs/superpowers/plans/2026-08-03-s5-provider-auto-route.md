@@ -1,8 +1,11 @@
 # Plan: S5 provider auto-route (load balance finders)
 
-Date: 2026-08-03. Parent epic: **S5** (GitHub issue opened with this plan).  
+Date: 2026-08-03. Parent epic: **[S5 #69](https://github.com/vega113/skodun/issues/69)**.  
 Design: `docs/superpowers/specs/2026-08-03-provider-auto-route-design.md`.  
 Epic seed: `docs/epics/s5-provider-auto-route.md`.
+
+Children: #70 config · #71 routing.py · #72 store views · #73 pipeline ·  
+#74 CLI · #75 MCP · #76 docs · #77 Phase B tracking.
 
 ## Goal
 
