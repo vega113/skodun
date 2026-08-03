@@ -1774,8 +1774,12 @@ class McpServer:
         alive = [w for w in workers if w.is_alive()]
         policy = disconnect_policy()
 
-        def _join_all(*, timeout: float | None, label: str) -> None:
-            """Join alive workers. ``timeout=None`` means unbounded."""
+        def _join_all(*, timeout: float | None, label: str) -> bool:
+            """Join alive workers. ``timeout=None`` means unbounded.
+
+            Returns True if any worker is still alive after the wait.
+            """
+            stuck = False
             for worker in workers:
                 if not worker.is_alive():
                     continue
@@ -1784,10 +1788,51 @@ class McpServer:
                     worker.join()
                 else:
                     worker.join(timeout=max(timeout, 0.0))
-                if worker.is_alive() and timeout is not None:
-                    self._note(
-                        f"{worker.name} still alive after {label}; "
-                        f"continuing shutdown")
+                if worker.is_alive():
+                    stuck = True
+                    if timeout is not None:
+                        self._note(
+                            f"{worker.name} still alive after {label}; "
+                            f"continuing shutdown")
+            return stuck
+
+        def _demote_orphaned_running_rows() -> None:
+            """Best-effort durable terminal for reviews this process still owns.
+
+            Used only when we must exit with a daemon worker still stuck after
+            cancel, so we do not leave forever-``running`` rows. Provider
+            process groups may still need OS cleanup; stale recovery is the
+            backstop for anything left behind.
+            """
+            import os
+            try:
+                from . import pipeline
+                pipeline.request_cancel_all()
+            except BaseException:
+                pass
+            try:
+                with self._store_factory() as store:
+                    mine = os.getpid()
+                    reason = (
+                        "cancelled: MCP process exiting with review worker "
+                        "still stuck after cancel wait")
+                    for rec in store.running_records():
+                        pid = rec.get("pid")
+                        rid = rec.get("id")
+                        if rid is None:
+                            continue
+                        if pid is not None and int(pid) != mine:
+                            continue
+                        try:
+                            if store.fail_if_running(str(rid), reason):
+                                self._note(
+                                    f"demoted stuck running review {rid} "
+                                    f"before MCP exit")
+                        except BaseException as e:
+                            self._note(
+                                f"could not demote stuck review {rid}: {e!r}")
+            except BaseException as e:
+                self._note(f"could not open store to demote stuck reviews: {e!r}")
 
         if not alive:
             return 0
@@ -1798,7 +1843,8 @@ class McpServer:
                     "disconnect policy=cancel; cancelling in-flight review "
                     "before exit")
                 cancel.set()
-            _join_all(timeout=post_cancel_join_sec(), label="cancel wait")
+            if _join_all(timeout=post_cancel_join_sec(), label="cancel wait"):
+                _demote_orphaned_running_rows()
             return 0
 
         # Drain: prefer finishing the review; optional ceiling then cancel.
@@ -1829,8 +1875,9 @@ class McpServer:
                 "drain timed out; cancelling in-flight review so the "
                 "MCP process can exit")
             cancel.set()
-            _join_all(
-                timeout=post_cancel_join_sec(), label="post-cancel wait")
+            if _join_all(
+                    timeout=post_cancel_join_sec(), label="post-cancel wait"):
+                _demote_orphaned_running_rows()
         return 0
 
     # -- diagnostics ------------------------------------------------------
