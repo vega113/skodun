@@ -133,6 +133,14 @@ DEFAULT_DISCONNECT_POLICY = DISCONNECT_DRAIN
 DRAIN_TIMEOUT_ENV = "SKODUN_MCP_DRAIN_TIMEOUT_SECONDS"
 DEFAULT_DRAIN_TIMEOUT_SEC = 2 * 60 * 60  # 2 hours — above normal review budgets
 
+#: After drain timeout (or cancel policy) sets the cancel token, wait this long
+#: for the worker to finish cleanup before exiting the process anyway. Review
+#: threads are daemons; a stuck join after cancel would otherwise pin MCP open
+#: forever. Provider process groups should die via the cancel path; residual
+#: orphans match the SIGKILL failure mode and are swept by stale recovery.
+POST_CANCEL_JOIN_ENV = "SKODUN_MCP_POST_CANCEL_JOIN_SECONDS"
+DEFAULT_POST_CANCEL_JOIN_SEC = 120.0
+
 #: The status a busy refusal and a failed handler report. 2 is the gate
 #: contract's "no trustworthy review covers this content" -- the conservative
 #: reading of every outcome where nothing ran to completion.
@@ -451,27 +459,39 @@ def disconnect_policy() -> str:
     return DISCONNECT_DRAIN
 
 
-def drain_timeout_sec() -> float:
-    """Seconds to wait under drain before cancelling a stuck review.
+def _env_nonneg_float(name: str, default: float) -> float:
+    """Parse a non-negative finite float env, else ``default``.
 
-    Positive number from ``SKODUN_MCP_DRAIN_TIMEOUT_SECONDS``, else the default
-    (2h). Junk / negative / non-finite (``nan``/``inf``) → default. Exact
-    ``0`` disables the ceiling (join until the worker finishes or an external
-    cancel arrives).
+    Exact ``0`` is kept (callers may treat it as "no wait" / "no ceiling").
+    Junk, negative, and non-finite values fall back to ``default``.
     """
     import math
 
-    raw = os.environ.get(DRAIN_TIMEOUT_ENV)
+    raw = os.environ.get(name)
     if raw is None or not str(raw).strip():
-        return float(DEFAULT_DRAIN_TIMEOUT_SEC)
+        return float(default)
     try:
         value = float(str(raw).strip())
     except ValueError:
-        return float(DEFAULT_DRAIN_TIMEOUT_SEC)
-    # nan/inf must not disable the ceiling or break Thread.join(timeout=…).
+        return float(default)
     if not math.isfinite(value) or value < 0:
-        return float(DEFAULT_DRAIN_TIMEOUT_SEC)
+        return float(default)
     return value
+
+
+def drain_timeout_sec() -> float:
+    """Seconds to wait under drain before cancelling a stuck review.
+
+    From ``SKODUN_MCP_DRAIN_TIMEOUT_SECONDS`` (default 2h). Junk / negative /
+    non-finite → default. Exact ``0`` disables the drain ceiling.
+    """
+    return _env_nonneg_float(DRAIN_TIMEOUT_ENV, DEFAULT_DRAIN_TIMEOUT_SEC)
+
+
+def post_cancel_join_sec() -> float:
+    """Seconds to join after cancel before exiting anyway (default 120)."""
+    return _env_nonneg_float(
+        POST_CANCEL_JOIN_ENV, DEFAULT_POST_CANCEL_JOIN_SEC)
 
 
 def _handle_review(call: "HandlerCall") -> "HandlerResult":
@@ -1791,13 +1811,24 @@ class McpServer:
                         "drain timed out; cancelling in-flight review so the "
                         "MCP process can exit")
                     cancel.set()
-            # Fall through to unbounded join (post-cancel cleanup, or
-            # ceiling=0 drain, or workers already done).
+            # Fall through to post-cancel / residual join below.
 
+        # Bounded join: after cancel (or under cancel policy) wait for cleanup,
+        # then exit even if the daemon worker is still stuck.
+        residual = post_cancel_join_sec()
         for worker in workers:
+            if not worker.is_alive():
+                continue
+            self._note(f"waiting for {worker.name} to finish before exiting")
+            if residual > 0:
+                worker.join(timeout=residual)
+            else:
+                worker.join(timeout=0.0)
             if worker.is_alive():
-                self._note(f"waiting for {worker.name} to finish before exiting")
-                worker.join()
+                self._note(
+                    f"{worker.name} still alive after cancel wait; exiting "
+                    f"anyway (daemon thread; prefer review_cancel / fix the "
+                    f"hung provider)")
         return 0
 
     # -- diagnostics ------------------------------------------------------

@@ -873,7 +873,12 @@ def test_disconnect_policy_defaults_to_drain(monkeypatch):
 
 
 def test_drain_timeout_sec_defaults_and_parses(monkeypatch):
-    from skodun.mcpserver import DEFAULT_DRAIN_TIMEOUT_SEC, drain_timeout_sec
+    from skodun.mcpserver import (
+        DEFAULT_DRAIN_TIMEOUT_SEC,
+        DEFAULT_POST_CANCEL_JOIN_SEC,
+        drain_timeout_sec,
+        post_cancel_join_sec,
+    )
 
     monkeypatch.delenv("SKODUN_MCP_DRAIN_TIMEOUT_SECONDS", raising=False)
     assert drain_timeout_sec() == float(DEFAULT_DRAIN_TIMEOUT_SEC)
@@ -887,6 +892,8 @@ def test_drain_timeout_sec_defaults_and_parses(monkeypatch):
     assert drain_timeout_sec() == float(DEFAULT_DRAIN_TIMEOUT_SEC)
     monkeypatch.setenv("SKODUN_MCP_DRAIN_TIMEOUT_SECONDS", "inf")
     assert drain_timeout_sec() == float(DEFAULT_DRAIN_TIMEOUT_SEC)
+    monkeypatch.delenv("SKODUN_MCP_POST_CANCEL_JOIN_SECONDS", raising=False)
+    assert post_cancel_join_sec() == float(DEFAULT_POST_CANCEL_JOIN_SEC)
 
 
 def test_drain_timeout_falls_back_to_cancel_if_review_stuck(monkeypatch):
