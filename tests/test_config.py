@@ -1192,9 +1192,23 @@ model = "m"
 
 
 @pytest.fixture(autouse=True)
-def _no_routing_env(monkeypatch):
-    """No test in this module inherits the developer's own routing mode."""
+def _no_routing_env(monkeypatch, tmp_path):
+    """No test in this module inherits the developer's OWN skodun config.
+
+    Two leaks, and the second one shipped broken: clearing the env override was
+    not enough, because `load_config(None, global_path=None)` resolves the
+    global path from `SKODUN_CONFIG` and falls back to
+    `~/.config/skodun/config.toml` -- so a developer whose real machine config
+    sets `[routing] mode = "auto"` failed the defaults test, and one whose
+    config was plain passed it. A test that reads a file outside the repo is
+    testing the machine, not the code.
+
+    `SKODUN_CONFIG` is pointed at a path that does not exist rather than at an
+    empty file, because "no global config at all" is the state these defaults
+    are about.
+    """
     monkeypatch.delenv(ROUTING_MODE_ENV, raising=False)
+    monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "no-such-global.toml"))
 
 
 def test_routing_defaults_are_off_with_an_implicit_pool():
