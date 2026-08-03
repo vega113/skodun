@@ -375,3 +375,88 @@ def test_auto_route_passes_the_operators_cross_model_switch_through(store):
     # other family.
     assert route.reviewer.name == "finder-a-xai"
     assert route.reason == ROUTE_FREE
+
+
+# --- head resolution (pipeline seam) ----------------------------------------
+# `pipeline.resolve_review_head` is the ONE place a head is chosen, so that the
+# CLI and any number of stdio MCP processes apply the same rule. These drive it
+# directly: they are about the DECISION, and a real model call would only make
+# the same assertions slower.
+
+
+def _head(cfg, store, **kw):
+    from skodun.pipeline import resolve_review_head
+
+    return resolve_review_head(cfg, store, **kw)
+
+
+def test_a_pin_wins_over_a_free_provider_and_is_not_scored(store):
+    """A caller asking a busy provider for a second opinion gets that provider."""
+    cfg = _cfg(_entry("finder-grok", "xai"), _entry("finder-codex", "openai"))
+    _hold(store, "xai", "h1")           # grok is busy, codex is idle
+    head, meta = _head(cfg, store, requested="finder-grok")
+    assert head.name == "finder-grok"
+    assert meta == {"requested_reviewer": "finder-grok",
+                    "routed_reviewer": "finder-grok",
+                    "route_reason": "pinned", "client_family": None}
+
+
+def test_mode_off_is_pre_s5_selection(store):
+    """The first enabled finder, whatever the load says. The shipped default."""
+    cfg = _cfg(_entry("finder-grok", "xai"), _entry("finder-codex", "openai"),
+               mode="off")
+    _hold(store, "xai", "h1")
+    head, meta = _head(cfg, store)
+    assert head.name == "finder-grok"
+    assert meta["route_reason"] == "config-finder"
+    assert meta["requested_reviewer"] is None
+    assert meta["routed_reviewer"] == "finder-grok"
+
+
+def test_mode_auto_routes_off_the_busy_provider_and_records_why(store):
+    cfg = _cfg(_entry("finder-grok", "xai"), _entry("finder-codex", "openai"))
+    _hold(store, "xai", "h1")
+    head, meta = _head(cfg, store)
+    assert head.name == "finder-codex"
+    assert meta == {"requested_reviewer": None,
+                    "routed_reviewer": "finder-codex",
+                    "route_reason": ROUTE_FREE, "client_family": None}
+
+
+def test_mode_auto_records_the_declared_client_family_either_way(store):
+    """The field describes the CALLER, so it is recorded whether or not it tipped."""
+    cfg = _cfg(_entry("finder-grok", "xai"), _entry("finder-codex", "openai"))
+    _, meta = _head(cfg, store, client_family="xai")
+    assert meta["client_family"] == "xai"
+    assert meta["route_reason"] == ROUTE_FREE_CROSS
+    assert meta["routed_reviewer"] == "finder-codex"
+
+
+def test_mode_auto_falls_back_to_the_config_finder_when_nothing_is_routable(store):
+    """A blacked-out pool is still a runnable review — the chain fails fast in
+    its own words, and a router that refused here would replace a diagnosis
+    with a shrug."""
+    until = time.strftime(_TS_FORMAT, time.gmtime(time.time() + 600))
+    store.mark_provider_unavailable("xai", "rate limited", "quota", until)
+    cfg = _cfg(_entry("finder-grok", "xai"))
+    head, meta = _head(cfg, store)
+    assert head.name == "finder-grok"
+    assert meta["route_reason"] == "auto:default-finder"
+
+
+def test_a_config_with_no_finder_is_refused_in_both_modes(store):
+    from skodun.pipeline import PreflightRefused
+
+    for mode in ("off", "auto"):
+        cfg = _cfg(_entry("r", "xai", role="refuter"), mode=mode)
+        with pytest.raises(PreflightRefused,
+                           match="no enabled reviewer with role 'finder'"):
+            _head(cfg, store)
+
+
+def test_a_pin_still_runs_when_the_config_names_no_finder_at_all(store):
+    """The request supplies the one thing the role lookup exists to produce."""
+    cfg = _cfg(_entry("second-opinion", "xai", role="refuter"), mode="auto")
+    head, meta = _head(cfg, store, requested="second-opinion")
+    assert head.name == "second-opinion"
+    assert meta["route_reason"] == "pinned"

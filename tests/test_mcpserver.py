@@ -430,7 +430,11 @@ def test_the_registry_types_are_the_pinned_contract():
     spec = [f.name for f in dataclasses.fields(HandlerSpec)]
     assert spec[:4] == ["name", "long_running", "input_schema", "handler"]
     assert [f.name for f in dataclasses.fields(HandlerCall)] == \
-        ["params", "store_factory", "cancel"]
+        ["params", "store_factory", "cancel", "client_name"]
+    # `client_name` defaults to None: it is a HINT the handshake may not carry,
+    # and every handler test that builds a call by hand predates it.
+    assert HandlerCall(params={}, store_factory=lambda: None,
+                       cancel=threading.Event()).client_name is None
     assert [f.name for f in dataclasses.fields(HandlerResult)] == \
         ["status", "text", "pending_acks"]
     # `pending_acks` defaults to empty: a tool with nothing to acknowledge

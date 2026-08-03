@@ -701,10 +701,24 @@ def test_the_review_tool_takes_a_reviewer_by_name_in_its_schema():
     selection. Optional: absent means the config's own finder heads the chain."""
     spec = _specs()["review"]
     props = spec.input_schema["properties"]
-    assert set(props) == {"repo", "reviewer"}
+    assert set(props) == {"repo", "reviewer", "client_family"}
     assert props["reviewer"]["type"] == "string"
     assert props["reviewer"]["description"]
     assert spec.input_schema["required"] == []
+
+
+def test_the_review_tool_publishes_client_family_and_says_it_is_soft():
+    """An agent can only pass what the schema publishes, and it can only use the
+    argument well if the description says what it does NOT do: prefer another
+    family, never refuse to review for the want of one."""
+    spec = _specs()["review"]
+    prop = spec.input_schema["properties"]["client_family"]
+    assert prop["type"] == "string"
+    assert "different" in prop["description"].lower()
+    assert "preference" in prop["description"].lower()
+    # ...and the tool description tells an agent to OMIT `reviewer` by default,
+    # which is the behaviour auto-routing needs to be given a chance at all.
+    assert "OMIT `reviewer`" in spec.description
 
 
 @pytest.mark.parametrize("name,needle", [
@@ -771,6 +785,85 @@ def test_a_reviewer_of_the_wrong_type_is_refused_by_the_transport(tmp_path,
         assert "reviewer must be" in res.text, (bad, res.text)
         assert "Traceback" not in res.text, (bad, res.text)
     assert not db.exists(), "a malformed call opened a store"
+
+
+def test_a_client_family_of_the_wrong_type_is_refused_by_the_transport(
+        tmp_path, monkeypatch):
+    """Same split as `reviewer`: a shape argparse cannot produce is the
+    transport's to refuse, and refused before anything is opened or run."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "t.db"
+    for bad in (["xai"], 7, True, {"name": "xai"}):
+        res = _tool("review", db, client_family=bad)
+        assert res.status == 2, (bad, res)
+        assert "client_family must be" in res.text, (bad, res.text)
+    assert not db.exists(), "a malformed call opened a store"
+
+
+def _review_family(monkeypatch, db, *, client_name=None, **params):
+    """What `client_family` the review tool hands the service for these inputs."""
+    seen: dict = {}
+
+    def fake(store, repo, **kw):
+        seen.update(kw)
+        return 0, "SKODUN VERDICT: trustworthy=true findings=0"
+
+    monkeypatch.setattr(services, "svc_review", fake)
+    spec = _specs()["review"]
+    spec.handler(HandlerCall(params=params,
+                             store_factory=lambda: Store.open(db),
+                             cancel=threading.Event(),
+                             client_name=client_name))
+    return seen["client_family"]
+
+
+def test_the_client_family_argument_reaches_the_service(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert _review_family(monkeypatch, tmp_path / "s.db",
+                          repo=str(tmp_path), client_family="XAI ") == "xai"
+
+
+def test_the_handshake_client_name_is_the_last_resort_default(tmp_path,
+                                                              monkeypatch):
+    """Priority is by SPECIFICITY: the argument describes this call, the env
+    describes this machine, and the client name is a guess about a handshake.
+
+    Resolved in the handler rather than threaded down raw, so the guess cannot
+    outrank the operator's env — which is what a naive pass-through would do.
+    """
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "s.db"
+    monkeypatch.delenv("SKODUN_CLIENT_FAMILY", raising=False)
+    assert _review_family(monkeypatch, db, repo=str(tmp_path),
+                          client_name="Grok CLI") == "xai"
+    monkeypatch.setenv("SKODUN_CLIENT_FAMILY", "google")
+    assert _review_family(monkeypatch, db, repo=str(tmp_path),
+                          client_name="Grok CLI") == "google"
+    assert _review_family(monkeypatch, db, repo=str(tmp_path),
+                          client_name="Grok CLI",
+                          client_family="junie") == "junie"
+
+
+def test_a_client_name_nothing_recognises_leaves_the_family_undeclared(
+        tmp_path, monkeypatch):
+    """Availability-only scoring is a perfectly good answer, and the default."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SKODUN_CLIENT_FAMILY", raising=False)
+    assert _review_family(monkeypatch, tmp_path / "s.db", repo=str(tmp_path),
+                          client_name="some-editor-nobody-mapped") is None
+
+
+def test_the_handshake_stashes_the_client_name_for_later_calls(tmp_path):
+    """`initialize` is where the only client-side hint this server ever gets
+    arrives; a server that dropped it would have nothing to default from."""
+    srv = McpServer(store_factory=lambda: Store.open(tmp_path / "s.db"))
+    srv._m_initialize({"protocolVersion": "2025-11-25",
+                       "clientInfo": {"name": "Grok CLI", "version": "1"}}, 1)
+    assert srv._client_name == "Grok CLI"
+    # A handshake with no `clientInfo` at all is legal, and leaves it unset.
+    srv2 = McpServer(store_factory=lambda: Store.open(tmp_path / "s.db"))
+    srv2._m_initialize({"protocolVersion": "2025-11-25"}, 1)
+    assert srv2._client_name is None
 
 
 # ==========================================================================

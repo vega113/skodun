@@ -192,6 +192,13 @@ class HandlerCall:
     params: dict
     store_factory: Callable[[], "Store"]
     cancel: threading.Event
+    #: The `clientInfo.name` this session handshook with, RAW and unmapped, or
+    #: None. A hint and nothing more: it is the lowest-priority source of the
+    #: caller's model family (`routing.resolve_client_family`), below both the
+    #: tool argument and the operator's env, and a name nothing recognises
+    #: simply leaves the family undeclared. Defaulted so that every handler test
+    #: that builds a call by hand keeps working.
+    client_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -518,17 +525,29 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
     a human get the same sentence for the same mistake. Only its TYPE is checked
     here, and before the store is opened, so a malformed call cannot start a
     review of anything.
+
+    `client_family` is resolved HERE rather than passed through, because this is
+    the only surface with a third source for it: the handshake's
+    `clientInfo.name`. The documented priority is by specificity -- the tool
+    argument describes this call, `SKODUN_CLIENT_FAMILY` describes this machine,
+    the client name is a guess about a handshake -- and threading the raw name
+    down instead would let the guess outrank the operator's env.
     """
-    from . import services
+    from . import routing, services
     repo, refusal = _repo_arg(call.params, "review")
     if refusal:
         return HandlerResult(status=2, text=refusal)
     reviewer, refusal = _opt_string_arg(call.params, "reviewer", "review")
     if refusal:
         return HandlerResult(status=2, text=refusal)
+    family, refusal = _opt_string_arg(call.params, "client_family", "review")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    family = routing.resolve_client_family(family, client_name=call.client_name)
     with call.store_factory() as store:
         status, text = services.svc_review(store, repo, cancel=call.cancel,
-                                           reviewer=reviewer)
+                                           reviewer=reviewer,
+                                           client_family=family)
     return HandlerResult(status=status, text=text)
 
 
@@ -847,6 +866,21 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                                    "or on a provider with no adapter is "
                                    "refused before anything runs, and the "
                                    "refusal names the configured entries"},
+                # The CALLER's family, not a reviewer's. Optional, and worth one
+                # tie-break: it lets an agent ask for a second opinion from a
+                # different model family without pinning a provider (which would
+                # also pin a model, an effort and a chain).
+                "client_family": {
+                    "type": "string",
+                    "description": "the calling client's own model family "
+                                   "(xai, openai, google, junie). With "
+                                   "auto-routing enabled and no `reviewer`, a "
+                                   "finder from a DIFFERENT family is "
+                                   "preferred when one is free. A soft "
+                                   "preference only -- it never leaves the "
+                                   "review without a reviewer. Defaults to "
+                                   "$SKODUN_CLIENT_FAMILY, else to a guess "
+                                   "from the client name in the handshake"},
             }),
             handler=_handle_review,
             description="Review the outgoing change NOW, in the foreground, and "
@@ -858,7 +892,12 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                         "legacy FG lock instead. Closing the session DRAINS by "
                         "default (review finishes into the store; set "
                         "SKODUN_MCP_DISCONNECT=cancel to abort). Explicit "
-                        "review_cancel / review-cancel still cancel. Status 0 "
+                        "review_cancel / review-cancel still cancel. OMIT "
+                        "`reviewer` unless you want a specific entry: with "
+                        "`[routing] mode = \"auto\"` that lets skodun pick a "
+                        "finder with a free provider slot instead of piling "
+                        "onto a busy one. A pin is absolute in every mode -- "
+                        "use it for a deliberate second opinion. Status 0 "
                         "= clean, 1 = findings open, 2 = nothing ran "
                         "(including busy refusal), 3 = gave up waiting for "
                         "capacity/lock, 4 = no trustworthy review exists."),
@@ -1247,6 +1286,11 @@ class McpServer:
         #: it is the fact a stricter gate would be built on, and both observed
         #: clients send it immediately after the handshake.
         self._initialized_notified = False
+        #: `clientInfo.name` from the handshake, kept only so an un-pinned
+        #: review can guess the caller's model family for the cross-model
+        #: preference (epic S5). Never used for anything a client could get
+        #: wrong by lying: the worst a bad guess buys is a +20 tie-break.
+        self._client_name: str | None = None
         self._stdout_lost = False
         self._write_lock = threading.Lock()
         self._slot_lock = threading.Lock()
@@ -1502,6 +1546,14 @@ class McpServer:
                             "invalid params: protocolVersion must be a string")
         negotiated = (requested if requested in SUPPORTED_PROTOCOL_VERSIONS
                       else MCP_PROTOCOL_VERSION)
+        # Stashed, not validated: `clientInfo` is optional in the spec and this
+        # server needs nothing from it. A well-formed name becomes a default
+        # model family for un-pinned reviews (epic S5); anything else leaves the
+        # family undeclared, which is the availability-only scoring every client
+        # gets by default.
+        info = params.get("clientInfo")
+        name = info.get("name") if isinstance(info, dict) else None
+        self._client_name = name if isinstance(name, str) else None
         # Idempotent on purpose: a second handshake is answered rather than
         # refused. Nothing here is stateful enough for a re-handshake to
         # corrupt, and refusing one would invent a failure mode.
@@ -1580,7 +1632,7 @@ class McpServer:
     def _run_handler(self, spec: HandlerSpec, arguments: dict,
                      cancel: threading.Event) -> HandlerResult:
         call = HandlerCall(params=arguments, store_factory=self._store_factory,
-                           cancel=cancel)
+                           cancel=cancel, client_name=self._client_name)
         try:
             res = spec.handler(call)
         except BaseException as e:

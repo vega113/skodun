@@ -166,7 +166,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import (batching, budget, capacity, chain, checklist, contextpack, gitio,
-               ids, passes, promptbuild, runner)
+               ids, passes, promptbuild, routing, runner)
 from .adapters import NORMAL_STOP_REASONS, REFUTER_CONTRACT, get_adapter
 from .config import Config, Defaults, Reviewer
 from .store import Store, _TS_FORMAT
@@ -1047,6 +1047,77 @@ def _requested_head(cfg: Config, requested: str) -> Reviewer:
         f"reviewers: {known or '(none)'}; no review ran")
 
 
+def _default_head(cfg: Config) -> Reviewer:
+    """The config's own finder, or refuse the run. Pre-S5 head selection."""
+    finder = _reviewer_for(cfg, "finder")
+    if finder is None:
+        raise PreflightRefused(
+            "no enabled reviewer with role 'finder' is configured; no "
+            "review ran")
+    return finder
+
+
+def resolve_review_head(cfg: Config, store: Store, *,
+                        requested: str | None = None,
+                        client_family: str | None = None,
+                        ) -> tuple[Reviewer, dict]:
+    """The entry that heads THIS run's chain, and the audit of how it was chosen.
+
+    The one place head selection happens, so the CLI and any number of stdio MCP
+    processes apply the same rule -- which is the whole reason routing lives here
+    and not in the MCP server: those processes cannot see each other except
+    through the store, and a policy that lived in one of them would be a policy
+    the others do not have.
+
+    Three paths, in priority order:
+
+    * **Pinned.** A `reviewer` name is absolute in every mode. It is not scored,
+      not compared against load, and never quietly downgraded -- a caller asking
+      a specific provider for a second opinion who silently got the default one
+      has been answered by the model they were routing around.
+    * **Auto.** `[routing] mode = "auto"` and no pin: `routing.auto_route` scores
+      the pool against store-visible load. Once, here -- not per poll.
+    * **Config.** `mode = "off"` (the default), and the fallback for an auto run
+      with nothing routable: today's first enabled `finder`.
+
+    Whatever is chosen, the head's OWN `fallbacks` chain is unchanged: routing
+    picks where the chain starts, never whether it can recover.
+
+    The returned dict is the audit, and it lands verbatim on the artifact.
+    `client_family` is recorded whether or not it changed anything -- it
+    describes the CALLER, and a record that only mentioned it on the runs where
+    it tipped a tie could not answer "was cross-model even in play here?".
+
+    NOTE (Phase A scope): the background pre-push worker keeps config-finder
+    selection. It is a different surface with a reserved, identity-pinned
+    record, and S5 Phase A is the foreground review loop the design diagram
+    names (CLI and MCP through `services.svc_review`).
+    """
+    if requested is not None:
+        head = _requested_head(cfg, requested)
+        reason = routing.ROUTE_PINNED
+    elif cfg.routing.mode == "auto":
+        route = routing.auto_route(cfg, store, client_family=client_family)
+        if route is None:
+            # Nothing routable: an empty pool, every candidate blacked out, or a
+            # store that could not answer. The config's finder still heads the
+            # run and `_finder_chain_unavailable` below still fails fast in its
+            # own words if the outage is real -- a router that refused here would
+            # replace a diagnosis with a shrug.
+            head, reason = _default_head(cfg), routing.ROUTE_DEFAULT_FINDER
+        else:
+            head, reason = route.reviewer, route.reason
+        _note(f"routing: {reason} -> {head.name} ({head.provider})")
+    else:
+        head, reason = _default_head(cfg), routing.ROUTE_CONFIG_FINDER
+    return head, {
+        "requested_reviewer": requested,
+        "routed_reviewer": head.name,
+        "route_reason": reason,
+        "client_family": client_family,
+    }
+
+
 def _adapter_for(reviewer: Reviewer):
     """Resolve one reviewer's adapter, or refuse the run before anything ran.
 
@@ -1074,7 +1145,8 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                lock_stale: float | None = None, *,
                progress_sink=None,
                cancel: "threading.Event | None" = None,
-               reviewer: str | None = None) -> dict:
+               reviewer: str | None = None,
+               client_family: str | None = None) -> dict:
     """Run one foreground review and return the record that was persisted.
 
     WRITES NOTHING TO STDOUT. Progress goes to stderr (or to `progress_sink`);
@@ -1132,6 +1204,13 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
       does not resolve is a `PreflightRefused` (see `_requested_head`): the
       request is never quietly downgraded to the config default. It selects the
       FINDER head only — the extra passes still choose by role.
+
+    * **`client_family`** — the caller's OWN model family (`xai`, `openai`, …),
+      used only for the cross-model preference when `[routing] mode = "auto"`
+      and no `reviewer` was pinned. `None` falls through to
+      `SKODUN_CLIENT_FAMILY`, and an undeclared family simply scores on
+      availability alone. It is a HINT worth one tie-break, never a filter: see
+      `routing.pick_finder`.
     """
     repo = Path(repo)
     d = cfg.defaults
@@ -1142,7 +1221,8 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
         _PROGRESS.sink = progress_sink
     try:
         return _run_review(repo, cfg, store, mode, lock_wait, lock_poll,
-                           id_prefix, lock_stale, cancel, d, reviewer)
+                           id_prefix, lock_stale, cancel, d, reviewer,
+                           client_family)
     finally:
         if progress_sink is not None:
             _PROGRESS.sink = None
@@ -1152,7 +1232,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 lock_wait: float | None, lock_poll: float | None,
                 id_prefix: str, lock_stale: float | None,
                 cancel: "threading.Event | None", d: Defaults,
-                requested: str | None = None) -> dict:
+                requested: str | None = None,
+                client_family: str | None = None) -> dict:
     """`run_review`'s body. Split off ONLY so the progress sink can be installed
     and removed around it without wrapping 400 lines in another indent level."""
 
@@ -1163,21 +1244,15 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         raise PreflightRefused(
             f"{repo} is the primary checkout; run the review from a linked "
             f"worktree or set SKODUN_ALLOW_MAIN=1; no review ran")
-    if requested is None:
-        finder = _reviewer_for(cfg, "finder")
-        if finder is None:
-            raise PreflightRefused(
-                "no enabled reviewer with role 'finder' is configured; no "
-                "review ran")
-    else:
-        # The caller named the head for THIS run. The role-based lookup above is
-        # skipped rather than merely overridden: the request already supplies
-        # the one thing that lookup exists to produce, so a config with no
-        # `finder` role at all is a perfectly runnable review once somebody says
-        # which entry to start from. Everything downstream — the chain, the
-        # budget, the extra passes' fallback — reads `finder`, so from here the
-        # run is shaped exactly as any other.
-        finder = _requested_head(cfg, requested)
+    # Who heads this run's chain, and the audit of why (S5). A caller who named
+    # the head supplies the one thing the role lookup exists to produce, so a
+    # config with no `finder` role at all is a perfectly runnable review once
+    # somebody says which entry to start from. Everything downstream — the
+    # chain, the budget, the extra passes' fallback — reads `finder`, so from
+    # here the run is shaped exactly as any other however it was chosen.
+    client_family = routing.resolve_client_family(client_family)
+    finder, route_meta = resolve_review_head(
+        cfg, store, requested=requested, client_family=client_family)
     # Resolved here, before anything is locked or persisted: an unknown
     # provider is a config error, not a review failure. EVERY reviewer this run
     # may reach for is resolved now, not just the finder's — a bad provider on a
@@ -1408,7 +1483,17 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             # existed. The NAME, not the provider id: the name is what was
             # asked for, and it is what would have to be typed again to
             # reproduce the run.
-            requested_reviewer=requested,
+            #
+            # Three more fields travel with it (S5), and together they are the
+            # whole audit of head selection: `routed_reviewer` (the entry that
+            # actually headed the chain — equal to `requested_reviewer` on a
+            # pin, and the router's pick otherwise), `route_reason` (which rule
+            # produced it: `pinned`, `config-finder`, `auto:free+cross`, …) and
+            # `client_family` (what the caller declared itself to be, recorded
+            # whether or not it tipped anything). Artifact fields only: they are
+            # serialized into `artifact_json` with the rest of the record, so
+            # nothing here needs a `SCHEMA_VERSION` bump.
+            **route_meta,
             # The budget for THIS review's own shape, persisted on the record so
             # `recover_stale` never has to recompute it from a config that may
             # since have changed — and never sweeps a live multi-batch run at
