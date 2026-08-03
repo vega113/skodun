@@ -1821,7 +1821,14 @@ class McpServer:
                         rid = rec.get("id")
                         if rid is None:
                             continue
-                        if pid is not None and int(pid) != mine:
+                        # Foreground MCP/CLI rows store os.getpid() of this
+                        # process (pipeline). Require an exact match — never
+                        # demote pid-less rows (other agents / mid-attach) or
+                        # foreign pids (background workers, other MCP).
+                        try:
+                            if pid is None or int(pid) != mine:
+                                continue
+                        except (TypeError, ValueError):
                             continue
                         try:
                             if store.fail_if_running(str(rid), reason):
