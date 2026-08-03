@@ -126,6 +126,13 @@ DISCONNECT_DRAIN = "drain"
 DISCONNECT_CANCEL = "cancel"
 DEFAULT_DISCONNECT_POLICY = DISCONNECT_DRAIN
 
+#: Max seconds to wait for an in-flight review under **drain** before falling
+#: back to cancel (so a hung provider cannot pin MCP open forever). Override
+#: with ``SKODUN_MCP_DRAIN_TIMEOUT_SECONDS``. ``0`` means no extra ceiling
+#: (join until cancel policy would apply only via SIGTERM/review_cancel).
+DRAIN_TIMEOUT_ENV = "SKODUN_MCP_DRAIN_TIMEOUT_SECONDS"
+DEFAULT_DRAIN_TIMEOUT_SEC = 2 * 60 * 60  # 2 hours — above normal review budgets
+
 #: The status a busy refusal and a failed handler report. 2 is the gate
 #: contract's "no trustworthy review covers this content" -- the conservative
 #: reading of every outcome where nothing ran to completion.
@@ -442,6 +449,25 @@ def disconnect_policy() -> str:
     if value == DISCONNECT_CANCEL:
         return DISCONNECT_CANCEL
     return DISCONNECT_DRAIN
+
+
+def drain_timeout_sec() -> float:
+    """Seconds to wait under drain before cancelling a stuck review.
+
+    Positive number from ``SKODUN_MCP_DRAIN_TIMEOUT_SECONDS``, else the default
+    (2h). Junk / negative → default. Exact ``0`` disables the ceiling (join
+    until the worker finishes or an external cancel arrives).
+    """
+    raw = os.environ.get(DRAIN_TIMEOUT_ENV)
+    if raw is None or not str(raw).strip():
+        return float(DEFAULT_DRAIN_TIMEOUT_SEC)
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        return float(DEFAULT_DRAIN_TIMEOUT_SEC)
+    if value < 0:
+        return float(DEFAULT_DRAIN_TIMEOUT_SEC)
+    return value
 
 
 def _handle_review(call: "HandlerCall") -> "HandlerResult":
@@ -1703,17 +1729,22 @@ class McpServer:
         behaviour. Explicit ``review_cancel`` / SIGTERM still cancel while the
         process is alive.
 
-        The join is UNBOUNDED on purpose. A review holds the foreground lock and
-        is about to write a record; abandoning it mid-write to make the process
-        exit a little sooner would leave a `running` row behind and a provider
-        process group with no parent. Under cancel policy, what bounds this wait
-        is the cancellation token (threaded into the provider watchdog). Under
-        drain, the wait is the real review runtime.
+        Under drain, the wait is bounded by ``drain_timeout_sec()`` (default
+        2h, env ``SKODUN_MCP_DRAIN_TIMEOUT_SECONDS``). If the worker is still
+        alive after that ceiling, cancel is set and we join again so a hung
+        provider cannot pin the MCP process open forever. Under cancel policy,
+        the cancellation token bounds the wait via the provider watchdog.
+
+        Abandoning a worker mid-write without cancel would leave a `running`
+        row and a provider process group with no parent — so we always join
+        (after optional drain timeout → cancel), never detach.
 
         The token is the LAST review's. Only one review executes at a time, so
         any earlier thread still in `_workers` has already finished its handler
         and is only finishing a write -- there is nothing left in it to cancel.
         """
+        import time
+
         with self._slot_lock:
             workers, cancel = list(self._workers), self._worker_cancel
         alive = [w for w in workers if w.is_alive()]
@@ -1725,10 +1756,40 @@ class McpServer:
                     "before exit")
                 cancel.set()
             else:
-                self._note(
-                    "disconnect policy=drain; waiting for in-flight review to "
-                    "finish (set SKODUN_MCP_DISCONNECT=cancel to abort on "
-                    "disconnect)")
+                ceiling = drain_timeout_sec()
+                if ceiling > 0:
+                    self._note(
+                        f"disconnect policy=drain; waiting up to {ceiling:g}s "
+                        f"for in-flight review (then cancel if still running; "
+                        f"set SKODUN_MCP_DISCONNECT=cancel to abort immediately)")
+                else:
+                    self._note(
+                        "disconnect policy=drain; waiting for in-flight review "
+                        "with no drain ceiling "
+                        "(SKODUN_MCP_DRAIN_TIMEOUT_SECONDS=0)")
+
+        if policy != DISCONNECT_CANCEL and alive:
+            ceiling = drain_timeout_sec()
+            if ceiling > 0:
+                deadline = time.monotonic() + ceiling
+                for worker in workers:
+                    if not worker.is_alive():
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._note(
+                        f"waiting for {worker.name} to finish before exiting")
+                    worker.join(timeout=remaining)
+                still = [w for w in workers if w.is_alive()]
+                if still and cancel is not None:
+                    self._note(
+                        "drain timed out; cancelling in-flight review so the "
+                        "MCP process can exit")
+                    cancel.set()
+            # Fall through to unbounded join (post-cancel cleanup, or
+            # ceiling=0 drain, or workers already done).
+
         for worker in workers:
             if worker.is_alive():
                 self._note(f"waiting for {worker.name} to finish before exiting")

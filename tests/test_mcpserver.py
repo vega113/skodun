@@ -872,6 +872,42 @@ def test_disconnect_policy_defaults_to_drain(monkeypatch):
     assert disconnect_policy() == "drain"
 
 
+def test_drain_timeout_sec_defaults_and_parses(monkeypatch):
+    from skodun.mcpserver import DEFAULT_DRAIN_TIMEOUT_SEC, drain_timeout_sec
+
+    monkeypatch.delenv("SKODUN_MCP_DRAIN_TIMEOUT_SECONDS", raising=False)
+    assert drain_timeout_sec() == float(DEFAULT_DRAIN_TIMEOUT_SEC)
+    monkeypatch.setenv("SKODUN_MCP_DRAIN_TIMEOUT_SECONDS", "0")
+    assert drain_timeout_sec() == 0.0
+    monkeypatch.setenv("SKODUN_MCP_DRAIN_TIMEOUT_SECONDS", "12.5")
+    assert drain_timeout_sec() == 12.5
+    monkeypatch.setenv("SKODUN_MCP_DRAIN_TIMEOUT_SECONDS", "nope")
+    assert drain_timeout_sec() == float(DEFAULT_DRAIN_TIMEOUT_SEC)
+
+
+def test_drain_timeout_falls_back_to_cancel_if_review_stuck(monkeypatch):
+    """A hung review must not pin MCP forever under default drain."""
+    monkeypatch.delenv("SKODUN_MCP_DISCONNECT", raising=False)
+    monkeypatch.setenv("SKODUN_MCP_DRAIN_TIMEOUT_SECONDS", "0.05")
+    fakes = _Fakes(hold_review=True)
+    pipe, out = _Pipe(), _Recorder()
+    server = _server(registry=fakes.registry(), stdin=pipe.reader, stdout=out)
+    t, box = _serve_in_thread(server)
+    try:
+        pipe.send(_HANDSHAKE)
+        pipe.send(_rpc("tools/call", 1, name="review", arguments={}))
+        _wait_until(fakes.started.is_set, what="the review to start")
+        pipe.close()                      # EOF; do NOT release hold
+        t.join(timeout=10)
+    finally:
+        fakes.release.set()
+        pipe.cleanup()
+    assert not t.is_alive(), "serve() did not return after drain timeout"
+    assert box["code"] == 0
+    assert fakes.cancel_seen == [True], (
+        "drain timeout must set cancel so a stuck review can finish cleanup")
+
+
 def test_an_id_less_call_never_occupies_the_review_slot():
     """The id-less rule, in the one place where executing it would be visible
     even without a response: the single review slot."""
