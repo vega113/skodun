@@ -1989,3 +1989,51 @@ class Store:
                WHERE provider=? AND at LIKE ?""",
             (provider, day_prefix + "%")).fetchone()
         return float(row["s"]) if row is not None else 0.0
+
+    def routing_counts(self, *, since_iso: str) -> list[dict]:
+        """Routing decisions since `since_iso`, grouped. Read-only, no schema.
+
+        `(adapter, route_reason, routed_reviewer)` with a count each, where
+        `adapter` is WHO SERVED (rewritten by the pipeline to whoever actually
+        answered) and `routed_reviewer` is who the router CHOSE. After a
+        fallback those name different providers, and the gap between them is
+        the fallback rate -- see the S5 telemetry design.
+
+        The routing fields live inside `artifact_json` rather than in columns,
+        so they are read with `json_extract`, and the grouping happens in SQL:
+        `list_reviews` decodes every artifact it returns, which for a whole
+        window would be megabytes of findings and attempts to answer a question
+        about four scalars. `json_valid` guards the extract so one malformed
+        row -- an artifact written by something other than `json.dumps` -- costs
+        its own row's attribution rather than blinding the whole query.
+
+        A record with no routing audit yields `route_reason IS NULL`: it is
+        either pre-S5 or a background pre-push review, and both consumed a
+        provider slot without being a routing decision. The caller decides how
+        to present that; this method does not hide it.
+
+        The window is a string comparison, correct only because store
+        timestamps are fixed-width canonical UTC -- hence `_require_ts`.
+        `reviewed_at` carries no index of its own (only `(branch,
+        reviewed_at)`), so this is a table scan. That is the right trade for a
+        read-only diagnostic at these row counts, and it is cheaper than the
+        index would be to maintain on every write.
+        """
+        since_iso = _require_ts("since_iso", since_iso)
+        rows = self._c.execute(
+            """SELECT adapter,
+                      CASE WHEN json_valid(artifact_json)
+                           THEN json_extract(artifact_json, '$.route_reason')
+                      END AS route_reason,
+                      CASE WHEN json_valid(artifact_json)
+                           THEN json_extract(artifact_json, '$.routed_reviewer')
+                      END AS routed_reviewer,
+                      COUNT(*) AS n
+                 FROM reviews
+                WHERE reviewed_at >= ?
+             GROUP BY adapter, route_reason, routed_reviewer
+             ORDER BY adapter, route_reason, routed_reviewer""",
+            (since_iso,)).fetchall()
+        return [{"adapter": r["adapter"], "route_reason": r["route_reason"],
+                 "routed_reviewer": r["routed_reviewer"], "n": int(r["n"])}
+                for r in rows]
