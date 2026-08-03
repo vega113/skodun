@@ -105,11 +105,16 @@ ROUTE_CONFIG_FINDER = "config-finder"
 ROUTE_DEFAULT_FINDER = "auto:default-finder"
 #: Routed to a provider with a free slot.
 ROUTE_FREE = "auto:free"
-#: Routed to a provider with a free slot, and the cross-model bonus decided it.
+#: Routed to a provider with a free slot, and the cross-model bonus is what
+#: DECIDED it -- the same pool scored without the bonus picks someone else.
+#: Causal, not descriptive: a cross-family provider that would have won on free
+#: slots alone records plain `auto:free`, because the question this field
+#: answers for an operator is "is `cross_model` doing anything for me?".
 ROUTE_FREE_CROSS = "auto:free+cross"
 #: Every candidate is busy; routed to the shortest queue.
 ROUTE_WAIT = "auto:wait"
-#: Every candidate is busy; the cross-model bonus applied to the pick.
+#: Every candidate is busy, and the cross-model bonus decided which queue.
+#: Causal in the same sense as `ROUTE_FREE_CROSS`.
 ROUTE_WAIT_CROSS = "auto:wait+cross"
 
 # --- scoring weights --------------------------------------------------------
@@ -294,9 +299,36 @@ def pick_finder(pool: Sequence[Reviewer],
     empty pool and a fully blacked-out one both still deserve the ordinary
     fail-fast the finder chain already performs, in its own words.
     """
+    winner = _argmax(pool, loads, client_family=client_family,
+                     cross_model=cross_model)
+    if winner is None:
+        return None
+    chosen, chosen_load = winner
+    # `+cross` is a CAUSAL claim -- "the cross-model preference is what sent
+    # this review here" -- so it is answered by asking the counterfactual
+    # rather than by observing that the winner happens to be cross-family. A
+    # cross-family provider with the most free slots would have won either way,
+    # and labelling that `+cross` would tell an operator the preference is
+    # earning its keep when it is not. Costs one more pass over a pool that has
+    # single digits of entries, once per review.
+    cross = cross_bonus_applies(chosen, client_family, cross_model)
+    if cross:
+        without = _argmax(pool, loads, client_family=client_family,
+                          cross_model=False)
+        cross = without is None or without[0].name != chosen.name
+    if chosen_load.free_slots > 0:
+        reason = ROUTE_FREE_CROSS if cross else ROUTE_FREE
+    else:
+        reason = ROUTE_WAIT_CROSS if cross else ROUTE_WAIT
+    return Route(reviewer=chosen, reason=reason)
+
+
+def _argmax(pool: Sequence[Reviewer], loads: Mapping[str, ProviderLoad], *,
+            client_family: str | None,
+            cross_model: bool) -> tuple[Reviewer, ProviderLoad] | None:
+    """The best-scoring routable candidate and its load, or None. Pure."""
     best: int | None = None
-    chosen: Reviewer | None = None
-    chosen_load: ProviderLoad | None = None
+    chosen: tuple[Reviewer, ProviderLoad] | None = None
     for entry in pool:
         load = loads.get(entry.provider)
         if load is None or load.unavailable:
@@ -307,15 +339,8 @@ def pick_finder(pool: Sequence[Reviewer],
         # place: that is the first-listed tie-break, and it is one comparison
         # rather than a sort key nobody would read the same way twice.
         if best is None or score > best:
-            best, chosen, chosen_load = score, entry, load
-    if chosen is None or chosen_load is None:
-        return None
-    cross = cross_bonus_applies(chosen, client_family, cross_model)
-    if chosen_load.free_slots > 0:
-        reason = ROUTE_FREE_CROSS if cross else ROUTE_FREE
-    else:
-        reason = ROUTE_WAIT_CROSS if cross else ROUTE_WAIT
-    return Route(reviewer=chosen, reason=reason)
+            best, chosen = score, (entry, load)
+    return chosen
 
 
 # --- store views ------------------------------------------------------------
@@ -389,9 +414,19 @@ def provider_loads(store, pool: Sequence[Reviewer], *,
     working install and would hide a real defect (a broken store query, a bug in
     the blackout predicate) behind reviews that keep succeeding. Every guard
     below therefore says what it swallowed, on the same progress stream the
-    chain reports quota outages on. Fail-closed is untouched either way -- what
-    degrades is which reviewer is chosen, never whether the review is trusted --
-    but a degradation nobody can see is a defect nobody can fix.
+    chain reports quota outages on.
+
+    This is deliberately NOT a fail-closed site, and the precedent is
+    `chain._cached_unavailable`, which guards the very same `provider_state`
+    read and lets an unreadable availability cache cost an extra attempt rather
+    than the review. The fail-closed invariant is about COVERAGE and TRUST: a
+    review that cannot be shown to be trustworthy must never certify a push.
+    Nothing here can affect that. A routing failure changes which configured
+    reviewer heads the chain; the model still reviews the real diff, the trust
+    axes are computed from that run exactly as always, and the gate reads the
+    same record it would have read. Failing a review because the load OPTIMISER
+    hiccuped would spend a model call to report a store hiccup, and would make
+    an optional feature able to take down the loop that works without it.
     """
     from . import capacity
     from .adapters import _REGISTRY

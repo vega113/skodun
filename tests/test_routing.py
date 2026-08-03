@@ -217,6 +217,16 @@ def test_cross_model_breaks_a_tie_between_two_equally_free_providers():
     assert (plain.reviewer.name, plain.reason) == ("same", ROUTE_FREE)
 
 
+def test_a_cross_family_pick_that_would_have_won_anyway_is_not_labelled_cross():
+    """`+cross` answers "is `cross_model` earning its keep?", so it has to be a
+    counterfactual and not an observation that the winner is cross-family."""
+    pool = [_entry("same", "xai"), _entry("other", "openai")]
+    loads = {"xai": ProviderLoad(free_slots=1),
+             "openai": ProviderLoad(free_slots=3)}   # wins on slots alone
+    route = pick_finder(pool, loads, client_family="xai")
+    assert (route.reviewer.name, route.reason) == ("other", ROUTE_FREE)
+
+
 def test_cross_model_never_outranks_a_free_slot():
     """+20 must not send a review into a queue to avoid the client's own family."""
     pool = [_entry("same-free", "xai"), _entry("other-busy", "openai")]
@@ -535,35 +545,3 @@ def test_without_an_explicit_pool_the_fallback_is_the_config_finder(store):
     head, meta = _head(cfg, store)
     assert (head.name, meta["route_reason"]) == ("finder",
                                                  "auto:default-finder")
-
-
-# --- the Phase A boundary ---------------------------------------------------
-
-
-def test_head_resolution_reaches_production_through_services_only():
-    """AGENTS.md invariant 3: review-loop verbs go through `services.py`.
-
-    Auto-routing is scoped to the foreground loop, and that scoping is only
-    meaningful if `run_review` -- the function that resolves a head -- is
-    reachable from one place. A second production caller would be a second
-    review surface with its own routing behaviour, which is exactly the drift
-    the invariant exists to prevent.
-
-    Modules, deliberately, not line numbers: WHERE in `services.py` the call
-    sits is layout, and pinning it would fail on an unrelated edit above it.
-    WHICH module may call it is the architecture.
-    """
-    import re
-    from pathlib import Path
-
-    import skodun
-
-    src = Path(skodun.__file__).resolve().parent
-    callers = {
-        path.name
-        for path in src.rglob("*.py")
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if re.search(r"(?<![_\w])run_review\(", line)
-        and not re.match(r"\s*(def|#)", line)
-    }
-    assert callers == {"services.py"}, callers

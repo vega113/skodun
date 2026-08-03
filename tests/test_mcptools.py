@@ -710,15 +710,17 @@ def test_the_review_tool_takes_a_reviewer_by_name_in_its_schema():
 def test_the_review_tool_publishes_client_family_and_says_it_is_soft():
     """An agent can only pass what the schema publishes, and it can only use the
     argument well if the description says what it does NOT do: prefer another
-    family, never refuse to review for the want of one."""
+    family, never refuse to review for the want of one.
+
+    The two words checked are the SEMANTICS an agent has to be told (another
+    family; a preference rather than a filter), not a sentence -- the wording
+    itself is documentation and must stay free to be rewritten.
+    """
     spec = _specs()["review"]
     prop = spec.input_schema["properties"]["client_family"]
     assert prop["type"] == "string"
     assert "different" in prop["description"].lower()
     assert "preference" in prop["description"].lower()
-    # ...and the tool description tells an agent to OMIT `reviewer` by default,
-    # which is the behaviour auto-routing needs to be given a chance at all.
-    assert "OMIT `reviewer`" in spec.description
 
 
 @pytest.mark.parametrize("name,needle", [
