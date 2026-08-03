@@ -86,8 +86,16 @@ SECRETS="${SKODUN_SECRETS_FILE:-$HOME/.secrets/.env}"
 # this often has a minimal PATH, and `exec skodun` would reintroduce exactly
 # the dependency the absolute `command` was there to avoid.
 SKODUN_BIN="${SKODUN_BIN:-$HOME/.local/bin/skodun}"
-if [ -z "${SKODUN_OPENAI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] \
-        && [ -r "$SECRETS" ]; then
+# An unexpanded "${OPENAI_API_KEY}" -- what a host that does not expand its env
+# block leaves behind -- is NOT a key. It is non-empty, so an emptiness check
+# alone would skip the file and exec skodun with a useless literal, failing auth
+# while the real secret sits unread. Treated as unset.
+case "${SKODUN_OPENAI_API_KEY:-}${OPENAI_API_KEY:-}" in
+    "")    need_key=1 ;;
+    '${'*) need_key=1 ;;
+    *)     need_key=0 ;;
+esac
+if [ "$need_key" = 1 ] && [ -r "$SECRETS" ]; then
     # BOTH documented names -- a secrets file may well use the preferred
     # OPENAI_API_KEY, and looking only for the alias exports nothing.
     for name in SKODUN_OPENAI_API_KEY OPENAI_API_KEY; do
@@ -105,6 +113,13 @@ exec "$SKODUN_BIN" "$@"
             "command": "/absolute/path/to/skodun-with-secrets",
             "args": ["mcp"], "env": {} }
 ```
+
+**Leave the MCP `env` block empty.** Migrating from the `"${OPENAI_API_KEY}"`
+recipe above? Delete that entry. On a host that does not expand it the literal
+is still *non-empty*, so a launcher checking only for emptiness would skip the
+secrets file and hand skodun a useless value — auth fails with the real key
+sitting unread. The gate above treats a leftover `${...}` as unset for exactly
+that reason, but removing the entry is clearer than relying on the guard.
 
 **Extract the one variable; do not source the file.** A secrets file usually
 holds credentials for unrelated systems — databases, cloud accounts — and
