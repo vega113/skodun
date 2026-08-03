@@ -20,7 +20,14 @@ Three properties this module is built around, and each one is load-bearing:
 * **Scored once.** The choice is made at head resolution and never revisited
   while waiting for a slot. Re-scoring every poll would make two peers chase
   each other between queues and would invalidate the entry-specific budget,
-  model and chain the pipeline has already resolved.
+  model and chain the pipeline has already resolved. The cost of scoring once
+  is a real, bounded window: two runs starting in the same instant read the
+  same snapshot -- neither has taken its `provider:<id>` slot yet -- and can
+  pick the same provider. Closing that needs mid-wait re-binding, an explicit
+  non-goal of this design, so what Phase A buys is narrowing the pile-up from
+  "always the same provider" to "only when starts collide". This is a router,
+  not an admission-time scheduler; the FIFO underneath is still what makes
+  contention correct.
 * **Soft cross-model.** A finder whose provider family differs from the calling
   client's gets a BONUS, never an exclusion. Preferring a second opinion from
   another model family must not be able to leave a single-family install with

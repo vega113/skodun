@@ -137,6 +137,15 @@ automatic runs off it.
 **Agents: prefer omitting `reviewer`.** Auto-routing can only spread load over
 callers that let it choose. Pin for a second opinion, not by habit.
 
+**What it does not fix (by design).** The score comes from a store snapshot
+taken once, at the start of the run. Two reviews that start *within the same
+instant*, before either takes its `provider:<id>` slot, can read the same
+picture and pick the same provider — one then queues while another sits idle.
+That window is the gap between scoring and acquiring, and closing it needs
+mid-wait re-binding, which is an explicit non-goal (see the design's Phase C).
+Auto-routing narrows the pile-up from "always the same provider" to "only when
+starts collide"; it is not an admission-time scheduler.
+
 ### Cancel / status (epic S1 — shipped)
 
 | Surface | Verb |

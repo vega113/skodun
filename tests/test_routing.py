@@ -506,3 +506,47 @@ def test_without_an_explicit_pool_the_fallback_is_the_config_finder(store):
     head, meta = _head(cfg, store)
     assert (head.name, meta["route_reason"]) == ("finder",
                                                  "auto:default-finder")
+
+
+# --- the Phase A boundary, proved rather than asserted in a docstring -------
+
+
+def test_run_review_is_the_only_production_caller_of_head_resolution():
+    """`resolve_review_head` reaches production through ONE door.
+
+    The Phase A boundary is that auto-routing applies to the foreground review
+    loop and not to the background pre-push worker. That claim is only worth
+    anything if it is a fact about the call graph rather than a sentence in a
+    docstring, so this pins both halves: `run_review` has exactly one caller
+    (`services.svc_review`, which is what both the CLI and the MCP tool go
+    through), and the worker's own entry point does not route at all.
+    """
+    import re
+    from pathlib import Path
+
+    import skodun
+
+    src = Path(skodun.__file__).resolve().parent
+    callers = sorted(
+        f"{path.name}:{i}"
+        for path in src.rglob("*.py")
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if re.search(r"(?<![_\w])run_review\(", line)
+        and not re.match(r"\s*(def|#)", line)
+    )
+    assert callers == ["services.py:240"], callers
+
+
+def test_the_background_prepush_worker_does_not_auto_route():
+    """The worker keeps config-finder selection in Phase A: its record is
+    reserved and identity-pinned, and it is not the surface the design's
+    diagram covers. Read off the source so a refactor that quietly routed it
+    has to change this test on purpose."""
+    import inspect
+
+    from skodun import pipeline
+
+    body = inspect.getsource(pipeline.run_prepush_review)
+    assert '_reviewer_for(cfg, "finder")' in body
+    assert "resolve_review_head" not in body
+    assert "routing." not in body
