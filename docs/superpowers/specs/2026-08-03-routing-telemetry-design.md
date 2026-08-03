@@ -65,8 +65,8 @@ routing: mode=auto pool=all-enabled-finders cross_model=on window=7d
 xai        | adapter=grok  | binary=… | state=none | holders=0 | served=12/40 (auto 8, pinned 3, unrouted 1)
 openai     | adapter=codex | binary=… | state=none | holders=0 | served=28/40 (auto 24, config 2, unrouted 2)
 …
-routing decisions (7d): auto:free 26 · auto:wait 4 · auto:free+cross 2 · pinned 3 · config-finder 2 · unrouted 3
-routed head:            finder-codex 24 · finder-grok 11 · finder-agy 2
+routing decisions (7d): auto:free 26, auto:wait 4, auto:free+cross 2, pinned 3, config-finder 2, unrouted 3
+routed head (7d):       finder-codex 24, finder-grok 11, finder-agy 2
 ```
 
 A header line for the effective routing config, the existing per-provider lines
@@ -81,6 +81,14 @@ the fallback rate.
 
 `pool=` shows `all-enabled-finders` when `[routing] pool` is empty, and the
 configured names otherwise.
+
+Output is **ASCII only**, separators included. `cli._emit` exists partly to keep
+a `UnicodeEncodeError` from an ASCII-only locale meeting a non-ASCII message
+from turning an exit code into the interpreter's 1, and no other `providers`
+output uses non-ASCII.
+
+An empty window is not reported as `served=0/0` on every line: the per-line bit
+is omitted entirely and the footer says so once.
 
 ### Buckets on the provider line
 
