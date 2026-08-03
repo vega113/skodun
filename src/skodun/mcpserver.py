@@ -1773,62 +1773,64 @@ class McpServer:
             workers, cancel = list(self._workers), self._worker_cancel
         alive = [w for w in workers if w.is_alive()]
         policy = disconnect_policy()
-        if alive:
-            if policy == DISCONNECT_CANCEL and cancel is not None:
+
+        def _join_all(*, timeout: float | None, label: str) -> None:
+            """Join alive workers. ``timeout=None`` means unbounded."""
+            for worker in workers:
+                if not worker.is_alive():
+                    continue
+                self._note(f"waiting for {worker.name} to finish before exiting")
+                if timeout is None:
+                    worker.join()
+                else:
+                    worker.join(timeout=max(timeout, 0.0))
+                if worker.is_alive() and timeout is not None:
+                    self._note(
+                        f"{worker.name} still alive after {label}; "
+                        f"continuing shutdown")
+
+        if not alive:
+            return 0
+
+        if policy == DISCONNECT_CANCEL:
+            if cancel is not None:
                 self._note(
                     "disconnect policy=cancel; cancelling in-flight review "
                     "before exit")
                 cancel.set()
-            else:
-                ceiling = drain_timeout_sec()
-                if ceiling > 0:
-                    self._note(
-                        f"disconnect policy=drain; waiting up to {ceiling:g}s "
-                        f"for in-flight review (then cancel if still running; "
-                        f"set SKODUN_MCP_DISCONNECT=cancel to abort immediately)")
-                else:
-                    self._note(
-                        "disconnect policy=drain; waiting for in-flight review "
-                        "with no drain ceiling "
-                        "(SKODUN_MCP_DRAIN_TIMEOUT_SECONDS=0)")
+            _join_all(timeout=post_cancel_join_sec(), label="cancel wait")
+            return 0
 
-        if policy != DISCONNECT_CANCEL and alive:
-            ceiling = drain_timeout_sec()
-            if ceiling > 0:
-                deadline = time.monotonic() + ceiling
-                for worker in workers:
-                    if not worker.is_alive():
-                        continue
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    self._note(
-                        f"waiting for {worker.name} to finish before exiting")
-                    worker.join(timeout=remaining)
-                still = [w for w in workers if w.is_alive()]
-                if still and cancel is not None:
-                    self._note(
-                        "drain timed out; cancelling in-flight review so the "
-                        "MCP process can exit")
-                    cancel.set()
-            # Fall through to post-cancel / residual join below.
+        # Drain: prefer finishing the review; optional ceiling then cancel.
+        ceiling = drain_timeout_sec()
+        if ceiling <= 0:
+            self._note(
+                "disconnect policy=drain; waiting for in-flight review with "
+                "no drain ceiling (SKODUN_MCP_DRAIN_TIMEOUT_SECONDS=0)")
+            _join_all(timeout=None, label="unlimited drain")
+            return 0
 
-        # Bounded join: after cancel (or under cancel policy) wait for cleanup,
-        # then exit even if the daemon worker is still stuck.
-        residual = post_cancel_join_sec()
+        self._note(
+            f"disconnect policy=drain; waiting up to {ceiling:g}s for "
+            f"in-flight review (then cancel if still running; set "
+            f"SKODUN_MCP_DISCONNECT=cancel to abort immediately)")
+        deadline = time.monotonic() + ceiling
         for worker in workers:
             if not worker.is_alive():
                 continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             self._note(f"waiting for {worker.name} to finish before exiting")
-            if residual > 0:
-                worker.join(timeout=residual)
-            else:
-                worker.join(timeout=0.0)
-            if worker.is_alive():
-                self._note(
-                    f"{worker.name} still alive after cancel wait; exiting "
-                    f"anyway (daemon thread; prefer review_cancel / fix the "
-                    f"hung provider)")
+            worker.join(timeout=remaining)
+        still = [w for w in workers if w.is_alive()]
+        if still and cancel is not None:
+            self._note(
+                "drain timed out; cancelling in-flight review so the "
+                "MCP process can exit")
+            cancel.set()
+            _join_all(
+                timeout=post_cancel_join_sec(), label="post-cancel wait")
         return 0
 
     # -- diagnostics ------------------------------------------------------
