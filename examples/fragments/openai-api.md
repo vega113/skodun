@@ -86,16 +86,24 @@ SECRETS="${SKODUN_SECRETS_FILE:-$HOME/.secrets/.env}"
 # this often has a minimal PATH, and `exec skodun` would reintroduce exactly
 # the dependency the absolute `command` was there to avoid.
 SKODUN_BIN="${SKODUN_BIN:-$HOME/.local/bin/skodun}"
+# PATH first: a host may spawn this with a minimal one, which is the same
+# reason SKODUN_BIN is absolute below. `sed` and `head` are used to read the
+# key, and there is no `set -e` here -- if they were missing, extraction would
+# yield an empty key silently and skodun would exec without the secret.
+PATH="/usr/bin:/bin:$PATH"
+export PATH
+
 # An unexpanded "${OPENAI_API_KEY}" -- what a host that does not expand its env
-# block leaves behind -- is NOT a key. It is non-empty, so an emptiness check
-# alone would skip the file and exec skodun with a useless literal, failing auth
-# while the real secret sits unread. Treated as unset.
-case "${SKODUN_OPENAI_API_KEY:-}${OPENAI_API_KEY:-}" in
-    "")    need_key=1 ;;
-    '${'*) need_key=1 ;;
-    *)     need_key=0 ;;
-esac
-if [ "$need_key" = 1 ] && [ -r "$SECRETS" ]; then
+# block leaves behind -- is NOT a key, and it is not merely useless: skodun
+# reads OPENAI_API_KEY BEFORE the alias, so a leftover literal would beat the
+# real key this script exports. Cleared, per variable, before anything else
+# looks at them.
+case "${OPENAI_API_KEY:-}" in '${'*) unset OPENAI_API_KEY ;; esac
+case "${SKODUN_OPENAI_API_KEY:-}" in '${'*) unset SKODUN_OPENAI_API_KEY ;; esac
+
+# Only consult the file when neither variable survived that.
+if [ -z "${SKODUN_OPENAI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] \
+        && [ -r "$SECRETS" ]; then
     # BOTH documented names -- a secrets file may well use the preferred
     # OPENAI_API_KEY, and looking only for the alias exports nothing.
     for name in SKODUN_OPENAI_API_KEY OPENAI_API_KEY; do
