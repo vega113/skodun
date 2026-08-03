@@ -114,6 +114,16 @@ if [ -z "${SKODUN_OPENAI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] \
         && [ -f "$SECRETS" ] && [ -r "$SECRETS" ]; then
     # BOTH documented names -- a secrets file may well use the preferred
     # OPENAI_API_KEY, and looking only for the alias exports nothing.
+    #
+    # The namespaced name is tried FIRST, which is the reverse of skodun's own
+    # env precedence, and deliberately. Those two orders answer different
+    # questions: skodun is picking between variables already in ITS
+    # environment, where the standard name is the likelier one to be set on
+    # purpose; this is picking between entries in a shared secrets FILE, where
+    # a SKODUN_-prefixed entry can only have been written for skodun, and a
+    # generic OPENAI_API_KEY is probably there for something else. Preferring
+    # the generic one would ignore a key the operator scoped to skodun by name.
+    # Only reachable when a file sets both to DIFFERENT values.
     for name in SKODUN_OPENAI_API_KEY OPENAI_API_KEY; do
         key=$(sed -n "s/^${name}=//p" "$SECRETS" | head -n 1 \
               | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/")
