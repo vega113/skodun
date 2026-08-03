@@ -650,8 +650,17 @@ def test_degraded_cancelled_stop_reason():
     assert p.parse_ok  # parse_ok and degraded are independent axes
 
 
+@pytest.mark.parametrize("value", ["EndTurn", "end_turn"])
+def test_normal_stop_reason_spellings_are_not_degraded(value):
+    """Grok CLI ≥0.2.118 emits `end_turn`; older builds emit `EndTurn`."""
+    p = GrokAdapter().parse(env(structuredOutput=GOOD, stopReason=value), b"")
+    assert not p.degraded, value
+    assert p.degraded_reason == ""
+    assert p.parse_ok and p.stop_reason == value
+
+
 @pytest.mark.parametrize("value", ["Cancelled", "MaxTokens", "Refusal",
-                                   "endturn", "EndTurn "])
+                                   "endturn", "EndTurn ", "END_TURN"])
 def test_any_stop_reason_other_than_endturn_is_degraded(value):
     p = GrokAdapter().parse(env(structuredOutput=GOOD, stopReason=value), b"")
     assert p.degraded, value

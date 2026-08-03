@@ -76,10 +76,17 @@ _LEAKED_TOKEN = "tool▁call".encode("utf-8")
 # stdout files.
 _MAX_TURNS = b"max turns reached"
 
-# The only stopReason value that means "completed normally". An ALLOWLIST is
+# The stopReason values that mean "completed normally". An ALLOWLIST is
 # deliberate: a false positive costs one re-review, a false negative is the
 # silent false all-clear this exists to prevent.
-_STOP_REASON_OK = "EndTurn"
+#
+# Grok CLI ≥0.2.118 emits snake_case `end_turn` (live dogfood 2026-08-03);
+# older builds emit PascalCase `EndTurn` (also the legacy tubescribes spelling
+# after its #3672 normalization). Both are normal completion. `Cancelled` and
+# unknown values stay degraded. The allowlist stays CLOSED — case folding of
+# arbitrary strings is not done (e.g. `endturn` without underscore is still
+# abnormal).
+_STOP_REASON_OK: frozenset[str] = frozenset({"EndTurn", "end_turn"})
 
 # --- unavailability tells (classify only; never inputs to `degraded`) ------
 #
@@ -479,7 +486,7 @@ def _detect_degraded(stdout: bytes, stderr: bytes,
         return True, (
             "grok leaked tool-call control tokens; the review was cut off mid "
             "tool-use and an empty result cannot be trusted")
-    if stop_reason is not None and stop_reason != _STOP_REASON_OK:
+    if stop_reason is not None and stop_reason not in _STOP_REASON_OK:
         return True, (
             f"grok run did not complete normally (stopReason: {stop_reason}); "
             f"the review was cut off mid-investigation and an empty result "
