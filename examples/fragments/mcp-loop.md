@@ -10,11 +10,11 @@ MCP review loop.
 This project uses **skodun** as the local review backend over MCP. The gate
 keys on **exact diff content**, not commit SHAs.
 
-### Tools
+### Tools (13 — full catalog)
 
-Pass **`repo`** as an **absolute path** to this project root on `gate`,
-`review`, `log`, and `surface` (if omitted, skodun uses the MCP server cwd,
-which may not be this repo).
+Pass **`repo`** as an **absolute path** to this project root on tools that
+accept it (if omitted, skodun uses the MCP server cwd, which may not be this
+repo).
 
 **MCP process ≠ one repo.** One `skodun mcp` can act on any worktree you pass as
 `repo`, but only **one** `review` runs at a time in that process (second call →
@@ -22,19 +22,33 @@ which may not be this repo).
 separate MCP processes or CLI — definitions in
 [`mcp-review-topology.md`](mcp-review-topology.md).
 
-- `gate` — does a trustworthy review cover **this** tree? Status **0** = clean
-  or all findings triaged. **Stop when status is 0.**
-- `review` — one foreground review (minutes, model cost). Optional `reviewer` =
-  configured `[[reviewers]]` **entry name** (not provider id).
-- `triage_list` / `triage_dismiss` / `triage_defer` / `triage_reopen` /
-  `adopt_refuter` — audited human decisions only; never bulk-clear.
-  `triage_defer` requires a **filed** `tracking_ref`.
-- `log` / `surface` — history / undelivered background rounds; **not** a gate.
-- `feedback_add` / `feedback_list` — **non-gate** agent judgment or skodun
-  product-bug notes for later human inspection (does **not** clear the gate).
-  See [`feedback.md`](feedback.md).
+| Tool | Use |
+|---|---|
+| `gate` | Does a trustworthy review cover **this** tree? Status **0** = stop |
+| `review` | One foreground review (minutes). Optional `reviewer` = config **entry name** |
+| `log` | Recent history (not a gate) |
+| `surface` | Undelivered background rounds (not a gate) |
+| `review_status` | Observe in-flight / terminal lifecycle (not a gate) |
+| `review_cancel` | Cancel by review id |
+| `triage_list` | Findings + state for one review |
+| `triage_dismiss` / `triage_defer` / `triage_reopen` / `adopt_refuter` | Audited **human** gate decisions only; never bulk-clear. `triage_defer` needs a **filed** `tracking_ref` |
+| `feedback_add` / `feedback_list` | Non-gate judgment / product bugs — see [`feedback.md`](feedback.md) |
+
+If your host shows **fewer than 13** tools, the MCP process is an **old build** —
+**restart the MCP session** (see below). Do not invent missing tools via shell.
 
 CLI-only when needed: `skodun doctor`, `skodun providers` (shell).
+
+### Restart MCP after upgrade / missing tools
+
+stdio MCP does **not** hot-reload. After `pip install` / upgrade / env change,
+or if tools are missing / `store schema … newer than this skodun`:
+
+1. Restart the host’s **skodun MCP** connection (or the whole agent session).
+2. Confirm `skodun --version` and that tools/list includes all 13 names.
+3. Prefer MCP tools again — do **not** permanently fall back to CLI for the loop.
+
+Operator detail: [`mcp-server-config.md`](mcp-server-config.md).
 
 ### Loop
 
@@ -57,4 +71,6 @@ you disagree with a finding.
 - Never treat `surface` as coverage of the current tree.
 - Never invent a second review system if skodun is the configured backend.
 - Never poll every 30–60s with a full agent turn — wait outside the model, then
-  call `gate` / `log`.
+  call `review_status` / `gate` / `log`.
+- Never replace MCP with shell `skodun review` just because tools look
+  incomplete or schema-behind — **restart MCP** first.

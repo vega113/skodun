@@ -279,14 +279,19 @@ cover **that worktree’s** diff identity; FG capacity for those worktrees is
 
 Prompts: `review-now`, `gate-check` (static policy text).
 
-### After upgrade
+### After upgrade — restart every skodun MCP session
 
-A running MCP process keeps the **old** Python build until the client restarts
-it. After upgrading skodun:
+A running MCP process keeps the **old** Python build (and the **old tool
+list**) until the client restarts it. After upgrading skodun (or whenever
+agents see fewer than **13** tools, or `store schema … newer than this
+skodun`):
 
-1. Restart the MCP connection/session.
-2. Confirm version: `skodun --version` and `serverInfo.version` from
-   `initialize` (pinned to `pyproject.toml`).
+1. **Restart** each host’s `skodun mcp` connection / agent session (graceful
+   reload preferred; avoid `kill -9` mid-review).
+2. Confirm CLI: `skodun --version` and `skodun doctor --repo <project>`.
+3. Confirm MCP: `serverInfo.version` from `initialize` matches the CLI; host
+   `tools/list` names all **13** tools in the table above (not an old 9-tool
+   snapshot).
 
 Smoke initialize (optional):
 
@@ -294,6 +299,9 @@ Smoke initialize (optional):
 printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"check","version":"0"}}}' \
   | skodun mcp
 ```
+
+Do **not** treat a short tool list or schema-behind as “prefer CLI forever” —
+restart MCP so agents keep using the intended transport.
 
 ### Concurrency (agents must know)
 
@@ -435,13 +443,13 @@ Last reviewed against skodun **0.4.x** / post-epic-#23 main:
 
 | Check | Result |
 |---|---|
-| Tool list matches `default_tools()` | 9 tools + 2 prompts |
+| Tool list matches `EXPECTED_TOOLS` | **13 tools** + 2 prompts (incl. status/cancel + feedback) |
 | MCP busy string | `"review already in flight"` |
 | Gate 0 meaning | clean **or** all findings triaged |
 | `repo` optional, defaults to server cwd | documented; recommend absolute path |
 | `reviewer` is config **name**, not provider id | documented |
 | Console script + `python3 -m skodun` | both documented |
-| Upgrade requires MCP restart | documented |
+| Upgrade / missing tools → restart MCP sessions | documented (README + mcp-server-config + mcp-loop) |
 | CLI-only ops list | doctor, providers, retain, schedule, install-hooks, … |
 | Links to #41 / #42 / #56 | present |
 | MCP topology fragment | `examples/fragments/mcp-review-topology.md` |

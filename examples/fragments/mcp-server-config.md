@@ -73,14 +73,38 @@ inherits the user environment and `OPENAI_API_KEY` is set there, an explicit
 Reviewer entry still lives in config TOML (`provider = "openai-api"`, any
 model id). Full notes: [`openai-api.md`](openai-api.md).
 
-### After installing or upgrading skodun
+### After installing or upgrading skodun — restart MCP sessions
 
-1. Restart the MCP client (stdio servers do not hot-reload code or env).
-2. Run `skodun doctor --repo <project>` in a shell.
-3. Confirm tools: `gate`, `review`, `log`, `surface`, triage, `feedback_*`.
-4. Prefer agents pass absolute `repo` on tool calls (server cwd may differ).
-5. For metered reviews: confirm the MCP process can see `OPENAI_API_KEY`
+stdio servers **do not hot-reload** code or env. Long-lived processes keep the
+**old** tool list and schema ladder until the host restarts them.
+
+**When to restart every client that runs `skodun mcp`:**
+
+| Trigger | Symptom if you skip restart |
+|---|---|
+| Upgrade / reinstall skodun | Old code; missing tools; wrong behaviour |
+| CLI upgraded store (`SCHEMA_VERSION`) | `store schema vN is newer than this skodun` |
+| Changed MCP `command` / `args` / `env` | Old env (e.g. missing `OPENAI_API_KEY`) |
+| Host shows &lt; **13** tools | Stale `tools/list` from pre-S1/feedback builds |
+
+**Steps:**
+
+1. **Restart** the MCP connection / agent session (Claude Code: reload MCP or
+   window; Cursor: restart MCP; Codex: new run; Grok: new session). Prefer
+   graceful reload over `kill -9` mid-review.
+2. Point MCP at the **same** `skodun` binary as the shell CLI.
+3. `skodun doctor --repo <project>` and `skodun --version`.
+4. Confirm **all 13 tools**:
+   `gate`, `review`, `log`, `surface`, `review_status`, `review_cancel`,
+   `triage_list`, `triage_dismiss`, `adopt_refuter`, `triage_reopen`,
+   `triage_defer`, `feedback_add`, `feedback_list`
+   (+ prompts `review-now`, `gate-check`).
+5. Prefer agents pass absolute `repo` on tool calls (server cwd may differ).
+6. For metered reviews: confirm the MCP process can see `OPENAI_API_KEY`
    (or `SKODUN_OPENAI_API_KEY`) without printing it.
+
+Agents must **not** switch to shell `skodun review` as a permanent workaround
+for schema-behind or a short tool list — restart MCP instead.
 
 ### Topology (operators)
 
