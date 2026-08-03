@@ -3582,6 +3582,30 @@ def test_routing_counts_reports_unrouted_records_as_their_own_group(tmp_path):
     assert by_reason == {None: 1, "auto:free": 1}
 
 
+def test_routing_counts_ignores_the_imported_legacy_archive(tmp_path):
+    """`import-legacy` rows never touched a skodun provider slot.
+
+    Not a tidiness rule: on a real store the legacy archive outnumbers skodun's
+    own reviews five to one, so counting it puts a four-figure denominator
+    under a three-figure numerator and reports a provider carrying 28% of the
+    load as carrying 5% -- the exact number this query exists to get right.
+    """
+    with Store.open(tmp_path / "s.db") as st:
+        _routing_review(st, "mine", at="2026-08-02T00:00:00Z", adapter="grok",
+                        reason="auto:free", routed="finder-grok")
+        st.save_review({
+            "id": "imported", "reviewed_at": "2026-08-02T01:00:00Z",
+            "source": "legacy", "branch": "feat", "head": "c" * 40,
+            "base_ref": "main", "base_sha": "b" * 40, "diff_hash": "imported",
+            "mode": "now", "model": "m", "adapter": None, "status": "clean",
+            "parse_ok": True, "degraded": False, "diff_truncated": False,
+            "trustworthy": True, "stop_reason": None, "findings": [],
+            "findings_total": 0, "summary": "",
+        })
+        rows = st.routing_counts(since_iso="2026-08-01T00:00:00Z")
+    assert [(r["adapter"], r["n"]) for r in rows] == [("grok", 1)]
+
+
 def test_routing_counts_on_an_empty_store_is_an_empty_list(tmp_path):
     with Store.open(tmp_path / "s.db") as st:
         assert st.routing_counts(since_iso="2026-08-01T00:00:00Z") == []

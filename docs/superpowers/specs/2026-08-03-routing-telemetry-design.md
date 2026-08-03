@@ -130,6 +130,14 @@ No schema change: the fields are already persisted. Grouping and the window
 filter both happen in SQL, so no artifact is decoded in Python — unlike
 `list_reviews`, which decodes every row it returns.
 
+The query is scoped to `source = 'skodun'`. This was found by running the
+surface against a real store rather than reasoned about up front, and it is
+load-bearing: a store that has run `import-legacy` holds the old grok-reviews
+archive, which on the author's machine outnumbers skodun's own reviews five to
+one and carries no adapter at all. Unscoped, the denominator was 1126 against
+191 attributable reviews, and grok's real 28% share printed as 5% — the exact
+number this surface exists to get right.
+
 The window filter is `reviewed_at >= since_iso`, correct as a string comparison
 because store timestamps are fixed-width canonical UTC. `reviewed_at` is not
 indexed on its own (only `(branch, reviewed_at)`), so this is a table scan. That

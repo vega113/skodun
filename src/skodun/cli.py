@@ -177,6 +177,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo", type=Path, default=Path("."),
         help="repository whose .skodun.toml to read (default: the current "
              "directory)")
+    providers.add_argument(
+        "--since-days", type=_since_days, default=7, dest="since_days",
+        metavar="N",
+        help="how many days of reviews the routing counts cover (default: 7)")
 
     log = sub.add_parser("log", help="show recent reviews, newest first")
     log.add_argument("--branch", default=None,
@@ -477,6 +481,25 @@ def _record_setup_failure(store, repo: Path, note: str) -> None:
             outcome="error", code=2, note=flatten_lines(note)))
     except BaseException:
         pass
+
+
+def _since_days(raw: str) -> int:
+    """`--since-days`: a positive whole number of days, or argparse's own 2.
+
+    An `argparse.ArgumentTypeError` rather than a check inside the command,
+    because `providers` reserves its exit 2 for "the repo, config or store
+    could not be read at all" -- and argparse already exits 2 for a malformed
+    argument, in the same words it uses for every other flag.
+    """
+    try:
+        value = int(raw, 10)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a whole number of days, got {raw!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be at least 1 day, got {value}")
+    return value
 
 
 def _emit(message: str, code: int) -> int:
@@ -1131,6 +1154,92 @@ def _shown_binary(binary: str, shown_field, cap: int) -> str:
     return shown + "...(truncated)" if len(binary) > cap else shown
 
 
+#: `route_reason` value -> the bucket the per-provider line counts it in.
+#: `auto` is every `auto:*`, because the line answers "did the ROUTER put this
+#: here", and which auto rule fired is the footer's question. `unrouted` is the
+#: absence of an audit: a pre-S5 record, or a background pre-push review, which
+#: the worker does not route. Both consumed a provider slot, so both are in the
+#: denominator; neither was a routing decision, so neither is in `auto`.
+_ROUTING_BUCKETS = ("auto", "pinned", "config", "unrouted", "other")
+
+
+def _routing_bucket(reason: str | None) -> str:
+    """Which `_ROUTING_BUCKETS` bucket a `route_reason` falls in.
+
+    An unrecognised non-null reason lands in `other` rather than being dropped,
+    so the buckets always sum to the total: a store written by a NEWER skodun
+    must not make this listing quietly lie about how many reviews there were.
+    """
+    if reason is None:
+        return "unrouted"
+    if reason == "pinned":
+        return "pinned"
+    if reason == "config-finder":
+        return "config"
+    if reason.startswith("auto:"):
+        return "auto"
+    return "other"
+
+
+def _routing_tally(rows: list[dict]) -> dict:
+    """Fold `Store.routing_counts` rows into what the listing prints.
+
+    `served` is keyed by ADAPTER NAME, which is what the review record carries
+    and what `providers` already has in hand per line -- and it means "who
+    actually answered", which after a fallback is not who the router chose.
+    `heads` is keyed by the chosen entry. The two do not reconcile on purpose,
+    and the gap between them is the fallback rate.
+    """
+    total = sum(r["n"] for r in rows)
+    served: dict[str, dict[str, int]] = {}
+    reasons: dict[str, int] = {}
+    heads: dict[str, int] = {}
+    for r in rows:
+        n = r["n"]
+        bucket = _routing_bucket(r["route_reason"])
+        per = served.setdefault(r["adapter"], {})
+        per[bucket] = per.get(bucket, 0) + n
+        label = r["route_reason"] or "unrouted"
+        reasons[label] = reasons.get(label, 0) + n
+        if r["routed_reviewer"]:
+            heads[r["routed_reviewer"]] = heads.get(r["routed_reviewer"], 0) + n
+    return {"total": total, "served": served, "reasons": reasons,
+            "heads": heads}
+
+
+def _fmt_counts(counts: dict) -> str:
+    """`name n, name n`, commonest first, ties by name. ASCII separators only.
+
+    `_emit` exists partly to keep a `UnicodeEncodeError` from an ASCII-only
+    locale turning an exit code into the interpreter's 1, so a prettier
+    separator here would be a way to lose an exit code on somebody else's
+    machine.
+    """
+    return ", ".join(f"{name} {n}" for name, n in
+                     sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _fmt_served(per_adapter: dict, total: int) -> str:
+    """The `served=` bit for one provider line, or `""` when there is nothing
+    to say. An empty window prints `served=0/0` on every line otherwise, which
+    is noise the footer says once and better."""
+    if total <= 0:
+        return ""
+    served = sum(per_adapter.values())
+    parts = ", ".join(f"{b} {per_adapter[b]}" for b in _ROUTING_BUCKETS
+                      if per_adapter.get(b))
+    detail = f" ({parts})" if parts else ""
+    return f" | served={served}/{total}{detail}"
+
+
+def _fmt_routing_header(routing, since_days: int) -> str:
+    """The effective routing config, above the provider lines."""
+    pool = ",".join(routing.pool) if routing.pool else "all-enabled-finders"
+    return (f"routing: mode={routing.mode} pool={pool} "
+            f"cross_model={'on' if routing.cross_model else 'off'} "
+            f"window={since_days}d")
+
+
 def _cmd_providers(args) -> int:
     """List every registered provider adapter: its id, its adapter name,
     where `resolve_binary()` says its CLI lives and whether that is really
@@ -1218,6 +1327,21 @@ def _cmd_providers(args) -> int:
         except BaseException as e:
             return _emit(f"skodun providers: could not read provider state: {e!r}", 2)
 
+        # S5 telemetry: the routing audit Phase A writes on every artifact,
+        # read back in aggregate. Guarded exactly like `holders=` below -- an
+        # operator reaching for a diagnostic because something is wrong must
+        # still get the parts of the listing that work.
+        since_days = int(getattr(args, "since_days", 7) or 7)
+        try:
+            tally = _routing_tally(store.routing_counts(
+                since_iso=time.strftime(
+                    store_mod._TS_FORMAT,
+                    time.gmtime(time.time() - since_days * 86400))))
+        except Exception:
+            tally = None
+        if tally is not None:
+            _emit(_fmt_routing_header(cfg.routing, since_days), 0)
+
         if store_mod._provider_state_bypassed(os.environ):
             raw = os.environ.get(store_mod.IGNORE_PROVIDER_STATE_ENV, "")
             _emit(f"skodun providers: NOTE {store_mod.IGNORE_PROVIDER_STATE_ENV}="
@@ -1241,15 +1365,34 @@ def _cmd_providers(args) -> int:
                 holders = None
             holders_bit = (f" | holders={holders}"
                            if holders is not None else "")
+            # WHO SERVED, not who was routed to: after a fallback those are
+            # different providers, and what an operator needs from a per-
+            # provider line is which subscription actually got burned.
+            served_bit = ("" if tally is None else _fmt_served(
+                tally["served"].get(adapter.name, {}), tally["total"]))
             _emit(f"{provider} | adapter={adapter.name} | "
                   f"binary={shown_binary} ({status}) | state={state}"
-                  f"{holders_bit}", 0)
+                  f"{holders_bit}{served_bit}", 0)
 
         for provider, row in sorted(state_rows.items()):
             if provider not in _REGISTRY:
                 _emit(f"skodun providers: NOTE cached provider_state for "
                       f"{shown_field(provider)!r} has no registered adapter -- "
                       f"{_fmt_provider_state(row, shown_field)}", 0)
+
+        if tally is not None:
+            if tally["total"] == 0:
+                _emit(f"routing: no reviews in the last {since_days}d", 0)
+            else:
+                # EXACT reasons rather than the line's buckets: `auto:free` vs
+                # `auto:wait` is the difference between "spreading works" and
+                # "everything is saturated", and `auto:free+cross` is the only
+                # way to see whether `cross_model` is earning its keep.
+                _emit(f"routing decisions ({since_days}d): "
+                      f"{_fmt_counts(tally['reasons'])}", 0)
+                if tally["heads"]:
+                    _emit(f"routed head ({since_days}d): "
+                          f"{_fmt_counts(tally['heads'])}", 0)
 
         unregistered = [(r.name, r.provider) for r in cfg.reviewers
                         if r.provider and r.provider not in _REGISTRY]

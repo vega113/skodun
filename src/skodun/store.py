@@ -2012,6 +2012,14 @@ class Store:
         provider slot without being a routing decision. The caller decides how
         to present that; this method does not hide it.
 
+        Scoped to `source = 'skodun'`, which is load-bearing rather than tidy.
+        A store that has run `import-legacy` holds the old grok-reviews
+        archive, and those rows never touched a skodun provider slot -- they
+        have no adapter at all. Counting them would put a four-figure
+        denominator under a three-figure numerator and report a provider
+        carrying 28% of the real load as carrying 5%, which is precisely the
+        number this method exists to get right.
+
         The window is a string comparison, correct only because store
         timestamps are fixed-width canonical UTC -- hence `_require_ts`.
         `reviewed_at` carries no index of its own (only `(branch,
@@ -2030,10 +2038,10 @@ class Store:
                       END AS routed_reviewer,
                       COUNT(*) AS n
                  FROM reviews
-                WHERE reviewed_at >= ?
+                WHERE reviewed_at >= ? AND source = ?
              GROUP BY adapter, route_reason, routed_reviewer
              ORDER BY adapter, route_reason, routed_reviewer""",
-            (since_iso,)).fetchall()
+            (since_iso, SKODUN_SOURCE)).fetchall()
         return [{"adapter": r["adapter"], "route_reason": r["route_reason"],
                  "routed_reviewer": r["routed_reviewer"], "n": int(r["n"])}
                 for r in rows]
