@@ -3606,6 +3606,32 @@ def test_routing_counts_ignores_the_imported_legacy_archive(tmp_path):
     assert [(r["adapter"], r["n"]) for r in rows] == [("grok", 1)]
 
 
+def test_routing_counts_ignores_rows_no_provider_can_own(tmp_path):
+    """skodun's OWN rows can have no adapter: a `reserve_prepush` row exists
+    before the worker runs, and a superseded or fail-if-running row can
+    terminate without one.
+
+    They are real reviews-in-progress, but nothing attributes them to a
+    provider -- so counting them would put the sum of the printed per-provider
+    numerators below their shared denominator on every listing that had one.
+    """
+    with Store.open(tmp_path / "s.db") as st:
+        _routing_review(st, "served", at="2026-08-02T00:00:00Z", adapter="grok",
+                        reason="auto:free", routed="finder-grok")
+        st.save_review({
+            "id": "reserved", "reviewed_at": "2026-08-02T01:00:00Z",
+            "source": "skodun", "branch": "feat", "head": "c" * 40,
+            "base_ref": "main", "base_sha": "b" * 40, "diff_hash": "reserved",
+            "mode": "now", "model": "m", "adapter": None, "status": "clean",
+            "parse_ok": True, "degraded": False, "diff_truncated": False,
+            "trustworthy": True, "stop_reason": None, "findings": [],
+            "findings_total": 0, "summary": "",
+        })
+        rows = st.routing_counts(since_iso="2026-08-01T00:00:00Z")
+    assert [(r["adapter"], r["n"]) for r in rows] == [("grok", 1)]
+    assert sum(r["n"] for r in rows) == 1, "the denominator counted a row no line owns"
+
+
 def test_routing_counts_on_an_empty_store_is_an_empty_list(tmp_path):
     with Store.open(tmp_path / "s.db") as st:
         assert st.routing_counts(since_iso="2026-08-01T00:00:00Z") == []

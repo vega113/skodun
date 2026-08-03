@@ -3410,6 +3410,29 @@ def test_a_routing_query_that_fails_omits_the_bit_and_keeps_exit_0(
     assert "adapter=grok" in out          # the rest of the listing still ran
 
 
+def test_routing_lines_cannot_forge_or_rewrite_terminal_rows(tmp_path,
+                                                              monkeypatch,
+                                                              capsys):
+    """`artifact_json` is a file on disk somebody can edit, so a stored
+    `routed_reviewer` is not trusted for having come out of the store.
+
+    A raw newline would forge an extra row in this listing and an ESC sequence
+    would rewrite the rows already printed -- the same reason this command
+    already sanitizes `provider_state.reason`.
+    """
+    db = tmp_path / "s.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    _seed_routing(db, [
+        ("a", _recent(1), "grok", "auto:free",
+         "evil\nxai | adapter=grok | FORGED\x1b[2K"),
+    ])
+    out = _providers_out(tmp_path, monkeypatch, capsys)
+    assert "FORGED" in out, "the value should still be shown, just defanged"
+    assert "\x1b" not in out
+    forged = [ln for ln in out.splitlines() if ln.startswith("xai | adapter")]
+    assert len(forged) == 1, f"a stored value forged a row: {forged}"
+
+
 @pytest.mark.parametrize("bad", ["0", "-1", "lots"])
 def test_since_days_must_be_a_positive_integer(tmp_path, bad, capsys):
     """argparse owns the refusal, and `main` turns its SystemExit into the 2

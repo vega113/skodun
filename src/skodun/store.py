@@ -2012,6 +2012,17 @@ class Store:
         provider slot without being a routing decision. The caller decides how
         to present that; this method does not hide it.
 
+        Two exclusions, and both are about the same invariant: the caller
+        prints a per-provider share, so every row counted has to be a row some
+        provider line can own.
+
+        `adapter IS NOT NULL` drops skodun's own rows that never reached a
+        provider -- a `reserve_prepush` row exists before the worker runs, and
+        a superseded or fail-if-running row can terminate without one. They are
+        real reviews-in-progress, but nothing attributes them, so counting them
+        would put a numerator sum below its own denominator on every listing
+        that had one.
+
         Scoped to `source = 'skodun'`, which is load-bearing rather than tidy.
         A store that has run `import-legacy` holds the old grok-reviews
         archive, and those rows never touched a skodun provider slot -- they
@@ -2039,6 +2050,7 @@ class Store:
                       COUNT(*) AS n
                  FROM reviews
                 WHERE reviewed_at >= ? AND source = ?
+                      AND adapter IS NOT NULL
              GROUP BY adapter, route_reason, routed_reviewer
              ORDER BY adapter, route_reason, routed_reviewer""",
             (since_iso, SKODUN_SOURCE)).fetchall()

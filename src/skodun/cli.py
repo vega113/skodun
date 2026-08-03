@@ -1214,8 +1214,18 @@ def _fmt_counts(counts: dict) -> str:
     locale turning an exit code into the interpreter's 1, so a prettier
     separator here would be a way to lose an exit code on somebody else's
     machine.
+
+    Every name goes through `shown_field`, the same sanitizer this command
+    already applies to `provider_state.reason` and to config-derived reviewer
+    text. These names are not more trusted for having come out of the store: a
+    `route_reason` or `routed_reviewer` is read back out of `artifact_json`,
+    which is a file on disk somebody can edit, and a raw newline in one would
+    forge an extra row in this listing while an ESC sequence would rewrite the
+    rows already printed.
     """
-    return ", ".join(f"{name} {n}" for name, n in
+    from .triage import shown_field
+
+    return ", ".join(f"{shown_field(name)} {n}" for name, n in
                      sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
@@ -1233,9 +1243,18 @@ def _fmt_served(per_adapter: dict, total: int) -> str:
 
 
 def _fmt_routing_header(routing, since_days: int) -> str:
-    """The effective routing config, above the provider lines."""
-    pool = ",".join(routing.pool) if routing.pool else "all-enabled-finders"
-    return (f"routing: mode={routing.mode} pool={pool} "
+    """The effective routing config, above the provider lines.
+
+    `pool` and `mode` are sanitized for the same reason `_fmt_counts` sanitizes
+    its names: they are config-derived strings reaching a one-line-per-item
+    terminal listing, and this command already caps and flattens config text on
+    its exit-1 path rather than trusting a `.skodun.toml` to be well-behaved.
+    """
+    from .triage import shown_field
+
+    pool = (",".join(shown_field(n) for n in routing.pool)
+            if routing.pool else "all-enabled-finders")
+    return (f"routing: mode={shown_field(routing.mode)} pool={pool} "
             f"cross_model={'on' if routing.cross_model else 'off'} "
             f"window={since_days}d")
 
