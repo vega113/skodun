@@ -165,11 +165,27 @@ block, which the launcher deliberately leaves empty:
 # number deliberately -- skodun's own default is 10, so a launcher that sets
 # anything else means `skodun` started through it and `skodun` started directly
 # do not agree.
-case "${SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY:-}" in
-    '${'*) unset SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY ;;
-esac
-SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY="${SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY:-10}"
-export SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY
+# Only when the caller named NO ceiling at all. skodun resolves four names in
+# order -- the per-provider _PER_DAY, the per-provider alias without it, then
+# the two global equivalents -- and the first set one wins. Defaulting the
+# _PER_DAY name unconditionally would therefore MASK a caller who set only the
+# alias, silently replacing their number with this one.
+#
+# A leftover unexpanded ${...} from a half-migrated env block counts as unset,
+# exactly as it does for the key above.
+for _n in SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY \
+          SKODUN_OPENAI_API_SPEND_LIMIT_USD \
+          SKODUN_API_SPEND_LIMIT_USD_PER_DAY \
+          SKODUN_API_SPEND_LIMIT_USD; do
+    eval "_v=\${$_n:-}"
+    case "$_v" in '${'*) unset "$_n"; _v= ;; esac
+    [ -n "$_v" ] && _have_limit=1
+done
+if [ -z "${_have_limit:-}" ]; then
+    SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY=10
+    export SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY
+fi
+unset _n _v _have_limit
 
 exec "$SKODUN_BIN" "$@"
 ```
