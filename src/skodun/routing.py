@@ -83,11 +83,18 @@ ROUTE_PINNED = "pinned"
 #: `mode = "off"`: the config's first enabled finder, i.e. pre-S5 selection.
 ROUTE_CONFIG_FINDER = "config-finder"
 #: `mode = "auto"` but nothing was routable (empty pool, every candidate
-#: blacked out, or the store could not be read) -- the config's first enabled
-#: finder heads the run and its own `fallbacks` still apply. Deliberately NOT a
-#: refusal: the chain-level `_finder_chain_unavailable` short-circuit already
-#: fails fast when every entry really is unavailable, and it says so in words
-#: an operator can act on.
+#: blacked out, or the store could not be read). The run falls back to this
+#: config's DEFAULT HEAD and that entry's own `fallbacks` still apply.
+#:
+#: "Default head" is the first entry of an explicit `[routing] pool`, else the
+#: first enabled `finder` -- see `pipeline._auto_fallback_head` for why the pool
+#: wins. The reason string names the RULE, not the role: which entry it actually
+#: resolved to is on the same artifact, as `routed_reviewer`, and that is the
+#: field to read when the two can differ.
+#:
+#: Deliberately NOT a refusal: the chain-level `_finder_chain_unavailable`
+#: short-circuit already fails fast when every entry really is unavailable, and
+#: it says so in words an operator can act on.
 ROUTE_DEFAULT_FINDER = "auto:default-finder"
 #: Routed to a provider with a free slot.
 ROUTE_FREE = "auto:free"

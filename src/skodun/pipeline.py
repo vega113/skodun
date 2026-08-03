@@ -1300,7 +1300,15 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     # a provider with no adapter unavailable -- and the config error would then
     # surface only on the runs where every other provider happened to be busy.
     # A misconfiguration found by luck of the load is not found at all.
-    pool = (routing.resolve_pool(cfg) if cfg.routing.mode == "auto" else ())
+    #
+    # Only when the router could actually have run: `requested is None` AND
+    # mode auto. A PINNED run never consults the pool, so a pooled entry is not
+    # a reviewer THAT run may reach for, and refusing it would let an unrelated
+    # typo break the one request that is supposed to be absolute in every mode.
+    # Mode off is the same argument -- nothing can reach the pool, and refusing
+    # would refuse configs that worked before S5.
+    pool = (routing.resolve_pool(cfg)
+            if requested is None and cfg.routing.mode == "auto" else ())
     for reviewer in (finder, *pool, *(_pass_reviewer(cfg, p, finder)
                                       for p in _EXTRA_PASS_ROLES)):
         for entry in _chain_for(cfg, reviewer):

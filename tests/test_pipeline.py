@@ -1586,3 +1586,23 @@ role = "finder"
 
     assert rec["trustworthy"] is True
     assert rec["routed_reviewer"] == "finder"
+
+
+def test_a_pin_is_not_refused_by_an_unrelated_pool_typo(tmp_path, capsys):
+    """A pin is absolute in every mode, and that has to survive the preflight
+    the test above adds: a pinned run never consults the pool, so a pooled
+    entry is not a reviewer THAT run may reach for."""
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path, '\n[routing]\nmode = "auto"\n' + """
+[[reviewers]]
+name = "finder-typo"
+provider = "opeani"
+model = "gpt-5.4"
+role = "finder"
+""")
+    st = _store(tmp_path)
+
+    rec = _run(repo, st, reviewer="finder")
+
+    assert rec["trustworthy"] is True
+    assert rec["route_reason"] == "pinned"
