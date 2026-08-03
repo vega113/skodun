@@ -47,6 +47,7 @@ bug the delivery ledger exists to remove.
 """
 
 import json
+import os
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -108,6 +109,37 @@ BUSY_TEXT = "review already in flight"
 #: Distinct from ``None`` (a valid previous disposition from ``signal.signal``)
 #: so restore does not leave a review-scoped handler installed forever.
 _SIGTERM_INSTALL_FAILED = object()
+
+#: How the server treats an in-flight `review` when the client disconnects
+#: (stdin EOF / session end) or the read loop otherwise stops.
+#:
+#: * ``drain`` (default) — do **not** set the cancel token; join the worker so
+#:   the review can finalize to the store. Operator MCP restarts and host
+#:   reloads must not throw away minutes of model work or leave a cancelled
+#:   row that never covers the tree.
+#: * ``cancel`` — set the cancel token then join (legacy). Explicit
+#:   ``review_cancel`` / cross-process SIGTERM still cancel regardless.
+#:
+#: Override with ``SKODUN_MCP_DISCONNECT=cancel`` or ``=drain``.
+DISCONNECT_POLICY_ENV = "SKODUN_MCP_DISCONNECT"
+DISCONNECT_DRAIN = "drain"
+DISCONNECT_CANCEL = "cancel"
+DEFAULT_DISCONNECT_POLICY = DISCONNECT_DRAIN
+
+#: Max seconds to wait for an in-flight review under **drain** before falling
+#: back to cancel (so a hung provider cannot pin MCP open forever). Override
+#: with ``SKODUN_MCP_DRAIN_TIMEOUT_SECONDS``. ``0`` means no extra ceiling
+#: (join until cancel policy would apply only via SIGTERM/review_cancel).
+DRAIN_TIMEOUT_ENV = "SKODUN_MCP_DRAIN_TIMEOUT_SECONDS"
+DEFAULT_DRAIN_TIMEOUT_SEC = 2 * 60 * 60  # 2 hours — above normal review budgets
+
+#: After drain timeout (or cancel policy) sets the cancel token, wait this long
+#: for the worker to finish cleanup before exiting the process anyway. Review
+#: threads are daemons; a stuck join after cancel would otherwise pin MCP open
+#: forever. Provider process groups should die via the cancel path; residual
+#: orphans match the SIGKILL failure mode and are swept by stale recovery.
+POST_CANCEL_JOIN_ENV = "SKODUN_MCP_POST_CANCEL_JOIN_SECONDS"
+DEFAULT_POST_CANCEL_JOIN_SEC = 120.0
 
 #: The status a busy refusal and a failed handler report. 2 is the gate
 #: contract's "no trustworthy review covers this content" -- the conservative
@@ -418,13 +450,61 @@ def _handle_gate(call: "HandlerCall") -> "HandlerResult":
     return HandlerResult(status=status, text=text)
 
 
+def disconnect_policy() -> str:
+    """``drain`` (default) or ``cancel`` for in-flight review on session end."""
+    raw = (os.environ.get(DISCONNECT_POLICY_ENV) or DEFAULT_DISCONNECT_POLICY)
+    value = str(raw).strip().lower()
+    if value == DISCONNECT_CANCEL:
+        return DISCONNECT_CANCEL
+    return DISCONNECT_DRAIN
+
+
+def _env_nonneg_float(name: str, default: float) -> float:
+    """Parse a non-negative finite float env, else ``default``.
+
+    Exact ``0`` is kept (callers may treat it as "no wait" / "no ceiling").
+    Junk, negative, and non-finite values fall back to ``default``.
+    """
+    import math
+
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return float(default)
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        return float(default)
+    if not math.isfinite(value) or value < 0:
+        return float(default)
+    return value
+
+
+def drain_timeout_sec() -> float:
+    """Seconds to wait under drain before cancelling a stuck review.
+
+    From ``SKODUN_MCP_DRAIN_TIMEOUT_SECONDS`` (default 2h). Junk / negative /
+    non-finite → default. Exact ``0`` disables the drain ceiling.
+    """
+    return _env_nonneg_float(DRAIN_TIMEOUT_ENV, DEFAULT_DRAIN_TIMEOUT_SEC)
+
+
+def post_cancel_join_sec() -> float:
+    """Seconds to join after cancel before exiting anyway (default 120)."""
+    return _env_nonneg_float(
+        POST_CANCEL_JOIN_ENV, DEFAULT_POST_CANCEL_JOIN_SEC)
+
+
 def _handle_review(call: "HandlerCall") -> "HandlerResult":
     """The long-running one. `call.cancel` is the whole point of it being so.
 
-    The token is set by the read loop when the client's stdin reaches EOF, and it
-    travels from here into `run_review`, its pass boundaries, the chain, and
-    finally the watchdog tick loop -- the only layer holding the provider's
-    process group. `svc_review` turns the resulting `ReviewCancelled` into
+    The token is set by **explicit cancel** (MCP ``review_cancel``, CLI
+    ``review-cancel``, or the main-thread SIGTERM forwarder used for
+    cross-process cancel) — not by a normal session end. On stdin EOF the
+    server **drains** by default: it joins this thread without setting the
+    token so the review can finalize into the store (restart-safe). Set
+    ``SKODUN_MCP_DISCONNECT=cancel`` to restore legacy cancel-on-disconnect.
+    The token still travels into `run_review`, pass boundaries, the chain, and
+    the watchdog tick loop. `svc_review` turns `ReviewCancelled` into
     `(4, "... reason=review cancelled")`, so this thread returns an ordinary tool
     result rather than raising, and the server joins it before exiting 0.
 
@@ -775,11 +855,13 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                         "be in flight per server -- a second call while one is "
                         "running is refused, not queued (a queue would review a "
                         "moved tree). CLI uses FIFO review-fg capacity + the "
-                        "legacy FG lock instead. Closing the session cancels "
-                        "the review in flight. Status 0 = clean, 1 = findings "
-                        "open, 2 = nothing ran (including busy refusal), "
-                        "3 = gave up waiting for capacity/lock, 4 = no "
-                        "trustworthy review exists."),
+                        "legacy FG lock instead. Closing the session DRAINS by "
+                        "default (review finishes into the store; set "
+                        "SKODUN_MCP_DISCONNECT=cancel to abort). Explicit "
+                        "review_cancel / review-cancel still cancel. Status 0 "
+                        "= clean, 1 = findings open, 2 = nothing ran "
+                        "(including busy refusal), 3 = gave up waiting for "
+                        "capacity/lock, 4 = no trustworthy review exists."),
         HandlerSpec(
             name="log", long_running=False,
             input_schema=_schema({
@@ -1055,6 +1137,24 @@ def default_store_factory():
     from .cli import _store_path
     from .store import Store
     return Store.open(_store_path())
+
+
+def _handler_failure_text(tool_name: str, exc: BaseException) -> str:
+    """Tool-visible failure text for a raised handler.
+
+    Schema-behind (store written by a newer skodun than this MCP process) is
+    the failure that most often causes agents to abandon MCP for the CLI —
+    which is the wrong fix. Surface the remediation in the tool text itself.
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, ValueError) and "newer than this skodun" in str(exc):
+        return (
+            f"skodun {tool_name}: MCP is schema-behind the store ({detail}). "
+            "Restart this MCP server so it loads the same upgraded skodun as "
+            f"`skodun --version` / doctor; do not fall back to the CLI for "
+            f"{tool_name} while MCP stays on the old build."
+        )
+    return f"skodun {tool_name}: the tool failed: {exc!r}"
 
 
 def _validate_result(res) -> str | None:
@@ -1406,9 +1506,18 @@ class McpServer:
         # refused. Nothing here is stateful enough for a re-handshake to
         # corrupt, and refusing one would invent a failure mode.
         self._initialized = True
+        # schemaVersion is additive: agents/ops can detect CLI/MCP install skew
+        # before a tool call hits the store. Clients that only read name/version
+        # ignore the extra field. Imported lazily so cold `skodun mcp` still
+        # avoids paying for sqlite until a tool needs the store.
+        from .store import SCHEMA_VERSION
         return {"protocolVersion": negotiated,
                 "capabilities": {"tools": {}, "prompts": {}},
-                "serverInfo": {"name": SERVER_NAME, "version": self._version}}
+                "serverInfo": {
+                    "name": SERVER_NAME,
+                    "version": self._version,
+                    "schemaVersion": SCHEMA_VERSION,
+                }}
 
     def _m_ping(self, params: dict, id_) -> dict:
         return {}
@@ -1481,7 +1590,7 @@ class McpServer:
             self._note(f"the {spec.name} tool raised: {e!r}")
             return HandlerResult(
                 status=HANDLER_FAILURE_STATUS,
-                text=f"skodun {spec.name}: the tool failed: {e!r}",
+                text=_handler_failure_text(spec.name, e),
                 pending_acks=[])
         problem = _validate_result(res)
         if problem is not None:
@@ -1634,26 +1743,148 @@ class McpServer:
     # -- shutdown ---------------------------------------------------------
 
     def _shutdown(self) -> int:
-        """Cancel the review in flight, wait for it, and report a clean 0.
+        """End the session: join the long-running worker, then return 0.
 
-        The join is UNBOUNDED on purpose. A review holds the foreground lock and
-        is about to write a record; abandoning it mid-write to make the process
-        exit a little sooner would leave a `running` row behind and a provider
-        process group with no parent. What bounds this wait is the cancellation
-        token, which Task 14 threads all the way into the provider watchdog.
+        Default disconnect policy is **drain** (see ``disconnect_policy`` /
+        ``SKODUN_MCP_DISCONNECT``): do **not** set the cancel token on session
+        end so an in-flight review can finish and write its store record. That
+        is how an MCP restart or host reload avoids losing ongoing work.
+        ``SKODUN_MCP_DISCONNECT=cancel`` restores the old cancel-then-join
+        behaviour. Explicit ``review_cancel`` / SIGTERM still cancel while the
+        process is alive.
+
+        Under drain, the wait is bounded by ``drain_timeout_sec()`` (default
+        2h, env ``SKODUN_MCP_DRAIN_TIMEOUT_SECONDS``). If the worker is still
+        alive after that ceiling, cancel is set and we join again so a hung
+        provider cannot pin the MCP process open forever. Under cancel policy,
+        the cancellation token bounds the wait via the provider watchdog.
+
+        Abandoning a worker mid-write without cancel would leave a `running`
+        row and a provider process group with no parent — so we always join
+        (after optional drain timeout → cancel), never detach.
 
         The token is the LAST review's. Only one review executes at a time, so
         any earlier thread still in `_workers` has already finished its handler
         and is only finishing a write -- there is nothing left in it to cancel.
         """
+        import time
+
         with self._slot_lock:
             workers, cancel = list(self._workers), self._worker_cancel
-        if cancel is not None:
-            cancel.set()
-        for worker in workers:
-            if worker.is_alive():
+        alive = [w for w in workers if w.is_alive()]
+        policy = disconnect_policy()
+
+        def _join_all(*, timeout: float | None, label: str) -> bool:
+            """Join alive workers. ``timeout=None`` means unbounded.
+
+            Returns True if any worker is still alive after the wait.
+            """
+            stuck = False
+            for worker in workers:
+                if not worker.is_alive():
+                    continue
                 self._note(f"waiting for {worker.name} to finish before exiting")
-                worker.join()
+                if timeout is None:
+                    worker.join()
+                else:
+                    worker.join(timeout=max(timeout, 0.0))
+                if worker.is_alive():
+                    stuck = True
+                    if timeout is not None:
+                        self._note(
+                            f"{worker.name} still alive after {label}; "
+                            f"continuing shutdown")
+            return stuck
+
+        def _demote_orphaned_running_rows() -> None:
+            """Best-effort durable terminal for reviews this process still owns.
+
+            Used only when we must exit with a daemon worker still stuck after
+            cancel, so we do not leave forever-``running`` rows. Provider
+            process groups may still need OS cleanup; stale recovery is the
+            backstop for anything left behind.
+            """
+            import os
+            try:
+                from . import pipeline
+                pipeline.request_cancel_all()
+            except BaseException:
+                pass
+            try:
+                with self._store_factory() as store:
+                    mine = os.getpid()
+                    reason = (
+                        "cancelled: MCP process exiting with review worker "
+                        "still stuck after cancel wait")
+                    for rec in store.running_records():
+                        pid = rec.get("pid")
+                        rid = rec.get("id")
+                        if rid is None:
+                            continue
+                        # Foreground MCP/CLI rows store os.getpid() of this
+                        # process (pipeline). Require an exact match — never
+                        # demote pid-less rows (other agents / mid-attach) or
+                        # foreign pids (background workers, other MCP).
+                        try:
+                            if pid is None or int(pid) != mine:
+                                continue
+                        except (TypeError, ValueError):
+                            continue
+                        try:
+                            if store.fail_if_running(str(rid), reason):
+                                self._note(
+                                    f"demoted stuck running review {rid} "
+                                    f"before MCP exit")
+                        except BaseException as e:
+                            self._note(
+                                f"could not demote stuck review {rid}: {e!r}")
+            except BaseException as e:
+                self._note(f"could not open store to demote stuck reviews: {e!r}")
+
+        if not alive:
+            return 0
+
+        if policy == DISCONNECT_CANCEL:
+            if cancel is not None:
+                self._note(
+                    "disconnect policy=cancel; cancelling in-flight review "
+                    "before exit")
+                cancel.set()
+            if _join_all(timeout=post_cancel_join_sec(), label="cancel wait"):
+                _demote_orphaned_running_rows()
+            return 0
+
+        # Drain: prefer finishing the review; optional ceiling then cancel.
+        ceiling = drain_timeout_sec()
+        if ceiling <= 0:
+            self._note(
+                "disconnect policy=drain; waiting for in-flight review with "
+                "no drain ceiling (SKODUN_MCP_DRAIN_TIMEOUT_SECONDS=0)")
+            _join_all(timeout=None, label="unlimited drain")
+            return 0
+
+        self._note(
+            f"disconnect policy=drain; waiting up to {ceiling:g}s for "
+            f"in-flight review (then cancel if still running; set "
+            f"SKODUN_MCP_DISCONNECT=cancel to abort immediately)")
+        deadline = time.monotonic() + ceiling
+        for worker in workers:
+            if not worker.is_alive():
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._note(f"waiting for {worker.name} to finish before exiting")
+            worker.join(timeout=remaining)
+        still = [w for w in workers if w.is_alive()]
+        if still and cancel is not None:
+            self._note(
+                "drain timed out; cancelling in-flight review so the "
+                "MCP process can exit")
+            cancel.set()
+            if _join_all(
+                    timeout=post_cancel_join_sec(), label="post-cancel wait"):
+                _demote_orphaned_running_rows()
         return 0
 
     # -- diagnostics ------------------------------------------------------

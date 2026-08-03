@@ -77,6 +77,20 @@ def run_doctor(
         f"{py} (need >= 3.12)",
     )
 
+    # Package / schema this CLI process understands (for CLI↔MCP skew)
+    try:
+        from . import __version__
+        from .store import SCHEMA_VERSION as _SCHEMA_V
+
+        report.add(
+            "package",
+            True,
+            f"version={__version__} schema_v={_SCHEMA_V} "
+            f"(MCP serverInfo must match after restart)",
+        )
+    except Exception as e:
+        report.add("package", False, f"{e!r}")
+
     # Config
     try:
         from .config import load_config
@@ -131,7 +145,14 @@ def run_doctor(
                 f"dir={log_dir}",
             )
     except Exception as e:
-        report.add("store", False, f"open failed: {e!r}")
+        detail = f"open failed: {e!r}"
+        if "newer than this skodun" in str(e):
+            detail += (
+                " — this CLI/doctor is older than the store; upgrade skodun, "
+                "then restart every MCP client so CLI and MCP share one install "
+                "(do not keep reviewing via CLI while MCP stays schema-behind)"
+            )
+        report.add("store", False, detail)
 
     # Adapters / binaries
     try:

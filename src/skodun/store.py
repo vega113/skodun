@@ -55,6 +55,23 @@ RUNNING = "running"
 #: higher was written by a newer skodun and is refused, untouched.
 SCHEMA_VERSION = 8
 
+
+def schema_too_new_message(store_version: int) -> str:
+    """Refusal text when the on-disk store was written by a newer skodun.
+
+    The usual real-world case is **version skew**: a freshly upgraded CLI (or a
+    newer MCP) migrated the shared DB, while a **long-lived older** `skodun mcp`
+    process still has the previous ``SCHEMA_VERSION``. Falling back to the CLI
+    for reviews makes the skew worse; the fix is one install and a restarted MCP.
+    """
+    return (
+        f"store schema v{store_version} is newer than this skodun "
+        f"(this build understands v{SCHEMA_VERSION}). "
+        "Upgrade this process to the same skodun install that wrote the store, "
+        "then restart MCP — do not fall back to the CLI while MCP stays on the "
+        "old build (CLI and MCP must share one install)."
+    )
+
 #: Set to anything other than "0", unset, or blank to ignore `provider_state`
 #: entirely.
 IGNORE_PROVIDER_STATE_ENV = "SKODUN_IGNORE_PROVIDER_STATE"
@@ -554,7 +571,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version > SCHEMA_VERSION:
-        raise ValueError(f"store schema v{version} is newer than this skodun")
+        raise ValueError(schema_too_new_message(version))
 
     _enable_wal(conn)
     conn.execute("PRAGMA foreign_keys=ON")

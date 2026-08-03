@@ -19,14 +19,36 @@ def test_run_doctor_reports_store_and_adapters(tmp_path, monkeypatch):
     report = run_doctor(repo=tmp_path, store_path=db)
     names = {c.name for c in report.checks}
     assert "python" in names
+    assert "package" in names
     assert "store" in names
     assert "adapters_registered" in names
     assert "mcp" in names
+    package_check = next(c for c in report.checks if c.name == "package")
+    assert package_check.ok
+    assert f"schema_v={SCHEMA_VERSION}" in package_check.detail
     store_check = next(c for c in report.checks if c.name == "store")
     assert store_check.ok
     assert f"v{SCHEMA_VERSION}" in store_check.detail or f"schema_v={SCHEMA_VERSION}" in store_check.detail
     assert "junie" in next(
         c.detail for c in report.checks if c.name == "adapters_registered")
+
+
+def test_doctor_store_open_failure_for_schema_behind_mentions_restart_mcp(
+        tmp_path, monkeypatch):
+    import sqlite3
+
+    db = tmp_path / "future.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    raw = sqlite3.connect(db)
+    raw.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1:d}")
+    raw.commit()
+    raw.close()
+    report = run_doctor(repo=tmp_path, store_path=db)
+    store_check = next(c for c in report.checks if c.name == "store")
+    assert not store_check.ok
+    assert "newer than this skodun" in store_check.detail
+    assert "restart" in store_check.detail.lower()
+    assert "MCP" in store_check.detail
 
 
 def test_doctor_does_not_mutate_store(tmp_path, monkeypatch):
