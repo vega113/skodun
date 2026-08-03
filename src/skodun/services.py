@@ -1126,7 +1126,13 @@ def _pid_is_live_skodun_fg(pid) -> bool:
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return False
     try:
-        cp = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
+        # `-ww` for the same reason as `dispatch.pid_is_skodun_worker` -- see
+        # the note there. This call reads the argv in the opposite direction
+        # (it REFUSES on the worker tokens rather than requiring them), so a
+        # line truncated by procps at 80 columns fails the other way: a real
+        # background worker whose tokens got cut is mistaken for a live FG
+        # process. Both directions need the full argv to answer honestly.
+        cp = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(pid)],
                             capture_output=True, timeout=30)
     except (OSError, ValueError, subprocess.SubprocessError):
         return False

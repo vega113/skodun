@@ -796,7 +796,15 @@ def pid_is_skodun_worker(pid: object, record_id: object) -> bool:
     if not isinstance(record_id, str) or not record_id:
         return False
     try:
-        cp = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
+        # `-ww`: UNLIMITED width, and load-bearing rather than tidy. Linux
+        # procps truncates `-o args=` to the terminal width -- 80 columns when
+        # there is no tty, which is every context skodun runs in -- while BSD
+        # `ps` on macOS does not. A real worker argv carries `--repo <absolute
+        # path>` after `--record-id <id>`, so it clears 80 columns easily, and
+        # the truncated line drops exactly the flag this guard binds on. That
+        # reads as "not the worker of this record" and the SIGTERM is silently
+        # withheld, which is the fail-closed direction and therefore invisible.
+        cp = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(pid)],
                             capture_output=True, timeout=30)
     except (OSError, ValueError, subprocess.SubprocessError):
         return False

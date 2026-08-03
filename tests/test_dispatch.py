@@ -1794,57 +1794,59 @@ def _fake_worker_process(tmp_path: Path, name: str = "skodun",
 
     A script file called `skodun` invoked with `worker ...`, so the guard is tested
     against a real `ps` reading a real argv rather than against a stub of it.
-
-    Returned only once `ps` can actually SEE that argv. `Popen` returns as soon
-    as the child is forked, and the `exec` that replaces its argv lands
-    asynchronously after that; until it does, `ps -o args=` reports the argv
-    this pytest process was started with, which names no worker at all. So the
-    guard answers False for a process that is about to become a worker -- a race
-    the caller cannot see, because it fails as a plain wrong answer rather than
-    as an error. A fast machine wins it every time; a loaded 2-core CI runner
-    does not, which is exactly where it first showed up (only the two
-    assertions expecting True broke; every negative one below was already
-    getting False for the right answer by accident).
     """
     script = tmp_path / "bin" / name
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_text("#!/bin/sh\ntrap '' TERM\nsleep 120\n", encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    proc = subprocess.Popen([str(script), "worker", "--record-id", record_id],
+    return subprocess.Popen([str(script), "worker", "--record-id", record_id],
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
-    _await_argv(proc, record_id)
-    return proc
-
-
-def _await_argv(proc: subprocess.Popen, record_id: str,
-                timeout: float = 30.0) -> None:
-    """Block until `ps` reports `record_id` in `proc`'s argv -- i.e. it exec'd.
-
-    Polled rather than slept: a fixed `sleep` long enough for the slowest runner
-    would be dead time on every other one, and short enough to be cheap would be
-    the same race with a smaller window. `record_id` is the token to wait on
-    because it is in the argv for EVERY caller here, including the ones that
-    spawn a deliberately non-worker `name`.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        cp = subprocess.run(["ps", "-o", "args=", "-p", str(proc.pid)],
-                            capture_output=True, text=True)
-        if cp.returncode == 0 and record_id in cp.stdout:
-            return
-        assert proc.poll() is None, (
-            f"the fake worker exited before it could be observed: {proc.returncode}")
-        time.sleep(0.02)
-    raise AssertionError(
-        f"`ps` never reported {record_id!r} in pid {proc.pid}'s argv "
-        f"within {timeout}s; the fake worker never exec'd")
 
 
 def test_a_pid_that_ps_confirms_as_a_worker_is_signalled(tmp_path):
     proc = _fake_worker_process(tmp_path)
     try:
         assert pid_is_skodun_worker(proc.pid, "sk_x") is True
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+
+def test_a_worker_whose_argv_is_longer_than_a_terminal_is_still_confirmed(
+        tmp_path):
+    """The guard must ask `ps` for UNLIMITED-width output.
+
+    Linux procps truncates `-o args=` to the terminal width, and with no tty
+    that is 80 columns -- which is every context skodun runs in. BSD `ps` on
+    macOS does not truncate at all. A real worker argv carries `--repo
+    <absolute path>` after `--record-id <id>`, so it clears 80 columns easily,
+    and the truncated line drops exactly the flag the guard binds on. The guard
+    then refuses to confirm a live worker of this very record, the SIGTERM is
+    withheld, and nothing complains: that is the fail-closed direction, so the
+    only symptom is superseded workers running to completion.
+
+    Honest limitation: on macOS this passes with or without the fix, because
+    BSD `ps` has nothing to truncate. It is load-bearing on procps only -- it
+    fails on Linux without `-ww`, which is where the defect was found and where
+    CI runs. The failure message carries both `ps` readings so a future break
+    diagnoses itself rather than sending the next person back to first
+    principles.
+    """
+    deep = tmp_path.joinpath(*(["a-padding-directory-name"] * 6))
+    proc = _fake_worker_process(deep, record_id="sk_wide")
+    try:
+        wide = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(proc.pid)],
+                              capture_output=True, text=True).stdout
+        assert len(wide.strip()) > 80, (
+            f"the padding no longer clears a terminal width, so this test "
+            f"would pass for the wrong reason: {wide!r}")
+        narrow = subprocess.run(["ps", "-o", "args=", "-p", str(proc.pid)],
+                                capture_output=True, text=True).stdout
+        assert pid_is_skodun_worker(proc.pid, "sk_wide") is True, (
+            f"the guard refused a live worker of this record.\n"
+            f"  ps -ww -o args=: {wide!r}\n"
+            f"  ps     -o args=: {narrow!r}")
     finally:
         proc.kill()
         proc.wait(timeout=30)
