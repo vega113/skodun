@@ -82,6 +82,10 @@ and execs skodun. The key stays in whatever file already holds your secrets:
 # ~/.local/bin/skodun-with-secrets   (chmod 700)
 set -u
 SECRETS="${SKODUN_SECRETS_FILE:-$HOME/.secrets/.env}"
+# ABSOLUTE, for the same reason `command` below must be: the host that spawns
+# this often has a minimal PATH, and `exec skodun` would reintroduce exactly
+# the dependency the absolute `command` was there to avoid.
+SKODUN_BIN="${SKODUN_BIN:-$HOME/.local/bin/skodun}"
 if [ -z "${SKODUN_OPENAI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] \
         && [ -r "$SECRETS" ]; then
     # BOTH documented names -- a secrets file may well use the preferred
@@ -93,7 +97,7 @@ if [ -z "${SKODUN_OPENAI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] \
     done
     unset key name
 fi
-exec skodun "$@"
+exec "$SKODUN_BIN" "$@"
 ```
 
 ```json
