@@ -632,16 +632,34 @@ written down, attributable, and reversible on the record with `triage --reopen`.
 
 ## MCP server
 
-`skodun mcp` serves the same review loop the CLI does — `gate`, `review`, `log`,
-`surface`, and the `triage` operations — to any MCP client, over stdio, as **9
-tools** and **2 prompts**. A tool's refusal is worded exactly like the CLI's,
-because neither surface owns the words: `services.py` is the one implementation
-both call.
+`skodun mcp` serves the same review loop the CLI does to any MCP client over
+stdio — **13 tools** and **2 prompts**. A tool's refusal is worded exactly like
+the CLI's, because neither surface owns the words: `services.py` is the one
+implementation both call. (Pinned by `tests/test_mcptools.py` `EXPECTED_TOOLS`.)
 
-Tools: `gate`, `review`, `log`, `surface`, `triage_list`, `triage_dismiss`,
-`adopt_refuter`, `triage_reopen`, `triage_defer`. Prompts: `review-now` (run a
-review and report findings without triaging any of them) and `gate-check` (ask
-whether a trustworthy review covers the current change, and explain the verdict).
+### Tools (complete list)
+
+| Tool | Role |
+|---|---|
+| `gate` | Does a trustworthy review cover this tree? Status 0/1/2 |
+| `review` | Foreground review (long-running; optional `reviewer` **entry name**) |
+| `log` | Recent reviews (history; not a gate) |
+| `surface` | Undelivered background rounds (history; not a gate) |
+| `review_status` | Lifecycle of a review by id or current for `repo` (not a gate) |
+| `review_cancel` | Cancel an in-flight review by id |
+| `triage_list` | Findings + effective triage state for one review |
+| `triage_dismiss` | Dismiss one finding (audited reason; **human** gate decision) |
+| `triage_defer` | Defer one finding (mandatory filed `tracking_ref`) |
+| `triage_reopen` | Reopen a dismissed/deferred finding |
+| `adopt_refuter` | Dismiss by adopting refuter annotation as reason |
+| `feedback_add` | Non-gate agent/human judgment or product-bug note |
+| `feedback_list` | List feedback events |
+
+Prompts: `review-now` (review and report without triaging) and `gate-check`
+(explain whether a trustworthy review covers the current change).
+
+Pass absolute **`repo`** on tools that accept it when the MCP server cwd may not
+be the project you mean.
 
 `triage_defer` takes a mandatory `tracking_ref` and refuses without a usable one,
 in the CLI's words. There is deliberately no `deferrals` tool: reviewing the
@@ -661,36 +679,55 @@ thread so the server keeps answering other requests; a second `review` call whil
 one is running is refused outright (`"review already in flight"`), never queued,
 because a queued review would run against a working tree that has since moved.
 Closing the client session cancels a review still in progress rather than
-abandoning it mid-write.
+abandoning it mid-write (use `review_cancel` for an explicit cancel by id).
 
 There is deliberately no `dispatch`, `worker`, `install-hooks`, `import-legacy`,
-`shadow-compare`, or `providers` tool, and no bulk triage tool (no
+`shadow-compare`, `doctor`, or `providers` tool, and no bulk triage tool (no
 `dismiss_all`/`adopt_all`): those are either machinery a human runs, or decisions
 a human makes one finding at a time.
 
-### Upgrading a running server
+### Restart MCP sessions (required after upgrade)
 
-**A running server keeps serving the build it started with.** Every tool call
-opens its own store connection, so data is always current — but the Python
-modules were loaded once, at startup. Upgrade skodun (or edit it, in a source
-checkout) and the server in your agent's config goes on running the old code
-until the client restarts it, silently: no error, no warning, just an older
-reviewer than you think you have.
+**A running `skodun mcp` keeps serving the build it started with.** Python
+modules load once at process start. Stdio hosts (Claude Code, Cursor, Codex,
+Grok, …) each hold their own long-lived process.
 
-So after upgrading, restart the client's MCP connection (in Claude Code, reload
-the session or the server entry; in Codex, start a new `codex` run). To confirm
-which build you actually reached, read `serverInfo.version` from the
-`initialize` response — it is `skodun.__version__`, the same string
-`skodun --version` prints, and a test pins it to the version declared in
-`pyproject.toml` so the three can never disagree:
+Restart the MCP **session / server entry** whenever you:
 
+1. **Install or upgrade skodun** (or change the MCP `command` / `args` / `env`)
+2. See **missing tools** (e.g. host still lists 9 tools after you added
+   `review_status` / `feedback_*` — the old process never reloaded `tools/list`)
+3. See **`store schema vN is newer than this skodun`** (“schema-behind”): a
+   newer CLI already migrated the shared DB; the old MCP cannot open it. Do
+   **not** paper over that with shell `skodun review` — restart MCP so it
+   matches `skodun --version`
+4. Change API keys / spend limits in the MCP `env` block
+
+How to restart (host-specific):
+
+| Host | Typical action |
+|---|---|
+| Claude Code | Reload window / restart the `skodun` MCP server entry |
+| Cursor | Restart MCP / reload window |
+| Codex | New `codex` run (new stdio process) |
+| Grok / other | Restart the agent session or re-enable the MCP server |
+
+Prefer a **graceful** host reload over `kill -9` (a hard kill mid-review can
+leave a `running` row until stale recovery).
+
+Confirm after restart:
+
+```bash
+skodun --version
+skodun doctor --repo /abs/path/to/project
+# optional: initialize should show serverInfo.version == skodun --version
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"check","version":"0"}}}' \
+  | skodun mcp
+# tools/list should name all 13 tools (gate … feedback_list)
 ```
-$ printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"check","version":"0"}}}' | skodun mcp
-{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-06-18",...,"serverInfo":{"name":"skodun","version":"0.3.0"}}}
-```
 
-If that version is not the one you just installed, the client is still holding
-the old process.
+If `serverInfo.version` is not the install you just upgraded, the client is still
+holding the old process — restart again.
 
 ### Claude Code
 

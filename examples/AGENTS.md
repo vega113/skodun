@@ -61,17 +61,22 @@ trustworthy review must cover it.
 - `skodun schedule install` — write launchd plists from `[[schedule.jobs]]`.
   No scheduler runs inside `skodun mcp`. **CLI-only** (macOS launchd).
 
-If skodun is wired in over MCP, the review-loop operations are the `gate`,
-`review`, `log`, `surface`, `triage_list`, `triage_dismiss`, `adopt_refuter`,
-`triage_reopen`, `triage_defer`, `review_status`, and `review_cancel` tools,
-with identical wording and identical refusals via the shared service path.
-Pass **`repo` as an absolute project path** on `gate` / `review` / `log` /
-`surface` / `review_status` when the MCP server’s cwd may not be this
+If skodun is wired in over MCP, prefer the **13 MCP tools** (full list in
+[`fragments/mcp-loop.md`](fragments/mcp-loop.md) and the README MCP section):
+`gate`, `review`, `log`, `surface`, `review_status`, `review_cancel`,
+`triage_list`, `triage_dismiss`, `adopt_refuter`, `triage_reopen`,
+`triage_defer`, `feedback_add`, `feedback_list` — identical wording and
+refusals via the shared service path. Pass **`repo` as an absolute project
+path** on tools that accept it when the MCP server’s cwd may not be this
 repository. Optional `reviewer` on `review` is a configured entry **name**,
 not a provider id. There is no `deferrals`, `doctor`, `retain`, or `schedule`
 tool: backlog review is a human's job, and ops verbs are shell-out CLI commands
 so the stdio MCP server stays free of schedulers and mutators that are not part
 of the agent review loop.
+
+**If the host shows fewer than 13 tools** (or schema-behind errors): **restart
+the MCP session** so it reloads the upgraded install — do not permanently fall
+back to the CLI. See [`fragments/mcp-server-config.md`](fragments/mcp-server-config.md).
 
 Setup for external projects: [`../docs/integrate-external-project.md`](../docs/integrate-external-project.md).
 
