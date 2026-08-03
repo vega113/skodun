@@ -124,11 +124,26 @@ role     = "finder"
 # the finder is allowed (the config loads fine) but defeats the point: a
 # model re-examining its own work tends to agree with itself, and
 # `triage --adopt-refuter` prints a WARNING when it detects this.
+#
+# GIVE IT A FALLBACK. This pass has a failure mode the finder does not: when
+# the refuter's own provider is unavailable -- quota, or a metered key the
+# process cannot see -- the pass does not merely skip, it can demote an
+# otherwise-clean finder to untrustworthy, so an outage on the SECOND opinion
+# costs you the first one. A one-entry chain back to a provider you know is up
+# keeps the pass alive:
+#
+#     fallbacks = ["finder"]
+#
+# That is same-family as the finder on the runs where it fires, which is the
+# thing this pass exists to avoid -- but only on the runs where the alternative
+# was no refuter at all. `fallbacks` hop on `unavailable` (quota, auth, missing
+# binary, unknown model), which is exactly the outage this covers.
 [[reviewers]]
-name     = "refuter"
-provider = "openai"
-model    = "gpt-5.4"
-role     = "refuter"
+name      = "refuter"
+provider  = "openai"
+model     = "gpt-5.4"
+role      = "refuter"
+fallbacks = ["finder"]
 
 # --- security pass: an anthropic reviewer, NOT a working example -----------
 #
