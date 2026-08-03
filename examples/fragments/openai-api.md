@@ -67,8 +67,150 @@ Some hosts want a skodun-only name:
 }
 ```
 
-After changing MCP env: **restart** the MCP connection (stdio servers do not
-hot-reload env).
+### When the host does not expand `${VARS}`
+
+Some hosts (Claude Code among them) take the `env` block as **literals** — a
+`"${OPENAI_API_KEY}"` there is passed through verbatim and skodun reports
+`missing api key`. That leaves a bad choice: paste the key into a config file
+that is plaintext on disk and often synced, or go without.
+
+There is a third option — point `command` at a launcher that exports the key
+and execs skodun. The key stays in whatever file already holds your secrets:
+
+```sh
+#!/bin/sh
+# ~/.local/bin/skodun-with-secrets   (chmod 700)
+set -u
+SECRETS="${SKODUN_SECRETS_FILE:-${HOME:-}/.secrets/.env}"
+# ABSOLUTE, for the same reason `command` below must be: the host that spawns
+# this often has a minimal PATH, and `exec skodun` would reintroduce exactly
+# the dependency the absolute `command` was there to avoid.
+SKODUN_BIN="${SKODUN_BIN:-${HOME:-}/.local/bin/skodun}"
+# APPENDED, never prepended: a host may spawn this with a minimal PATH -- the
+# same reason SKODUN_BIN is absolute below -- and `sed`/`head` read the key with
+# no `set -e` to catch their absence, so a missing utility would yield an empty
+# key silently. Appending guarantees they resolve without changing precedence
+# for anything already on PATH; prepending could shadow a provider CLI that
+# skodun goes on to spawn by bare name.
+# `:+` not `:-`: an EMPTY element in PATH means the current directory, so
+# `"${PATH:-}:/usr/bin"` on a stripped environment would silently put CWD on
+# the search path of every provider CLI skodun spawns.
+PATH="${PATH:+$PATH:}/usr/bin:/bin"
+export PATH
+
+# An unexpanded "${OPENAI_API_KEY}" -- what a host that does not expand its env
+# block leaves behind -- is NOT a key, and it is not merely useless: skodun
+# reads OPENAI_API_KEY BEFORE the alias, so a leftover literal would beat the
+# real key this script exports. Cleared, per variable, before anything else
+# looks at them.
+case "${OPENAI_API_KEY:-}" in '${'*) unset OPENAI_API_KEY ;; esac
+case "${SKODUN_OPENAI_API_KEY:-}" in '${'*) unset SKODUN_OPENAI_API_KEY ;; esac
+
+# Only consult the file when neither variable survived that.
+# `-f` as well as `-r`: a readable DIRECTORY passes `-r`, extraction then yields
+# an empty key, and skodun execs without a secret -- auth failing with no hint
+# that the path was never a file.
+if [ -z "${SKODUN_OPENAI_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] \
+        && [ -f "$SECRETS" ] && [ -r "$SECRETS" ]; then
+    # BOTH documented names -- a secrets file may well use the preferred
+    # OPENAI_API_KEY, and looking only for the alias exports nothing.
+    #
+    # The namespaced name is tried FIRST, which is the reverse of skodun's own
+    # env precedence, and deliberately. Those two orders answer different
+    # questions: skodun is picking between variables already in ITS
+    # environment, where the standard name is the likelier one to be set on
+    # purpose; this is picking between entries in a shared secrets FILE, where
+    # a SKODUN_-prefixed entry can only have been written for skodun, and a
+    # generic OPENAI_API_KEY is probably there for something else. Preferring
+    # the generic one would ignore a key the operator scoped to skodun by name.
+    # Only reachable when a file sets both to DIFFERENT values.
+    for name in SKODUN_OPENAI_API_KEY OPENAI_API_KEY; do
+        key=$(sed -n "s/^${name}=//p" "$SECRETS" | head -n 1 \
+              | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/")
+        [ -n "$key" ] && export SKODUN_OPENAI_API_KEY="$key" && break
+    done
+    unset key name
+fi
+exec "$SKODUN_BIN" "$@"
+```
+
+```json
+"skodun": { "type": "stdio",
+            "command": "/absolute/path/to/skodun-with-secrets",
+            "args": ["mcp"], "env": {} }
+```
+
+**Leave the MCP `env` block empty.** Migrating from the `"${OPENAI_API_KEY}"`
+recipe above? Delete that entry. On a host that does not expand it the literal
+is still *non-empty*, so a launcher checking only for emptiness would skip the
+secrets file and hand skodun a useless value — auth fails with the real key
+sitting unread. The gate above treats a leftover `${...}` as unset for exactly
+that reason, but removing the entry is clearer than relying on the guard.
+
+**Extract the one variable; do not source the file.** A secrets file usually
+holds credentials for unrelated systems — databases, cloud accounts — and
+skodun spawns third-party provider CLIs that inherit its environment. Sourcing
+the whole file hands every one of those secrets to every model subprocess.
+`SKODUN_OPENAI_API_KEY` is the only one that is skodun's business.
+
+The same launcher is the right home for the spend ceiling, since it applies
+however skodun was started. **These two lines go in the script above**, on the
+line before `exec` -- not in a file of their own, and not in the MCP `env`
+block, which the launcher deliberately leaves empty:
+
+```sh
+# ...key extraction above...
+
+# Your ceiling. `:-` so an explicit value from the caller still wins. Pick the
+# number deliberately -- skodun's own default is 10, so a launcher that sets
+# anything else means `skodun` started through it and `skodun` started directly
+# do not agree.
+# Only when the caller named NO ceiling at all. skodun resolves four names in
+# order -- the per-provider _PER_DAY, the per-provider alias without it, then
+# the two global equivalents -- and the first set one wins. Defaulting the
+# _PER_DAY name unconditionally would therefore MASK a caller who set only the
+# alias, silently replacing their number with this one.
+#
+# A leftover unexpanded ${...} from a half-migrated env block counts as unset,
+# exactly as it does for the key above.
+for _n in SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY \
+          SKODUN_OPENAI_API_SPEND_LIMIT_USD \
+          SKODUN_API_SPEND_LIMIT_USD_PER_DAY \
+          SKODUN_API_SPEND_LIMIT_USD; do
+    eval "_v=\${$_n:-}"
+    case "$_v" in '${'*) unset "$_n"; _v= ;; esac
+    [ -n "$_v" ] && _have_limit=1
+done
+if [ -z "${_have_limit:-}" ]; then
+    SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY=10
+    export SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY
+fi
+unset _n _v _have_limit
+
+exec "$SKODUN_BIN" "$@"
+```
+
+**What that extraction handles:** a plain `NAME=value` line, optionally wrapped
+in single or double quotes. It is not a dotenv parser -- a trailing inline
+comment (`NAME=value # note`) ends up in the key and authentication fails with
+the secret sitting right there in the file. Keep the line plain, or extend the
+`sed` if your file needs more.
+
+A shell rc is not equivalent, and neither is a shell *env* file. Know what each
+one actually covers before relying on it:
+
+| Where | Applies to |
+|---|---|
+| the launcher | every `skodun` started through it, **whatever the shell, or none** |
+| `~/.zshenv` | every **zsh**, interactive or not — but not bash, and not a process spawned directly |
+| `~/.zshrc` | **interactive zsh only** — a script, a CI step or an agent tool silently gets the default ceiling |
+
+Only the launcher is shell-independent, because it sets the variable itself
+rather than relying on something having sourced a file first. A shell file is a
+useful complement for `skodun` typed at a prompt; it is not a substitute.
+
+After changing MCP env — or the launcher — **restart** the MCP connection
+(stdio servers do not hot-reload env).
 
 Agent tool call (absolute `repo`):
 
@@ -125,6 +267,9 @@ export SKODUN_OPENAI_API_OUTPUT_USD_PER_1M=4.0
 
 1. Install skodun (`pip` / pipx); `skodun providers` lists `openai-api`.
 2. Add `[[reviewers]]` with `provider = "openai-api"` and the model you want.
-3. Put `OPENAI_API_KEY` (or alias) in **MCP server env** and/or the user shell.
+3. Get the key into the skodun **process**: the user shell for CLI use, and for
+   MCP either an `env` block your host really expands **or** the launcher above
+   with `env: {}`. Do not leave a half-migrated `"${OPENAI_API_KEY}"` behind —
+   see the launcher section for why a leftover literal is worse than nothing.
 4. Restart MCP; call `review` with absolute `repo` + `reviewer` name.
 5. Watch spend notes on stderr / store; raise or lower the daily limit as needed.
