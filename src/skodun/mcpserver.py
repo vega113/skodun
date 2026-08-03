@@ -455,9 +455,12 @@ def drain_timeout_sec() -> float:
     """Seconds to wait under drain before cancelling a stuck review.
 
     Positive number from ``SKODUN_MCP_DRAIN_TIMEOUT_SECONDS``, else the default
-    (2h). Junk / negative → default. Exact ``0`` disables the ceiling (join
-    until the worker finishes or an external cancel arrives).
+    (2h). Junk / negative / non-finite (``nan``/``inf``) → default. Exact
+    ``0`` disables the ceiling (join until the worker finishes or an external
+    cancel arrives).
     """
+    import math
+
     raw = os.environ.get(DRAIN_TIMEOUT_ENV)
     if raw is None or not str(raw).strip():
         return float(DEFAULT_DRAIN_TIMEOUT_SEC)
@@ -465,7 +468,8 @@ def drain_timeout_sec() -> float:
         value = float(str(raw).strip())
     except ValueError:
         return float(DEFAULT_DRAIN_TIMEOUT_SEC)
-    if value < 0:
+    # nan/inf must not disable the ceiling or break Thread.join(timeout=…).
+    if not math.isfinite(value) or value < 0:
         return float(DEFAULT_DRAIN_TIMEOUT_SEC)
     return value
 
