@@ -22,9 +22,10 @@ Three properties are worth more than the rest and each has its own section:
     that raises leaves the rounds undelivered, and a completed buffer write is
     never "delivered".
 
-The end-to-end cancellation drill lives here too, because the mechanism only
-exists once both ends are real: a `skodun mcp` SUBPROCESS, a hanging fake
-provider, and a closed stdin.
+The end-to-end disconnect drills live here too, because the mechanism only
+exists once both ends are real: a `skodun mcp` SUBPROCESS, a fake provider, and
+a closed stdin. Default disconnect is **drain** (review finishes); cancel-on-
+disconnect is opt-in via ``SKODUN_MCP_DISCONNECT=cancel``.
 """
 
 from __future__ import annotations
@@ -1328,25 +1329,20 @@ def _group_alive(pgid: int) -> bool:
 
 
 def test_closing_stdin_cancels_the_review_in_flight_end_to_end(tmp_path):
-    """THE DRILL. A real `skodun mcp` process, a real review, and a closed stdin.
+    """Cancel-on-disconnect drill (opt-in ``SKODUN_MCP_DISCONNECT=cancel``).
 
-    Every link in the chain is exercised exactly once here and nowhere else:
-    stdin EOF -> the server sets the token -> `svc_review` -> `run_review`'s pass
-    boundaries -> `chain.run_chain` -> the watchdog tick loop, which is the only
-    layer holding the provider's process group. Then back out: the pipeline's
-    `finally` demotes the record and releases the lock, the server JOINS the
-    review thread, and the process exits 0.
+    Every link in the chain is exercised: stdin EOF -> the server sets the token
+    -> `svc_review` -> `run_review` -> chain -> the watchdog tick loop (provider
+    process group). Then: demote record, release lock, join, exit 0.
 
-    The four assertions are the four ways this fails in production: the process
-    hangs (or exits non-zero, which every client harness reports as a crashed
-    server), the record is left `running` for a stale sweep to find a whole budget
-    later, the foreground lock is left behind so the next review waits out the
-    ceiling, or the model keeps burning quota on a review nobody will read.
+    Default disconnect is **drain** (separate test). This pins the legacy cancel
+    path operators can re-enable when they want session end to abort work.
     """
     from skodun.gitio import git_common_dir
 
     repo, bindir = _hang_repo(tmp_path)
     env = _env(tmp_path)
+    env["SKODUN_MCP_DISCONNECT"] = "cancel"
     env["SKODUN_GROK_BIN"] = str(bindir / "grok")
     env["SKODUN_ALLOW_MAIN"] = "1"
     env["SKODUN_SECURITY_PASS"] = "0"
@@ -1406,6 +1402,82 @@ def test_closing_stdin_cancels_the_review_in_flight_end_to_end(tmp_path):
         "the cancelled review kept the foreground lock"
 
 
+def test_closing_stdin_drains_the_review_so_it_finishes_end_to_end(tmp_path):
+    """Default disconnect policy: session EOF does not cancel; review completes.
+
+    A slow-but-finite provider starts, stdin closes mid-flight, and the process
+    must wait for a real terminal store row (clean) rather than aborting to
+    failed/cancelled. That is the restart-safe path.
+    """
+    from tests.test_pipeline import CLEAN, _emit, _fake_grok
+    from skodun.gitio import git_common_dir
+
+    # Start marker + short sleep + clean emit: long enough to close stdin while
+    # running, short enough for a 120s wait. `$D` expands in the fake grok shim.
+    _fake_grok(
+        tmp_path,
+        'python3 -c "import os; open(\'$D/started.pgid\',\'w\')'
+        '.write(str(os.getpgid(0)))"\n'
+        "sleep 1\n"
+        + _emit(CLEAN),
+    )
+
+    repo = _mkrepo(tmp_path)
+    (repo / ".skodun.toml").write_text(CFG, encoding="utf-8")
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    bindir = tmp_path / "bin"
+
+    env = _env(tmp_path)
+    # Explicit drain (also the default) so a dirty env cannot fluke cancel.
+    env["SKODUN_MCP_DISCONNECT"] = "drain"
+    env["SKODUN_GROK_BIN"] = str(bindir / "grok")
+    env["SKODUN_ALLOW_MAIN"] = "1"
+    env["SKODUN_SECURITY_PASS"] = "0"
+    env["SKODUN_SKEPTIC_PASS"] = "0"
+    env["SKODUN_LOCK_WAIT_SECONDS"] = "5"
+    env["SKODUN_LOCK_POLL_SECONDS"] = "0.05"
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "skodun", "mcp"], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+        start_new_session=True)
+    pgid_file = bindir / "started.pgid"
+    try:
+        proc.stdin.write(_HANDSHAKE)
+        proc.stdin.write(_rpc("tools/call", 1, name="review",
+                              arguments={"repo": str(repo)}))
+        proc.stdin.flush()
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and not pgid_file.exists():
+            assert proc.poll() is None, "the server exited before reviewing"
+            time.sleep(0.05)
+        assert pgid_file.exists(), "the provider never started"
+        proc.stdin.close()                  # EOF while review still running
+        rc = proc.wait(timeout=120)
+        out, err = proc.stdout.read(), proc.stderr.read()
+    finally:
+        if proc.poll() is None:             # pragma: no cover - defensive
+            proc.kill()
+            proc.wait(timeout=30)
+        proc.stdout.close()
+        proc.stderr.close()
+
+    assert rc == 0, err.decode()
+    assert b"Traceback" not in err, err.decode()
+    assert b"disconnect policy=drain" in err, err.decode()
+    for line in out.decode().splitlines():
+        assert json.loads(line)["jsonrpc"] == "2.0"
+
+    with Store.open(Path(env["SKODUN_DB"])) as st:
+        rows = st.list_reviews(None, 10)
+    assert len(rows) == 1, rows
+    # Drain finishes the work: not cancelled/failed-from-cancel.
+    assert rows[0]["status"] not in ("running",), rows[0]
+    assert rows[0].get("trustworthy") is True, rows[0]
+    assert not (git_common_dir(repo) / "grok-reviews-foreground.lock").exists()
+
+
 def test_the_server_joins_the_review_thread_before_exiting(tmp_path):
     """Skipping the join is a named mutation, and this is the test it dies on.
 
@@ -1413,11 +1485,14 @@ def test_the_server_joins_the_review_thread_before_exiting(tmp_path):
     mid-write: a `running` row, a held lock, and an orphaned provider group. The
     ORDERING is what is asserted -- the review's own record must be terminal by
     the time the process is gone, which is only true if the exit waited for it.
+
+    Uses cancel-on-disconnect so a hanging provider still terminates promptly.
     """
     from skodun.gitio import git_common_dir
 
     repo, bindir = _hang_repo(tmp_path)
     env = _env(tmp_path)
+    env["SKODUN_MCP_DISCONNECT"] = "cancel"
     env["SKODUN_GROK_BIN"] = str(bindir / "grok")
     env["SKODUN_ALLOW_MAIN"] = "1"
     env["SKODUN_LOCK_WAIT_SECONDS"] = "5"

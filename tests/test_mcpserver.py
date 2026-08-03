@@ -439,9 +439,15 @@ def test_the_registry_types_are_the_pinned_contract():
 
 
 def test_the_serverinfo_names_skodun_and_its_own_version():
+    from skodun.store import SCHEMA_VERSION
+
     code, out, _ = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25"))
     result = _responses(out.data, "initialize")[0]["result"]
-    assert result["serverInfo"] == {"name": "skodun", "version": skodun.__version__}
+    assert result["serverInfo"] == {
+        "name": "skodun",
+        "version": skodun.__version__,
+        "schemaVersion": SCHEMA_VERSION,
+    }
     assert result["capabilities"] == {"tools": {}, "prompts": {}}
 
 
@@ -508,6 +514,41 @@ def test_a_handler_that_returns_nonsense_is_a_tool_error_not_a_crash():
     assert result["isError"] is True
     assert result["structuredContent"]["status"] == 2
     assert "liar" in result["content"][0]["text"]
+
+
+def test_schema_behind_tool_failure_tells_agents_to_restart_mcp_not_use_cli():
+    """When store schema is newer than this build, agents must restart MCP —
+    not shell out to CLI. The tool text is the only signal most agents see."""
+    from skodun.store import schema_too_new_message
+
+    def boom(call):
+        raise ValueError(schema_too_new_message(99))
+
+    registry = (HandlerSpec(name="gate", long_running=False, input_schema={},
+                            handler=boom),)
+    code, out, err = _drive(
+        _HANDSHAKE + _rpc("tools/call", 2, name="gate", arguments={}),
+        registry=registry)
+    assert code == 0, err.getvalue()
+    result = _responses(out.data, "gate")[-1]["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "schema-behind" in text
+    assert "Restart this MCP server" in text
+    assert "do not fall back to the CLI" in text
+    assert "gate" in text
+
+
+def test_handler_failure_text_formats_schema_behind_and_generic():
+    from skodun.mcpserver import _handler_failure_text
+    from skodun.store import schema_too_new_message
+
+    schema = _handler_failure_text("review", ValueError(schema_too_new_message(9)))
+    assert "schema-behind" in schema
+    assert "do not fall back to the CLI" in schema
+    generic = _handler_failure_text("log", RuntimeError("disk full"))
+    assert "the tool failed" in generic
+    assert "disk full" in generic
 
 
 # --------------------------------------------------------------------------
@@ -768,13 +809,14 @@ def test_the_slot_is_free_as_soon_as_the_handler_is_done_not_when_the_write_is()
         assert got[id_]["result"]["isError"] is False, got[id_]
 
 
-def test_eof_cancels_the_review_in_flight_and_joins_its_thread_before_exiting():
-    """The mechanism Task 14 hangs real cancellation on. Two facts: the handler
-    OBSERVES its cancellation token set, and its response is on stdout before
-    `serve` returns -- i.e. the loop joined instead of abandoning the thread
-    mid-write, which would either lose the response or write it into a stream
-    the process had already finished with.
+def test_eof_drains_the_review_in_flight_without_cancelling(monkeypatch):
+    """Default disconnect policy is drain: session end must not abort a review.
+
+    Operator MCP restarts and host reloads close stdin; cancelling would throw
+    away the in-flight work. The server joins the worker without setting the
+    cancel token, and the tool response is still written before serve returns.
     """
+    monkeypatch.delenv("SKODUN_MCP_DISCONNECT", raising=False)
     fakes = _Fakes(hold_review=True)
     pipe, out = _Pipe(), _Recorder()
     server = _server(registry=fakes.registry(), stdin=pipe.reader, stdout=out)
@@ -784,14 +826,50 @@ def test_eof_cancels_the_review_in_flight_and_joins_its_thread_before_exiting():
         pipe.send(_rpc("tools/call", 1, name="review", arguments={}))
         _wait_until(fakes.started.is_set, what="the review to start")
         pipe.close()                      # EOF with a review still running
+        # Drain: release the held review so it can finish without cancel.
+        fakes.release.set()
+        t.join(timeout=10)
+    finally:
+        fakes.release.set()
+        pipe.cleanup()
+    assert not t.is_alive(), "serve() did not return"
+    assert box["code"] == 0
+    assert fakes.cancel_seen == [False], (
+        "default drain must not set the cancel token on EOF")
+    assert 1 in _by_id(out), "the in-flight review's response was abandoned"
+
+
+def test_eof_cancels_when_disconnect_policy_is_cancel(monkeypatch):
+    """Legacy cancel-on-disconnect is opt-in via SKODUN_MCP_DISCONNECT=cancel."""
+    monkeypatch.setenv("SKODUN_MCP_DISCONNECT", "cancel")
+    fakes = _Fakes(hold_review=True)
+    pipe, out = _Pipe(), _Recorder()
+    server = _server(registry=fakes.registry(), stdin=pipe.reader, stdout=out)
+    t, box = _serve_in_thread(server)
+    try:
+        pipe.send(_HANDSHAKE)
+        pipe.send(_rpc("tools/call", 1, name="review", arguments={}))
+        _wait_until(fakes.started.is_set, what="the review to start")
+        pipe.close()
         t.join(timeout=10)
     finally:
         pipe.cleanup()
     assert not t.is_alive(), "serve() did not return"
     assert box["code"] == 0
     assert fakes.cancel_seen == [True], (
-        "the handler did not see its cancellation token set at EOF")
+        "cancel policy must set the cancel token at EOF")
     assert 1 in _by_id(out), "the in-flight review's response was abandoned"
+
+
+def test_disconnect_policy_defaults_to_drain(monkeypatch):
+    from skodun.mcpserver import disconnect_policy
+
+    monkeypatch.delenv("SKODUN_MCP_DISCONNECT", raising=False)
+    assert disconnect_policy() == "drain"
+    monkeypatch.setenv("SKODUN_MCP_DISCONNECT", "CANCEL")
+    assert disconnect_policy() == "cancel"
+    monkeypatch.setenv("SKODUN_MCP_DISCONNECT", "nope")
+    assert disconnect_policy() == "drain"
 
 
 def test_an_id_less_call_never_occupies_the_review_slot():

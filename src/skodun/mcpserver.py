@@ -47,6 +47,7 @@ bug the delivery ledger exists to remove.
 """
 
 import json
+import os
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -108,6 +109,22 @@ BUSY_TEXT = "review already in flight"
 #: Distinct from ``None`` (a valid previous disposition from ``signal.signal``)
 #: so restore does not leave a review-scoped handler installed forever.
 _SIGTERM_INSTALL_FAILED = object()
+
+#: How the server treats an in-flight `review` when the client disconnects
+#: (stdin EOF / session end) or the read loop otherwise stops.
+#:
+#: * ``drain`` (default) — do **not** set the cancel token; join the worker so
+#:   the review can finalize to the store. Operator MCP restarts and host
+#:   reloads must not throw away minutes of model work or leave a cancelled
+#:   row that never covers the tree.
+#: * ``cancel`` — set the cancel token then join (legacy). Explicit
+#:   ``review_cancel`` / cross-process SIGTERM still cancel regardless.
+#:
+#: Override with ``SKODUN_MCP_DISCONNECT=cancel`` or ``=drain``.
+DISCONNECT_POLICY_ENV = "SKODUN_MCP_DISCONNECT"
+DISCONNECT_DRAIN = "drain"
+DISCONNECT_CANCEL = "cancel"
+DEFAULT_DISCONNECT_POLICY = DISCONNECT_DRAIN
 
 #: The status a busy refusal and a failed handler report. 2 is the gate
 #: contract's "no trustworthy review covers this content" -- the conservative
@@ -418,13 +435,26 @@ def _handle_gate(call: "HandlerCall") -> "HandlerResult":
     return HandlerResult(status=status, text=text)
 
 
+def disconnect_policy() -> str:
+    """``drain`` (default) or ``cancel`` for in-flight review on session end."""
+    raw = (os.environ.get(DISCONNECT_POLICY_ENV) or DEFAULT_DISCONNECT_POLICY)
+    value = str(raw).strip().lower()
+    if value == DISCONNECT_CANCEL:
+        return DISCONNECT_CANCEL
+    return DISCONNECT_DRAIN
+
+
 def _handle_review(call: "HandlerCall") -> "HandlerResult":
     """The long-running one. `call.cancel` is the whole point of it being so.
 
-    The token is set by the read loop when the client's stdin reaches EOF, and it
-    travels from here into `run_review`, its pass boundaries, the chain, and
-    finally the watchdog tick loop -- the only layer holding the provider's
-    process group. `svc_review` turns the resulting `ReviewCancelled` into
+    The token is set by **explicit cancel** (MCP ``review_cancel``, CLI
+    ``review-cancel``, or the main-thread SIGTERM forwarder used for
+    cross-process cancel) — not by a normal session end. On stdin EOF the
+    server **drains** by default: it joins this thread without setting the
+    token so the review can finalize into the store (restart-safe). Set
+    ``SKODUN_MCP_DISCONNECT=cancel`` to restore legacy cancel-on-disconnect.
+    The token still travels into `run_review`, pass boundaries, the chain, and
+    the watchdog tick loop. `svc_review` turns `ReviewCancelled` into
     `(4, "... reason=review cancelled")`, so this thread returns an ordinary tool
     result rather than raising, and the server joins it before exiting 0.
 
@@ -775,11 +805,13 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                         "be in flight per server -- a second call while one is "
                         "running is refused, not queued (a queue would review a "
                         "moved tree). CLI uses FIFO review-fg capacity + the "
-                        "legacy FG lock instead. Closing the session cancels "
-                        "the review in flight. Status 0 = clean, 1 = findings "
-                        "open, 2 = nothing ran (including busy refusal), "
-                        "3 = gave up waiting for capacity/lock, 4 = no "
-                        "trustworthy review exists."),
+                        "legacy FG lock instead. Closing the session DRAINS by "
+                        "default (review finishes into the store; set "
+                        "SKODUN_MCP_DISCONNECT=cancel to abort). Explicit "
+                        "review_cancel / review-cancel still cancel. Status 0 "
+                        "= clean, 1 = findings open, 2 = nothing ran "
+                        "(including busy refusal), 3 = gave up waiting for "
+                        "capacity/lock, 4 = no trustworthy review exists."),
         HandlerSpec(
             name="log", long_running=False,
             input_schema=_schema({
@@ -1055,6 +1087,24 @@ def default_store_factory():
     from .cli import _store_path
     from .store import Store
     return Store.open(_store_path())
+
+
+def _handler_failure_text(tool_name: str, exc: BaseException) -> str:
+    """Tool-visible failure text for a raised handler.
+
+    Schema-behind (store written by a newer skodun than this MCP process) is
+    the failure that most often causes agents to abandon MCP for the CLI —
+    which is the wrong fix. Surface the remediation in the tool text itself.
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, ValueError) and "newer than this skodun" in str(exc):
+        return (
+            f"skodun {tool_name}: MCP is schema-behind the store ({detail}). "
+            "Restart this MCP server so it loads the same upgraded skodun as "
+            f"`skodun --version` / doctor; do not fall back to the CLI for "
+            f"{tool_name} while MCP stays on the old build."
+        )
+    return f"skodun {tool_name}: the tool failed: {exc!r}"
 
 
 def _validate_result(res) -> str | None:
@@ -1406,9 +1456,18 @@ class McpServer:
         # refused. Nothing here is stateful enough for a re-handshake to
         # corrupt, and refusing one would invent a failure mode.
         self._initialized = True
+        # schemaVersion is additive: agents/ops can detect CLI/MCP install skew
+        # before a tool call hits the store. Clients that only read name/version
+        # ignore the extra field. Imported lazily so cold `skodun mcp` still
+        # avoids paying for sqlite until a tool needs the store.
+        from .store import SCHEMA_VERSION
         return {"protocolVersion": negotiated,
                 "capabilities": {"tools": {}, "prompts": {}},
-                "serverInfo": {"name": SERVER_NAME, "version": self._version}}
+                "serverInfo": {
+                    "name": SERVER_NAME,
+                    "version": self._version,
+                    "schemaVersion": SCHEMA_VERSION,
+                }}
 
     def _m_ping(self, params: dict, id_) -> dict:
         return {}
@@ -1481,7 +1540,7 @@ class McpServer:
             self._note(f"the {spec.name} tool raised: {e!r}")
             return HandlerResult(
                 status=HANDLER_FAILURE_STATUS,
-                text=f"skodun {spec.name}: the tool failed: {e!r}",
+                text=_handler_failure_text(spec.name, e),
                 pending_acks=[])
         problem = _validate_result(res)
         if problem is not None:
@@ -1634,13 +1693,22 @@ class McpServer:
     # -- shutdown ---------------------------------------------------------
 
     def _shutdown(self) -> int:
-        """Cancel the review in flight, wait for it, and report a clean 0.
+        """End the session: join the long-running worker, then return 0.
+
+        Default disconnect policy is **drain** (see ``disconnect_policy`` /
+        ``SKODUN_MCP_DISCONNECT``): do **not** set the cancel token on session
+        end so an in-flight review can finish and write its store record. That
+        is how an MCP restart or host reload avoids losing ongoing work.
+        ``SKODUN_MCP_DISCONNECT=cancel`` restores the old cancel-then-join
+        behaviour. Explicit ``review_cancel`` / SIGTERM still cancel while the
+        process is alive.
 
         The join is UNBOUNDED on purpose. A review holds the foreground lock and
         is about to write a record; abandoning it mid-write to make the process
         exit a little sooner would leave a `running` row behind and a provider
-        process group with no parent. What bounds this wait is the cancellation
-        token, which Task 14 threads all the way into the provider watchdog.
+        process group with no parent. Under cancel policy, what bounds this wait
+        is the cancellation token (threaded into the provider watchdog). Under
+        drain, the wait is the real review runtime.
 
         The token is the LAST review's. Only one review executes at a time, so
         any earlier thread still in `_workers` has already finished its handler
@@ -1648,8 +1716,19 @@ class McpServer:
         """
         with self._slot_lock:
             workers, cancel = list(self._workers), self._worker_cancel
-        if cancel is not None:
-            cancel.set()
+        alive = [w for w in workers if w.is_alive()]
+        policy = disconnect_policy()
+        if alive:
+            if policy == DISCONNECT_CANCEL and cancel is not None:
+                self._note(
+                    "disconnect policy=cancel; cancelling in-flight review "
+                    "before exit")
+                cancel.set()
+            else:
+                self._note(
+                    "disconnect policy=drain; waiting for in-flight review to "
+                    "finish (set SKODUN_MCP_DISCONNECT=cancel to abort on "
+                    "disconnect)")
         for worker in workers:
             if worker.is_alive():
                 self._note(f"waiting for {worker.name} to finish before exiting")

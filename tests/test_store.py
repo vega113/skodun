@@ -1175,7 +1175,11 @@ def test_future_schema_error_names_the_version(tmp_path):
     raw.close()
     with pytest.raises(ValueError) as e:
         Store.open(db)
-    assert "v99" in str(e.value)
+    msg = str(e.value)
+    assert "v99" in msg
+    assert f"v{SCHEMA_VERSION}" in msg or f"understands v{SCHEMA_VERSION}" in msg
+    assert "restart MCP" in msg
+    assert "do not fall back to the CLI" in msg
 
 
 def test_a_store_one_version_above_this_build_is_refused_untouched(tmp_path):
