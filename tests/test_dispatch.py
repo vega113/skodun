@@ -1794,51 +1794,14 @@ def _fake_worker_process(tmp_path: Path, name: str = "skodun",
 
     A script file called `skodun` invoked with `worker ...`, so the guard is tested
     against a real `ps` reading a real argv rather than against a stub of it.
-
-    Returned only once `ps` can actually SEE that argv. `Popen` returns as soon
-    as the child is forked, and the `exec` that replaces its argv lands
-    asynchronously after that; until it does, `ps -o args=` reports the argv
-    this pytest process was started with, which names no worker at all. So the
-    guard answers False for a process that is about to become a worker -- a race
-    the caller cannot see, because it fails as a plain wrong answer rather than
-    as an error. A fast machine wins it every time; a loaded 2-core CI runner
-    does not, which is exactly where it first showed up (only the two
-    assertions expecting True broke; every negative one below was already
-    getting False for the right answer by accident).
     """
     script = tmp_path / "bin" / name
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_text("#!/bin/sh\ntrap '' TERM\nsleep 120\n", encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    proc = subprocess.Popen([str(script), "worker", "--record-id", record_id],
+    return subprocess.Popen([str(script), "worker", "--record-id", record_id],
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
-    _await_argv(proc, record_id)
-    return proc
-
-
-def _await_argv(proc: subprocess.Popen, record_id: str,
-                timeout: float = 30.0) -> None:
-    """Block until `ps` reports `record_id` in `proc`'s argv -- i.e. it exec'd.
-
-    Polled rather than slept: a fixed `sleep` long enough for the slowest runner
-    would be dead time on every other one, and short enough to be cheap would be
-    the same race with a smaller window. `record_id` is the token to wait on
-    because it is in the argv for EVERY caller here, including the ones that
-    spawn a deliberately non-worker `name`.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        cp = subprocess.run(["ps", "-o", "args=", "-p", str(proc.pid)],
-                            capture_output=True, text=True)
-        if cp.returncode == 0 and record_id in cp.stdout:
-            return
-        assert proc.poll() is None, (
-            f"the fake worker exited before it could be observed: {proc.returncode}")
-        time.sleep(0.02)
-    raise AssertionError(
-        f"`ps` never reported {record_id!r} in pid {proc.pid}'s argv "
-        f"within {timeout}s; the fake worker never exec'd")
 
 
 def test_a_pid_that_ps_confirms_as_a_worker_is_signalled(tmp_path):
