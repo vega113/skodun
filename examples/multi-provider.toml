@@ -20,6 +20,68 @@
 # `anthropic` is NOT registered -- see the commented `security` block below.
 # Run `skodun providers` to check what THIS machine actually has.
 
+# --- auto-route: let skodun pick which finder heads an un-pinned review ----
+#
+# Without this table, every review that does NOT pass `--reviewer` starts at
+# the FIRST enabled `finder` below -- so on a machine running several agents
+# they all pile into one provider's FIFO while the others sit idle. `mode =
+# "auto"` scores the pool at head resolution instead, from what the store can
+# actually see: free `provider:<id>` slots, queue depth, and `provider_state`
+# quota blackouts.
+#
+# `off` is the SHIPPED DEFAULT. It is `auto` here because this file is the
+# multi-provider example and auto-routing is the reason to have more than one
+# finder configured -- a single-provider config gains nothing from it.
+#
+# Three properties worth knowing before you turn it on:
+#
+#   * A PIN STILL WINS, in every mode. `--reviewer finder-openai` (MCP:
+#     `{"reviewer": "finder-openai"}`) is absolute -- that is what makes it
+#     usable for a deliberate second opinion.
+#   * SCORED ONCE, at the start of the run. It does not re-route while waiting
+#     for a slot; once a head is chosen, that entry's own `fallbacks` chain
+#     handles failure exactly as it does today.
+#   * IT CHANGES NOTHING WHILE NOTHING IS BUSY. Ties go to the entry you listed
+#     first, so with every provider idle `auto` heads the same entry `off`
+#     would have. It deviates only once load actually differs.
+#   * EXTRA PASSES ARE NOT ROUTED. The security, skeptic, refuter and
+#     integration passes still pick by ROLE, so a refuter you deliberately put
+#     on another provider stays there.
+#
+# Every review records `routed_reviewer` and `route_reason` (`pinned`,
+# `config-finder`, `auto:free`, `auto:free+cross`, `auto:wait`, …) on its
+# artifact, so a spread can be explained after the fact.
+#
+# Env override, for turning this off on one machine without editing the file:
+#   export SKODUN_ROUTING_MODE=off        # or auto
+[routing]
+mode = "auto"
+
+# The entries the router may choose between, by NAME. Omit the key entirely to
+# mean "every enabled role = finder entry", which is what most configs want --
+# this list is here to show the shape, and because an explicit pool is how you
+# keep a finder configured (for pinning) while excluding it from automatic
+# selection -- and that exclusion holds even when the pool is fully blacked
+# out, so an entry you kept out never heads an automatic run.
+#
+# Names are validated at load: one that does not exist, is disabled, or is not
+# a finder is a loud config error, not a silently smaller pool. So is a pooled
+# entry whose provider has no adapter, refused in preflight rather than routed
+# around -- a typo found only on the runs where the other providers happened to
+# be busy is a typo not found at all.
+pool = ["finder", "finder-openai"]
+
+# Soft preference for a finder whose provider FAMILY differs from the calling
+# client's (`--client-family xai`, MCP `client_family`, or
+# $SKODUN_CLIENT_FAMILY). Families: xai / openai (both the codex CLI and
+# openai-api -- two doors to the same models) / google / junie.
+#
+# SOFT is the whole design. It is worth a tie-break between two providers that
+# are equally free; it never outranks a free slot, and it never excludes the
+# last available family -- a single-provider machine still gets reviewed.
+# Default true; set false if you would rather score on availability alone.
+cross_model = true
+
 # --- the finder, with a same-role fallback on a different provider ---------
 #
 # `fallbacks` is tried, in order, only when the head reviewer's OWN attempt

@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-from skodun import pipeline, runner
+from skodun import capacity, pipeline, runner
 from skodun.adapters import REVIEW_CONTRACT
 from skodun.cli import main
 from skodun.config import load_config
@@ -1418,3 +1418,191 @@ def test_ts_format_is_imported_from_store_not_a_second_literal():
     assert "%Y-%m-%dT%H:%M:%SZ" not in src, (
         "pipeline.py still spells out the timestamp format literal directly "
         "somewhere instead of using the imported store._TS_FORMAT")
+
+
+# --- S5: routing metadata on the record -------------------------------------
+# Four ADDITIVE artifact fields, serialized into `artifact_json` with the rest
+# of the record — no schema bump, and a record written before they existed is
+# simply one without them.
+
+#: A second finder on a DIFFERENT provider, so that a routed head is visibly a
+#: different `provider:<id>` queue and not just a different entry name.
+_SECOND_FINDER = """
+[[reviewers]]
+name = "finder-codex"
+provider = "openai"
+model = "gpt-5.4-codex"
+role = "finder"
+"""
+
+
+def _hold_xai(st: Store) -> None:
+    """One admitted holder on `provider:xai` — the config finder's own queue.
+
+    A run that heads xai from here cannot admit at all, which is the point: it
+    is what "the head is sticky" costs, and what auto-routing avoids.
+    """
+    st.capacity_enqueue(admission_id="held",
+                        resource_class=capacity.provider_resource_class("xai"),
+                        scope="xai")
+    st.capacity_force_admit("held")
+
+
+def test_the_record_carries_the_route_audit_on_a_default_run(tmp_path, capsys):
+    """`mode = "off"` is the shipped default: the config's own finder, said so."""
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path)
+    st = _store(tmp_path)
+
+    rec = _run(repo, st)
+
+    assert rec["requested_reviewer"] is None
+    assert rec["routed_reviewer"] == "finder"
+    assert rec["route_reason"] == "config-finder"
+    assert rec["client_family"] is None
+    # ...and it survives the round trip, which is what makes it an audit.
+    assert st.get_review(rec["id"])["route_reason"] == "config-finder"
+
+
+def test_a_pinned_run_records_the_pin_as_both_requested_and_routed(tmp_path,
+                                                                   capsys):
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path)
+    st = _store(tmp_path)
+
+    rec = _run(repo, st, reviewer="finder")
+
+    assert rec["requested_reviewer"] == "finder"
+    assert rec["routed_reviewer"] == "finder"
+    assert rec["route_reason"] == "pinned"
+
+
+def test_an_auto_run_heads_a_different_provider_than_mode_off_would(
+        tmp_path, capsys, monkeypatch):
+    """The whole point of S5, end to end: the config's finder is busy, so the
+    idle provider heads the run — and the record says which rule did it.
+
+    Hermetic: `SKODUN_CODEX_BIN` names nothing, and a missing binary is detected
+    BEFORE spawning, so this costs no process. The review itself is therefore
+    untrustworthy — which is the honest outcome for a provider this machine
+    cannot run, and irrelevant to what is asserted here. That the attempt was
+    made against `openai` at all is the proof the head really moved.
+    """
+    _fake_grok(tmp_path, _emit(CLEAN))
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(tmp_path / "no-such-codex"))
+    repo = _repo(tmp_path, '\n[routing]\nmode = "auto"\n' + _SECOND_FINDER)
+    st = _store(tmp_path)
+    _hold_xai(st)
+
+    rec = _run(repo, st, client_family="openai")
+
+    assert rec["routed_reviewer"] == "finder-codex"
+    assert rec["route_reason"] == "auto:free"
+    assert rec["client_family"] == "openai"
+    assert [a["provider"] for a in rec["attempts"]] == ["openai"]
+
+
+def test_the_same_config_with_mode_off_still_heads_the_config_finder(
+        tmp_path, capsys, monkeypatch):
+    """The control for the test above, and the case S5 exists for: without
+    `mode = "auto"` the busy provider keeps the head, so this review queues
+    behind the holder and gives up with an idle provider sitting right there."""
+    _fake_grok(tmp_path, _emit(CLEAN))
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(tmp_path / "no-such-codex"))
+    # This run is EXPECTED to wait out the provider slot it can never get, so
+    # the wait is shortened: the assertion is about which queue it joined.
+    monkeypatch.setenv("SKODUN_ADMISSION_WAIT_SECONDS", "1")
+    repo = _repo(tmp_path, _SECOND_FINDER)
+    st = _store(tmp_path)
+    _hold_xai(st)
+
+    rec = _run(repo, st, client_family="openai")
+
+    assert rec["routed_reviewer"] == "finder"
+    assert rec["route_reason"] == "config-finder"
+    assert rec["trustworthy"] is False
+    assert "finder/xai" in rec["failure_reason"]
+
+
+def test_a_pin_beats_auto_routing(tmp_path, capsys, monkeypatch):
+    """`mode = "auto"` does not weaken a pin: it is absolute in every mode."""
+    _fake_grok(tmp_path, _emit(CLEAN))
+    monkeypatch.setenv("SKODUN_ADMISSION_WAIT_SECONDS", "1")
+    repo = _repo(tmp_path, '\n[routing]\nmode = "auto"\n' + _SECOND_FINDER)
+    st = _store(tmp_path)
+    _hold_xai(st)
+
+    rec = _run(repo, st, reviewer="finder")
+
+    assert rec["routed_reviewer"] == "finder"
+    assert rec["route_reason"] == "pinned"
+    # ...and it really did join the busy queue rather than the idle one the
+    # router would have chosen. A pin is a decision, including a costly one.
+    assert "finder/xai" in rec["failure_reason"]
+
+
+def test_a_pooled_entry_with_no_adapter_is_refused_not_routed_around(
+        tmp_path, capsys):
+    """Fail closed on a config error the router would otherwise hide.
+
+    `provider_loads` marks a provider with no adapter unavailable, so without
+    the preflight the router would quietly pick the healthy finder and the typo
+    would surface only on the runs where that one happened to be busy. A
+    misconfiguration found by luck of the load is not found at all.
+    """
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path, '\n[routing]\nmode = "auto"\n' + """
+[[reviewers]]
+name = "finder-typo"
+provider = "opeani"
+model = "gpt-5.4"
+role = "finder"
+""")
+    st = _store(tmp_path)
+
+    with pytest.raises(PreflightRefused) as e:
+        _run(repo, st)
+
+    assert "finder-typo" in str(e.value)
+    assert "no adapter for provider 'opeani'" in str(e.value)
+    assert "no review ran" in str(e.value)
+
+
+def test_mode_off_does_not_preflight_the_pool(tmp_path, capsys):
+    """The pool is only a set of candidates when the router may use it. With
+    routing off nothing can reach that entry, so it is not this run's graph and
+    refusing on it would refuse configs that worked before S5."""
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path, """
+[[reviewers]]
+name = "finder-typo"
+provider = "opeani"
+model = "gpt-5.4"
+role = "finder"
+""")
+    st = _store(tmp_path)
+
+    rec = _run(repo, st)
+
+    assert rec["trustworthy"] is True
+    assert rec["routed_reviewer"] == "finder"
+
+
+def test_a_pin_is_not_refused_by_an_unrelated_pool_typo(tmp_path, capsys):
+    """A pin is absolute in every mode, and that has to survive the preflight
+    the test above adds: a pinned run never consults the pool, so a pooled
+    entry is not a reviewer THAT run may reach for."""
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _repo(tmp_path, '\n[routing]\nmode = "auto"\n' + """
+[[reviewers]]
+name = "finder-typo"
+provider = "opeani"
+model = "gpt-5.4"
+role = "finder"
+""")
+    st = _store(tmp_path)
+
+    rec = _run(repo, st, reviewer="finder")
+
+    assert rec["trustworthy"] is True
+    assert rec["route_reason"] == "pinned"

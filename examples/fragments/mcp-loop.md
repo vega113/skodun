@@ -25,7 +25,7 @@ separate MCP processes or CLI — definitions in
 | Tool | Use |
 |---|---|
 | `gate` | Does a trustworthy review cover **this** tree? Status **0** = stop |
-| `review` | One foreground review (minutes). Optional `reviewer` = config **entry name** |
+| `review` | One foreground review (minutes). **Omit `reviewer`** unless you want a specific entry — see below. Optional `client_family` declares your own model family |
 | `log` | Recent history (not a gate) |
 | `surface` | Undelivered background rounds (not a gate) |
 | `review_status` | Observe in-flight / terminal lifecycle (not a gate) |
@@ -54,11 +54,29 @@ Operator detail: [`mcp-server-config.md`](mcp-server-config.md).
 
 1. Finish edits; freeze the tree.
 2. Call `gate` with `repo`. If status `0`, **stop** (already covered).
-3. Call `review` **once** with `repo`. Do not start a second `review` while one
-   is in flight (refused: `review already in flight`).
+3. Call `review` **once** with `repo`, normally with **no `reviewer`**. Do not
+   start a second `review` while one is in flight (refused: `review already in
+   flight`).
 4. Summarize findings for a human. Do **not** dismiss/defer unless the human
    decided.
 5. Call `gate` again. **Stop at 0** — not at “reviewer found nothing.”
+
+### Which reviewer runs (omit `reviewer` by default)
+
+When the operator has `[routing] mode = "auto"`, **omitting `reviewer` lets
+skodun pick a finder whose provider has a free slot** instead of piling onto a
+busy one. Pinning by habit defeats that for every other agent on the machine.
+
+- **Omit `reviewer`** — the normal case.
+- **Pin `reviewer`** only for a deliberate second opinion, or a provider you
+  know is healthy when skodun does not. A pin is absolute in every mode.
+- **`client_family`** (optional, e.g. `"xai"` if you are Grok) asks for a
+  finder from a *different* model family when one is equally free. Soft: it
+  never blocks a review. Most hosts can skip it — skodun already guesses from
+  the MCP handshake, and `SKODUN_CLIENT_FAMILY` covers the rest.
+
+With routing `off` (the default), omitting `reviewer` simply uses the
+configured finder, exactly as before.
 
 ### Escalation (do not iterate forever)
 

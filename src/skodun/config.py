@@ -389,6 +389,136 @@ def _bounded_dispatch_int(key: str, value: object, minimum: int) -> int:
     return value
 
 
+#: The `[routing] mode` vocabulary. `off` is today's behaviour (the config's
+#: first enabled `finder` heads every un-pinned run); `auto` lets the router
+#: choose among the pool by store-visible load. Two values on purpose: a mode
+#: is a POLICY switch, and every additional policy that is not implemented is a
+#: config a user can write and skodun will silently not honour.
+ROUTING_MODES = frozenset({"off", "auto"})
+
+#: Operator override for `[routing] mode`, read at `load_config` time so that
+#: every surface (CLI, MCP, hooks) sees one effective mode. Set -> wins over
+#: both config layers; unset or empty -> the config decides. A value that is not
+#: a mode is LOUD for the same reason a mistyped table key is: an operator who
+#: exported `SKODUN_ROUTING_MODE=Auto` asked for auto-routing and would
+#: otherwise be silently left on `off`.
+ROUTING_MODE_ENV = "SKODUN_ROUTING_MODE"
+
+
+@dataclass(frozen=True)
+class Routing:
+    """The `[routing]` table: who heads a review nobody pinned.
+
+    Routing answers ONE question -- which `[[reviewers]]` entry starts the chain
+    when the caller named none -- and it answers it once, at head resolution. It
+    is not a scheduler: the `provider:<id>` FIFO admission that follows is
+    unchanged, and so are the head entry's own `fallbacks`. The router only
+    chooses which queue to join.
+
+    * `mode` -- `off` (default) is pre-S5 behaviour, kept as the default for the
+      first release so that enabling multi-provider review is a decision an
+      operator makes rather than one an upgrade makes for them. `auto` scores
+      the pool (see `routing.pick_finder`).
+    * `pool` -- the `[[reviewers]]` NAMES the router may choose between. Empty
+      (the default) means every enabled `role = "finder"` entry, which is what
+      a multi-provider config already spells out. Names are validated against
+      the merged reviewer table, exactly like `fallbacks`.
+    * `cross_model` -- whether a finder whose provider family differs from the
+      calling client's gets a soft preference. A BONUS, never an exclusion: the
+      last available family must still be able to review.
+
+    A pin (`--reviewer` / the MCP `reviewer` argument) ignores this table
+    entirely, in every mode.
+    """
+
+    mode: str = "off"
+    pool: tuple[str, ...] = ()
+    cross_model: bool = True
+
+
+#: The `[routing]` bool fields, validated as EXACT bools -- `_strict_bool`'s
+#: reasoning applies unchanged (`cross_model = "false"` must never enable it).
+_ROUTING_FLAGS = ("cross_model",)
+
+
+def _routing_mode(value: object, *, source: str) -> str:
+    """Validate a routing mode from config or env, or raise naming `source`."""
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{source}: expected one of {sorted(ROUTING_MODES)}, got "
+            f"{type(value).__name__}")
+    if value not in ROUTING_MODES:
+        raise ValueError(
+            f"{source}: unknown mode {value!r}; known modes are "
+            f"{sorted(ROUTING_MODES)}")
+    return value
+
+
+def _routing_pool(value: object) -> tuple[str, ...]:
+    """Normalize `[routing] pool` into a tuple of names, or raise.
+
+    A bare string is refused for the reason `_fallback_tuple` gives: it is
+    iterable, so `pool = "finder-grok"` would otherwise become eleven
+    single-letter reviewer names nobody configured. A repeated name is refused
+    because a pool is a SET of candidates -- listing one twice cannot mean
+    anything the router could honour, so it is a typo.
+
+    Spelled out rather than delegated to `_str_tuple` only because that helper
+    names `[defaults]` in its messages, and a user whose `[routing] pool` is
+    wrong must not be sent to a table they did not write.
+    """
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"[routing] pool: expected an array of strings, got "
+            f"{type(value).__name__}")
+    seen: set[str] = set()
+    out: list[str] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            raise ValueError(
+                f"[routing] pool: entry {i} must be a string, got "
+                f"{type(item).__name__}")
+        if not item.strip():
+            raise ValueError(f"[routing] pool: entry {i} must not be empty")
+        if item in seen:
+            raise ValueError(f"[routing] pool: {item!r} listed more than once")
+        seen.add(item)
+        out.append(item)
+    return tuple(out)
+
+
+def _strict_routing_bool(key: str, value: object) -> bool:
+    """`_strict_bool` for `[routing]`, naming that table in the message."""
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"[routing] {key}: expected true or false, got "
+            f"{type(value).__name__}")
+    return value
+
+
+def _validate_routing(routing: Routing, reviewers: tuple[Reviewer, ...]) -> None:
+    """Validate `[routing] pool` against the fully merged reviewer table.
+
+    Runs after every layer is merged, exactly like `_validate_fallbacks`, and
+    is loud for the same reason: a pool naming an entry that does not exist, is
+    disabled, or is not a finder would silently shrink the set of providers the
+    router may spread load across -- which looks like "auto-routing does not
+    work" rather than like the typo it is.
+    """
+    by_name = {r.name: r for r in reviewers}
+    for name in routing.pool:
+        entry = by_name.get(name)
+        if entry is None:
+            raise ValueError(
+                f"[routing] pool: reviewer {name!r} does not exist")
+        if not entry.enabled:
+            raise ValueError(f"[routing] pool: reviewer {name!r} is disabled")
+        if entry.role != "finder":
+            raise ValueError(
+                f"[routing] pool: reviewer {name!r} has role {entry.role!r}; "
+                f"the pool may only name 'finder' entries")
+
+
 @dataclass(frozen=True)
 class Config:
     # Reviewers are selected by ROLE: `pipeline._reviewer_for` takes the first
@@ -412,6 +542,10 @@ class Config:
     dispatch: Dispatch = Dispatch()
     #: The `[retention]` table. Same defaulting posture as `dispatch`.
     retention: Retention = Retention()
+    #: The `[routing]` table. Same defaulting posture as `dispatch`, and the
+    #: default (`mode="off"`) is pre-S5 head selection, so a config that has
+    #: never heard of routing behaves exactly as it did.
+    routing: Routing = Routing()
     #: The `[schedule]` table (launchd job specs). Empty by default.
     schedule_jobs: tuple = ()
 
@@ -595,6 +729,7 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     dvals: dict = {}
     pvals: dict = {}
     retvals: dict = {}
+    routevals: dict = {}
     rmap: dict[str, dict] = {}
     order: list[str] = []
     for layer in layers:
@@ -603,6 +738,7 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
         # dispatch key keeps the global file's answer for the others.
         pvals.update(layer.get("dispatch", {}))
         retvals.update(layer.get("retention", {}))
+        routevals.update(layer.get("routing", {}))
         for entry in layer.get("reviewers", []):
             if "name" not in entry:
                 raise ValueError("reviewer entry is missing its required 'name' key")
@@ -641,6 +777,27 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     for key, minimum in _RETENTION_MINIMUMS.items():
         if key in retvals:
             retvals[key] = _bounded_retention_int(key, retvals[key], minimum)
+    routeknown = {f.name for f in fields(Routing)}
+    routeunknown = set(routevals) - routeknown
+    if routeunknown:
+        raise ValueError(f"unknown [routing] keys: {sorted(routeunknown)}")
+    if "mode" in routevals:
+        routevals["mode"] = _routing_mode(routevals["mode"],
+                                          source="[routing] mode")
+    if "pool" in routevals:
+        routevals["pool"] = _routing_pool(routevals["pool"])
+    for key in _ROUTING_FLAGS:
+        if key in routevals:
+            routevals[key] = _strict_routing_bool(key, routevals[key])
+    # LAST, so it wins over both config layers: the env is the operator saying
+    # "not on this machine / not on this run", and that has to beat a file
+    # somebody else's install wrote. Unset and empty are both "no opinion" --
+    # `SKODUN_ROUTING_MODE=` in a wrapper script must not silently mean `off`.
+    env_mode = os.environ.get(ROUTING_MODE_ENV)
+    if env_mode is not None and env_mode.strip():
+        routevals["mode"] = _routing_mode(env_mode.strip(),
+                                          source=ROUTING_MODE_ENV)
+
     rknown = {f.name for f in fields(Reviewer)}
     reviewers = []
     for name in order:
@@ -655,6 +812,8 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
         reviewers.append(_validate(Reviewer(**e)))
     reviewers = tuple(reviewers)
     _validate_fallbacks(reviewers)
+    routing = Routing(**routevals)
+    _validate_routing(routing, reviewers)
     # Schedule jobs are validated in schedule.parse_schedule_table; keep the
     # raw table merge simple (last layer wins for the whole jobs list).
     schedule_raw = {}
@@ -667,6 +826,7 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     return Config(defaults=Defaults(**dvals), reviewers=reviewers,
                   dispatch=Dispatch(**pvals),
                   retention=Retention(**retvals),
+                  routing=routing,
                   schedule_jobs=schedule_cfg.jobs)
 
 

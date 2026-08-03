@@ -1,7 +1,7 @@
 # Epic S5 — Provider auto-route (load balance across finders)
 
 > **Live issue:** https://github.com/vega113/skodun/issues/69
-> **Status:** design + plan reviewed; Phase A open via child issues.
+> **Status:** Phase A implemented (default `mode = "off"`); Phase B not started.
 > **Plan:** `docs/superpowers/plans/2026-08-03-s5-provider-auto-route.md`  
 > **Depends on:** S4 provider slots + `provider_state` (shipped).  
 > **Related:** [`s4-multi-slot-provider-concurrency.md`](s4-multi-slot-provider-concurrency.md),
@@ -44,20 +44,29 @@ store signals.
 
 ### Phase A — MVP (ship first)
 
-- [ ] Auto-route mode selectable: config and/or env (default **off** until
-      proven, or **on** with safe pool = all enabled finders — decide in design).
-- [ ] When auto-route is on and caller did **not** pass `reviewer`, pick a
+- [x] Auto-route mode selectable: `[routing] mode` plus `SKODUN_ROUTING_MODE`.
+      Default **off**; pool defaults to all enabled finders.
+- [x] When auto-route is on and caller did **not** pass `reviewer`, pick a
       **finder entry** before first provider acquire using store-visible signals:
       free slots / queue depth / `provider_state` blackout / live holder count.
-- [ ] Explicit `reviewer` / `--reviewer` **always wins** (no silent override).
-- [ ] Record on the review artifact: `requested_reviewer`, `routed_reviewer`,
-      `route_reason` (auditable).
-- [ ] Optional **client family** hint: if client is Grok (or `client_family=xai`),
-      prefer a non-xai finder when available (cross-model review preference).
-- [ ] Same path for CLI and MCP; MCP may pass `client_family` from host metadata
-      or env; CLI via env/`--client-family` optional.
-- [ ] Docs: concurrency + AGENTS fragments; tests for pin vs auto vs cross-model.
-- [ ] Gate/trust unchanged.
+      Scored once, at head resolution (`pipeline.resolve_review_head`).
+- [x] Explicit `reviewer` / `--reviewer` **always wins** (no silent override).
+- [x] Record on the review artifact: `requested_reviewer`, `routed_reviewer`,
+      `route_reason`, `client_family` (artifact fields only — no schema bump).
+- [x] Optional **client family** hint: soft `+20` for a different family; never
+      a hard exclusion, so the last available family still reviews.
+- [x] Same path for CLI and MCP (`services.svc_review` → `run_review`). MCP
+      resolves `client_family` from the tool argument, then
+      `SKODUN_CLIENT_FAMILY`, then the handshake `clientInfo.name`; CLI has
+      `--client-family` and the same env.
+- [x] Docs: README, concurrency + mcp-loop + AGENTS fragments,
+      `examples/multi-provider.toml`; tests for pin vs auto vs cross-model.
+- [x] Gate/trust unchanged.
+
+**Not routed in Phase A** (deliberate, recorded here so it is not mistaken for
+an oversight): the background pre-push worker. It is a different surface with a
+reserved, identity-pinned record; the design's diagram covers the foreground
+loop.
 
 ### Phase B — Weights (later)
 
@@ -89,9 +98,12 @@ store signals.
 
 ---
 
-## Open product decisions (resolve in PR 0 / design)
+## Product decisions (resolved)
 
-1. Default: auto-route **on** vs **opt-in** for one release.  
-2. Pool: all enabled `role=finder` entries vs explicit `route_pool = [...]`.  
-3. How client family is detected (MCP `clientInfo.name`, env, flag).  
-4. Whether “prefer non-matching family” is hard constraint or soft score.
+1. Default: **opt-in** — `mode = "off"` on first merge; `examples/multi-provider.toml`
+   ships `auto` because that is the config auto-routing exists for.
+2. Pool: **all enabled `role=finder`** by default; `[routing] pool` narrows it
+   by name, validated against the merged reviewer table.
+3. Client family: explicit flag/argument → `SKODUN_CLIENT_FAMILY` → MCP
+   `clientInfo.name` heuristic → undeclared (availability-only scoring).
+4. Cross-model is a **soft score** (`+20`), never a hard constraint.

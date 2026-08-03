@@ -31,11 +31,14 @@ trustworthy review must cover it.
   the only command that answers that question. Exit `0` clean or all findings
   triaged, `1` findings still open, `2` nothing trustworthy covers this content.
 - `skodun review` — run a review now, in the foreground. Minutes, and it spends
-  model calls. Do not run two at once; they serialize on a lock. Add
-  `--reviewer <name>` (MCP: `{"reviewer": "<name>"}`) to head this one review
-  with a named reviewer entry — a second opinion, or a provider you know is
-  healthy. A name that does not resolve is refused before anything runs, and the
-  refusal lists the configured names; do not retry with a guess.
+  model calls. Do not run two at once; they serialize on a lock. **Normally
+  pass no `--reviewer`**: where the operator enabled `[routing] mode = "auto"`,
+  that is what lets skodun send this review to a provider with a free slot
+  instead of a busy one. Add `--reviewer <name>` (MCP: `{"reviewer": "<name>"}`)
+  when you want a specific entry — a deliberate second opinion, or a provider
+  you know is healthy. A pin is absolute; a name that does not resolve is
+  refused before anything runs, and the refusal lists the configured names, so
+  do not retry with a guess.
 - `skodun triage --list <review-id>` — the findings, with their triage state
   (`OPEN`, `DISMISSED`, `DEFERRED -> <ref>`, `REOPENED`).
 - `skodun triage --defer <review-id> <n> <tracking-ref> "<reason>"` — record that

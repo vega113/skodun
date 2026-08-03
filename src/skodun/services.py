@@ -146,7 +146,7 @@ def svc_gate(store, repo) -> tuple[int, str]:
 
 
 def svc_review(store, repo, *, progress_sink=None, cancel=None,
-               reviewer=None) -> tuple[int, str]:
+               reviewer=None, client_family=None) -> tuple[int, str]:
     """Run one foreground review. `(code, banner)`. Exit codes, and why:
 
       0  trustworthy and clean            3  gave up waiting for the lock
@@ -167,6 +167,23 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
     `PreflightRefused` the 2 branch below already renders. That is what makes
     them word-for-word identical across the two surfaces without either surface
     — or this module — owning the words.
+
+    `client_family` is the caller's own model family (`skodun review
+    --client-family`, the MCP `review` tool's `client_family`), and it is
+    likewise one request arriving through two doors. It matters only when the
+    config enables auto-routing and nobody pinned a reviewer, where it buys a
+    soft preference for a DIFFERENT family — a second opinion when one is going
+    spare. `None` falls through to `SKODUN_CLIENT_FAMILY` and then to nothing,
+    and "nothing" is a perfectly good answer: the router then scores on
+    availability alone. Passed through unvalidated for the same reason
+    `reviewer` is: `routing.normalize_family` owns what counts as a family, and
+    that vocabulary is deliberately OPEN -- an unlisted provider's family is its
+    own id, so a new adapter's family is a legitimate value and there is no
+    closed set to check against. A family this install has no finder from cannot
+    misroute (the bonus lands on every candidate at once, leaving the order
+    untouched) but it also cannot do anything, so the router names the families
+    it actually has rather than leave an operator believing cross-model review
+    is on. Never a review it refuses to run.
 
     The banner is DERIVED here, from the record `run_review` returns, through
     `trust.banner` — the one definition of it. The pipeline itself prints
@@ -226,7 +243,8 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
 
     try:
         rec = run_review(root, cfg, store, progress_sink=progress_sink,
-                         cancel=cancel, reviewer=reviewer)
+                         cancel=cancel, reviewer=reviewer,
+                         client_family=client_family)
     except PreflightRefused as e:
         return 2, banner_failure(str(e))
     except LockTimeout as e:

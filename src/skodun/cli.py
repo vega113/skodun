@@ -111,6 +111,19 @@ def build_parser() -> argparse.ArgumentParser:
                              "head this review's chain, instead of the "
                              "config's own 'finder' role (default: the "
                              "config decides)")
+    # The FAMILY of the model asking for the review, not a reviewer and not a
+    # provider: it is what makes "prefer a second opinion" expressible. Read
+    # only when `[routing] mode = "auto"` and nothing was pinned, where it is
+    # worth one tie-break between otherwise equal candidates. Omitted ->
+    # `SKODUN_CLIENT_FAMILY`, and then nothing at all, which scores on
+    # availability alone.
+    review.add_argument("--client-family", default=None, dest="client_family",
+                        metavar="FAMILY",
+                        help="the calling client's own model family (xai, "
+                             "openai, google, junie); with [routing] "
+                             "mode=auto and no --reviewer, prefers a finder "
+                             "from a different family when one is free "
+                             "(default: $SKODUN_CLIENT_FAMILY, else none)")
 
     # Epic S1: observe / cancel without a second gate. Hyphenated CLI names
     # match install-hooks / import-legacy; MCP tools use underscores like the
@@ -679,8 +692,10 @@ def _cmd_review(args) -> int:
         # this seam has not read, and the MCP tool must be refused in the same
         # words. `getattr` because `_cmd_review` is called by name in the suite
         # with hand-built argument objects that predate the flag.
-        code, text = svc_review(store, Path(args.repo),
-                                reviewer=getattr(args, "reviewer", None))
+        code, text = svc_review(
+            store, Path(args.repo),
+            reviewer=getattr(args, "reviewer", None),
+            client_family=getattr(args, "client_family", None))
     return _emit(text, code)
 
 

@@ -3210,3 +3210,51 @@ def test_the_declared_package_version_matches_the_one_the_code_reports():
         f"pyproject.toml declares {declared!r} but skodun.__version__ is "
         f"{skodun.__version__!r}; a client reading the MCP server's "
         f"serverInfo.version would be told the wrong build")
+
+
+# --- S5: --client-family ----------------------------------------------------
+# The caller's own model family, forwarded to the one service both surfaces
+# use. Nothing about it is validated here: `routing.normalize_family` owns what
+# counts as a family, and a value it cannot read is a tie-break skodun declines
+# to apply, never a review it refuses to run.
+
+
+def _svc_review_kwargs(monkeypatch, argv, capsys) -> dict:
+    """Run `skodun review` with the SERVICE stubbed; return what it was given."""
+    from skodun import services
+
+    seen: dict = {}
+
+    def fake(store, repo, **kw):
+        seen.update(kw)
+        return 0, "SKODUN VERDICT: trustworthy=true findings=0"
+
+    monkeypatch.setattr(services, "svc_review", fake)
+    assert main(argv) == 0
+    capsys.readouterr()
+    return seen
+
+
+def test_client_family_reaches_the_service(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    seen = _svc_review_kwargs(
+        monkeypatch,
+        ["review", "--repo", str(tmp_path), "--client-family", "xai"], capsys)
+    assert seen["client_family"] == "xai"
+
+
+def test_an_omitted_client_family_is_not_a_declaration(tmp_path, monkeypatch,
+                                                       capsys):
+    """None, not `""`: the env fallback lives in `routing.resolve_client_family`,
+    and a CLI that pre-empted it with an empty string would disable it."""
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    seen = _svc_review_kwargs(monkeypatch, ["review", "--repo", str(tmp_path)],
+                              capsys)
+    assert seen["client_family"] is None
+
+
+def test_review_help_documents_the_flag_and_its_env_fallback(capsys):
+    main(["review", "--help"])
+    out = capsys.readouterr().out
+    assert "--client-family" in out
+    assert "SKODUN_CLIENT_FAMILY" in out

@@ -6,7 +6,8 @@ import pytest
 from skodun.config import (
     _DEFAULTS_MINIMUMS, _DISPATCH_FLAGS, _DISPATCH_MINIMUMS,
     SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOT_NAMES, SECURITY_PROMPT_SLOTS,
-    Defaults, Dispatch, Reviewer, load_config,
+    _ROUTING_FLAGS, ROUTING_MODE_ENV,
+    Defaults, Dispatch, Reviewer, Routing, load_config,
 )
 
 
@@ -1180,3 +1181,172 @@ model = "m"
     assert cfg.defaults.timeout_sec == 411      # the two tables are separate
     assert cfg.dispatch.timeout_sec == 7
     assert [r.name for r in cfg.reviewers] == ["finder"]
+
+
+# --- [routing] (epic S5) ----------------------------------------------------
+# Which finder entry heads a review nobody pinned. `mode = "off"` is the
+# shipped default and is pre-S5 selection exactly, so a config that has never
+# heard of routing behaves as it always did; the env override exists because an
+# operator has to be able to say "not on this machine" without editing a file
+# somebody else's install wrote.
+
+
+@pytest.fixture(autouse=True)
+def _no_routing_env(monkeypatch):
+    """No test in this module inherits the developer's own routing mode."""
+    monkeypatch.delenv(ROUTING_MODE_ENV, raising=False)
+
+
+def test_routing_defaults_are_off_with_an_implicit_pool():
+    cfg = load_config(None, global_path=None)
+    assert cfg.routing == Routing()
+    assert (cfg.routing.mode, cfg.routing.pool, cfg.routing.cross_model) == (
+        "off", (), True)
+
+
+def test_routing_values_load_and_the_project_layer_wins(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[routing]
+mode = "auto"
+cross_model = false
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+[[reviewers]]
+name = "b"
+provider = "openai"
+model = "m"
+""")
+    repo = tmp_path / "repo"; repo.mkdir()
+    _write(repo / ".skodun.toml", """
+[routing]
+pool = ["b", "a"]
+""")
+    r = load_config(repo, global_path=g).routing
+    assert r.mode == "auto"              # global key survives the merge
+    assert r.cross_model is False
+    assert r.pool == ("b", "a")          # project layer contributes its own key
+
+
+def test_routing_rejects_an_unknown_key(tmp_path):
+    g = _write(tmp_path / "g.toml", "[routing]\nweights = 1\n")
+    with pytest.raises(ValueError, match=r"unknown \[routing\] keys: \['weights'\]"):
+        load_config(None, global_path=g)
+
+
+def test_routing_rejects_an_unknown_mode(tmp_path):
+    g = _write(tmp_path / "g.toml", '[routing]\nmode = "weighted"\n')
+    with pytest.raises(ValueError,
+                       match=r"\[routing\] mode: unknown mode 'weighted'"):
+        load_config(None, global_path=g)
+
+
+def test_routing_rejects_a_non_string_mode(tmp_path):
+    g = _write(tmp_path / "g.toml", "[routing]\nmode = true\n")
+    with pytest.raises(ValueError, match=r"\[routing\] mode: expected one of"):
+        load_config(None, global_path=g)
+
+
+@pytest.mark.parametrize("literal, shown", [
+    ('"finder"', "str"), ("[1]", "int"), ('[["a"]]', "list"),
+])
+def test_routing_pool_rejects_a_bad_shape(tmp_path, literal, shown):
+    """A bare string is iterable; without the check it becomes letter-names."""
+    g = _write(tmp_path / "g.toml", f"[routing]\npool = {literal}\n")
+    with pytest.raises(ValueError, match=rf"\[routing\] pool: .*{shown}"):
+        load_config(None, global_path=g)
+
+
+def test_routing_pool_rejects_a_repeated_name(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[routing]
+pool = ["a", "a"]
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+""")
+    with pytest.raises(ValueError,
+                       match=r"\[routing\] pool: 'a' listed more than once"):
+        load_config(None, global_path=g)
+
+
+def test_routing_pool_rejects_a_name_nobody_configured(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[routing]
+pool = ["ghost"]
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+""")
+    with pytest.raises(ValueError,
+                       match=r"\[routing\] pool: reviewer 'ghost' does not exist"):
+        load_config(None, global_path=g)
+
+
+def test_routing_pool_rejects_a_disabled_entry(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[routing]
+pool = ["a"]
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+enabled = false
+""")
+    with pytest.raises(ValueError,
+                       match=r"\[routing\] pool: reviewer 'a' is disabled"):
+        load_config(None, global_path=g)
+
+
+def test_routing_pool_rejects_a_non_finder_entry(tmp_path):
+    """A pool naming the refuter would quietly shrink the candidate set."""
+    g = _write(tmp_path / "g.toml", """
+[routing]
+pool = ["r"]
+[[reviewers]]
+name = "r"
+provider = "xai"
+model = "m"
+role = "refuter"
+""")
+    with pytest.raises(ValueError,
+                       match=r"\[routing\] pool: reviewer 'r' has role 'refuter'"):
+        load_config(None, global_path=g)
+
+
+def test_routing_cross_model_rejects_anything_but_a_bool(tmp_path):
+    g = _write(tmp_path / "g.toml", '[routing]\ncross_model = "false"\n')
+    with pytest.raises(
+            ValueError,
+            match=r"\[routing\] cross_model: expected true or false, got str"):
+        load_config(None, global_path=g)
+
+
+def test_routing_flags_cover_every_bool_field_of_routing():
+    flags = {f.name for f in fields(Routing) if f.type in ("bool", bool)}
+    assert flags == set(_ROUTING_FLAGS)
+
+
+def test_routing_mode_env_overrides_both_config_layers(tmp_path, monkeypatch):
+    g = _write(tmp_path / "g.toml", '[routing]\nmode = "auto"\n')
+    monkeypatch.setenv(ROUTING_MODE_ENV, "off")
+    assert load_config(None, global_path=g).routing.mode == "off"
+    monkeypatch.setenv(ROUTING_MODE_ENV, " auto ")
+    assert load_config(None, global_path=None).routing.mode == "auto"
+
+
+def test_an_empty_routing_mode_env_is_no_opinion(tmp_path, monkeypatch):
+    """A wrapper script's `SKODUN_ROUTING_MODE=` must not silently mean off."""
+    g = _write(tmp_path / "g.toml", '[routing]\nmode = "auto"\n')
+    monkeypatch.setenv(ROUTING_MODE_ENV, "")
+    assert load_config(None, global_path=g).routing.mode == "auto"
+
+
+def test_a_bad_routing_mode_env_is_loud(monkeypatch):
+    monkeypatch.setenv(ROUTING_MODE_ENV, "Auto")
+    with pytest.raises(ValueError,
+                       match=rf"{ROUTING_MODE_ENV}: unknown mode 'Auto'"):
+        load_config(None, global_path=None)
