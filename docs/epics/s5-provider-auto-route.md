@@ -1,6 +1,8 @@
 # Epic S5 — Provider auto-route (load balance across finders)
 
-> **Status:** design seed (not shipped).  
+> **Live issue:** https://github.com/vega113/skodun/issues/69
+> **Status:** design + plan reviewed; Phase A open via child issues.
+> **Plan:** `docs/superpowers/plans/2026-08-03-s5-provider-auto-route.md`  
 > **Depends on:** S4 provider slots + `provider_state` (shipped).  
 > **Related:** [`s4-multi-slot-provider-concurrency.md`](s4-multi-slot-provider-concurrency.md),
 > [`../superpowers/specs/2026-08-03-provider-auto-route-design.md`](../superpowers/specs/2026-08-03-provider-auto-route-design.md).
