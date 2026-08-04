@@ -1497,3 +1497,22 @@ model = "m"
 """)
     assert load_config(None, global_path=g).routing.weights == (
         ("xai", 1e300), ("openai", 1e299))
+
+
+def test_routing_weights_reject_an_integer_no_float_can_hold(tmp_path):
+    """TOML integers are arbitrary precision, so `10 ** 400` is a perfectly
+    good `int` that no float can represent -- and `math.isfinite` RAISES
+    `OverflowError` on it rather than answering. An unusable weight has to
+    leave the validator the way every other unusable weight does: as a
+    `ValueError` naming the table and the key."""
+    g = _write(tmp_path / "g.toml", f"""
+[routing]
+weights = {{ xai = {10 ** 400} }}
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+""")
+    with pytest.raises(ValueError,
+                       match=r"\[routing\] weights: 'xai' is too large"):
+        load_config(None, global_path=g)

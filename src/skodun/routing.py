@@ -431,8 +431,11 @@ def pick_finder(pool: Sequence[Reviewer],
     which model reviews, for a reason that has nothing to do with load. First-
     listed is the operator's own stated preference, it is equally deterministic
     for two peers reading the same config, and it gives the property that makes
-    `auto` safe to turn on: while nothing is busy, auto-routing picks exactly
-    what `off` would have picked, and only deviates once load actually differs.
+    `auto` safe to turn on: with no `weights` and no declared `client_family`,
+    auto-routing picks exactly what `off` would have picked while nothing is
+    busy, and only deviates once load actually differs. Those two are the
+    deliberate exceptions -- each breaks an idle tie, and each only when an
+    operator has asked for it.
 
     None means "the caller decides", which for the pipeline is today's first
     enabled finder recorded as `auto:default-finder`. It is NOT a refusal: an

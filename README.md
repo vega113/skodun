@@ -322,7 +322,7 @@ lets skodun choose instead, for runs that pass no `--reviewer`:
 mode        = "auto"    # off (the default) | auto
 pool        = []        # reviewer NAMES; empty means every enabled role=finder
 cross_model = true      # soft preference for a different provider family
-weights     = {}        # declared share per PROVIDER; empty means equal
+weights     = {}        # declared share per PROVIDER; empty means no share term
 weights_window_days = 7 # how far back the served counts are read
 ```
 
@@ -339,9 +339,11 @@ is refused outright, naming the entry, rather than quietly routed around.
 Ties go to the entry you listed first — `[routing] pool` as written, else the
 reviewer table's own order. Two entries on one provider always score
 identically, so an alphabetical tie-break would let a rename decide which model
-reviews. It also gives the property that makes `auto` safe to turn on: **while
-nothing is busy, it picks exactly what `off` would have picked**, and only
-deviates once load actually differs.
+reviews. It also gives the property that makes `auto` safe to turn on: **with
+no weights and no declared client family, while nothing is busy it picks
+exactly what `off` would have picked**, and only deviates once load actually
+differs. `cross_model` and `weights` are the two things that deliberately break
+that tie — each only when you have asked for it.
 
 The properties that make this safe to turn on:
 
@@ -371,8 +373,10 @@ weights = { xai = 3, google = 1 }   # xai should serve ~3 reviews per google's 1
 
 Keyed by **provider id**, not reviewer name: a weight is a statement about a
 subscription, and two `[[reviewers]]` entries on one provider draw on the same
-one. A provider you do not list counts as `1`, so raising one does not mean
-listing them all. Zero and negative are refused — "never route here" is what
+one. In a **non-empty** table, a provider you do not list counts as `1`, so
+raising one does not mean listing them all. An **empty** table — the default —
+is not "everyone equal": the share term is not computed at all, the served
+counts are not read, and scoring is Phase A's exactly. Zero and negative are refused — "never route here" is what
 `pool` and `enabled = false` already say, and a third, silent way to exclude a
 provider is a trap.
 

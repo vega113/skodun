@@ -540,6 +540,19 @@ def _routing_weights(value: object) -> tuple[tuple[str, float], ...]:
             raise ValueError(
                 f"[routing] weights: {provider!r} must be a number, got "
                 f"{type(weight).__name__}")
+        try:
+            weight = float(weight)
+        except OverflowError:
+            # TOML integers are arbitrary precision, so `xai = 10**400` is a
+            # perfectly good `int` that no float can hold -- and `math.isfinite`
+            # raises `OverflowError` on it rather than answering. Converted here
+            # so an unusable weight leaves this function the way every other
+            # unusable weight does: as a `ValueError` naming the table and the
+            # key, not as an exception type the callers do not expect.
+            raise ValueError(
+                f"[routing] weights: {provider!r} is too large to be a share; "
+                f"only the RATIO between weights matters, so use smaller "
+                f"numbers") from None
         if not math.isfinite(weight):
             raise ValueError(
                 f"[routing] weights: {provider!r} must be a finite number, "
@@ -549,7 +562,7 @@ def _routing_weights(value: object) -> tuple[tuple[str, float], ...]:
                 f"[routing] weights: {provider!r} must be greater than 0 "
                 f"(use [routing] pool or enabled = false to exclude a "
                 f"provider; a weight of {weight!r} would exclude it silently)")
-        out.append((provider, float(weight)))
+        out.append((provider, weight))
     # The SUM, not just each term. Two finite weights can add to `inf`
     # (`{ xai = 1e308, openai = 1e308 }`), and the router divides by that
     # total: every target would come out `0.0`, so the declared ratio would be

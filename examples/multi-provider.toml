@@ -94,7 +94,9 @@ cross_model = true
 # Read as a RATIO against what each provider actually served in the last
 # `weights_window_days` (the same counts `skodun providers` prints), so it
 # self-corrects: a provider that got ahead of its share is scored down until
-# the others catch up. A provider you do not list counts as 1. Zero and
+# the others catch up. In a NON-EMPTY table a provider you do not list counts
+# as 1; leaving the table out entirely is not "everyone equal" -- the share
+# term is not computed at all and the served counts are never read. Zero and
 # negative are refused -- "never route here" is what `pool` and
 # `enabled = false` already say, and a third, silent way to exclude a provider
 # is a trap.

@@ -1258,7 +1258,11 @@ def _fmt_routing_header(routing, since_days: int) -> str:
     # on" is the first question an operator has after setting them, and the
     # answer has to be readable beside the `served=` counts they are measured
     # against rather than reconstructed from two config layers by hand.
-    weights = (",".join(f"{shown_field(p)}={w:g}" for p, w in routing.weights)
+    # `repr`, not `:g`: the format spec defaults to six significant digits, so
+    # a configured `1.23456789` would print as `1.23457` -- a diagnostic that
+    # reports a different number from the one the router is using is worse than
+    # no diagnostic. `repr` of a float round-trips.
+    weights = (",".join(f"{shown_field(p)}={w!r}" for p, w in routing.weights)
                if routing.weights else "off")
     return (f"routing: mode={shown_field(routing.mode)} pool={pool} "
             f"cross_model={'on' if routing.cross_model else 'off'} "

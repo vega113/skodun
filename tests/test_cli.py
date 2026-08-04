@@ -3346,7 +3346,8 @@ def test_providers_reports_the_declared_weights_beside_the_served_counts(
     them, and the answer belongs beside the `served=` counts the weights are
     measured against -- not reconstructed from two config layers by hand."""
     monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
-    repo = tmp_path / "w"; repo.mkdir()
+    repo = tmp_path / "w"
+    repo.mkdir()
     (repo / ".skodun.toml").write_text("""
 [routing]
 mode = "auto"
@@ -3364,7 +3365,7 @@ role = "finder"
 """, encoding="utf-8")
     monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "no-global.toml"))
     main(["providers", "--repo", str(repo)])
-    assert "weights=xai=3,openai=1" in capsys.readouterr().out
+    assert "weights=xai=3.0,openai=1.0" in capsys.readouterr().out
 
 
 def test_providers_splits_served_counts_by_how_the_head_was_chosen(
@@ -3483,3 +3484,26 @@ def test_since_days_must_be_a_positive_integer(tmp_path, bad, capsys):
     the invariant that makes the last line of stdout always a verdict."""
     assert main(["providers", "--repo", str(tmp_path), "--since-days", bad]) == 2
     assert capsys.readouterr().out.strip().startswith(BANNER)
+
+
+def test_providers_does_not_round_the_weights_it_reports(tmp_path, monkeypatch,
+                                                         capsys):
+    """A diagnostic that reports a different number from the one the router is
+    using is worse than no diagnostic. `:g` defaults to six significant digits,
+    which silently rewrote a configured weight."""
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    repo = tmp_path / "p"
+    repo.mkdir()
+    (repo / ".skodun.toml").write_text("""
+[routing]
+mode = "auto"
+weights = { xai = 1.23456789 }
+[[reviewers]]
+name = "finder-grok"
+provider = "xai"
+model = "m"
+role = "finder"
+""", encoding="utf-8")
+    monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "no-global.toml"))
+    main(["providers", "--repo", str(repo)])
+    assert "weights=xai=1.23456789" in capsys.readouterr().out
