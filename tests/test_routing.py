@@ -868,3 +868,36 @@ def test_a_blacked_out_provider_is_not_in_the_share_denominators(store):
     assert (with_blackout["openai"].deficit
             - with_blackout["xai"].deficit) == pytest.approx(0.1)
     assert shares["openai"].deficit - shares["xai"].deficit == pytest.approx(1.0)
+
+
+def test_the_served_mapping_uses_the_shipped_adapter_accessor(store):
+    """Every registered provider, credited through `get_adapter` -- the same
+    accessor `pipeline._adapter_for` and the `providers` listing use.
+
+    Reading `.name` off the registry's CLASS works only while every adapter
+    happens to declare it at class level. One that set it in `__init__` would
+    raise inside `provider_served`, `auto_route` would catch it, and weights
+    would go quietly inert while the config still said they were on -- the
+    worst shape of failure for an optional feature.
+    """
+    from skodun.adapters import _REGISTRY, get_adapter
+    from skodun.routing import provider_served
+
+    providers = sorted(_REGISTRY)
+    _seed_served(store, {get_adapter(p).name: i + 1
+                         for i, p in enumerate(providers)})
+
+    served = provider_served(store, providers, window_days=7)
+
+    assert served == {p: i + 1 for i, p in enumerate(providers)}
+
+
+def test_a_provider_with_no_adapter_is_skipped_rather_than_fatal(store):
+    """`provider_loads` has already excluded it, so it is not a candidate and
+    its share is nobody's -- but it must not take the whole term down with it,
+    because `auto_route` would swallow that as "no weights today"."""
+    from skodun.routing import provider_served
+
+    _seed_served(store, {"grok": 3})
+    assert provider_served(store, ["xai", "no-such-provider"],
+                           window_days=7) == {"xai": 3, "no-such-provider": 0}

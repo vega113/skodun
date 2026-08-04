@@ -672,7 +672,7 @@ def provider_served(store, providers: Sequence[str], *,
     index of its own. That is a real cost and a small one beside a review that
     takes minutes, and it is paid only when weights are configured.
     """
-    from .adapters import _REGISTRY
+    from .adapters import get_adapter
     from .pipeline import _iso_at
 
     since = _iso_at(time.time() - max(1, int(window_days)) * 86400.0)
@@ -690,8 +690,22 @@ def provider_served(store, providers: Sequence[str], *,
     # `google`), which are not the same strings for three of the five shipped
     # adapters. Reading `served` as if they were would score every one of them
     # as having served nothing, i.e. permanently owed the whole share.
+    #
+    # Through `get_adapter`, which INSTANTIATES -- the same accessor
+    # `pipeline._adapter_for` and the `providers` listing use. Reading `.name`
+    # off the registry's class works today only because every shipped adapter
+    # happens to declare it at class level; an adapter that set it in
+    # `__init__` would raise here, `auto_route` would catch it, and weights
+    # would go quietly inert while the config still said they were on.
     wanted = set(providers)
-    by_adapter = {_REGISTRY[p].name: p for p in wanted if p in _REGISTRY}
+    by_adapter: dict[str, str] = {}
+    for p in wanted:
+        try:
+            by_adapter[get_adapter(p).name] = p
+        except ValueError:
+            # No adapter for this provider. `provider_loads` has already
+            # excluded it, so it is not a candidate and its share is nobody's.
+            continue
     out: dict[str, int] = {p: 0 for p in wanted}
     for row in rows:
         provider = by_adapter.get(row.get("adapter"))
