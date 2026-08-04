@@ -10,10 +10,12 @@ capacity tables and a fake would only prove the fake.
 
 from __future__ import annotations
 
+import ast
 import time
 
 import pytest
 
+import skodun
 from skodun import capacity, routing
 from skodun.config import Config, Defaults, Reviewer, Routing
 from skodun.routing import (
@@ -951,3 +953,103 @@ def test_pure_load_keeps_the_credit_when_no_soft_term_moved_anything(store):
     # openai is owed the share AND is cross-family, but it is busy and xai has
     # a free slot -- which no soft term may overturn.
     assert (route.reviewer.name, route.reason) == ("finder-a", ROUTE_FREE)
+
+
+def _identifier_sites(tree: ast.AST, target: str) -> set[str]:
+    """Every place `target` is mentioned, as `"<qualified scope>::<kind>"`.
+
+    `def` is the definition itself; `ref` is any other mention -- a call, a
+    bare name, an attribute access, either side of an import (`import x as
+    target` binds the name just as `from x import target` does). Lumping them together is the
+    point: the invariant below is about the identifier being MENTIONED, not
+    about how, so an alias (`head_of = pipeline.resolve_review_head`) is a
+    `ref` exactly like a direct call and cannot slip past a scan looking for
+    one shape.
+
+    An explicit descent, not `ast.walk` per function: `walk` also traverses
+    nested defs, so a mention inside a closure would be attributed to the
+    closure AND to every function around it -- a failure naming several
+    functions when only one of them mentions anything.
+
+    The scope is QUALIFIED (`Outer.method`, `outer.<locals>.inner`) rather than
+    the innermost name alone. Two same-named functions in one file -- methods
+    of different classes, most obviously -- would otherwise collapse to one
+    label, so a second site could hide behind the first and the failure could
+    not be located. Qualified rather than line-numbered because the expected
+    set below must not churn every time something above it moves.
+    """
+    sites: set[str] = set()
+
+    def descend(node: ast.AST, where: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.ClassDef, ast.FunctionDef,
+                                  ast.AsyncFunctionDef)):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and child.name == target:
+                    sites.add(f"{where}::def")
+                qualified = (child.name if where == "<module>"
+                             else f"{where}.{child.name}")
+                descend(child, qualified)   # the nested scope owns its body
+                continue
+            if ((isinstance(child, ast.Name) and child.id == target)
+                    or (isinstance(child, ast.Attribute) and child.attr == target)
+                    or (isinstance(child, ast.alias)
+                        and target in (child.name, child.asname))):
+                sites.add(f"{where}::ref")
+            descend(child, where)
+
+    descend(tree, "<module>")
+    return sites
+
+
+def test_run_review_is_the_only_production_caller_of_head_resolution():
+    """The call-graph half of the Phase A scope note (issue #98).
+
+    `resolve_review_head`'s docstring scopes auto-routing to the foreground
+    loop, and the reviewer who raised it was right that a docstring is weak
+    evidence for a claim about callers. The consequential half -- that the
+    background pre-push worker does not route -- is pinned behaviourally in
+    `tests/test_dispatch.py::test_the_background_worker_does_not_auto_route`,
+    through the shipped entry point and against a config that WOULD route.
+
+    This is the other half, and it catches something that one cannot: a NEW
+    caller on some third surface, acquiring routing semantics nobody decided
+    to give it. `run_prepush_review` picks its head with `_reviewer_for(cfg,
+    "finder")` and `resolve_review_head` now duplicates that selection, so the
+    two are a standing invitation to be collapsed -- and a failure here is the
+    moment to have that conversation rather than to discover it from a
+    background review that routed.
+
+    The assertion is deliberately about the IDENTIFIER rather than about
+    calls, and that is what makes it hard to walk past by accident. Counting
+    call sites invites every alias to defeat it -- `from .pipeline import
+    resolve_review_head as head_of`, or `head_of = pipeline.resolve_review_head`
+    after an `import skodun.pipeline` -- and the way those arrive is somebody
+    being tidy, not somebody evading a test. "The name is written in exactly
+    two places" has no such surface: a reference of any shape, anywhere else,
+    is a site.
+
+    Read from the SOURCE rather than by monkeypatching, because the claim is
+    about what is written: a caller on a branch this test never takes would be
+    invisible to any dynamic check. The one residual gap is string reflection
+    (`getattr(pipeline, "resolve_review_head")`), which no AST check can see
+    and which nobody reaches for by accident.
+    """
+    from pathlib import Path
+
+    src = Path(skodun.__file__).resolve().parent
+    # BYTES, not decoded text: `ast.parse` honours a PEP 263 encoding
+    # declaration itself, while `read_text(encoding="utf-8")` would raise on a
+    # source file that declares another one.
+    sites = {f"{path.relative_to(src)}::{site}"
+             for path in sorted(src.rglob("*.py"))
+             for site in _identifier_sites(
+                 ast.parse(path.read_bytes(), filename=str(path)),
+                 "resolve_review_head")}
+
+    assert sites == {"pipeline.py::<module>::def",
+                     "pipeline.py::_run_review::ref"}, (
+        "`resolve_review_head` is written somewhere new. That is not "
+        "automatically wrong -- it IS a decision about which surfaces "
+        "auto-route, and Phase A scoped it to the foreground review loop. "
+        "Widen this set deliberately, and say so in the function's scope note.")
