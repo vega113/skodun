@@ -766,7 +766,7 @@ def test_the_degraded_fixture_matches_what_the_runner_really_exits_with(
 
 def test_a_row_written_before_midnight_stops_counting_after_it(tmp_path,
                                                                monkeypatch):
-    """"Per UTC day" at the only moment the phrase means anything.
+    """The per-UTC-day rule, at the only moment the phrase means anything.
 
     The test above pins that YESTERDAY does not count, using a row stamped in
     2020 -- which any implementation of "today" gets right, including a wrong
