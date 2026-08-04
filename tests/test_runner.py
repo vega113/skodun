@@ -680,3 +680,33 @@ def test_a_refused_signal_is_reported_rather_than_swallowed(tmp_path,
     said = capsys.readouterr().err
     assert f"provider group {pg} refused signal" in said, said
     assert "EPERM" in said
+
+
+def test_a_ctrl_c_while_reporting_a_refused_signal_is_not_eaten(tmp_path,
+                                                               monkeypatch):
+    """"Never raises" has one exception in this module and it is the
+    operator's own interrupt.
+
+    `_cancelled` and `_sleep_or_cancelled` both re-raise `KeyboardInterrupt`
+    out of their catch-all, and `_sleep_or_cancelled` does so because
+    swallowing it left a Ctrl-C during a lock wait doing nothing at all
+    (issue #6). A diagnostic on the shutdown path is not a reason to break
+    that.
+    """
+    def boom(_message):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("skodun.pipeline._note", boom)
+    with pytest.raises(KeyboardInterrupt):
+        runner._note_unsignalable(4242, signal.SIGKILL)
+
+
+def test_an_ordinary_broken_sink_still_cannot_break_the_shutdown(tmp_path,
+                                                                 monkeypatch):
+    """Everything that is not the interrupt stays swallowed: a note is never
+    worth failing a kill over."""
+    def boom(_message):
+        raise RuntimeError("the sink is gone")
+
+    monkeypatch.setattr("skodun.pipeline._note", boom)
+    runner._note_unsignalable(4242, signal.SIGKILL)      # must not raise

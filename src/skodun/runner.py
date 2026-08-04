@@ -408,6 +408,19 @@ def _note_unsignalable(pg: int, sig: int) -> None:
     guarded because this is only ever called from an `except` that must not
     acquire a second failure mode of its own -- the same shape `routing._note`
     uses for the same reason.
+
+    `KeyboardInterrupt` is re-raised, exactly as `_cancelled` and
+    `_sleep_or_cancelled` above re-raise it: "never raises" has one exception
+    in this module and it is the operator's own interrupt. Swallowing a Ctrl-C
+    that lands in a diagnostic would leave it doing nothing at all, which is
+    the defect issue #6 filed against `_sleep_or_cancelled`.
+
+    It reaches a caller-supplied sink, so in principle a slow sink delays a
+    shutdown. That is accepted rather than dodged: it is the same channel every
+    other line of a review's progress goes through, this site is no more
+    exposed than they are, and the alternative -- writing straight to stderr --
+    would hide from an MCP client exactly the operator who needs to know their
+    provider group may have outlived the review.
     """
     try:
         from .pipeline import _note
@@ -415,6 +428,8 @@ def _note_unsignalable(pg: int, sig: int) -> None:
         _note(f"provider group {pg} refused signal {sig} (EPERM): it is "
               f"either gone and its pgid reused, or alive under credentials "
               f"we may not signal; continuing the shutdown either way")
+    except KeyboardInterrupt:
+        raise
     except BaseException:       # pragma: no cover - a note is never worth a raise
         pass
 
