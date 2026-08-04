@@ -25,11 +25,14 @@ healthy.txt / healthy_noisy_stderr.txt / refuter_healthy.txt
     SYNTHESIZED in the runner's accepted shape. No live capture.
 
 degraded_stderr.txt / degraded_truncated_answer.txt
-    SYNTHESIZED, from strings that are present VERBATIM in this repository:
-    `openai_api_runner.INCOMPLETE_PREFIX` writes the `openai-api response
-    incomplete (finish_reason=…)` line, and `could not extract contract json:`
-    is that module's own extraction failure. `finish_reason: "length"` is the
-    Chat Completions value for hitting the token ceiling.
+    CAPTURED from `openai_api_runner.main` itself, run against a mocked HTTP
+    response carrying `finish_reason: "length"` and a payload cut mid-string;
+    the token counts and the request id are then replaced with plausible ones.
+    So the `rc`, the line ORDER and the wording are the runner's own, not an
+    author's recollection of them -- which is what the first draft of these
+    two got wrong in a small way that matters here more than most: it declared
+    `rc=2` where `main` really exits `1`, in a directory whose entire job is
+    fidelity to the runner's wire behaviour.
 
     The pair is the two shapes that matter, and they are not the same case.
     `_truncated_answer` is the one worth having: a payload that VALIDATES

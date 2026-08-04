@@ -288,12 +288,27 @@ def test_a_finish_reason_other_than_stop_is_reported_on_stderr():
             assert f"finish_reason={reason}" in got
 
 
-def test_an_unknown_finish_reason_reads_as_incomplete():
+def test_an_unknown_finish_reason_reads_as_incomplete(capsys):
     """An allowlist of one, not a denylist: a reason the API adds after this
-    was written must read as "stopped early", never as "fine"."""
-    from skodun.adapters.openai_api_runner import COMPLETE_FINISH_REASON
+    was written must read as "stopped early", never as "fine".
 
-    assert COMPLETE_FINISH_REASON == "stop"
+    Driven through `_emit_incomplete` and the adapter rather than asserted
+    against the constant -- comparing `COMPLETE_FINISH_REASON == "stop"` is a
+    restatement of the source, and would go on passing if the emitter stopped
+    consulting it.
+    """
+    from skodun.adapters.openai_api_runner import _emit_incomplete
+
+    _emit_incomplete("a_reason_from_2027")
+    written = capsys.readouterr().err
+
+    assert written, "an unrecognised reason was treated as a complete answer"
+    assert get_adapter("openai-api").classify(
+        1, b"", written.encode()).kind == "degraded"
+
+    # ...and `stop` remains the one value that means "it finished".
+    _emit_incomplete("stop")
+    assert capsys.readouterr().err == ""
 
 
 def test_the_runner_records_finish_reason_even_when_the_json_is_unusable(
@@ -448,12 +463,16 @@ def test_the_marker_only_counts_at_the_start_of_a_line():
     assert a.classify(1, b"", real).kind == "degraded"
 
 
+_ABSENT = object()
+
+
 @pytest.mark.parametrize("reason, recorded", [
     ("length", "length"),
     ("stop", "stop"),
     (None, None),          # nullable, and NOT the string "None"
     (123, None),
     ("", None),
+    (_ABSENT, None),       # the key missing entirely
 ])
 def test_a_null_finish_reason_is_not_a_truncation(monkeypatch, reason,
                                                   recorded):
@@ -467,7 +486,9 @@ def test_a_null_finish_reason_is_not_a_truncation(monkeypatch, reason,
         def read(self):
             choice = {"message": {"content": json.dumps(
                 {"summary": "ok", "findings": []})}}
-            if reason is not None or True:
+            # `_ABSENT` leaves the key out entirely, which is a different
+            # input from `null` and is the one the `KeyError` guard exists for.
+            if reason is not _ABSENT:
                 choice["finish_reason"] = reason
             return json.dumps({
                 "id": "chatcmpl-null",
@@ -662,3 +683,55 @@ def test_the_whole_runner_stderr_classifies_as_degraded_not_an_outage(
     assert b"rate_limit" not in stderr, stderr
     v = get_adapter("openai-api").classify(1, b"", stderr)
     assert (v.kind, v.category) == ("degraded", ""), v
+
+
+def test_the_degraded_fixture_matches_what_the_runner_really_exits_with(
+        tmp_path, monkeypatch, capsys):
+    """A fixture directory whose job is fidelity to the runner has to be
+    checked against the runner.
+
+    The first draft of `degraded_stderr.txt` declared `rc=2` where `main`
+    really exits `1` -- harmless for the verdict (only `127` is read from
+    `rc`), and exactly the kind of drift a hand-written witness accumulates
+    until it is describing a program nobody has run.
+    """
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return json.dumps({
+                "id": "chatcmpl-cut",
+                "choices": [{"finish_reason": "length",
+                             "message": {"content": '{"summary": "half'}}],
+                "usage": {"prompt_tokens": 9100, "completion_tokens": 4096,
+                          "total_tokens": 13196},
+            }).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(
+        "skodun.adapters.openai_api_runner.urllib.request.urlopen",
+        lambda *a, **k: _Resp())
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    prompt = tmp_path / "p.txt"
+    prompt.write_text("review", encoding="utf-8")
+
+    rc = runner_main([
+        "--prompt", str(prompt), "--model", MODEL,
+        "--schema", REVIEW_CONTRACT.json_schema, "--timeout-ms", "5000",
+    ])
+    real_err = capsys.readouterr().err
+
+    fx = load_fixture(FIXTURES / "degraded_stderr.txt")
+    assert fx.rc == rc, (
+        f"the fixture declares rc={fx.rc}; the runner exits {rc}")
+    # Line SHAPE, not the numbers -- the fixture's tokens and request id are
+    # plausible stand-ins, and pinning them would make this a test about a
+    # mock.
+    assert ([line.split(" ")[0] for line in
+             fx.stderr.decode().strip().splitlines()]
+            == [line.split(" ")[0] for line in real_err.strip().splitlines()])

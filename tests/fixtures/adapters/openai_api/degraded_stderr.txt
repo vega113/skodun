@@ -1,7 +1,7 @@
-rc=2
+rc=1
 --- stdout ---
 
 --- stderr ---
-SKODUN_API_USAGE {"prompt_tokens":9100,"completion_tokens":4096,"total_tokens":13196,"cost_usd":0.041,"model":"gpt-5.6-luna","finish_reason":"length"}
+SKODUN_API_USAGE {"prompt_tokens":9100,"completion_tokens":4096,"total_tokens":13196,"model":"gpt-5.6-luna","cost_usd":0.041,"request_id":"chatcmpl-cut","finish_reason":"length"}
 openai-api response incomplete (finish_reason=length)
 could not extract contract json: JSONDecodeError('Unterminated string starting at: line 1 column 812 (char 811)')
