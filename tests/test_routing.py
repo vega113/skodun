@@ -10,10 +10,12 @@ capacity tables and a fake would only prove the fake.
 
 from __future__ import annotations
 
+import ast
 import time
 
 import pytest
 
+import skodun
 from skodun import capacity, routing
 from skodun.config import Config, Defaults, Reviewer, Routing
 from skodun.routing import (
@@ -951,3 +953,59 @@ def test_pure_load_keeps_the_credit_when_no_soft_term_moved_anything(store):
     # openai is owed the share AND is cross-family, but it is busy and xai has
     # a free slot -- which no soft term may overturn.
     assert (route.reviewer.name, route.reason) == ("finder-a", ROUTE_FREE)
+
+
+def test_run_review_is_the_only_production_caller_of_head_resolution():
+    """The call-graph half of the Phase A scope note (issue #98).
+
+    `resolve_review_head`'s docstring scopes auto-routing to the foreground
+    loop, and the reviewer who raised it was right that a docstring is weak
+    evidence for a claim about callers. The consequential half -- that the
+    background pre-push worker does not route -- is pinned behaviourally in
+    `tests/test_dispatch.py::test_the_background_worker_does_not_auto_route`,
+    through the shipped entry point and against a config that WOULD route.
+
+    This is the other half, and it catches something that one cannot: a NEW
+    caller on some third surface, acquiring routing semantics nobody decided
+    to give it. `run_prepush_review` picks its head with `_reviewer_for(cfg,
+    "finder")` and `resolve_review_head` now duplicates that selection, so the
+    two are a standing invitation to be collapsed -- and a `# noqa`-free
+    failure here is the moment to have that conversation rather than to
+    discover it from a background review that routed.
+
+    Read from the SOURCE rather than by monkeypatching, because the claim is
+    about what is written, not about what one run happened to execute: a
+    caller on a branch this test never takes would be invisible to any
+    dynamic check.
+    """
+    from pathlib import Path
+
+    src = Path(skodun.__file__).resolve().parent
+    callers: set[str] = set()
+    for path in sorted(src.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        # The enclosing def of every `resolve_review_head(...)` call, by walking
+        # each function body rather than the module: `ast` has no parent links,
+        # and the enclosing name is the whole point of the assertion.
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.Call)
+                        and _called_name(inner.func) == "resolve_review_head"):
+                    callers.add(f"{path.relative_to(src)}::{node.name}")
+
+    assert callers == {"pipeline.py::_run_review"}, (
+        "head resolution has a caller outside the foreground review loop. "
+        "That is not automatically wrong -- it IS a decision about which "
+        "surfaces auto-route, and Phase A scoped it to the one. Widen this "
+        "set deliberately, and say so in `resolve_review_head`'s scope note.")
+
+
+def _called_name(func: ast.expr) -> str:
+    """The bare name a call targets: `f()` and `mod.f()` both give `f`."""
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return ""
