@@ -1,0 +1,7 @@
+rc=0
+--- stdout ---
+{"summary": "Started reviewing svc/cache.py and did not reach the end of the file.", "findings": [{"file": "svc/cache.py", "line": 11, "severity": "high", "category": "correctness", "title": "Unhandled KeyError when fetching non existent key", "detail": "The get function unpacks _STORE[key] without verifying key existence."}]}
+
+--- stderr ---
+SKODUN_API_USAGE {"prompt_tokens":9100,"completion_tokens":4096,"total_tokens":13196,"cost_usd":0.041,"model":"gpt-5.6-luna","finish_reason":"length"}
+openai-api response incomplete (finish_reason=length)

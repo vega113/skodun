@@ -47,6 +47,37 @@ def _emit_usage(usage: dict) -> None:
     sys.stderr.buffer.flush()
 
 
+#: The `finish_reason` that means the model said everything it meant to. Every
+#: other value -- `length` at the token ceiling, `content_filter`, whatever the
+#: API adds next -- means the answer stopped early, so this is an allowlist of
+#: one rather than a list of the bad ones: a reason nobody here has heard of
+#: must read as "incomplete", not as "fine".
+COMPLETE_FINISH_REASON = "stop"
+
+#: Wording the adapter's degradation table matches. Written HERE, by skodun,
+#: which is what makes the signal verifiable -- the table it feeds used to
+#: match `truncated` and `envelope refused`, neither of which anything in this
+#: adapter's path ever wrote (issue #99).
+INCOMPLETE_PREFIX = "openai-api response incomplete"
+
+
+def _emit_incomplete(finish_reason: object) -> None:
+    """Say so on stderr when the API stopped the answer early. No-op for `stop`.
+
+    Also a no-op when the reason is absent: a response that never reached the
+    `choices` array (a network error, an HTTP status) has its own message, and
+    inventing "incomplete" from silence would be the inference-from-absence
+    every adapter's degradation detection is written to avoid.
+    """
+    if not isinstance(finish_reason, str) or not finish_reason:
+        return
+    if finish_reason == COMPLETE_FINISH_REASON:
+        return
+    sys.stderr.buffer.write(
+        f"{INCOMPLETE_PREFIX} (finish_reason={finish_reason})\n".encode("utf-8"))
+    sys.stderr.buffer.flush()
+
+
 def _fail(msg: str, rc: int = 2) -> int:
     sys.stderr.buffer.write((msg.rstrip() + "\n").encode("utf-8"))
     sys.stderr.buffer.flush()
@@ -131,6 +162,21 @@ def call_chat_completions(
     if status != 200:
         return status, None, usage, f"http {status}"
 
+    # BEFORE the content is touched, and that ordering is the point: the API's
+    # own statement that it stopped early is most useful on exactly the runs
+    # where the content is then unusable. `finish_reason: "length"` truncates
+    # mid-JSON, so `json.loads` below raises and the reason would be lost with
+    # it -- leaving "the model returned garbage" and "the answer was cut off at
+    # the token ceiling" indistinguishable in the record.
+    #
+    # Carried on `usage` rather than in a wider return tuple because that dict
+    # is already the runner's metadata channel (`request_id` rides on it too),
+    # and `chain._record_api_usage` reads four named keys and ignores the rest.
+    try:
+        usage["finish_reason"] = str(doc["choices"][0]["finish_reason"])
+    except (KeyError, IndexError, TypeError):
+        pass
+
     try:
         choices = doc["choices"]
         content = choices[0]["message"]["content"]
@@ -198,6 +244,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     if usage:
         _emit_usage(usage)
+    # BEFORE the failure branch below, so a truncation that ALSO broke the JSON
+    # is still reported as a truncation. `_fail`'s own message would otherwise
+    # be the only thing on stderr, and it describes the symptom (unparseable)
+    # rather than the cause.
+    _emit_incomplete(usage.get("finish_reason"))
     if rc != 0 or payload is None:
         # Surface rate limits clearly for classify().
         detail = err or "openai api call failed"
