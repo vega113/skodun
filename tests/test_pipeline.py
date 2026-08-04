@@ -1650,14 +1650,31 @@ role = "finder"
 # --------------------------------------------------------------------------
 
 
-def test_the_dead_pid_helper_hands_back_a_pid_that_is_really_dead():
+def test_the_dead_pid_helper_hands_back_a_pid_that_is_really_dead(monkeypatch):
     """The premise two lock-reclaim tests rest on, asserted instead of assumed.
 
-    Checked with the production predicate rather than a copy: if the two ever
-    disagree about what dead means, the failure belongs here, not in the
+    Asserted over what the helper DID -- the answer `pipeline._pid_alive` gave
+    for the pid it chose -- and not by asking again afterwards. Re-checking
+    after the return would reintroduce the very race this helper exists to
+    narrow: the pid can be reissued in the gap, and a test written that way is
+    flaky in exactly the manner it is meant to prevent.
+
+    Checked through the production predicate rather than a copy: if the two
+    ever disagree about what dead means, the failure belongs here, not in the
     reclaim test that would otherwise report it as a lock bug.
     """
-    assert pipeline._pid_alive(_spawned_pid()) is False
+    real = pipeline._pid_alive
+    answers: dict[int, bool] = {}
+
+    def spy(pid):
+        answers[pid] = real(pid)
+        return answers[pid]
+
+    monkeypatch.setattr(pipeline, "_pid_alive", spy)
+
+    pid = _spawned_pid()
+
+    assert answers[pid] is False, "the pid handed back was not checked as dead"
 
 
 def test_the_dead_pid_helper_re_spawns_when_a_pid_reads_as_alive(monkeypatch):
@@ -1678,8 +1695,11 @@ def test_the_dead_pid_helper_re_spawns_when_a_pid_reads_as_alive(monkeypatch):
 
     pid = _spawned_pid()
 
+    # The LAST pid checked is the one returned, and the helper only returns
+    # when the check answered dead -- so this says the retry happened and the
+    # result came from it, without asking the kernel a second time.
     assert len(seen) > 1, "a pid that read as alive was returned anyway"
-    assert pid == seen[-1] and real(pid) is False
+    assert pid == seen[-1]
 
 
 def test_the_dead_pid_helper_refuses_rather_than_returning_a_live_pid(
