@@ -20,10 +20,31 @@ healthy.txt / healthy_noisy_stderr.txt / refuter_healthy.txt
     are plain ASCII (rule 6). No live junie capture yet — replace with a
     sanitized live capture when one is available.
 
-degraded_stderr.txt / degraded_missing_envelope.txt
+unavailable_harness_envelope.txt / unavailable_harness_missing_envelope.txt
     SYNTHESIZED from the outer runner's own refusal strings
     (`envelope refused`, `did not produce a JSON output envelope`), which are
-    present verbatim in `junie_runner.py`.
+    present verbatim in `junie_runner.py`. These two were `degraded_stderr.txt`
+    and `degraded_missing_envelope.txt` until issue #92: a refusal from
+    skodun's OWN wrapper is not a review that came back badly, and classifying
+    it as one stopped the fallback chain on an entry that had not served at
+    all. Renamed rather than edited so the rename is what the diff shows.
+
+degraded_truncated_stderr.txt / degraded_truncated_answer.txt
+    SYNTHESIZED, and weaker than the two above: they carry the one remaining
+    entry of `_DEGRADED_STDERR_SIGNALS` (`truncated`), which matches JUNIE's
+    own stderr as the runner passes it through, and no wording of junie's has
+    been captured for it. The wording here is therefore the author's, not the
+    CLI's -- what these fixtures prove is that the adapter reads the axis, not
+    that junie spells it this way.
+
+    The pair covers the two shapes that matter and they are not the same case:
+    `_answer` is the one worth having, an envelope that VALIDATES beside stderr
+    saying the answer was cut short, which is the only way junie can return a
+    review that parses and must not be trusted. `_stderr` is the empty-handed
+    one, and is also the fixture rule 6 splices signal words from.
+
+    Standing obligation, same as the quota one: when a truncated junie run is
+    captured, replace these with the sanitized real stderr.
 
 unavailable_auth.txt / unavailable_model.txt
     SYNTHESIZED from the adapter's stderr signal tables and common CLI

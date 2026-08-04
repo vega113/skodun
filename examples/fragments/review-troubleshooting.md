@@ -20,6 +20,7 @@ Long-form: [`../../docs/integrate-external-project.md`](../../docs/integrate-ext
 | Host shows **&lt;13** MCP tools (no `review_status` / `feedback_*`) | **Stale MCP process** after upgrade | **Restart MCP session**; confirm tools/list = 13. See [`mcp-server-config.md`](mcp-server-config.md) |
 | `store schema vN is newer than this skodun` | CLI upgraded store; MCP still old build | **Restart MCP** (same install as CLI). Do not abandon MCP for shell review permanently |
 | Finder clean then whole review untrustworthy (agy `status: ERROR`) | Often **provider quota** (e.g. Google “Individual quota reached”) | Check `skodun providers`; wait for TTL / upgrade sub; ensure skodun classifies as quota so fallbacks hop |
+| Attempt ends in **~1.5s**, `classification.kind=unavailable category=harness`, junie | skodun's own confined runner produced no readable output envelope — **not** a junie outage and not a quota one | The `detail` on that attempt quotes the runner's own line, including the exception; the chain has already hopped to the next entry. Reproduce with `junie --task … -p .` by hand and compare |
 
 Diagnostics (CLI only — not MCP tools):
 

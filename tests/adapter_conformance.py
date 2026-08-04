@@ -141,6 +141,14 @@ to return, and the vocabulary is CLOSED — exactly one of::
     binary   the CLI is not installed or not on PATH (rc 127). This is the
              reviewer's configuration being wrong, never a provider outage.
     model    the requested model id is unknown to the CLI. Attempt-local.
+    harness  SKODUN's own invocation of the CLI failed, so the provider was
+             never asked a question it could answer badly: a confinement
+             wrapper that produced no output envelope, or one that cannot be
+             read, decoded or normalized. Attempt-local like `auth`, and
+             pointedly NOT `degraded` — `chain.run_chain` advances a fallback
+             chain only on `unavailable`, so classifying a broken harness as a
+             review outcome spends every attempt on the entry that cannot
+             serve and leaves working providers idle (issue #92).
     other    unavailable for a reason none of the above names. Deliberately
              last: reach for it only when the stderr genuinely says nothing
              more specific, because it caches nothing and explains nothing.
@@ -193,7 +201,16 @@ from tests.test_adapter_base import _recursion_bomb
 # imported so that a category quietly added to `base` still has to be argued
 # for HERE, where the cacheability consequences live: only `quota` is a
 # property of the provider as a whole and may be remembered beyond one attempt.
-_UNAVAILABLE_CATEGORIES = frozenset({"quota", "auth", "binary", "model", "other"})
+#
+# `harness` earns its place rather than folding into `other` because the two
+# answer different questions for whoever reads the record. `other` says "this
+# provider could not serve and its stderr said nothing more specific"; `harness`
+# says "skodun's own wrapper never got as far as asking it", which points at
+# this repository and not at the provider's status page. Both cache nothing, so
+# adding it changes no fallback behaviour beyond the reclassification it exists
+# for.
+_UNAVAILABLE_CATEGORIES = frozenset({"quota", "auth", "binary", "model",
+                                     "harness", "other"})
 
 _KINDS = frozenset({"ok", "degraded", "unavailable"})
 

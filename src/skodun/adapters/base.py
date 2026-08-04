@@ -10,8 +10,9 @@ CLIs rather than being copied into each of them. Three ideas:
   truncated or corrupted; `unavailable` means the provider could not serve at
   all. `category` is the cacheability axis: only `"quota"` is a property of the
   provider as a whole, so only `"quota"` may be remembered beyond one attempt.
-  `auth`/`binary`/`model` are attempt-local — they describe this reviewer's
-  configuration, and caching them would take down providers that are fine.
+  `auth`/`binary`/`model`/`harness` are attempt-local — they describe this
+  reviewer's configuration, or skodun's own invocation of it, and caching them
+  would take down providers that are fine.
 * **`OutputContract`** — the response shape a run is asked for. An adapter is
   contract-generic: it hands `contract.json_schema` to whatever schema
   mechanism its CLI offers, finds the envelope with `contract.eligible`, and
@@ -133,7 +134,8 @@ class ClassifyResult:
     """
 
     kind: Literal["ok", "degraded", "unavailable"]
-    category: str = ""     # for unavailable: quota|auth|binary|model|other
+    # for unavailable: quota|auth|binary|model|harness|other
+    category: str = ""
     detail: str = ""
 
 

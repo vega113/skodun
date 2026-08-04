@@ -1,0 +1,5 @@
+rc=2
+--- stdout ---
+
+--- stderr ---
+junie: response truncated before the final message
