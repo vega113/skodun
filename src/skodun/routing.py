@@ -447,35 +447,60 @@ def pick_finder(pool: Sequence[Reviewer],
     if winner is None:
         return None
     chosen, chosen_load = winner
-    # `+cross` and `+share` are CAUSAL claims -- "this is what sent the review
-    # here" -- so each is answered by asking the counterfactual rather than by
-    # observing that the winner happens to be cross-family or below its share.
-    # A cross-family provider with the most free slots would have won either
-    # way, and labelling that `+cross` would tell an operator the preference is
-    # earning its keep when it is not. Costs one more pass over a pool that has
-    # single digits of entries, once per review.
-    cross = cross_bonus_applies(chosen, client_family, cross_model)
-    if cross:
-        without = _argmax(pool, loads, client_family=client_family,
-                          cross_model=False, shares=shares)
-        cross = without is None or without[0].name != chosen.name
-    share_decided = False
-    if shares:
-        without = _argmax(pool, loads, client_family=client_family,
-                          cross_model=cross_model, shares=None)
-        share_decided = without is None or without[0].name != chosen.name
-    # PRECEDENCE, when both counterfactuals hold: the operator's declared share
-    # is an instruction and the family bonus is a heuristic, so `+share` is the
-    # honest answer to "why here". One label per decision, deliberately -- a
-    # `+share+cross` would double the vocabulary to describe a case an operator
-    # acts on the same way.
-    if share_decided:
-        reason = ROUTE_FREE_SHARE if chosen_load.free_slots > 0 else ROUTE_WAIT_SHARE
-    elif cross:
-        reason = ROUTE_FREE_CROSS if chosen_load.free_slots > 0 else ROUTE_WAIT_CROSS
-    else:
-        reason = ROUTE_FREE if chosen_load.free_slots > 0 else ROUTE_WAIT
+    reason = _label(pool, loads, chosen, chosen_load,
+                    client_family=client_family, cross_model=cross_model,
+                    shares=shares)
     return Route(reviewer=chosen, reason=reason)
+
+
+def _label(pool: Sequence[Reviewer], loads: Mapping[str, ProviderLoad],
+           chosen: Reviewer, chosen_load: ProviderLoad, *,
+           client_family: str | None, cross_model: bool,
+           shares: Mapping[str, ShareTarget] | None) -> str:
+    """Which `route_reason` explains this pick. Pure; up to three extra passes.
+
+    `+cross` and `+share` are CAUSAL claims -- "this is what sent the review
+    here" -- so neither is answered by observing that the winner happens to be
+    cross-family or below its share. A cross-family provider with the most free
+    slots would have won either way, and labelling that `+cross` would tell an
+    operator the preference is earning its keep when it is not.
+
+    Attribution is against the PURE-LOAD ordering, not against "this term
+    removed". Asking each term separately whether removing it changes the
+    winner is the obvious thing and it is wrong in a way that matters: when
+    either term ALONE would have been enough, removing one leaves the other to
+    produce the same head, both questions answer "no", and the record says
+    plain `auto:free` for a review that neither term-free scoring would have
+    sent there. The audit then under-counts `auto:*+share` and makes configured
+    weights look inert exactly when they are working.
+
+    So: if the winner is what pure load would have chosen, no term is credited.
+    Otherwise the credit goes to `+share` when the share term ALONE reproduces
+    the winner, to `+cross` when only the cross-model bonus does, and to
+    `+share` again when neither alone does and the two are jointly necessary --
+    an operator's declared share is an instruction and the family bonus is a
+    heuristic, so it is the honest answer to "why here". One label per
+    decision, deliberately: a `+share+cross` would double the vocabulary to
+    describe a case an operator acts on the same way.
+
+    Costs at most three more passes over a pool with single digits of entries,
+    once per review, and only when a soft term is in play at all.
+    """
+    def wins(*, cross: bool, share: bool) -> bool:
+        """Whether `chosen` still heads the pool under that scoring."""
+        got = _argmax(pool, loads, client_family=client_family,
+                      cross_model=cross_model and cross,
+                      shares=shares if share else None)
+        return got is not None and got[0].name == chosen.name
+
+    free = chosen_load.free_slots > 0
+    if wins(cross=False, share=False):
+        # Pure load already picks this head: neither soft term did anything.
+        return ROUTE_FREE if free else ROUTE_WAIT
+    if wins(cross=False, share=True) or not wins(cross=True, share=False):
+        # Share alone suffices, or neither alone does (jointly necessary).
+        return ROUTE_FREE_SHARE if free else ROUTE_WAIT_SHARE
+    return ROUTE_FREE_CROSS if free else ROUTE_WAIT_CROSS
 
 
 def _warn_inert_client_family(cfg: Config, pool: Sequence[Reviewer],

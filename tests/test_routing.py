@@ -901,3 +901,53 @@ def test_a_provider_with_no_adapter_is_skipped_rather_than_fatal(store):
     _seed_served(store, {"grok": 3})
     assert provider_served(store, ["xai", "no-such-provider"],
                            window_days=7) == {"xai": 3, "no-such-provider": 0}
+
+
+def test_a_share_that_would_have_decided_it_alone_is_still_credited(store):
+    """The false negative that made the audit lie.
+
+    Attributing each term by "does removing it change the winner" is the
+    obvious rule and it is wrong when EITHER term alone would have been
+    enough: remove the share and cross-model still produces the same head,
+    remove cross-model and the share still does, so both questions answer "no"
+    and the record says plain `auto:free` -- for a review that pure load would
+    have sent somewhere else entirely. `skodun providers` then under-counts
+    `auto:*+share` and makes configured weights look inert exactly when they
+    are working.
+
+    Here `finder-b` is BOTH the cross-family provider and the one owed the
+    larger share, and each of those alone outranks first-listed `finder-a`.
+    """
+    cfg = _cfg(_entry("finder-a", "xai"), _entry("finder-b", "openai"),
+               weights=(("xai", 1), ("openai", 3)))
+
+    route = auto_route(cfg, store, client_family="xai")
+
+    assert route.reviewer.name == "finder-b"
+    assert route.reason == ROUTE_FREE_SHARE
+
+
+def test_cross_model_keeps_the_credit_when_it_is_the_only_explanation(store):
+    """The other side of the same rule: weights configured, but flat, so the
+    share term cannot be what moved this review."""
+    cfg = _cfg(_entry("finder-a", "xai"), _entry("finder-b", "openai"),
+               weights=(("xai", 1), ("openai", 1)))
+
+    route = auto_route(cfg, store, client_family="xai")
+
+    assert route.reviewer.name == "finder-b"
+    assert route.reason == ROUTE_FREE_CROSS
+
+
+def test_pure_load_keeps_the_credit_when_no_soft_term_moved_anything(store):
+    """And the base case: a head pure load would have picked anyway is neither
+    `+share` nor `+cross`, however many soft terms are switched on."""
+    _hold(store, "openai", "h1")
+    cfg = _cfg(_entry("finder-a", "xai"), _entry("finder-b", "openai"),
+               weights=(("xai", 1), ("openai", 9)))
+
+    route = auto_route(cfg, store, client_family="xai")
+
+    # openai is owed the share AND is cross-family, but it is busy and xai has
+    # a free slot -- which no soft term may overturn.
+    assert (route.reviewer.name, route.reason) == ("finder-a", ROUTE_FREE)

@@ -127,15 +127,27 @@ no history, begin with the share the operator asked for.
 
 ## 4. Telemetry
 
-Two new `route_reason` values, causal in the same sense as `auto:free+cross` —
-recorded only when re-scoring *without* the share term picks someone else:
+Two new `route_reason` values, causal in the same sense as `auto:free+cross`:
 
 * `auto:free+share`
 * `auto:wait+share`
 
-When both the share term and the cross-model bonus would independently change
-the winner, the label is `+share`: the operator's instruction outranks the
-heuristic, and one label per decision keeps the vocabulary readable.
+Attribution is against the **pure-load** ordering, not against "this term
+removed", and the difference is not academic. Asking each term separately
+whether removing it changes the winner is the obvious rule and it under-reports
+whenever *either* term alone would have sufficed: remove the share and
+cross-model produces the same head, remove cross-model and the share does, both
+questions answer "no", and the record says plain `auto:free` for a review that
+neither-term scoring would have sent elsewhere. `skodun providers` then
+under-counts `auto:*+share` and makes configured weights look inert exactly
+when they are working.
+
+So a head that pure load would have picked anyway credits nothing. Otherwise
+the credit goes to `+share` when the share term alone reproduces it, to
+`+cross` when only the cross-model bonus does, and to `+share` when neither
+alone does and the two are jointly necessary — the operator's instruction
+outranks the heuristic, and one label per decision keeps the vocabulary
+readable.
 
 `skodun providers` prints the effective weights in its routing header, so "are
 my weights on" is answerable without reading the config layers by hand. Its

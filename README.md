@@ -414,10 +414,12 @@ Every artifact records `requested_reviewer`, `routed_reviewer`, `route_reason`
 (`pinned`, `config-finder`, `auto:free`, `auto:free+cross`, `auto:free+share`,
 `auto:wait`, `auto:wait+cross`, `auto:wait+share`, `auto:default-finder`) and
 `client_family`, so why a given review went where it did is answerable
-afterwards. `+cross` and `+share` are causal: they appear only when re-scoring
-without that term picks somebody else, so they answer "is this earning its
-keep?" rather than "did this apply?". When both would have decided it, the
-label is `+share` — the operator's instruction outranks the heuristic.
+afterwards. `+cross` and `+share` are causal: they are credited only when the
+head is **not** what pure load would have chosen, so they answer "is this
+earning its keep?" rather than "did this apply?". The credit goes to `+share`
+when the share term alone reproduces that head, to `+cross` when only the
+cross-model bonus does, and to `+share` when neither alone does and the two
+are jointly necessary — the operator's instruction outranks the heuristic.
 
 `skodun providers` reads those back in aggregate: the effective routing config,
 then per provider how many reviews it *served* in the window
