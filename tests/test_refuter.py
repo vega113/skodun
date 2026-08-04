@@ -823,7 +823,7 @@ def test_no_refuter_configured_skips_the_pass_with_a_note(tmp_path, capsys):
 
 
 def test_no_refuter_configured_writes_no_stderr_line_about_it(tmp_path, capsys):
-    """"Silently skipped with a note" (brief) means the note lives on the
+    """The brief's "silently skipped with a note" means the note lives on the
     record (`extra_passes.refuter.status == "skipped"`, asserted above) and
     nothing is narrated to the operator about a pass the repo's default
     single-reviewer config never configured. A genuine refuter FAILURE
