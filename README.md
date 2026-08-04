@@ -420,8 +420,10 @@ keep?" rather than "did this apply?". When both would have decided it, the
 label is `+share` — the operator's instruction outranks the heuristic.
 
 `skodun providers` reads those back in aggregate: the effective routing config,
-then per provider how many reviews it *served* in the last 7 days
-(`--since-days N`) split by how the head was chosen, then footer lines breaking
+then per provider how many reviews it *served* in the window
+(`--since-days N`; default 7, or `[routing] weights_window_days` when weights
+are configured, so the counts shown are the ones the router scored against)
+split by how the head was chosen, then footer lines breaking
 down exact `route_reason` values and routed entries.
 
 ```

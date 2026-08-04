@@ -178,9 +178,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="repository whose .skodun.toml to read (default: the current "
              "directory)")
     providers.add_argument(
-        "--since-days", type=_since_days, default=7, dest="since_days",
+        "--since-days", type=_since_days, default=None, dest="since_days",
         metavar="N",
-        help="how many days of reviews the routing counts cover (default: 7)")
+        help="how many days of reviews the routing counts cover. Defaults to "
+             "[routing] weights_window_days when weights are configured -- so "
+             "the counts shown are the ones the router actually scored "
+             "against -- and to 7 otherwise")
 
     log = sub.add_parser("log", help="show recent reviews, newest first")
     log.add_argument("--branch", default=None,
@@ -1360,7 +1363,17 @@ def _cmd_providers(args) -> int:
         # read back in aggregate. Guarded exactly like `holders=` below -- an
         # operator reaching for a diagnostic because something is wrong must
         # still get the parts of the listing that work.
-        since_days = int(getattr(args, "since_days", 7) or 7)
+        # An explicit flag wins; otherwise follow the window the ROUTER used,
+        # which is `[routing] weights_window_days` whenever weights are
+        # configured. This listing exists to explain routing decisions, and a
+        # default that reported seven days of counts while the router scored
+        # against two would answer a question nobody asked -- the operator
+        # would have to already know the configured window to type it in.
+        since_days = getattr(args, "since_days", None)
+        if since_days is None:
+            since_days = (cfg.routing.weights_window_days
+                          if cfg.routing.weights else 7)
+        since_days = int(since_days)
         try:
             tally = _routing_tally(store.routing_counts(
                 since_iso=time.strftime(

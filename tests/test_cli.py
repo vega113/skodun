@@ -3507,3 +3507,44 @@ role = "finder"
     monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "no-global.toml"))
     main(["providers", "--repo", str(repo)])
     assert "weights=xai=1.23456789" in capsys.readouterr().out
+
+
+def test_providers_defaults_its_window_to_the_one_the_router_scored_with(
+        tmp_path, monkeypatch, capsys):
+    """This listing exists to explain routing decisions, so its default window
+    has to be the router's. Reporting seven days of counts while the router
+    scored against `[routing] weights_window_days = 2` answers a question
+    nobody asked, and the operator would have to already know the configured
+    window to type it in."""
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    repo = tmp_path / "win"
+    repo.mkdir()
+    (repo / ".skodun.toml").write_text("""
+[routing]
+mode = "auto"
+weights = { xai = 3 }
+weights_window_days = 2
+[[reviewers]]
+name = "finder-grok"
+provider = "xai"
+model = "m"
+role = "finder"
+""", encoding="utf-8")
+    monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "no-global.toml"))
+
+    main(["providers", "--repo", str(repo)])
+    assert "window=2d" in capsys.readouterr().out
+
+    # ...and an explicit flag still wins, because an operator asking for a
+    # different window is asking a different question.
+    main(["providers", "--repo", str(repo), "--since-days", "5"])
+    assert "window=5d" in capsys.readouterr().out
+
+
+def test_providers_without_weights_keeps_the_seven_day_window(tmp_path,
+                                                              monkeypatch,
+                                                              capsys):
+    """No weights means the router read no counts at all, so there is no
+    routing window to follow and the shipped default stands."""
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    assert "window=7d" in _providers_out(tmp_path, monkeypatch, capsys)

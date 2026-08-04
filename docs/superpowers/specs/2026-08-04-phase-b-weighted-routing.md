@@ -138,7 +138,11 @@ the winner, the label is `+share`: the operator's instruction outranks the
 heuristic, and one label per decision keeps the vocabulary readable.
 
 `skodun providers` prints the effective weights in its routing header, so "are
-my weights on" is answerable without reading the config layers by hand.
+my weights on" is answerable without reading the config layers by hand. Its
+`--since-days` also defaults to `weights_window_days` whenever weights are
+configured, so the counts it shows are the ones the router actually scored
+against rather than a seven-day window nobody asked for; an explicit flag
+still wins.
 
 ## 5. What this does NOT do, and why
 
