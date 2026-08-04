@@ -3342,8 +3342,8 @@ def test_providers_reports_the_effective_routing_config(tmp_path, monkeypatch,
 
 def test_providers_reports_the_declared_weights_beside_the_served_counts(
         tmp_path, monkeypatch, capsys):
-    """"Are my weights on" is the first question an operator has after setting
-    them, and the answer belongs beside the `served=` counts the weights are
+    """The first question an operator has after setting weights is whether
+    they are on, and the answer belongs beside the `served=` counts they are
     measured against -- not reconstructed from two config layers by hand."""
     monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
     repo = tmp_path / "w"

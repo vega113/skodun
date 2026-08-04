@@ -684,8 +684,8 @@ def test_a_refused_signal_is_reported_rather_than_swallowed(tmp_path,
 
 def test_a_ctrl_c_while_reporting_a_refused_signal_is_not_eaten(tmp_path,
                                                                monkeypatch):
-    """"Never raises" has one exception in this module and it is the
-    operator's own interrupt.
+    """In this module, "never raises" has exactly one exception, and it is
+    the operator's own interrupt.
 
     `_cancelled` and `_sleep_or_cancelled` both re-raise `KeyboardInterrupt`
     out of their catch-all, and `_sleep_or_cancelled` does so because
