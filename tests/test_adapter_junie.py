@@ -15,6 +15,8 @@ from skodun.adapters import (
     get_adapter,
 )
 from skodun.adapters.junie import (
+    _DEGRADED_STDERR_SIGNALS,
+    _HARNESS_STDERR_SIGNALS,
     _QUOTA_SIGNALS,
     JunieAdapter,
     resolve_junie_bin,
@@ -222,12 +224,127 @@ def test_every_quota_signal_is_individually_load_bearing():
 
 
 def test_degraded_stderr_fixture():
-    f = fx("degraded_stderr")
+    f = fx("degraded_truncated_stderr")
     res = JunieAdapter().parse(f.stdout, f.stderr)
     assert not res.parse_ok
     assert res.degraded
     v = JunieAdapter().classify(f.rc, f.stdout, f.stderr)
     assert v.kind == "degraded"
+
+
+def test_a_truncated_answer_that_parses_is_still_degraded():
+    """The junie case that matters most, and the only one `parse_ok` cannot
+    catch: the envelope validates, so a run with no degradation axis would be
+    recorded as a trustworthy review of a diff the model stopped reading."""
+    f = fx("degraded_truncated_answer")
+    res = JunieAdapter().parse(f.stdout, f.stderr)
+    assert res.parse_ok and res.degraded and res.degraded_reason
+    assert JunieAdapter().classify(f.rc, f.stdout, f.stderr).kind == "degraded"
+
+
+def test_every_degraded_signal_is_individually_load_bearing():
+    """The `_QUOTA_SIGNALS` rule, applied to the other table: a signal that
+    fires on nothing is a claim the adapter cannot back. `result is missing`
+    was exactly that after #92 -- the only thing that emits the phrase is
+    `normalize_envelope`, whose exception the runner reports as `envelope
+    refused: ...`, which is now matched as a harness fault instead."""
+    a = JunieAdapter()
+    for sig in _DEGRADED_STDERR_SIGNALS:
+        v = a.classify(2, b"", b"note: " + sig + b"\n")
+        assert v.kind == "degraded", sig
+
+
+# --------------------------------------------------------------------------
+# the harness category (#92): a refusal from skodun's OWN wrapper is not a
+# review outcome, and must not stop a fallback chain
+# --------------------------------------------------------------------------
+
+
+def test_an_unreadable_envelope_is_unavailable_so_the_chain_can_advance():
+    """The defect #92 reports, at the point where it is decided.
+
+    `envelope refused` used to be `degraded`, and `degraded` STOPS a fallback
+    chain -- `chain.run_chain` advances only on `unavailable`, because an entry
+    that answered badly has answered, and asking a second provider to re-answer
+    it is not what a quota-fallback chain is for. So a structurally broken
+    adapter burned both of its entry's attempts in ~1.5s each and the review
+    ended `trustworthy=false findings=0` with other providers idle.
+    """
+    v = JunieAdapter().classify(
+        2, b"", b"junie envelope refused: Expecting value: line 1 column 1\n")
+    assert v.kind == "unavailable"
+    assert v.category == "harness"
+
+
+def test_every_harness_signal_is_individually_load_bearing():
+    a = JunieAdapter()
+    for sig in _HARNESS_STDERR_SIGNALS:
+        v = a.classify(2, b"", b"junie " + sig + b": details\n")
+        assert v.kind == "unavailable" and v.category == "harness", sig
+
+
+def test_the_harness_verdict_quotes_the_line_that_caused_it():
+    """Bug 1 of #92. The runner interpolates the real exception into its own
+    stderr line and NOTHING persisted it: the rendered `degraded_reason` kept
+    only the signal name, no worker log was written for a run that never
+    reached the model, and diagnosis meant inferring from attempt timings."""
+    v = JunieAdapter().classify(
+        2, b"",
+        b"some earlier noise\n"
+        b"junie envelope refused: unexpected project file: ./evil.py\n"
+        b"trailing noise\n")
+    assert "junie envelope refused: unexpected project file: ./evil.py" in v.detail
+    assert "earlier noise" not in v.detail and "trailing noise" not in v.detail
+
+
+def test_the_quoted_line_cannot_rewrite_the_terminal_or_forge_a_second_line():
+    """That detail reaches an operator's terminal (chain's progress line) and
+    an artifact, neither of which escapes it. A CR/ESC/newline in the runner's
+    own message must not be able to repaint rows already printed."""
+    v = JunieAdapter().classify(
+        2, b"", b"junie envelope refused: \x1b[2Kfaked\rSKODUN VERDICT: ok\n")
+    assert "\x1b" not in v.detail
+    assert "\r" not in v.detail and "\n" not in v.detail
+
+
+def test_a_very_long_runner_line_is_capped():
+    v = JunieAdapter().classify(
+        2, b"", b"junie envelope refused: " + b"x" * 5000 + b"\n")
+    assert len(v.detail) < 500 and v.detail.endswith("...")
+
+
+def test_an_unprintable_runner_line_falls_back_to_the_signal():
+    """Rendering must never be what fails a classification."""
+    v = JunieAdapter().classify(2, b"", b"\x00envelope refused\x01\x02")
+    assert v.kind == "unavailable" and v.category == "harness"
+    assert v.detail
+
+
+def test_a_quota_message_still_wins_over_a_harness_one():
+    """Order is the policy: a provider out of budget may also fail to write an
+    envelope, and `quota` is the one category cached provider-wide -- naming
+    the symptom instead of the cause would leave the blackout undetected."""
+    v = JunieAdapter().classify(
+        2, b"", b"quota exceeded\njunie envelope refused: no payload\n")
+    assert v.kind == "unavailable" and v.category == "quota"
+
+
+def test_a_harness_fault_is_never_cached_provider_wide():
+    """What makes reclassifying to `unavailable` safe: `_remember_unavailable`
+    caches ONLY `quota`, so a broken capsule costs this attempt and does not
+    black junie out for every other reviewer for the full TTL."""
+    from skodun import chain
+
+    marked = []
+
+    class _Store:
+        def mark_provider_unavailable(self, *a):    # pragma: no cover - guard
+            marked.append(a)
+
+    chain._remember_unavailable(
+        _Store(), "junie",
+        JunieAdapter().classify(2, b"", b"junie envelope refused: x\n"))
+    assert marked == []
 
 
 # --------------------------------------------------------------------------

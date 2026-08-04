@@ -102,6 +102,17 @@ role = "finder"
 CFG_OPENAI_THEN_XAI = _HEAD_OPENAI + _ENTRY_XAI
 CFG_XAI_THEN_OPENAI = _HEAD_XAI + _ENTRY_OPENAI
 
+# A junie head with a working fallback: the shape issue #92 was reported on,
+# where the head's own wrapper is what fails.
+CFG_JUNIE_THEN_XAI = """
+[[reviewers]]
+name = "primary"
+provider = "junie"
+model = "junie-test-0309"
+role = "finder"
+fallbacks = ["backup"]
+""" + _ENTRY_XAI
+
 CFG_XAI_ONLY = f"""
 [[reviewers]]
 name = "primary"
@@ -400,6 +411,58 @@ def test_degraded_does_not_hop_providers(tmp_path, monkeypatch, capsys):
     assert rec["trustworthy"] is False
     assert _calls(tmp_path) == ["grok", "grok"]     # the retry, not the hop
     assert rec["degraded"] is True
+
+
+def test_a_broken_junie_harness_hops_instead_of_burning_the_entry(
+        tmp_path, monkeypatch, capsys):
+    """Issue #92, end to end through the real chain and the real adapter.
+
+    The outer junie runner refuses when it cannot read the output envelope it
+    staged. That refusal used to classify as `degraded`, which is a verdict
+    about a REVIEW -- so the chain correctly refused to hop, spent both of the
+    entry's attempts on a wrapper that could not produce anything, and returned
+    `trustworthy=false findings=0` while a configured fallback sat idle.
+
+    The child process is faked (it is `python -I -c ... junie_runner`, and what
+    is under test is what the chain does with its output, not Seatbelt); the
+    classification, the chain and the record are all real.
+    """
+    monkeypatch.setenv("SKODUN_JUNIE_BIN", "/bin/sh")   # present, never run
+    _fake_cli(tmp_path, "grok", _emit(CLEAN))
+    spawned: list[str] = []
+
+    real_watchdog = runner.run_with_watchdog
+
+    def fake(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        if "junie_runner" not in " ".join(cmd):
+            return real_watchdog(cmd, timeout_sec, cwd, out, err,
+                                 stdin_path=stdin_path, cancel=cancel)
+        spawned.append("junie")
+        out.write_bytes(b"")
+        err.write_bytes(b"junie envelope refused: Expecting value: line 1 "
+                        b"column 1 (char 0)\n")
+        return runner.RunResult(rc=2, timed_out=False, duration_sec=1.7,
+                                first_output_sec=None)
+
+    monkeypatch.setattr(runner, "run_with_watchdog", fake)
+    repo = _repo(tmp_path, CFG_JUNIE_THEN_XAI,
+                 "\n[defaults]\ndegraded_retries = 1\n")
+
+    rec = _run(repo, _store(tmp_path))
+
+    # ONE junie attempt, not two: the entry could not serve, so the retry
+    # budget is not what this failure spends.
+    assert spawned == ["junie"]
+    assert _calls(tmp_path) == ["grok"]
+    junie_attempt, grok_attempt = rec["attempts"]
+    assert junie_attempt["classification"] == {
+        "kind": "unavailable", "category": "harness",
+        "detail": junie_attempt["classification"]["detail"]}
+    # ...and the root cause the runner interpolated is IN the record, which is
+    # the other half of #92: nothing used to persist it.
+    assert "Expecting value: line 1 column 1" in junie_attempt["classification"]["detail"]
+    assert grok_attempt["classification"]["kind"] == "ok"
+    assert rec["trustworthy"] is True and rec["adapter"] == "grok"
 
 
 def test_a_classify_only_degradation_consumes_the_retry_and_demotes(

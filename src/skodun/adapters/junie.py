@@ -8,6 +8,14 @@ payload on stdout. Off macOS the runner refuses before inference.
 
 Classification never reads model-authored prose for a verdict. `parse` and
 `classify` never raise on garbage.
+
+One split is worth stating here because it decides whether a review survives a
+broken install: a refusal from the OUTER RUNNER (no envelope, an envelope that
+will not read or normalize, a stderr capture that escaped the capsule) is
+`unavailable`/`harness`, while evidence that JUNIE's own answer was cut short
+is `degraded`. The chain advances only on `unavailable`, so the first class
+lets a fallback provider serve the review and the second correctly keeps it
+with the reviewer that answered badly.
 """
 
 from __future__ import annotations
@@ -40,12 +48,35 @@ _EFFORT_MAP: dict[str, str] = {
 }
 _EFFORT_OFF = (None, "none")
 
-# --- degradation tells (stderr of the outer runner) ----------------------
-_DEGRADED_STDERR_SIGNALS: tuple[bytes, ...] = (
+# --- harness tells (stderr of the outer runner) --------------------------
+# THE OUTER RUNNER's own refusals: the envelope file is missing, or it exists
+# and could not be read, JSON-decoded or normalized, or the confined stderr
+# capture escaped the capsule. Every one of them is a fault in skodun's own
+# harness -- junie was never asked a question it could answer badly.
+#
+# These used to be `degraded`, and that classification cost a whole review.
+# `chain.run_chain` advances a fallback chain ONLY on `unavailable`; `degraded`
+# means "this reviewer answered badly", which correctly STOPS the chain rather
+# than asking a second provider to re-answer a question the first one did
+# answer. So a structurally broken adapter spent both of its entry's attempts
+# in ~1.5s each and returned `trustworthy=false findings=0` with three other
+# providers configured and idle (issue #92). An envelope that cannot be read is
+# not a review outcome, and the entry that could not produce one has not served
+# at all -- which is exactly what `unavailable` means.
+_HARNESS_STDERR_SIGNALS: tuple[bytes, ...] = (
     b"envelope refused",
     b"did not produce a json output envelope",
-    b"result is missing",
     b"stderr capture escaped",
+)
+
+# --- degradation tells (stderr of the outer runner) ----------------------
+# What is left is evidence about the REVIEW rather than about the harness: an
+# answer that may be incomplete. `result is missing` is deliberately NOT here
+# any more -- the only thing that emits that phrase is `normalize_envelope`,
+# whose exception the runner reports as `envelope refused: junie result is
+# missing`, so it is matched above and an entry here could only ever be dead
+# weight (see `test_every_degraded_signal_is_individually_load_bearing`).
+_DEGRADED_STDERR_SIGNALS: tuple[bytes, ...] = (
     b"truncated",
 )
 
@@ -260,8 +291,29 @@ class JunieAdapter:
                             f"({sig.decode()}) with no usable "
                             f"{contract.name} payload",
                         )
-        # Degradation (truncated / refused envelope) is not unavailability —
-        # check before inventing an empty-rc unavailable.
+            # AFTER the four above, and the order is the policy: a provider
+            # that is out of quota (or unauthenticated, or asked for a model it
+            # does not have) may ALSO fail to write an envelope, and the record
+            # has to name the cause rather than the symptom -- `quota` above
+            # all, because it is the one category cached provider-wide.
+            #
+            # The detail quotes the runner's own LINE rather than the signal it
+            # matched. That line is `junie envelope refused: {e}`, where `{e}`
+            # is the exception `normalize_envelope` or the JSON decoder raised
+            # -- the root cause, which nothing used to persist: the rendered
+            # `degraded_reason` kept only the signal name, no worker log was
+            # written for a run that never reached the model, and diagnosing
+            # #92 meant inferring from attempt timings and reproducing by hand.
+            for sig in _HARNESS_STDERR_SIGNALS:
+                if sig in diagnostics:
+                    return ClassifyResult(
+                        "unavailable",
+                        "harness",
+                        f"skodun's junie harness produced no {contract.name} "
+                        f"envelope: {_evidence(stderr, sig)}",
+                    )
+        # Degradation (a truncated answer) is not unavailability — check before
+        # inventing an empty-rc unavailable.
         degraded, reason = _detect_degraded(stderr, parse_ok=parse_ok)
         if degraded:
             return ClassifyResult("degraded", "", reason)
@@ -291,6 +343,43 @@ def _extract(stdout: bytes, eligible) -> dict | None:
         if _ask(eligible, root):
             return root
     return _first_eligible_object(text, eligible)
+
+
+#: How much of a runner line `_evidence` keeps. Long enough for a decoder
+#: message with a line/column and a path, short enough that a classification
+#: detail stays a sentence in a record and on the progress stream.
+_EVIDENCE_MAX = 240
+
+
+def _evidence(stderr: bytes, sig: bytes) -> str:
+    """The runner's own LINE carrying `sig`, made safe to persist and print.
+
+    `sig` matched against a lower-cased copy of `stderr`, so the line is found
+    on the lower-cased text and returned from the original bytes at the same
+    offsets -- the message keeps its real casing and paths.
+
+    Sanitized rather than passed through, because this string reaches two
+    places that neither quote nor escape it: `attempts[].classification.detail`
+    in the artifact, and `chain`'s progress line on stderr. Control characters
+    are dropped (an ESC sequence would rewrite rows already printed on an
+    operator's terminal, and a newline would forge a second progress line), and
+    the result is capped. Falls back to the signal itself if anything about the
+    line is unusable -- rendering must never be what fails a classification.
+    """
+    text = stderr.decode("utf-8", "replace")
+    lowered = text.lower()
+    at = lowered.find(sig.decode())
+    if at < 0:                                  # pragma: no cover - caller checked
+        return sig.decode()
+    start = lowered.rfind("\n", 0, at) + 1
+    end = lowered.find("\n", at)
+    line = text[start:] if end < 0 else text[start:end]
+    cleaned = "".join(c for c in line if c.isprintable()).strip()
+    if not cleaned:
+        return sig.decode()
+    if len(cleaned) > _EVIDENCE_MAX:
+        cleaned = cleaned[:_EVIDENCE_MAX] + "..."
+    return cleaned
 
 
 def _detect_degraded(stderr: bytes, *, parse_ok: bool) -> tuple[bool, str]:
