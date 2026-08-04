@@ -192,11 +192,48 @@ def _write_owner(lock: Path, pid: int, started: int, worktree: Path) -> None:
         f"pid={pid}\nstarted={started}\nworktree={worktree}\n", encoding="utf-8")
 
 
+#: How many times `_spawned_pid` will re-spawn before giving up. Reuse of a
+#: just-reaped pid needs the kernel's counter to wrap onto that exact number
+#: inside a few microseconds, so one retry is already generous; five is the
+#: cheapest number that cannot be mistaken for "we tried once".
+_SPAWNED_PID_TRIES = 5
+
+
 def _spawned_pid() -> int:
-    """The pid of a process that has already exited and been reaped."""
-    p = subprocess.Popen(["sh", "-c", "exit 0"])
-    p.wait()
-    return p.pid
+    """The pid of a process that has already exited -- VERIFIED dead.
+
+    A pid is only free until the kernel hands it to somebody else. The counter
+    on a developer machine sits in the tens of thousands and wraps at
+    `kern.maxproc`, and a suite that spawns thousands of processes moves it
+    briskly, so a reaped pid can be reissued while a caller here is still
+    calling it dead. Both callers write it into a lock's `owner` file to mean
+    "the holder is gone"; a live pid there flips the premise, the lock is not
+    reclaimed, and the run times out on a wait the test never meant to take.
+
+    Verified with `pipeline._pid_alive` -- the predicate the reclaim under test
+    consults -- rather than with a second copy of that logic here. It answers
+    "alive" for `PermissionError` and for any other `OSError` too, so a pid
+    reissued to another user's process is caught as well; and if the two ever
+    disagree about what dead means, this helper's premise was wrong in exactly
+    the way the assertion downstream would blame on the code.
+
+    This narrows the window to the microseconds between this return and the
+    caller's write. It does not close it, and nothing on POSIX can: the only
+    honest claim is that the pid was dead when we looked.
+
+    Same family as the reuse that produced the EPERM defect in
+    `runner._killpg` (#102). There it broke a kill; here it would break a
+    premise, which is quieter and worse.
+    """
+    for _ in range(_SPAWNED_PID_TRIES):
+        p = subprocess.Popen(["sh", "-c", "exit 0"])
+        p.wait()
+        if not pipeline._pid_alive(p.pid):
+            return p.pid
+    raise AssertionError(
+        f"every one of {_SPAWNED_PID_TRIES} reaped pids still reads as alive; "
+        f"returning one would make a lock-reclaim test assert against a "
+        f"premise that is not true")
 
 
 # --------------------------------------------------------------------------
@@ -1606,3 +1643,51 @@ role = "finder"
 
     assert rec["trustworthy"] is True
     assert rec["route_reason"] == "pinned"
+
+
+# --------------------------------------------------------------------------
+# the dead-pid helper's own contract
+# --------------------------------------------------------------------------
+
+
+def test_the_dead_pid_helper_hands_back_a_pid_that_is_really_dead():
+    """The premise two lock-reclaim tests rest on, asserted instead of assumed.
+
+    Checked with the production predicate rather than a copy: if the two ever
+    disagree about what dead means, the failure belongs here, not in the
+    reclaim test that would otherwise report it as a lock bug.
+    """
+    assert pipeline._pid_alive(_spawned_pid()) is False
+
+
+def test_the_dead_pid_helper_re_spawns_when_a_pid_reads_as_alive(monkeypatch):
+    """Reuse is rare, not impossible -- so it is retried, not tolerated.
+
+    The kernel can reissue a just-reaped pid; the fake below is that moment,
+    made deterministic. Without the retry the helper hands the caller a live
+    pid and the reclaim test fails on a premise nobody stated.
+    """
+    seen: list[int] = []
+    real = pipeline._pid_alive
+
+    def alive_once(pid):
+        seen.append(pid)
+        return True if len(seen) == 1 else real(pid)
+
+    monkeypatch.setattr(pipeline, "_pid_alive", alive_once)
+
+    pid = _spawned_pid()
+
+    assert len(seen) > 1, "a pid that read as alive was returned anyway"
+    assert pid == seen[-1] and real(pid) is False
+
+
+def test_the_dead_pid_helper_refuses_rather_than_returning_a_live_pid(
+        monkeypatch):
+    """The loud end of the same rule. Returning a live pid is the one outcome
+    this helper exists to prevent, so an exhausted retry budget must say so
+    rather than quietly degrade to the behaviour it replaced."""
+    monkeypatch.setattr(pipeline, "_pid_alive", lambda pid: True)
+
+    with pytest.raises(AssertionError, match="still reads as alive"):
+        _spawned_pid()
