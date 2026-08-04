@@ -325,6 +325,11 @@ def _terminate_group(proc: subprocess.Popen, pg: int) -> int:
     that scenario. This port always finishes the grace period and always
     issues the group SIGKILL, so it does not leak that grandchild. Stronger
     than the oracle, not equivalent to it.
+
+    "Always issues" is the honest limit of the guarantee: the kernel can still
+    refuse the signal with EPERM, and no caller can make it not. `_killpg`
+    reports that case rather than raising -- raising would skip this very
+    SIGKILL and the reaping below it, which is the worse of the two outcomes.
     """
     _killpg(pg, signal.SIGTERM)
     grace_end = time.monotonic() + _TERM_GRACE_SEC
@@ -355,10 +360,78 @@ def _terminate_group(proc: subprocess.Popen, pg: int) -> int:
 
 
 def _killpg(pg: int, sig: int) -> None:
+    """Signal a process group, treating "cannot" as done rather than as fatal.
+
+    `ProcessLookupError` is unambiguous success: nothing is left to signal.
+
+    `PermissionError` (EPERM) is a failure, and is swallowed anyway, for two
+    reasons. A child is its own group leader, so its PGID is its PID -- and
+    the moment the group is gone that number is free to be reused. Signal it
+    after the reuse and the kernel answers EPERM instead of ESRCH. The window
+    is the gap between deciding to kill and killing, which a loaded machine
+    widens; this was observed as a real full-suite failure, reported to the
+    caller as `the review failed: PermissionError(...)` in place of the
+    cancellation verdict.
+
+    Letting it propagate was strictly worse than ignoring it. It aborted
+    `_terminate_group` mid-way: from the SIGTERM call it skipped the grace
+    period, the unconditional final SIGKILL that function exists to guarantee,
+    and `proc.wait()` -- so the very grandchild the group kill is for could
+    survive, and the leader went unreaped.
+
+    But it is NOT silently ignored, because EPERM has a second cause that the
+    first reading would paper over. A descendant that changed credentials --
+    by exec'ing a setuid helper, say -- leaves a group that is still alive and
+    that we may no longer signal. There is no way to tell that apart from pid
+    reuse: `_group_alive` answers EPERM with `True` precisely because it cannot
+    either. So the kill path continues (the leader is still reaped, the caller
+    still gets its own exception rather than this one), and the fact that the
+    group could not be shown dead is said out loud instead of being swallowed
+    into a clean-looking return.
+
+    `_group_alive` below has handled EPERM since it was written; this function
+    not handling it at all was the asymmetry, not a decision.
+    """
     try:
         os.killpg(pg, sig)
     except ProcessLookupError:
         pass  # nothing left to signal is success, not an error
+    except PermissionError:
+        _note_unsignalable(pg, sig)
+
+
+def _note_unsignalable(pg: int, sig: int) -> None:
+    """Say that a group refused our signal. Never raises, never blocks a kill.
+
+    `pipeline._note` is the one progress channel (the caller's sink, else
+    stderr), imported lazily because `pipeline` imports this module, and
+    guarded because this is only ever called from an `except` that must not
+    acquire a second failure mode of its own -- the same shape `routing._note`
+    uses for the same reason.
+
+    `KeyboardInterrupt` is re-raised, exactly as `_cancelled` and
+    `_sleep_or_cancelled` above re-raise it: "never raises" has one exception
+    in this module and it is the operator's own interrupt. Swallowing a Ctrl-C
+    that lands in a diagnostic would leave it doing nothing at all, which is
+    the defect issue #6 filed against `_sleep_or_cancelled`.
+
+    It reaches a caller-supplied sink, so in principle a slow sink delays a
+    shutdown. That is accepted rather than dodged: it is the same channel every
+    other line of a review's progress goes through, this site is no more
+    exposed than they are, and the alternative -- writing straight to stderr --
+    would hide from an MCP client exactly the operator who needs to know their
+    provider group may have outlived the review.
+    """
+    try:
+        from .pipeline import _note
+
+        _note(f"provider group {pg} refused signal {sig} (EPERM): it is "
+              f"either gone and its pgid reused, or alive under credentials "
+              f"we may not signal; continuing the shutdown either way")
+    except KeyboardInterrupt:
+        raise
+    except BaseException:       # pragma: no cover - a note is never worth a raise
+        pass
 
 
 def _group_alive(pg: int) -> bool:
