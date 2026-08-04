@@ -16,6 +16,7 @@ import time
 
 import pytest
 
+from skodun import runner
 from skodun.runner import run_with_watchdog
 
 
@@ -555,3 +556,88 @@ def test_an_ordinary_unreadable_token_is_unchanged(monkeypatch):
     assert _cancelled(_RaisingToken(RuntimeError("stale proxy"))) is False
     assert _sleep_or_cancelled(_RaisingToken(RuntimeError("x")), 1.5) is False
     assert slept == [1.5]
+
+
+# --------------------------------------------------------------------------
+# EPERM from the group kill
+# --------------------------------------------------------------------------
+
+
+def test_a_group_we_may_not_signal_does_not_abort_the_kill_path(tmp_path,
+                                                                monkeypatch):
+    """`os.killpg` raises `PermissionError` as well as `ProcessLookupError`,
+    and `_terminate_group` has to survive it.
+
+    A child is its own group leader, so its PGID is its PID -- and once the
+    group is gone that number is free to be reused. Signal it after the reuse
+    and the kernel answers EPERM (or ESRCH if we are lucky). The window is the
+    gap between deciding to kill and killing, which a loaded machine widens;
+    this reproduced as a real full-suite failure.
+
+    Letting EPERM propagate skipped everything after it: the grace loop, the
+    unconditional final SIGKILL that `_terminate_group`'s docstring exists to
+    explain, and `proc.wait()` -- so the run left an unreaped child and, on
+    the SIGTERM call, a group that never got its SIGKILL. It also surfaced to
+    the caller as `the review failed: PermissionError(...)` in place of the
+    cancellation verdict.
+
+    Swallowing it is also the SAFE reading: EPERM means the pgid is not ours
+    to signal, so there is nothing useful left to do to it, and pressing on
+    would only mean signalling somebody else's process.
+    """
+    import subprocess as _sp
+
+    proc = _sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                     start_new_session=True)
+    pg = os.getpgid(proc.pid)
+    refused: list[int] = []
+
+    def killpg(target, sig):
+        refused.append(sig)
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(runner.os, "killpg", killpg)
+    try:
+        rc = runner._terminate_group(proc, pg)
+    finally:
+        monkeypatch.undo()
+        if proc.poll() is None:                 # pragma: no cover - safety net
+            proc.kill()
+            proc.wait()
+
+    # It ran to the end: both signals were attempted, and the leader was
+    # reaped rather than left for the OS.
+    assert signal.SIGTERM in refused and signal.SIGKILL in refused
+    assert rc is not None and proc.poll() is not None
+
+
+def test_a_cancel_survives_a_group_we_may_not_signal(tmp_path, monkeypatch):
+    """The same fault through the shipped entry point: the caller must still
+    get `ReviewCancelled`, not the `PermissionError` underneath it.
+
+    That distinction is the whole of the reported symptom -- `svc_review`'s
+    general guard turns anything that is not `ReviewCancelled` into "the
+    review failed", so a cancelled review reported a traceback instead of a
+    cancellation.
+    """
+    from skodun.runner import ReviewCancelled
+
+    real_killpg = os.killpg
+
+    def killpg(target, sig):
+        if sig in (signal.SIGTERM, signal.SIGKILL):
+            real_killpg(target, sig)            # really kill it...
+            raise PermissionError(1, "Operation not permitted")   # ...then EPERM
+        return real_killpg(target, sig)
+
+    cancel = threading.Event()
+    t = threading.Timer(0.6, cancel.set)
+    t.start()
+    monkeypatch.setattr(runner.os, "killpg", killpg)
+    try:
+        with pytest.raises(ReviewCancelled):
+            run_with_watchdog(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                60, tmp_path, tmp_path / "out", tmp_path / "err", cancel=cancel)
+    finally:
+        t.cancel()

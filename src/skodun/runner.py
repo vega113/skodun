@@ -355,10 +355,34 @@ def _terminate_group(proc: subprocess.Popen, pg: int) -> int:
 
 
 def _killpg(pg: int, sig: int) -> None:
+    """Signal a process group, treating "cannot" as done rather than as fatal.
+
+    `ProcessLookupError` is unambiguous success: nothing is left to signal.
+
+    `PermissionError` (EPERM) is a failure, and is swallowed anyway, for two
+    reasons. A child is its own group leader, so its PGID is its PID -- and
+    the moment the group is gone that number is free to be reused. Signal it
+    after the reuse and the kernel answers EPERM instead of ESRCH. The window
+    is the gap between deciding to kill and killing, which a loaded machine
+    widens; this was observed as a real full-suite failure, reported to the
+    caller as `the review failed: PermissionError(...)` in place of the
+    cancellation verdict.
+
+    Letting it propagate was strictly worse than ignoring it. It aborted
+    `_terminate_group` mid-way: from the SIGTERM call it skipped the grace
+    period, the unconditional final SIGKILL that function exists to guarantee,
+    and `proc.wait()` -- so the very grandchild the group kill is for could
+    survive, and the leader went unreaped. Ignoring it also happens to be the
+    SAFE reading: EPERM says the group is not ours, so there is nothing useful
+    left to do to it, and trying harder would only mean signalling a stranger.
+
+    `_group_alive` below has handled EPERM since it was written; this function
+    not handling it was the asymmetry, not a decision.
+    """
     try:
         os.killpg(pg, sig)
-    except ProcessLookupError:
-        pass  # nothing left to signal is success, not an error
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def _group_alive(pg: int) -> bool:
