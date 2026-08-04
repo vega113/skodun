@@ -100,6 +100,9 @@ Load-bearing paths agents cannot safely guess:
 ## Testing instructions
 
 - Full suite: `python3 -m pytest` from repo root.
+- The root `tests/conftest.py` deletes every `SKODUN_*` variable from the
+  environment before each test (allowlist: `SKODUN_ORACLE_DIR`). Tests set what
+  they need themselves; nothing is inherited from the shell that ran pytest.
 - Iterate with targeted modules (e.g. `tests/test_pipeline.py`, `tests/test_capacity.py`).
 - Heavy store ResourceWarning sweep (deselect only when unrelated to store work):
   ```bash
