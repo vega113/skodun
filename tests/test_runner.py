@@ -641,3 +641,42 @@ def test_a_cancel_survives_a_group_we_may_not_signal(tmp_path, monkeypatch):
                 60, tmp_path, tmp_path / "out", tmp_path / "err", cancel=cancel)
     finally:
         t.cancel()
+
+
+def test_a_refused_signal_is_reported_rather_than_swallowed(tmp_path,
+                                                            monkeypatch,
+                                                            capsys):
+    """EPERM has two causes and they are not distinguishable from here.
+
+    One is harmless: the group is gone and its pgid has been reused, so the
+    refusal is about a stranger. The other is not: a descendant that changed
+    credentials -- exec'ing a setuid helper -- leaves a group that is alive
+    and that we may no longer signal, and returning quietly from the kill path
+    would report a clean shutdown over a live process. `_group_alive` answers
+    EPERM with `True` exactly because it cannot tell them apart either.
+
+    So the shutdown continues (raising would skip the final SIGKILL and the
+    reaping, which is worse), and the fact that the group could not be shown
+    dead is said out loud.
+    """
+    import subprocess as _sp
+
+    proc = _sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                     start_new_session=True)
+    pg = os.getpgid(proc.pid)
+
+    def killpg(target, sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(runner.os, "killpg", killpg)
+    try:
+        runner._terminate_group(proc, pg)
+    finally:
+        monkeypatch.undo()
+        if proc.poll() is None:                 # pragma: no cover - safety net
+            proc.kill()
+            proc.wait()
+
+    said = capsys.readouterr().err
+    assert f"provider group {pg} refused signal" in said, said
+    assert "EPERM" in said

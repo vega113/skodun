@@ -325,6 +325,11 @@ def _terminate_group(proc: subprocess.Popen, pg: int) -> int:
     that scenario. This port always finishes the grace period and always
     issues the group SIGKILL, so it does not leak that grandchild. Stronger
     than the oracle, not equivalent to it.
+
+    "Always issues" is the honest limit of the guarantee: the kernel can still
+    refuse the signal with EPERM, and no caller can make it not. `_killpg`
+    reports that case rather than raising -- raising would skip this very
+    SIGKILL and the reaping below it, which is the worse of the two outcomes.
     """
     _killpg(pg, signal.SIGTERM)
     grace_end = time.monotonic() + _TERM_GRACE_SEC
@@ -372,16 +377,45 @@ def _killpg(pg: int, sig: int) -> None:
     `_terminate_group` mid-way: from the SIGTERM call it skipped the grace
     period, the unconditional final SIGKILL that function exists to guarantee,
     and `proc.wait()` -- so the very grandchild the group kill is for could
-    survive, and the leader went unreaped. Ignoring it also happens to be the
-    SAFE reading: EPERM says the group is not ours, so there is nothing useful
-    left to do to it, and trying harder would only mean signalling a stranger.
+    survive, and the leader went unreaped.
+
+    But it is NOT silently ignored, because EPERM has a second cause that the
+    first reading would paper over. A descendant that changed credentials --
+    by exec'ing a setuid helper, say -- leaves a group that is still alive and
+    that we may no longer signal. There is no way to tell that apart from pid
+    reuse: `_group_alive` answers EPERM with `True` precisely because it cannot
+    either. So the kill path continues (the leader is still reaped, the caller
+    still gets its own exception rather than this one), and the fact that the
+    group could not be shown dead is said out loud instead of being swallowed
+    into a clean-looking return.
 
     `_group_alive` below has handled EPERM since it was written; this function
-    not handling it was the asymmetry, not a decision.
+    not handling it at all was the asymmetry, not a decision.
     """
     try:
         os.killpg(pg, sig)
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
+        pass  # nothing left to signal is success, not an error
+    except PermissionError:
+        _note_unsignalable(pg, sig)
+
+
+def _note_unsignalable(pg: int, sig: int) -> None:
+    """Say that a group refused our signal. Never raises, never blocks a kill.
+
+    `pipeline._note` is the one progress channel (the caller's sink, else
+    stderr), imported lazily because `pipeline` imports this module, and
+    guarded because this is only ever called from an `except` that must not
+    acquire a second failure mode of its own -- the same shape `routing._note`
+    uses for the same reason.
+    """
+    try:
+        from .pipeline import _note
+
+        _note(f"provider group {pg} refused signal {sig} (EPERM): it is "
+              f"either gone and its pgid reused, or alive under credentials "
+              f"we may not signal; continuing the shutdown either way")
+    except BaseException:       # pragma: no cover - a note is never worth a raise
         pass
 
 
