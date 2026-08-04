@@ -956,7 +956,7 @@ def test_pure_load_keeps_the_credit_when_no_soft_term_moved_anything(store):
 
 
 def _identifier_sites(tree: ast.AST, target: str) -> set[str]:
-    """Every place `target` is mentioned, as `"<enclosing def>::<kind>"`.
+    """Every place `target` is mentioned, as `"<qualified scope>::<kind>"`.
 
     `def` is the definition itself; `ref` is any other mention -- a call, a
     bare name, an attribute access, an import. Lumping them together is the
@@ -969,15 +969,26 @@ def _identifier_sites(tree: ast.AST, target: str) -> set[str]:
     nested defs, so a mention inside a closure would be attributed to the
     closure AND to every function around it -- a failure naming several
     functions when only one of them mentions anything.
+
+    The scope is QUALIFIED (`Outer.method`, `outer.<locals>.inner`) rather than
+    the innermost name alone. Two same-named functions in one file -- methods
+    of different classes, most obviously -- would otherwise collapse to one
+    label, so a second site could hide behind the first and the failure could
+    not be located. Qualified rather than line-numbered because the expected
+    set below must not churn every time something above it moves.
     """
     sites: set[str] = set()
 
     def descend(node: ast.AST, where: str) -> None:
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if child.name == target:
+            if isinstance(child, (ast.ClassDef, ast.FunctionDef,
+                                  ast.AsyncFunctionDef)):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and child.name == target:
                     sites.add(f"{where}::def")
-                descend(child, child.name)      # the nested def owns its body
+                qualified = (child.name if where == "<module>"
+                             else f"{where}.{child.name}")
+                descend(child, qualified)   # the nested scope owns its body
                 continue
             if ((isinstance(child, ast.Name) and child.id == target)
                     or (isinstance(child, ast.Attribute) and child.attr == target)
@@ -1025,11 +1036,14 @@ def test_run_review_is_the_only_production_caller_of_head_resolution():
     from pathlib import Path
 
     src = Path(skodun.__file__).resolve().parent
+    # BYTES, not decoded text: `ast.parse` honours a PEP 263 encoding
+    # declaration itself, while `read_text(encoding="utf-8")` would raise on a
+    # source file that declares another one.
     sites = {f"{path.relative_to(src)}::{site}"
              for path in sorted(src.rglob("*.py"))
              for site in _identifier_sites(
-                 ast.parse(path.read_text(encoding="utf-8"),
-                           filename=str(path)), "resolve_review_head")}
+                 ast.parse(path.read_bytes(), filename=str(path)),
+                 "resolve_review_head")}
 
     assert sites == {"pipeline.py::<module>::def",
                      "pipeline.py::_run_review::ref"}, (
