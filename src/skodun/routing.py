@@ -33,6 +33,16 @@ Three properties this module is built around, and each one is load-bearing:
   another model family must not be able to leave a single-family install with
   no reviewer at all.
 
+Phase B (`docs/superpowers/specs/2026-08-04-phase-b-weighted-routing.md`) adds
+one term to that scoring and nothing else: `[routing] weights`, the share of
+reviews an operator DECLARES for each provider, measured against how many each
+actually served in a window. It is declared rather than derived because the
+quantity weights express -- how much of a subscription a review consumes -- is
+not observable to skodun for a flat-rate CLI at any window length, so a router
+that inferred it would be acting on a number it invented. The term is bounded
+so it can never outrank a free slot: capacity still decides, and weights break
+what capacity leaves tied. Absent weights (the default) it does not exist.
+
 A pin (`--reviewer` / the MCP `reviewer` argument) never reaches this module:
 it is an absolute request, and answering it with a different provider would
 hand the caller back the very model they were routing around.
@@ -40,7 +50,9 @@ hand the caller back the very model they were routing around.
 
 from __future__ import annotations
 
+import math
 import os
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -116,6 +128,15 @@ ROUTE_WAIT = "auto:wait"
 #: Every candidate is busy, and the cross-model bonus decided which queue.
 #: Causal in the same sense as `ROUTE_FREE_CROSS`.
 ROUTE_WAIT_CROSS = "auto:wait+cross"
+#: Routed to a provider with a free slot, and the operator's DECLARED SHARE
+#: (`[routing] weights`, Phase B) is what decided it -- the same pool scored
+#: without the share term picks someone else. Causal in exactly the sense
+#: `ROUTE_FREE_CROSS` is, and for the same reason: the question an operator has
+#: after setting weights is "are they doing anything?", which a merely
+#: descriptive label cannot answer.
+ROUTE_FREE_SHARE = "auto:free+share"
+#: Every candidate is busy, and the declared share decided which queue.
+ROUTE_WAIT_SHARE = "auto:wait+share"
 
 # --- scoring weights --------------------------------------------------------
 # The MVP numbers from the design, named rather than inlined so the tests that
@@ -135,6 +156,37 @@ FREE_SLOT_SCORE = 100
 QUEUE_DEPTH_PENALTY = 10
 #: Flat bonus for a provider family that differs from the client's.
 CROSS_MODEL_BONUS = 20
+
+#: Per unit of SHARE DEFICIT (`target - actual`, in [-1, 1]) -- Phase B.
+#:
+#: A COEFFICIENT, not a flat bonus, and the difference is worth being precise
+#: about because it is easy to read this number as one. A candidate's term is
+#: `24 * deficit`, so `24` is the CEILING, reached only by a provider that
+#: declared the whole share and has served none of it. Two candidates 3:1 apart
+#: with nothing served yet have deficits of 0.75 and 0.25, so the share term
+#: separates them by 12 -- not 24, and less than `CROSS_MODEL_BONUS`.
+#:
+#: That proportionality is the intent, not a rounding error: a marginal
+#: declared difference should be a marginal signal, and a router that made
+#: 1.01:1 as decisive as 100:1 would be reading a preference as an ultimatum.
+#: What follows from it is the honest statement of precedence -- **a WIDE share
+#: gap outranks the cross-model heuristic and a narrow one does not**, with the
+#: crossover at a deficit spread of `CROSS_MODEL_BONUS / WEIGHT_SHARE_SCORE`
+#: (about 0.83, i.e. roughly a 10:1 declared split from a cold start). Both are
+#: soft terms; neither is an instruction the other must obey.
+#:
+#: The one bound that IS absolute: `2 * WEIGHT_SHARE_SCORE < FREE_SLOT_SCORE`,
+#: so the widest gap the term can open between two candidates (48) still cannot
+#: reorder providers that differ by one free slot (100). A provider that can
+#: start NOW wins whatever the weights say -- the same guarantee
+#: `CROSS_MODEL_BONUS` has, for the same reason: a review that starts now
+#: finishes sooner than any prediction about a queue.
+#:
+#: Against `QUEUE_DEPTH_PENALTY` it is deliberately NOT bounded: among
+#: providers that are all busy, steering by declared share is the entire job
+#: weights exist for, and the ±24 ceiling already limits it to about two
+#: waiters' worth of queue.
+WEIGHT_SHARE_SCORE = 24
 
 
 def provider_family(provider_id: str) -> str:
@@ -211,6 +263,39 @@ class ProviderLoad:
 
 
 @dataclass(frozen=True)
+class ShareTarget:
+    """Where one provider stands against its DECLARED share of the window.
+
+    Both fields are fractions in `[0, 1]`, and both are computed over THIS
+    RUN'S CANDIDATES rather than over every provider the install has: `target`
+    is this provider's weight over the total weight of the pool's providers,
+    and `actual` is the reviews it served over the reviews those same providers
+    served in the window.
+
+    The two denominators have to be the same set or the difference between
+    them means nothing. Making `actual` a share of ALL reviews -- including
+    ones served by a provider that is not a candidate today, or by a `role =
+    "refuter"` entry nothing routes to -- would leave the actuals summing to
+    less than the targets and read as "every candidate is owed work", which is
+    not a decision this router can act on: it can only choose between the
+    candidates it has. Reviews a non-candidate served are not work these
+    candidates can rebalance.
+
+    The scorer uses only the difference, but both are kept: a bare difference
+    cannot be explained to an operator afterwards, and "am I below my share or
+    is everyone?" is the question weights create.
+    """
+
+    target: float = 0.0
+    actual: float = 0.0
+
+    @property
+    def deficit(self) -> float:
+        """How far BELOW its declared share this provider is, in `[-1, 1]`."""
+        return self.target - self.actual
+
+
+@dataclass(frozen=True)
 class Route:
     """A routing decision: the entry to head the chain, and why."""
 
@@ -247,9 +332,55 @@ def cross_bonus_applies(entry: Reviewer, client_family: str | None,
     return provider_family(entry.provider) != client_family
 
 
+def share_targets(weights: Mapping[str, float],
+                  providers: Sequence[str],
+                  served: Mapping[str, int]) -> dict[str, ShareTarget]:
+    """Declared share vs served share, per provider. Pure -- no store, no clock.
+
+    `providers` is the DISTINCT provider set of this run's pool, and BOTH
+    fractions are computed over it -- the target rather than over the whole
+    weights table, the actual rather than over every review in the window. See
+    `ShareTarget` for why the two denominators must be the same set; the short
+    version is that a share of a population this router cannot choose between
+    is not a number it can act on.
+
+    A provider the operator did not weight counts as **1**, so raising one
+    provider does not mean listing every other one.
+
+    An EMPTY window (nothing served yet) leaves every `actual` at 0, so each
+    deficit is just the target and the highest-weighted provider goes first.
+    That is the right cold start: with no history, begin with the share that
+    was asked for.
+
+    `{}` for an empty weights table, which is what turns the whole Phase B term
+    off -- and off is the default, so an install that never sets weights scores
+    exactly as Phase A did.
+    """
+    if not weights or not providers:
+        return {}
+    declared = {p: float(weights.get(p, 1.0)) for p in providers}
+    total_weight = sum(declared.values())
+    # Both branches are unreachable through `load_config`, which refuses a
+    # non-positive weight and a set of weights that adds to infinity. Kept
+    # because this function is PUBLIC and pure: a caller that builds its own
+    # weights map must get no share term rather than a division by zero or a
+    # table of NaNs.
+    if not math.isfinite(total_weight) or total_weight <= 0:  # pragma: no cover
+        return {}
+    counts = {p: max(0, int(served.get(p, 0))) for p in providers}
+    total_served = sum(counts.values())
+    return {
+        p: ShareTarget(target=w / total_weight,
+                       actual=(counts[p] / total_served
+                               if total_served > 0 else 0.0))
+        for p, w in declared.items()
+    }
+
+
 def score_candidate(entry: Reviewer, load: ProviderLoad, *,
                     client_family: str | None = None,
-                    cross_model: bool = True) -> int:
+                    cross_model: bool = True,
+                    share: ShareTarget | None = None) -> int:
     """Score one candidate. Higher is better. Pure -- no store, no clock.
 
     Free capacity dominates: `FREE_SLOT_SCORE` per free slot, so a provider with
@@ -259,6 +390,11 @@ def score_candidate(entry: Reviewer, load: ProviderLoad, *,
     incremented) so that "least bad wait" is still an ordering rather than a
     coin-flip.
 
+    `share` is Phase B: how far this provider is below the share of reviews its
+    operator declared for it (`[routing] weights`). `None` -- the default, and
+    what every install without weights gets -- adds nothing at all, so the
+    ordering is Phase A's exactly.
+
     An unavailable provider is scored here anyway rather than special-cased:
     `pick_finder` excludes it before scoring, and a scorer that quietly returned
     a sentinel for it would be a second, hidden exclusion rule.
@@ -267,6 +403,8 @@ def score_candidate(entry: Reviewer, load: ProviderLoad, *,
         score = FREE_SLOT_SCORE * load.free_slots
     else:
         score = -QUEUE_DEPTH_PENALTY * (load.queue_depth + 1)
+    if share is not None:
+        score += round(WEIGHT_SHARE_SCORE * share.deficit)
     if cross_bonus_applies(entry, client_family, cross_model):
         score += CROSS_MODEL_BONUS
     return score
@@ -275,7 +413,9 @@ def score_candidate(entry: Reviewer, load: ProviderLoad, *,
 def pick_finder(pool: Sequence[Reviewer],
                 loads: Mapping[str, ProviderLoad], *,
                 client_family: str | None = None,
-                cross_model: bool = True) -> Route | None:
+                cross_model: bool = True,
+                shares: Mapping[str, ShareTarget] | None = None,
+                ) -> Route | None:
     """The best candidate in `pool`, or None when nothing is routable.
 
     Pure. `loads` is keyed by provider id; a candidate whose provider is ABSENT
@@ -300,26 +440,38 @@ def pick_finder(pool: Sequence[Reviewer],
     fail-fast the finder chain already performs, in its own words.
     """
     winner = _argmax(pool, loads, client_family=client_family,
-                     cross_model=cross_model)
+                     cross_model=cross_model, shares=shares)
     if winner is None:
         return None
     chosen, chosen_load = winner
-    # `+cross` is a CAUSAL claim -- "the cross-model preference is what sent
-    # this review here" -- so it is answered by asking the counterfactual
-    # rather than by observing that the winner happens to be cross-family. A
-    # cross-family provider with the most free slots would have won either way,
-    # and labelling that `+cross` would tell an operator the preference is
+    # `+cross` and `+share` are CAUSAL claims -- "this is what sent the review
+    # here" -- so each is answered by asking the counterfactual rather than by
+    # observing that the winner happens to be cross-family or below its share.
+    # A cross-family provider with the most free slots would have won either
+    # way, and labelling that `+cross` would tell an operator the preference is
     # earning its keep when it is not. Costs one more pass over a pool that has
     # single digits of entries, once per review.
     cross = cross_bonus_applies(chosen, client_family, cross_model)
     if cross:
         without = _argmax(pool, loads, client_family=client_family,
-                          cross_model=False)
+                          cross_model=False, shares=shares)
         cross = without is None or without[0].name != chosen.name
-    if chosen_load.free_slots > 0:
-        reason = ROUTE_FREE_CROSS if cross else ROUTE_FREE
+    share_decided = False
+    if shares:
+        without = _argmax(pool, loads, client_family=client_family,
+                          cross_model=cross_model, shares=None)
+        share_decided = without is None or without[0].name != chosen.name
+    # PRECEDENCE, when both counterfactuals hold: the operator's declared share
+    # is an instruction and the family bonus is a heuristic, so `+share` is the
+    # honest answer to "why here". One label per decision, deliberately -- a
+    # `+share+cross` would double the vocabulary to describe a case an operator
+    # acts on the same way.
+    if share_decided:
+        reason = ROUTE_FREE_SHARE if chosen_load.free_slots > 0 else ROUTE_WAIT_SHARE
+    elif cross:
+        reason = ROUTE_FREE_CROSS if chosen_load.free_slots > 0 else ROUTE_WAIT_CROSS
     else:
-        reason = ROUTE_WAIT_CROSS if cross else ROUTE_WAIT
+        reason = ROUTE_FREE if chosen_load.free_slots > 0 else ROUTE_WAIT
     return Route(reviewer=chosen, reason=reason)
 
 
@@ -350,7 +502,9 @@ def _warn_inert_client_family(cfg: Config, pool: Sequence[Reviewer],
 
 def _argmax(pool: Sequence[Reviewer], loads: Mapping[str, ProviderLoad], *,
             client_family: str | None,
-            cross_model: bool) -> tuple[Reviewer, ProviderLoad] | None:
+            cross_model: bool,
+            shares: Mapping[str, ShareTarget] | None = None,
+            ) -> tuple[Reviewer, ProviderLoad] | None:
     """The best-scoring routable candidate and its load, or None. Pure."""
     best: int | None = None
     chosen: tuple[Reviewer, ProviderLoad] | None = None
@@ -358,8 +512,9 @@ def _argmax(pool: Sequence[Reviewer], loads: Mapping[str, ProviderLoad], *,
         load = loads.get(entry.provider)
         if load is None or load.unavailable:
             continue
-        score = score_candidate(entry, load, client_family=client_family,
-                                cross_model=cross_model)
+        score = score_candidate(
+            entry, load, client_family=client_family, cross_model=cross_model,
+            share=None if shares is None else shares.get(entry.provider))
         # STRICTLY greater, so an equal score leaves the earlier candidate in
         # place: that is the first-listed tie-break, and it is one comparison
         # rather than a sort key nobody would read the same way twice.
@@ -492,6 +647,75 @@ def provider_loads(store, pool: Sequence[Reviewer], *,
     return out
 
 
+def provider_served(store, providers: Sequence[str], *,
+                    window_days: int) -> dict[str, int] | None:
+    """Reviews each provider SERVED in the window, or None if unreadable.
+
+    Folded from `Store.routing_counts`, which is the same read `skodun
+    providers --since-days N` reports, so the number an operator sees when they
+    ask whether their weights are working is the number the router scored with.
+    Keyed by the ADAPTER that answered rather than by the head that was chosen:
+    a weight rations a SUBSCRIPTION, and after a fallback the subscription that
+    was spent is the one that served.
+
+    `None`, not an empty dict, when the store cannot answer. The difference is
+    load-bearing: `{}` is a real, empty window and correctly starts everyone at
+    zero served, while a failed read knows nothing -- and scoring a failed read
+    as an empty window would hand the whole share to the highest-weighted
+    provider on the strength of a store error. The caller drops the share term
+    for that run instead, and says so.
+
+    One table scan per routed review, on a table whose `reviewed_at` carries no
+    index of its own. That is a real cost and a small one beside a review that
+    takes minutes, and it is paid only when weights are configured.
+    """
+    from .adapters import _REGISTRY
+    from .pipeline import _iso_at
+
+    since = _iso_at(time.time() - max(1, int(window_days)) * 86400.0)
+    try:
+        rows = store.routing_counts(since_iso=since)
+    except Exception as e:
+        # This module's own `_note`, not `pipeline._note`: it is the guarded
+        # one, and this is an `except` that must not acquire a second failure
+        # mode of its own.
+        _note(f"routing: could not read served counts since {since}: {e!r}; "
+              f"scoring this run without [routing] weights")
+        return None
+    # A review record carries the ADAPTER that answered (`grok`, `codex`,
+    # `agy`), and weights are declared per PROVIDER (`xai`, `openai`,
+    # `google`), which are not the same strings for three of the five shipped
+    # adapters. Reading `served` as if they were would score every one of them
+    # as having served nothing, i.e. permanently owed the whole share.
+    wanted = set(providers)
+    by_adapter = {_REGISTRY[p].name: p for p in wanted if p in _REGISTRY}
+    out: dict[str, int] = {p: 0 for p in wanted}
+    for row in rows:
+        provider = by_adapter.get(row.get("adapter"))
+        if provider is not None:
+            out[provider] += int(row.get("n") or 0)
+    return out
+
+
+def _shares_for(cfg: Config, pool: Sequence[Reviewer],
+                store) -> dict[str, ShareTarget] | None:
+    """This run's share targets, or None when the Phase B term does not apply.
+
+    Three ways to get None, and they are all "score as Phase A did": no
+    `[routing] weights` at all (the default), a store that could not answer the
+    served counts, and -- via `share_targets` -- an empty candidate set.
+    """
+    weights = dict(cfg.routing.weights)
+    if not weights:
+        return None
+    providers = list(dict.fromkeys(e.provider for e in pool))
+    served = provider_served(
+        store, providers, window_days=cfg.routing.weights_window_days)
+    if served is None:
+        return None
+    return share_targets(weights, providers, served)
+
+
 def auto_route(cfg: Config, store, *,
                client_family: str | None = None) -> Route | None:
     """Score the configured pool against live load. None -> caller decides.
@@ -509,7 +733,8 @@ def auto_route(cfg: Config, store, *,
         _warn_inert_client_family(cfg, pool, client_family)
         loads = provider_loads(store, pool)
         return pick_finder(pool, loads, client_family=client_family,
-                           cross_model=cfg.routing.cross_model)
+                           cross_model=cfg.routing.cross_model,
+                           shares=_shares_for(cfg, pool, store))
     except Exception as e:
         _note(f"routing: auto-route failed ({e!r}); falling back to this "
               f"config's default head")

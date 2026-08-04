@@ -322,6 +322,8 @@ lets skodun choose instead, for runs that pass no `--reviewer`:
 mode        = "auto"    # off (the default) | auto
 pool        = []        # reviewer NAMES; empty means every enabled role=finder
 cross_model = true      # soft preference for a different provider family
+weights     = {}        # declared share per PROVIDER; empty means equal
+weights_window_days = 7 # how far back the served counts are read
 ```
 
 `mode` defaults to **`off`**, which is exactly pre-S5 behaviour, and
@@ -355,10 +357,63 @@ The properties that make this safe to turn on:
   run still starts inside the pool (`route_reason` `auto:default-finder`) — a
   finder you kept out of the pool never heads an automatic run.
 
+#### Declaring a share per provider
+
+Free capacity is the right tie-break when providers are interchangeable. When
+they are not — a subscription with three times another's headroom, a metered
+key you want used sparingly — `weights` is where you say so:
+
+```toml
+[routing]
+mode    = "auto"
+weights = { xai = 3, google = 1 }   # xai should serve ~3 reviews per google's 1
+```
+
+Keyed by **provider id**, not reviewer name: a weight is a statement about a
+subscription, and two `[[reviewers]]` entries on one provider draw on the same
+one. A provider you do not list counts as `1`, so raising one does not mean
+listing them all. Zero and negative are refused — "never route here" is what
+`pool` and `enabled = false` already say, and a third, silent way to exclude a
+provider is a trap.
+
+Each candidate's declared share is compared with how many reviews it actually
+*served* in the last `weights_window_days` (the same counts `skodun providers`
+prints), and a provider below its share is scored up by how far below it is:
+
+```
+free capacity   100 per free slot
+declared share  24 × (declared − served share), so ±24 at the extreme
+cross-model      20
+queue depth     -10 per waiter
+```
+
+**No weight can outrank a free slot** — a provider that can start now still
+wins, exactly as with `cross_model`, because two candidates can differ by at
+most 48 on the share term and a free slot is worth 100.
+
+Note that `24` is a *coefficient*, not a flat bonus: two providers weighted 3:1
+with nothing served yet are 12 apart, not 24, so the cross-model preference
+(+20) still tips that one. A **wide** share gap outranks cross-model and a
+narrow one does not. That is deliberate — a marginal declared difference should
+be a marginal signal, and treating 1.01:1 as decisively as 100:1 would read a
+preference as an ultimatum. With nothing served yet and no cross-model
+preference in play, the highest-weighted provider goes first.
+
+Weights are **declared, never inferred**. The thing they express — how much of
+a subscription a review consumes — is not observable to skodun for a flat-rate
+CLI: no balance is published, no cost is reported, and the same prompt costs a
+different fraction of a different tier. A router that inferred a weight would
+be acting on a number it made up. See
+[the Phase B design](docs/superpowers/specs/2026-08-04-phase-b-weighted-routing.md).
+
 Every artifact records `requested_reviewer`, `routed_reviewer`, `route_reason`
-(`pinned`, `config-finder`, `auto:free`, `auto:free+cross`, `auto:wait`,
-`auto:wait+cross`, `auto:default-finder`) and `client_family`, so why a given
-review went where it did is answerable afterwards.
+(`pinned`, `config-finder`, `auto:free`, `auto:free+cross`, `auto:free+share`,
+`auto:wait`, `auto:wait+cross`, `auto:wait+share`, `auto:default-finder`) and
+`client_family`, so why a given review went where it did is answerable
+afterwards. `+cross` and `+share` are causal: they appear only when re-scoring
+without that term picks somebody else, so they answer "is this earning its
+keep?" rather than "did this apply?". When both would have decided it, the
+label is `+share` — the operator's instruction outranks the heuristic.
 
 `skodun providers` reads those back in aggregate: the effective routing config,
 then per provider how many reviews it *served* in the last 7 days
@@ -366,7 +421,7 @@ then per provider how many reviews it *served* in the last 7 days
 down exact `route_reason` values and routed entries.
 
 ```
-routing: mode=auto pool=all-enabled-finders cross_model=on window=7d
+routing: mode=auto pool=all-enabled-finders cross_model=on weights=off window=7d
 xai | adapter=grok | … | holders=0 | served=53/191 (auto 2, pinned 1, unrouted 50)
 routing decisions (7d): unrouted 170, pinned 18, auto:free 2, config-finder 1
 routed head (7d): finder-openai-api 15, finder 3, finder-codex 2

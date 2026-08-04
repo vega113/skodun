@@ -23,9 +23,13 @@ from skodun.routing import (
     QUEUE_DEPTH_PENALTY,
     ROUTE_FREE,
     ROUTE_FREE_CROSS,
+    ROUTE_FREE_SHARE,
     ROUTE_WAIT,
     ROUTE_WAIT_CROSS,
+    ROUTE_WAIT_SHARE,
+    WEIGHT_SHARE_SCORE,
     ProviderLoad,
+    ShareTarget,
     auto_route,
     cross_bonus_applies,
     family_for_client_name,
@@ -36,6 +40,7 @@ from skodun.routing import (
     resolve_client_family,
     resolve_pool,
     score_candidate,
+    share_targets,
 )
 from skodun.store import Store, _TS_FORMAT
 
@@ -47,10 +52,13 @@ def _entry(name: str, provider: str, *, role: str = "finder",
 
 
 def _cfg(*reviewers: Reviewer, mode: str = "auto",
-         pool: tuple[str, ...] = (), cross_model: bool = True) -> Config:
+         pool: tuple[str, ...] = (), cross_model: bool = True,
+         weights: tuple[tuple[str, float], ...] = (),
+         weights_window_days: int = 7) -> Config:
     return Config(defaults=Defaults(), reviewers=tuple(reviewers),
                   routing=Routing(mode=mode, pool=pool,
-                                  cross_model=cross_model))
+                                  cross_model=cross_model, weights=weights,
+                                  weights_window_days=weights_window_days))
 
 
 @pytest.fixture(autouse=True)
@@ -307,6 +315,30 @@ def _hold(store: Store, provider: str, admission_id: str) -> None:
                            resource_class=capacity.provider_resource_class(provider),
                            scope=provider)
     store.capacity_force_admit(admission_id)
+
+
+def _seed_served(store: Store, per_adapter: dict[str, int]) -> None:
+    """`n` reviews inside the window, credited to each ADAPTER name.
+
+    Written through `save_review` so the rows are the ones `routing_counts`
+    really reads -- source, adapter and timestamp all as the pipeline persists
+    them. Keyed by adapter (`grok`, `codex`) rather than provider (`xai`,
+    `openai`) because that is what a review record carries, and the gap between
+    the two is exactly what `provider_served` has to bridge.
+    """
+    at = time.strftime(_TS_FORMAT, time.gmtime(time.time() - 3600))
+    for adapter, n in per_adapter.items():
+        for i in range(n):
+            store.save_review({
+                "id": f"{adapter}-{i}", "reviewed_at": at, "source": "skodun",
+                "branch": "feat", "head": "a" * 40, "base_ref": "main",
+                "base_sha": "b" * 40, "diff_hash": f"{adapter}{i}",
+                "mode": "now", "model": "m", "adapter": adapter,
+                "status": "clean", "parse_ok": True, "degraded": False,
+                "diff_truncated": False, "trustworthy": True,
+                "stop_reason": None, "findings": [], "findings_total": 0,
+                "summary": "",
+            })
 
 
 def _queue(store: Store, provider: str, admission_id: str) -> None:
@@ -575,3 +607,225 @@ def test_no_inert_warning_when_the_operator_turned_cross_model_off(store,
     cfg = _cfg(_entry("finder-a", "xai"), cross_model=False)
     auto_route(cfg, store, client_family="opneai")
     assert "matches no configured" not in capsys.readouterr().err
+
+
+# --- Phase B: declared share (#77) ------------------------------------------
+# `[routing] weights` is the operator saying how reviews should be SPLIT across
+# providers, measured against how many each actually served. Declared rather
+# than derived: what weights express -- how much of a subscription a review
+# consumes -- is not observable for a flat-rate CLI at any window length, so a
+# router that inferred it would be acting on a number it made up. See
+# `docs/superpowers/specs/2026-08-04-phase-b-weighted-routing.md` §1.
+
+
+def test_no_weights_is_phase_a_exactly():
+    """The default, and the property that makes the term safe to ship: an
+    install that never sets weights scores byte-for-byte as it did before."""
+    e = _entry("f", "xai")
+    load = ProviderLoad(free_slots=1)
+    assert (score_candidate(e, load, share=None)
+            == score_candidate(e, load) == FREE_SLOT_SCORE)
+    assert share_targets({}, ["xai", "openai"], {"xai": 10}) == {}
+
+
+def test_an_unweighted_provider_counts_as_one():
+    """So raising ONE provider does not mean listing every other."""
+    got = share_targets({"xai": 3}, ["xai", "openai"], {})
+    assert got["xai"].target == pytest.approx(0.75)
+    assert got["openai"].target == pytest.approx(0.25)
+
+
+def test_the_target_is_computed_over_this_run_s_candidates_only():
+    """A weight for a provider that is not a candidate today must not shrink
+    every real candidate's target -- the shares would stop summing to one and
+    everybody would read as permanently owed work."""
+    got = share_targets({"xai": 1, "google": 99}, ["xai", "openai"], {})
+    assert got["xai"].target + got["openai"].target == pytest.approx(1.0)
+    assert "google" not in got
+
+
+def test_an_empty_window_leaves_everyone_at_zero_served():
+    """The cold start: with no history, begin with the share that was asked
+    for, so the highest-weighted provider goes first."""
+    got = share_targets({"xai": 3, "openai": 1}, ["xai", "openai"], {})
+    assert got["xai"].actual == got["openai"].actual == 0.0
+    assert got["xai"].deficit > got["openai"].deficit
+
+
+def test_a_provider_over_its_share_is_scored_below_one_under_it():
+    """xai declared three quarters and served all ten of ten: it is over, and
+    openai -- declared a quarter, served none -- is owed."""
+    got = share_targets({"xai": 3}, ["xai", "openai"], {"xai": 10, "openai": 0})
+    assert got["xai"].deficit < 0 < got["openai"].deficit
+    over = score_candidate(_entry("a", "xai"), ProviderLoad(free_slots=1),
+                           share=got["xai"])
+    under = score_candidate(_entry("b", "openai"), ProviderLoad(free_slots=1),
+                            share=got["openai"])
+    assert under > over
+
+
+def test_a_free_slot_still_beats_any_declared_share():
+    """THE bound on this term, and the reason it is 24. A review that can start
+    now finishes sooner than any prediction about a queue, so no weight may
+    reorder providers that differ by a free slot -- the same guarantee
+    `cross_model` has."""
+    maximally_owed = ShareTarget(target=1.0, actual=0.0)
+    maximally_over = ShareTarget(target=0.0, actual=1.0)
+    starved_but_busy = score_candidate(
+        _entry("a", "xai"), ProviderLoad(free_slots=0, queue_depth=0),
+        share=maximally_owed)
+    fed_and_free = score_candidate(
+        _entry("b", "openai"), ProviderLoad(free_slots=1),
+        share=maximally_over)
+    assert fed_and_free > starved_but_busy
+    # ...and the same at the tightest margin the scale allows: one free slot
+    # against two, which is exactly `FREE_SLOT_SCORE` apart.
+    one = score_candidate(_entry("a", "xai"), ProviderLoad(free_slots=1),
+                          share=maximally_owed)
+    two = score_candidate(_entry("b", "openai"), ProviderLoad(free_slots=2),
+                          share=maximally_over)
+    assert two > one
+    assert 2 * WEIGHT_SHARE_SCORE < FREE_SLOT_SCORE
+
+
+def test_a_wide_share_gap_outranks_cross_model_and_a_narrow_one_does_not():
+    """`WEIGHT_SHARE_SCORE` is a COEFFICIENT, not a flat bonus, so comparing it
+    with `CROSS_MODEL_BONUS` is not the whole story: a candidate's term is
+    `24 * deficit`, and two providers 3:1 apart from a cold start are only 12
+    apart -- less than the +20 a cross-family provider gets.
+
+    That is intended. A marginal declared difference should be a marginal
+    signal; a router that made 1.01:1 as decisive as 100:1 would be reading a
+    preference as an ultimatum. What it means is that the honest precedence is
+    "a wide share gap wins, a narrow one does not", with the crossover at a
+    deficit spread of CROSS_MODEL_BONUS / WEIGHT_SHARE_SCORE.
+    """
+    def duel(target_a: float, target_b: float) -> str:
+        """Two equally free providers, `b` cross-family, `a` the client's own."""
+        a = score_candidate(
+            _entry("a", "xai"), ProviderLoad(free_slots=1),
+            share=ShareTarget(target=target_a, actual=0.0),
+            client_family="xai")
+        b = score_candidate(
+            _entry("b", "openai"), ProviderLoad(free_slots=1),
+            share=ShareTarget(target=target_b, actual=0.0),
+            client_family="xai")
+        return "a" if a > b else "b"
+
+    # The crossover spread, stated as the arithmetic rather than as a magic
+    # pair of numbers. Each side is taken with a margin rather than at the
+    # boundary itself, because the term is `round()`ed to an integer and the
+    # last fraction of a point is not a property worth pinning.
+    crossover = CROSS_MODEL_BONUS / WEIGHT_SHARE_SCORE
+
+    def spread(width: float) -> str:
+        return duel(0.5 + width / 2, 0.5 - width / 2)
+
+    # 3:1 from a cold start is a 0.5 spread, worth 12: it loses to the +20.
+    assert duel(0.75, 0.25) == "b"
+    assert spread(crossover - 0.3) == "b"
+    assert spread(crossover + 0.15) == "a"
+    assert duel(1.0, 0.0) == "a"
+
+
+def test_the_share_label_is_causal_not_descriptive(store):
+    """`auto:free+share` claims the weights are what SENT the review here. A
+    provider that would have won on load alone records plain `auto:free`, or
+    an operator reading the telemetry would believe their weights are earning
+    their keep when they are not."""
+    cfg = _cfg(_entry("finder-a", "xai"), _entry("finder-b", "openai"),
+               weights=(("xai", 3),))
+    # Nothing served, nothing busy: xai is both first-listed AND the most owed,
+    # so the share term changed nothing.
+    route = auto_route(cfg, store)
+    assert (route.reviewer.name, route.reason) == ("finder-a", ROUTE_FREE)
+
+
+def test_a_declared_share_moves_the_head_and_says_so(store, monkeypatch):
+    """The whole feature, end to end through the real store: xai has served
+    everything in the window, so the review that would have gone to the
+    first-listed entry goes to the one that is owed."""
+    _seed_served(store, {"grok": 9, "codex": 1})
+    cfg = _cfg(_entry("finder-a", "xai"), _entry("finder-b", "openai"),
+               weights=(("xai", 1), ("openai", 1)))
+
+    route = auto_route(cfg, store)
+
+    assert (route.reviewer.name, route.reason) == ("finder-b",
+                                                   ROUTE_FREE_SHARE)
+
+
+def test_the_same_store_without_weights_keeps_the_first_listed_head(store):
+    """The control for the test above: the served counts are identical and it
+    is the WEIGHTS that changed the answer, not the history."""
+    _seed_served(store, {"grok": 9, "codex": 1})
+    cfg = _cfg(_entry("finder-a", "xai"), _entry("finder-b", "openai"))
+    route = auto_route(cfg, store)
+    assert (route.reviewer.name, route.reason) == ("finder-a", ROUTE_FREE)
+
+
+def test_served_counts_are_read_by_provider_not_by_adapter_name(store):
+    """Three of the five shipped adapters have a name that is not their
+    provider id (`xai`/grok, `openai`/codex, `google`/agy). Reading `served`
+    as if they matched scores every one of them as having served nothing --
+    permanently owed the whole share, whatever it really did."""
+    _seed_served(store, {"grok": 5})
+    from skodun.routing import provider_served
+
+    assert provider_served(store, ["xai", "openai"], window_days=7) == {
+        "xai": 5, "openai": 0}
+
+
+def test_a_store_that_cannot_answer_drops_the_term_rather_than_guessing(
+        store, capsys):
+    """A failed read knows NOTHING, which is not the same as an empty window:
+    scoring it as empty would hand the whole share to the highest-weighted
+    provider on the strength of a store error. Loud, like every other guard in
+    this module."""
+    class _Broken:
+        def __getattr__(self, name):
+            return getattr(store, name)
+
+        def routing_counts(self, *a, **k):
+            raise RuntimeError("no such column")
+
+    cfg = _cfg(_entry("finder-a", "xai"), _entry("finder-b", "openai"),
+               weights=(("openai", 99),))
+    route = auto_route(cfg, _Broken())
+    assert (route.reviewer.name, route.reason) == ("finder-a", ROUTE_FREE)
+    assert "could not read served counts" in capsys.readouterr().err
+
+
+def test_weights_steer_between_two_busy_providers(store):
+    """Among providers that are ALL busy, steering by declared share is the
+    entire job weights exist for."""
+    _seed_served(store, {"grok": 10})
+    _hold(store, "xai", "h1")
+    _hold(store, "openai", "h2")
+    cfg = _cfg(_entry("finder-a", "xai"), _entry("finder-b", "openai"),
+               weights=(("xai", 1), ("openai", 1)))
+
+    route = auto_route(cfg, store)
+
+    assert (route.reviewer.name, route.reason) == ("finder-b",
+                                                   ROUTE_WAIT_SHARE)
+
+
+def test_both_fractions_are_computed_over_the_same_candidate_set():
+    """`target` and `actual` must share a denominator or their difference
+    means nothing.
+
+    A provider outside this run's pool -- another finder kept out of it, or a
+    `role = "refuter"` entry nothing routes to -- may well have served reviews
+    in the window. Counting those in the DENOMINATOR while the targets still
+    sum to one would make every candidate read as owed work, which is not a
+    decision this router can act on: it can only choose between the candidates
+    it has, and a review some non-candidate served is not work they can
+    rebalance.
+    """
+    got = share_targets({"xai": 1, "openai": 1}, ["xai", "openai"],
+                        {"xai": 3, "openai": 1, "google": 1000})
+    assert sum(t.target for t in got.values()) == pytest.approx(1.0)
+    assert sum(t.actual for t in got.values()) == pytest.approx(1.0)
+    assert got["xai"].actual == pytest.approx(0.75)
+    assert "google" not in got

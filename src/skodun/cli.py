@@ -1254,9 +1254,15 @@ def _fmt_routing_header(routing, since_days: int) -> str:
 
     pool = (",".join(shown_field(n) for n in routing.pool)
             if routing.pool else "all-enabled-finders")
+    # Weights are printed even though they are usually absent: "are my weights
+    # on" is the first question an operator has after setting them, and the
+    # answer has to be readable beside the `served=` counts they are measured
+    # against rather than reconstructed from two config layers by hand.
+    weights = (",".join(f"{shown_field(p)}={w:g}" for p, w in routing.weights)
+               if routing.weights else "off")
     return (f"routing: mode={shown_field(routing.mode)} pool={pool} "
             f"cross_model={'on' if routing.cross_model else 'off'} "
-            f"window={since_days}d")
+            f"weights={weights} window={since_days}d")
 
 
 def _cmd_providers(args) -> int:

@@ -3336,7 +3336,35 @@ def test_providers_reports_the_effective_routing_config(tmp_path, monkeypatch,
     assert "routing: mode=auto" in out
     assert "pool=all-enabled-finders" in out
     assert "cross_model=on" in out
+    assert "weights=off" in out
     assert "window=7d" in out
+
+
+def test_providers_reports_the_declared_weights_beside_the_served_counts(
+        tmp_path, monkeypatch, capsys):
+    """"Are my weights on" is the first question an operator has after setting
+    them, and the answer belongs beside the `served=` counts the weights are
+    measured against -- not reconstructed from two config layers by hand."""
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    repo = tmp_path / "w"; repo.mkdir()
+    (repo / ".skodun.toml").write_text("""
+[routing]
+mode = "auto"
+weights = { xai = 3, openai = 1 }
+[[reviewers]]
+name = "finder-grok"
+provider = "xai"
+model = "m"
+role = "finder"
+[[reviewers]]
+name = "finder-codex"
+provider = "openai"
+model = "m"
+role = "finder"
+""", encoding="utf-8")
+    monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "no-global.toml"))
+    main(["providers", "--repo", str(repo)])
+    assert "weights=xai=3,openai=1" in capsys.readouterr().out
 
 
 def test_providers_splits_served_counts_by_how_the_head_was_chosen(

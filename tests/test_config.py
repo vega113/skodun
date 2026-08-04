@@ -1244,8 +1244,97 @@ pool = ["b", "a"]
 
 
 def test_routing_rejects_an_unknown_key(tmp_path):
-    g = _write(tmp_path / "g.toml", "[routing]\nweights = 1\n")
-    with pytest.raises(ValueError, match=r"unknown \[routing\] keys: \['weights'\]"):
+    """`weights` was this test's example of a key nobody configured, until
+    Phase B made it one that exists. The example has to be a key that is
+    genuinely unknown, or the test passes on the wrong error."""
+    g = _write(tmp_path / "g.toml", "[routing]\nstickiness = 1\n")
+    with pytest.raises(ValueError,
+                       match=r"unknown \[routing\] keys: \['stickiness'\]"):
+        load_config(None, global_path=g)
+
+
+def test_routing_weights_default_to_off_and_a_seven_day_window():
+    """The default is Phase A exactly: no weights, so no share term at all."""
+    r = load_config(None, global_path=None).routing
+    assert r.weights == () and r.weights_window_days == 7
+
+
+def test_routing_weights_load_as_ordered_pairs(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[routing]
+weights = { xai = 3, openai = 1.5 }
+weights_window_days = 2
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+[[reviewers]]
+name = "b"
+provider = "openai"
+model = "m"
+""")
+    r = load_config(None, global_path=g).routing
+    assert r.weights == (("xai", 3.0), ("openai", 1.5))
+    assert r.weights_window_days == 2
+
+
+@pytest.mark.parametrize("literal, expected", [
+    ("{ xai = 0 }", r"must be greater than 0"),
+    ("{ xai = -1 }", r"must be greater than 0"),
+    # TOML has `inf` as a literal and `inf > 0` is TRUE, so this one reaches
+    # the router: `target` becomes `inf / inf` (NaN), the scorer's `round()`
+    # raises on it, and `auto_route`'s guard swallows that on EVERY routed run
+    # -- auto-routing silently off, from a config that loaded cleanly.
+    ("{ xai = inf }", r"must be a finite number"),
+    ("{ xai = -inf }", r"must be a finite number"),
+    ("{ xai = nan }", r"must be a finite number"),
+    ('{ xai = "3" }', r"must be a number, got str"),
+    ("{ xai = true }", r"must be a number, got bool"),
+    ("3", r"expected a table of provider = number, got int"),
+])
+def test_routing_weights_reject_what_cannot_be_a_share(tmp_path, literal,
+                                                       expected):
+    """Every one of these is a typo that would otherwise do NOTHING, quietly,
+    while the operator believed a provider was rationed. Zero is refused
+    rather than clamped for a sharper reason: it reads as "never route here",
+    which `pool` and `enabled = false` already say -- accepting it would add a
+    third, SILENT way to exclude a provider from a table whose job is
+    preference, not exclusion."""
+    g = _write(tmp_path / "g.toml", f"""
+[routing]
+weights = {literal}
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+""")
+    with pytest.raises(ValueError, match=rf"\[routing\] weights: .*{expected}"):
+        load_config(None, global_path=g)
+
+
+def test_routing_weights_reject_a_provider_nobody_configured(tmp_path):
+    """`pool`'s argument, for the other table: a weight on a provider that
+    cannot be routed to is a typo, and a typo that changes nothing is the one
+    an operator never finds."""
+    g = _write(tmp_path / "g.toml", """
+[routing]
+weights = { xia = 3 }
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+""")
+    with pytest.raises(
+            ValueError,
+            match=r"\[routing\] weights: no reviewer uses provider 'xia'"):
+        load_config(None, global_path=g)
+
+
+def test_routing_weights_window_must_be_a_positive_integer(tmp_path):
+    g = _write(tmp_path / "g.toml",
+               "[routing]\nweights_window_days = 0\n")
+    with pytest.raises(ValueError,
+                       match=r"\[routing\] weights_window_days: must be >= 1"):
         load_config(None, global_path=g)
 
 
@@ -1364,3 +1453,47 @@ def test_a_bad_routing_mode_env_is_loud(monkeypatch):
     with pytest.raises(ValueError,
                        match=rf"{ROUTING_MODE_ENV}: unknown mode 'Auto'"):
         load_config(None, global_path=None)
+
+
+def test_routing_weights_reject_a_total_that_overflows_to_infinity(tmp_path):
+    """Each term finite is not enough: two finite weights can ADD to `inf`,
+    and the router divides by that total -- every target would come out `0.0`,
+    so the declared ratio would be gone while `skodun providers` went on
+    reporting the weights as set. Same silent-disable this table refuses a
+    bare `inf` for, one addition later."""
+    g = _write(tmp_path / "g.toml", """
+[routing]
+weights = { xai = 1e308, openai = 1e308 }
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+[[reviewers]]
+name = "b"
+provider = "openai"
+model = "m"
+""")
+    with pytest.raises(ValueError,
+                       match=r"\[routing\] weights: the weights add up to "
+                             r"infinity"):
+        load_config(None, global_path=g)
+
+
+def test_routing_weights_accept_large_but_summable_numbers(tmp_path):
+    """The check is arithmetic validity, not a policy guess about how big a
+    weight may be -- only the RATIO between them matters, so a config that
+    expresses one with big numbers is still a config."""
+    g = _write(tmp_path / "g.toml", """
+[routing]
+weights = { xai = 1e300, openai = 1e299 }
+[[reviewers]]
+name = "a"
+provider = "xai"
+model = "m"
+[[reviewers]]
+name = "b"
+provider = "openai"
+model = "m"
+""")
+    assert load_config(None, global_path=g).routing.weights == (
+        ("xai", 1e300), ("openai", 1e299))
