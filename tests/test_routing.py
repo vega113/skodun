@@ -959,7 +959,8 @@ def _identifier_sites(tree: ast.AST, target: str) -> set[str]:
     """Every place `target` is mentioned, as `"<qualified scope>::<kind>"`.
 
     `def` is the definition itself; `ref` is any other mention -- a call, a
-    bare name, an attribute access, an import. Lumping them together is the
+    bare name, an attribute access, either side of an import (`import x as
+    target` binds the name just as `from x import target` does). Lumping them together is the
     point: the invariant below is about the identifier being MENTIONED, not
     about how, so an alias (`head_of = pipeline.resolve_review_head`) is a
     `ref` exactly like a direct call and cannot slip past a scan looking for
@@ -992,7 +993,8 @@ def _identifier_sites(tree: ast.AST, target: str) -> set[str]:
                 continue
             if ((isinstance(child, ast.Name) and child.id == target)
                     or (isinstance(child, ast.Attribute) and child.attr == target)
-                    or (isinstance(child, ast.alias) and child.name == target)):
+                    or (isinstance(child, ast.alias)
+                        and target in (child.name, child.asname))):
                 sites.add(f"{where}::ref")
             descend(child, where)
 
