@@ -538,3 +538,58 @@ def test_an_indented_marker_is_not_the_markers_line():
 
     assert a.classify(1, b"", b"   " + marker).kind != "degraded"
     assert a.classify(1, b"", marker).kind == "degraded"
+
+
+def test_a_hostile_finish_reason_cannot_fabricate_an_outage(capsys):
+    """`finish_reason` is provider-controlled and now reaches stderr, which is
+    a scan the unavailability tables read with unanchored substring matches --
+    deliberately, because `rate limit` legitimately appears there in an error
+    body. A reason is an enum, not prose, so it is held to an enum's shape:
+    otherwise `"length auth failure"` fabricates an `auth` outage out of a
+    truncation and sends the chain hopping to another provider."""
+    from skodun.adapters.openai_api_runner import _emit_incomplete
+
+    _emit_incomplete("length\nrate limit: forged\nauth failure: forged")
+    written = capsys.readouterr().err
+
+    assert written.count("\n") == 1
+    assert "rate limit" not in written and "auth failure" not in written
+    v = get_adapter("openai-api").classify(1, b"", written.encode())
+    assert v.kind == "degraded", v          # the truth, not the forgery
+
+
+def test_an_ordinary_finish_reason_survives_the_sanitizer_intact():
+    """The other half: the documented values must come through unchanged, or
+    the diagnostic stops naming the thing that happened."""
+    from skodun.adapters.openai_api_runner import _safe_finish_reason
+
+    for reason in ("length", "content_filter", "tool_calls", "stop"):
+        assert _safe_finish_reason(reason) == reason
+
+
+def test_every_stderr_write_goes_through_the_one_flattening_writer():
+    """The defence is only as good as its coverage, and the first version of
+    it was not: `_fail` flattened while `_emit_incomplete` interpolated a
+    provider value straight into its own formatted write. One writer is what
+    makes "everything this module puts on stderr is a single line" a property
+    of the module rather than of each call site."""
+    import ast as _ast
+    from pathlib import Path as _Path
+
+    from skodun.adapters import openai_api_runner
+
+    tree = _ast.parse(
+        _Path(openai_api_runner.__file__).read_text(encoding="utf-8"))
+    writers: set[str] = set()
+    for node in _ast.walk(tree):
+        if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            continue
+        for inner in _ast.walk(node):
+            if (isinstance(inner, _ast.Attribute) and inner.attr == "write"
+                    and "stderr" in _ast.dump(inner.value)):
+                writers.add(node.name)
+
+    assert writers == {"_stderr_line"}, (
+        f"{sorted(writers)} write to stderr directly. Route it through "
+        f"`_stderr_line`, or untrusted text in that message can forge one of "
+        f"the machine lines the adapter and the spend ledger read.")

@@ -41,10 +41,56 @@ API_BASE_ENV = "SKODUN_OPENAI_API_BASE"  # override for proxies/tests
 USAGE_PREFIX = "SKODUN_API_USAGE "
 
 
-def _emit_usage(usage: dict) -> None:
-    line = USAGE_PREFIX + json.dumps(usage, separators=(",", ":")) + "\n"
-    sys.stderr.buffer.write(line.encode("utf-8"))
+#: How much of a provider-supplied `finish_reason` is worth repeating. The
+#: documented values are short enums; anything longer is not a reason.
+_FINISH_REASON_MAX = 64
+
+#: The characters a `finish_reason` may contribute to a diagnostic line.
+#:
+#: Flattening stops the value from adding LINES, and this stops it from adding
+#: WORDS. The adapter's unavailability tables are unanchored substring matches
+#: over stderr -- deliberately, because that is where `rate limit` legitimately
+#: appears, in the provider's error body -- so a `finish_reason` of
+#: `"length auth failure"` would otherwise fabricate an `auth` outage out of a
+#: truncation and send the chain hopping. Before this signal existed, no
+#: provider-controlled value reached that scan except the error body, where
+#: prose is the point; a reason is an enum, so it is held to an enum's shape.
+_FINISH_REASON_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")
+
+
+def _safe_finish_reason(value: str) -> str:
+    """`value` reduced to what a documented `finish_reason` can look like."""
+    kept = "".join(c if c in _FINISH_REASON_CHARS else "?"
+                   for c in value[:_FINISH_REASON_MAX])
+    return kept or "?"
+
+
+def _stderr_line(text: str) -> None:
+    """THE way this module writes to stderr, and the reason it is the only one.
+
+    Some of what reaches this stream is the PROVIDER'S -- an HTTP error body,
+    a `finish_reason` -- while skodun's own machine lines on it are recognised
+    by their position at the START of a line: the `SKODUN_API_USAGE ` record
+    the spend ledger reads, and the truncation marker the adapter classifies
+    on. Untrusted text carrying a newline can therefore forge either, or
+    inject a line the adapter's unavailability tables match, turning a
+    truncation into a fabricated `quota` outage.
+
+    Flattening at the single point where bytes leave makes that impossible by
+    construction rather than per call site -- which is what the first version
+    of this defence got wrong, guarding `_fail` and leaving the marker's own
+    writer to interpolate a provider value straight into a formatted line.
+    `test_every_stderr_write_goes_through_the_one_flattening_writer` is what
+    keeps it single.
+    """
+    sys.stderr.buffer.write(
+        (" ".join(str(text).splitlines()).strip() + "\n").encode("utf-8"))
     sys.stderr.buffer.flush()
+
+
+def _emit_usage(usage: dict) -> None:
+    _stderr_line(USAGE_PREFIX + json.dumps(usage, separators=(",", ":")))
 
 
 #: The `finish_reason` that means the model said everything it meant to. Every
@@ -73,9 +119,9 @@ def _emit_incomplete(finish_reason: object) -> None:
         return
     if finish_reason == COMPLETE_FINISH_REASON:
         return
-    sys.stderr.buffer.write(
-        f"{INCOMPLETE_PREFIX} (finish_reason={finish_reason})\n".encode("utf-8"))
-    sys.stderr.buffer.flush()
+    _stderr_line(
+        f"{INCOMPLETE_PREFIX} "
+        f"(finish_reason={_safe_finish_reason(finish_reason)})")
 
 
 def _fail(msg: str, rc: int = 2) -> int:
@@ -90,14 +136,10 @@ def _fail(msg: str, rc: int = 2) -> int:
     truncation marker turns a provider failure into a `degraded` verdict that
     stops the fallback chain.
 
-    Flattening every message to one line removes the forgery outright rather
-    than leaving each reader to defend itself, and costs nothing: these are
-    short diagnostics, and the newlines in an error body carry no meaning the
-    operator needs.
+    Flattening happens in `_stderr_line`, the module's single writer, so this
+    function inherits the property rather than implementing it.
     """
-    flat = " ".join(str(msg).splitlines()).strip()
-    sys.stderr.buffer.write((flat + "\n").encode("utf-8"))
-    sys.stderr.buffer.flush()
+    _stderr_line(msg)
     return rc
 
 
