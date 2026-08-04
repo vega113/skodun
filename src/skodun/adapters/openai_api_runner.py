@@ -172,10 +172,18 @@ def call_chat_completions(
     # Carried on `usage` rather than in a wider return tuple because that dict
     # is already the runner's metadata channel (`request_id` rides on it too),
     # and `chain._record_api_usage` reads four named keys and ignores the rest.
+    # Recorded ONLY when the API really said something. `finish_reason` is
+    # nullable -- it is `null` on a response that is not finalized -- and
+    # coercing that with `str()` produces `"None"`, a non-empty string that is
+    # not `stop` and would therefore be reported as a truncation. That is
+    # inference from absence, and it would demote usable output on the
+    # strength of the API declining to answer.
     try:
-        usage["finish_reason"] = str(doc["choices"][0]["finish_reason"])
+        reason = doc["choices"][0]["finish_reason"]
     except (KeyError, IndexError, TypeError):
-        pass
+        reason = None
+    if isinstance(reason, str) and reason:
+        usage["finish_reason"] = reason
 
     try:
         choices = doc["choices"]

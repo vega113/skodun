@@ -446,3 +446,51 @@ def test_the_marker_only_counts_at_the_start_of_a_line():
 
     assert a.classify(1, b"", quoted).kind != "degraded"
     assert a.classify(1, b"", real).kind == "degraded"
+
+
+@pytest.mark.parametrize("reason, recorded", [
+    ("length", "length"),
+    ("stop", "stop"),
+    (None, None),          # nullable, and NOT the string "None"
+    (123, None),
+    ("", None),
+])
+def test_a_null_finish_reason_is_not_a_truncation(monkeypatch, reason,
+                                                  recorded):
+    """`finish_reason` is nullable -- `null` on a response that is not
+    finalized -- and `str(None)` is `"None"`: a non-empty string that is not
+    `stop`, so a coerced null would be reported as a truncation and demote
+    usable output on the strength of the API declining to answer."""
+    class _Resp:
+        status = 200
+
+        def read(self):
+            choice = {"message": {"content": json.dumps(
+                {"summary": "ok", "findings": []})}}
+            if reason is not None or True:
+                choice["finish_reason"] = reason
+            return json.dumps({
+                "id": "chatcmpl-null",
+                "choices": [choice],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2},
+            }).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Resp())
+    _, payload, usage, _ = call_chat_completions(
+        api_key="sk-test", model=MODEL, prompt="review",
+        schema={"type": "object",
+                "properties": {"summary": {"type": "string"},
+                               "findings": {"type": "array"}},
+                "required": ["summary", "findings"]},
+        timeout_sec=5.0,
+        base_url="https://example.invalid/v1/chat/completions")
+
+    assert payload is not None
+    assert usage.get("finish_reason") == recorded
