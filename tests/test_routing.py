@@ -955,6 +955,45 @@ def test_pure_load_keeps_the_credit_when_no_soft_term_moved_anything(store):
     assert (route.reviewer.name, route.reason) == ("finder-a", ROUTE_FREE)
 
 
+def _enclosing_calls(tree: ast.AST, target: str) -> set[str]:
+    """`{enclosing def name}` for every call to `target`, innermost def wins.
+
+    Written as an explicit descent rather than `ast.walk` per `FunctionDef`,
+    because `walk` also traverses NESTED defs: a call inside a closure would be
+    attributed to the closure AND to every function around it, so the invariant
+    below would fail naming several functions when only one of them calls
+    anything. A module-level call has no enclosing def and is reported as
+    `<module>` rather than dropped.
+    """
+    found: set[str] = set()
+
+    def descend(node: ast.AST, where: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                descend(child, child.name)      # the nested def owns its body
+                continue
+            if (isinstance(child, ast.Call)
+                    and _called_name(child.func) == target):
+                found.add(where)
+            descend(child, where)
+
+    descend(tree, "<module>")
+    return found
+
+
+def _binds_name(tree: ast.AST, target: str) -> bool:
+    """Whether this module imports or rebinds `target` under ANY name."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if any(a.name == target for a in node.names):
+                return True
+        if isinstance(node, ast.Assign):
+            if any(isinstance(v, ast.Name) and v.id == target
+                   for v in ast.walk(node.value)):
+                return True
+    return False
+
+
 def test_run_review_is_the_only_production_caller_of_head_resolution():
     """The call-graph half of the Phase A scope note (issue #98).
 
@@ -969,32 +1008,39 @@ def test_run_review_is_the_only_production_caller_of_head_resolution():
     caller on some third surface, acquiring routing semantics nobody decided
     to give it. `run_prepush_review` picks its head with `_reviewer_for(cfg,
     "finder")` and `resolve_review_head` now duplicates that selection, so the
-    two are a standing invitation to be collapsed -- and a `# noqa`-free
-    failure here is the moment to have that conversation rather than to
-    discover it from a background review that routed.
+    two are a standing invitation to be collapsed -- and a failure here is the
+    moment to have that conversation rather than to discover it from a
+    background review that routed.
 
     Read from the SOURCE rather than by monkeypatching, because the claim is
     about what is written, not about what one run happened to execute: a
     caller on a branch this test never takes would be invisible to any
     dynamic check.
+
+    Two assertions, because one name-matched scan is evadable. The reference
+    check is what closes an ALIAS -- `from .pipeline import resolve_review_head
+    as head_of` calls through a name no scan for the literal would match, and
+    the way that arrives is somebody being tidy, not somebody evading a test.
+    Requiring the name to be imported nowhere else makes the second scan's
+    narrower job safe.
     """
     from pathlib import Path
 
     src = Path(skodun.__file__).resolve().parent
-    callers: set[str] = set()
-    for path in sorted(src.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        # The enclosing def of every `resolve_review_head(...)` call, by walking
-        # each function body rather than the module: `ast` has no parent links,
-        # and the enclosing name is the whole point of the assertion.
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for inner in ast.walk(node):
-                if (isinstance(inner, ast.Call)
-                        and _called_name(inner.func) == "resolve_review_head"):
-                    callers.add(f"{path.relative_to(src)}::{node.name}")
+    trees = {path.relative_to(src): ast.parse(path.read_text(encoding="utf-8"),
+                                              filename=str(path))
+             for path in sorted(src.rglob("*.py"))}
 
+    borrowed = {str(rel) for rel, tree in trees.items()
+                if str(rel) != "pipeline.py"
+                and _binds_name(tree, "resolve_review_head")}
+    assert borrowed == set(), (
+        f"{sorted(borrowed)} import or rebind `resolve_review_head`. Head "
+        f"selection is the foreground loop's, and a module that holds a "
+        f"reference to it can call it under a name no scan will match.")
+
+    callers = {f"{rel}::{name}" for rel, tree in trees.items()
+               for name in _enclosing_calls(tree, "resolve_review_head")}
     assert callers == {"pipeline.py::_run_review"}, (
         "head resolution has a caller outside the foreground review loop. "
         "That is not automatically wrong -- it IS a decision about which "
