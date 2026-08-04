@@ -24,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from tests.conftest import INHERITED_ENV
 
@@ -79,3 +80,51 @@ def test_a_child_process_inherits_the_scrubbed_environment():
          "if n.startswith('SKODUN_'))))"],
         capture_output=True, text=True, check=True).stdout
     assert set(json.loads(out)) <= set(INHERITED_ENV)
+
+
+#: A variable no production code reads, injected into a child pytest run so
+#: the three assertions above have something to be wrong about.
+_PROBE = "SKODUN_ENV_ISOLATION_PROBE"
+
+#: The tests re-run inside that child. Not this module wholesale: the spawning
+#: test is in it, and a child that spawned its own child would recurse.
+_UNDER_PROBE = (
+    "test_no_ambient_skodun_variable_reaches_a_test",
+    "test_the_shipped_default_is_what_an_unset_variable_gives",
+    "test_a_child_process_inherits_the_scrubbed_environment",
+)
+
+
+def test_the_scrub_is_what_makes_the_assertions_above_pass():
+    """The three tests above are VACUOUS on a clean environment.
+
+    That is the whole difficulty of testing a scrub: on CI, where nothing is
+    exported, `_ambient()` is empty and `provider_max_in_flight_from_env()` is
+    1 whether or not the fixture exists — so deleting `_no_ambient_skodun_env`
+    would leave this file green in exactly the place it is supposed to fail.
+    The bug it guards against was only ever visible on a machine that had the
+    variable set, which is the one place nobody runs the suite to check a
+    fixture.
+
+    So this test supplies the missing environment itself: a child `pytest`
+    with `SKODUN_ENV_ISOLATION_PROBE` exported, running those three by name.
+    They pass in that child only because the root fixture removed it. Remove
+    the fixture and this test fails on any machine, CI included.
+    """
+    env = dict(os.environ) | {_PROBE: "1"}
+    here = Path(__file__).resolve()
+    root = here.parent.parent
+
+    # The control, and it is not ceremony: if the probe never reached the
+    # child, the run below would pass for the wrong reason and this test would
+    # be as vacuous as the ones it exists to back up.
+    reached = subprocess.run(
+        [sys.executable, "-c", f"import os;print({_PROBE!r} in os.environ)"],
+        env=env, capture_output=True, text=True, check=True).stdout.strip()
+    assert reached == "True", "the probe never reached a child process"
+
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         *(f"{here}::{name}" for name in _UNDER_PROBE)],
+        cwd=root, env=env, capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
