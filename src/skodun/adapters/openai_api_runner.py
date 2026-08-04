@@ -41,29 +41,39 @@ API_BASE_ENV = "SKODUN_OPENAI_API_BASE"  # override for proxies/tests
 USAGE_PREFIX = "SKODUN_API_USAGE "
 
 
-#: How much of a provider-supplied `finish_reason` is worth repeating. The
-#: documented values are short enums; anything longer is not a reason.
-_FINISH_REASON_MAX = 64
-
-#: The characters a `finish_reason` may contribute to a diagnostic line.
+#: The `finish_reason` values Chat Completions documents. Anything else is
+#: rendered as `_UNRECOGNIZED_FINISH_REASON` rather than repeated.
 #:
-#: Flattening stops the value from adding LINES, and this stops it from adding
-#: WORDS. The adapter's unavailability tables are unanchored substring matches
-#: over stderr -- deliberately, because that is where `rate limit` legitimately
-#: appears, in the provider's error body -- so a `finish_reason` of
-#: `"length auth failure"` would otherwise fabricate an `auth` outage out of a
-#: truncation and send the chain hopping. Before this signal existed, no
-#: provider-controlled value reached that scan except the error body, where
-#: prose is the point; a reason is an enum, so it is held to an enum's shape.
-_FINISH_REASON_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")
+#: An ALLOWLIST, not a charset filter, and the difference is the whole defence.
+#: This value is provider-controlled and reaches stderr twice -- in the
+#: `SKODUN_API_USAGE ` JSON and in the truncation marker -- where the adapter's
+#: unavailability tables scan for `rate_limit`, `unauthorized`, `auth failure`
+#: and friends with unanchored substring matches. A charset filter passes
+#: `rate_limit` through untouched, because it is a perfectly ordinary token;
+#: the run would then classify `unavailable`/`quota`, hop the chain, and cache
+#: a provider-wide outage that never happened. Only values chosen HERE can
+#: reach that scan.
+#:
+#: The cost is that a reason the API adds later is reported as unrecognized
+#: instead of by name. The BEHAVIOUR is unchanged -- anything that is not
+#: `stop` still reads as incomplete -- so what is lost is a word in a
+#: diagnostic, which is the right thing to trade for not being able to
+#: fabricate an outage.
+KNOWN_FINISH_REASONS = frozenset({
+    "stop", "length", "content_filter", "tool_calls", "function_call",
+})
+
+#: What an unlisted reason renders as. Deliberately not a value any table above
+#: matches, and deliberately not empty -- "it stopped early for a reason this
+#: build does not know" is worth saying.
+_UNRECOGNIZED_FINISH_REASON = "unrecognized"
 
 
-def _safe_finish_reason(value: str) -> str:
-    """`value` reduced to what a documented `finish_reason` can look like."""
-    kept = "".join(c if c in _FINISH_REASON_CHARS else "?"
-                   for c in value[:_FINISH_REASON_MAX])
-    return kept or "?"
+def _safe_finish_reason(value: object) -> str:
+    """`value` if the API documents it, else `unrecognized`."""
+    if isinstance(value, str) and value in KNOWN_FINISH_REASONS:
+        return value
+    return _UNRECOGNIZED_FINISH_REASON
 
 
 def _stderr_line(text: str) -> None:
@@ -119,9 +129,11 @@ def _emit_incomplete(finish_reason: object) -> None:
         return
     if finish_reason == COMPLETE_FINISH_REASON:
         return
-    _stderr_line(
-        f"{INCOMPLETE_PREFIX} "
-        f"(finish_reason={_safe_finish_reason(finish_reason)})")
+    # Already through `_safe_finish_reason` at capture; re-applied because this
+    # function is reachable on its own and a caller that skipped that step must
+    # not be able to write an unfiltered value.
+    finish_reason = _safe_finish_reason(finish_reason)
+    _stderr_line(f"{INCOMPLETE_PREFIX} (finish_reason={finish_reason})")
 
 
 def _fail(msg: str, rc: int = 2) -> int:
@@ -242,7 +254,10 @@ def call_chat_completions(
     except (KeyError, IndexError, TypeError):
         reason = None
     if isinstance(reason, str) and reason:
-        usage["finish_reason"] = reason
+        # Sanitized HERE, at the single point it enters skodun's data, so the
+        # usage JSON and the marker line below cannot disagree and neither can
+        # carry a token the adapter's unavailability tables match.
+        usage["finish_reason"] = _safe_finish_reason(reason)
 
     try:
         choices = doc["choices"]

@@ -19,7 +19,7 @@ from skodun.adapters.openai_api_runner import (
 )
 from skodun.config import Defaults, Reviewer
 from skodun.store import SCHEMA_VERSION, Store
-from skodun.adapters import get_adapter
+from skodun.adapters import REVIEW_CONTRACT, get_adapter
 from tests.adapter_conformance import (  # noqa: F401 - collected below
     AdapterConformance,
     load_fixture,
@@ -561,10 +561,33 @@ def test_a_hostile_finish_reason_cannot_fabricate_an_outage(capsys):
 def test_an_ordinary_finish_reason_survives_the_sanitizer_intact():
     """The other half: the documented values must come through unchanged, or
     the diagnostic stops naming the thing that happened."""
+    from skodun.adapters.openai_api_runner import (
+        KNOWN_FINISH_REASONS, _safe_finish_reason)
+
+    for reason in KNOWN_FINISH_REASONS:
+        assert _safe_finish_reason(reason) == reason
+
+
+@pytest.mark.parametrize("hostile", [
+    "rate_limit",        # a single ordinary token a charset filter passes
+    "unauthorized",
+    "auth failure",
+    "model_not_found",
+    "quota",
+])
+def test_a_finish_reason_that_looks_like_an_outage_is_not_repeated(hostile):
+    """The reason the filter is an ALLOWLIST and not a charset.
+
+    `rate_limit` is a perfectly ordinary token: any character-level filter
+    passes it through, it lands in the `SKODUN_API_USAGE ` JSON and the marker
+    line, and the adapter's unanchored `_QUOTA_SIGNALS` scan then reads a
+    truncation as a quota outage -- hopping the chain and caching a
+    provider-wide blackout that never happened. Only values skodun names can
+    reach that scan.
+    """
     from skodun.adapters.openai_api_runner import _safe_finish_reason
 
-    for reason in ("length", "content_filter", "tool_calls", "stop"):
-        assert _safe_finish_reason(reason) == reason
+    assert hostile not in _safe_finish_reason(hostile)
 
 
 def test_every_stderr_write_goes_through_the_one_flattening_writer():
@@ -593,3 +616,49 @@ def test_every_stderr_write_goes_through_the_one_flattening_writer():
         f"{sorted(writers)} write to stderr directly. Route it through "
         f"`_stderr_line`, or untrusted text in that message can forge one of "
         f"the machine lines the adapter and the spend ledger read.")
+
+
+def test_the_whole_runner_stderr_classifies_as_degraded_not_an_outage(
+        tmp_path, monkeypatch, capsys):
+    """End to end through `main`, which writes BOTH lines.
+
+    The unit tests above each cover one writer, and that is how the previous
+    round's gap survived: the usage JSON carries `finish_reason` too, and
+    nothing exercised the two together as `classify` actually sees them. Here
+    the provider returns a hostile reason, `main` runs for real, and the
+    verdict is taken from everything it wrote.
+    """
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return json.dumps({
+                "id": "chatcmpl-hostile",
+                "choices": [{"finish_reason": "rate_limit",
+                             "message": {"content": '{"summary": "half'}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20,
+                          "total_tokens": 30},
+            }).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(
+        "skodun.adapters.openai_api_runner.urllib.request.urlopen",
+        lambda *a, **k: _Resp())
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    prompt = tmp_path / "p.txt"
+    prompt.write_text("review", encoding="utf-8")
+
+    runner_main([
+        "--prompt", str(prompt), "--model", MODEL,
+        "--schema", REVIEW_CONTRACT.json_schema, "--timeout-ms", "5000",
+    ])
+
+    stderr = capsys.readouterr().err.encode()
+    assert b"rate_limit" not in stderr, stderr
+    v = get_adapter("openai-api").classify(1, b"", stderr)
+    assert (v.kind, v.category) == ("degraded", ""), v
