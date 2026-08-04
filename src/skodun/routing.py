@@ -698,17 +698,32 @@ def provider_served(store, providers: Sequence[str], *,
 
 
 def _shares_for(cfg: Config, pool: Sequence[Reviewer],
+                loads: Mapping[str, ProviderLoad],
                 store) -> dict[str, ShareTarget] | None:
     """This run's share targets, or None when the Phase B term does not apply.
 
-    Three ways to get None, and they are all "score as Phase A did": no
+    The candidate set is the pool MINUS whatever `provider_loads` marked
+    unavailable -- a quota blackout, a metered provider out of daily budget, a
+    provider with no adapter -- because `_argmax` skips exactly those and the
+    two must agree. `ShareTarget`'s rule is that both denominators are the set
+    this run is choosing between, and a provider that cannot be chosen is not
+    in it: leaving one in dilutes every real candidate's target while its own
+    served count inflates the denominator, which shrinks the deficits the
+    scorer compares. The winner often survives that, but the MAGNITUDE does
+    not, and magnitude is what decides whether the share term outranks the
+    cross-model bonus.
+
+    Three ways to get None, and all of them mean "score as Phase A did": no
     `[routing] weights` at all (the default), a store that could not answer the
     served counts, and -- via `share_targets` -- an empty candidate set.
     """
     weights = dict(cfg.routing.weights)
     if not weights:
         return None
-    providers = list(dict.fromkeys(e.provider for e in pool))
+    providers = [
+        p for p in dict.fromkeys(e.provider for e in pool)
+        if p in loads and not loads[p].unavailable
+    ]
     served = provider_served(
         store, providers, window_days=cfg.routing.weights_window_days)
     if served is None:
@@ -732,9 +747,11 @@ def auto_route(cfg: Config, store, *,
             return None
         _warn_inert_client_family(cfg, pool, client_family)
         loads = provider_loads(store, pool)
+        # AFTER the loads, because the share denominators are the providers
+        # this run can actually choose between -- see `_shares_for`.
         return pick_finder(pool, loads, client_family=client_family,
                            cross_model=cfg.routing.cross_model,
-                           shares=_shares_for(cfg, pool, store))
+                           shares=_shares_for(cfg, pool, loads, store))
     except Exception as e:
         _note(f"routing: auto-route failed ({e!r}); falling back to this "
               f"config's default head")

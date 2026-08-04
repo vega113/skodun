@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-from skodun import capacity
+from skodun import capacity, routing
 from skodun.config import Config, Defaults, Reviewer, Routing
 from skodun.routing import (
     CLIENT_FAMILY_ENV,
@@ -829,3 +829,42 @@ def test_both_fractions_are_computed_over_the_same_candidate_set():
     assert sum(t.actual for t in got.values()) == pytest.approx(1.0)
     assert got["xai"].actual == pytest.approx(0.75)
     assert "google" not in got
+
+
+def test_a_blacked_out_provider_is_not_in_the_share_denominators(store):
+    """`_argmax` skips an unavailable provider, so the share arithmetic must
+    skip it too or the two disagree about what "the candidate set" is.
+
+    Leaving one in dilutes every real candidate's target while its own served
+    count inflates the denominator, so the deficits the scorer compares shrink.
+    The winner often survives that; the MAGNITUDE does not, and magnitude is
+    what decides whether the share term outranks the cross-model bonus.
+    """
+    until = time.strftime(_TS_FORMAT, time.gmtime(time.time() + 600))
+    store.mark_provider_unavailable("google", "rate limited", "quota", until)
+    _seed_served(store, {"grok": 10, "agy": 90})
+    cfg = _cfg(_entry("finder-a", "xai"), _entry("finder-b", "openai"),
+               _entry("finder-c", "google"),
+               weights=(("xai", 1), ("openai", 1), ("google", 8)))
+
+    shares = routing._shares_for(
+        cfg, resolve_pool(cfg), provider_loads(store, resolve_pool(cfg)), store)
+
+    assert set(shares) == {"xai", "openai"}
+    # Both denominators are the two REMAINING candidates: equal weights, and
+    # xai served everything they served between them.
+    assert shares["xai"].target == shares["openai"].target == pytest.approx(0.5)
+    assert shares["xai"].actual == pytest.approx(1.0)
+    assert shares["openai"].actual == pytest.approx(0.0)
+    # ...so the gap is the full 1.0 the two of them really differ by. Stated
+    # against what counting the blacked-out provider WOULD have produced,
+    # because the difference is the whole point and a bare 1.0 does not show
+    # it: a tenth of the signal, which is under the crossover where the share
+    # term stops outranking the cross-model bonus.
+    with_blackout = share_targets(
+        {"xai": 1, "openai": 1, "google": 8},
+        ["xai", "openai", "google"],
+        {"xai": 10, "openai": 0, "google": 90})
+    assert (with_blackout["openai"].deficit
+            - with_blackout["xai"].deficit) == pytest.approx(0.1)
+    assert shares["openai"].deficit - shares["xai"].deficit == pytest.approx(1.0)
