@@ -313,6 +313,32 @@ def test_a_very_long_runner_line_is_capped():
     assert len(v.detail) < 500 and v.detail.endswith("...")
 
 
+def test_a_non_ascii_line_earlier_in_stderr_does_not_shift_the_quote():
+    """`str.lower()` is not length-preserving: `"İ".lower()` is two code
+    points. Finding the line by offsets taken from ONE lower-cased copy and
+    slicing the original with them therefore drifts by one character per such
+    character seen earlier -- quoting `unie envelope refused: ...` and
+    dragging in the trailing newline the sanitizer then has to strip.
+    """
+    v = JunieAdapter().classify(
+        2, b"",
+        "İstanbul mirror warning\n"
+        "junie envelope refused: unexpected project file: ./evil.py\n".encode())
+    assert v.detail.endswith(
+        "junie envelope refused: unexpected project file: ./evil.py")
+    assert "İstanbul" not in v.detail
+
+
+def test_the_degraded_reason_does_not_blame_the_harness_any_more():
+    """The taxonomy has to hold in the words an operator reads, not only in
+    the `kind`: every signal left in the degraded table is junie saying its
+    OWN answer was cut short, and the harness refusals that used to share this
+    wording are `unavailable`/`harness` now."""
+    res = JunieAdapter().parse(b"", b"junie: response truncated\n")
+    assert res.degraded and "harness" not in res.degraded_reason
+    assert "cut short" in res.degraded_reason
+
+
 def test_an_unprintable_runner_line_falls_back_to_the_signal():
     """Rendering must never be what fails a classification."""
     v = JunieAdapter().classify(2, b"", b"\x00envelope refused\x01\x02")

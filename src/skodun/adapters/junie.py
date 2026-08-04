@@ -354,9 +354,13 @@ _EVIDENCE_MAX = 240
 def _evidence(stderr: bytes, sig: bytes) -> str:
     """The runner's own LINE carrying `sig`, made safe to persist and print.
 
-    `sig` matched against a lower-cased copy of `stderr`, so the line is found
-    on the lower-cased text and returned from the original bytes at the same
-    offsets -- the message keeps its real casing and paths.
+    The search runs per LINE of the original text, each lower-cased for the
+    comparison only, so the line that is returned keeps its real casing and
+    paths. Deliberately not offset arithmetic over one lower-cased copy:
+    `str.lower()` is not length-preserving in Unicode (`"İ".lower()` is two
+    code points), so an offset taken from the lowered text and applied to the
+    original slices the wrong characters -- one such character anywhere earlier
+    in stderr and the quoted cause comes out mangled.
 
     Sanitized rather than passed through, because this string reaches two
     places that neither quote nor escape it: `attempts[].classification.detail`
@@ -366,14 +370,12 @@ def _evidence(stderr: bytes, sig: bytes) -> str:
     the result is capped. Falls back to the signal itself if anything about the
     line is unusable -- rendering must never be what fails a classification.
     """
-    text = stderr.decode("utf-8", "replace")
-    lowered = text.lower()
-    at = lowered.find(sig.decode())
-    if at < 0:                                  # pragma: no cover - caller checked
-        return sig.decode()
-    start = lowered.rfind("\n", 0, at) + 1
-    end = lowered.find("\n", at)
-    line = text[start:] if end < 0 else text[start:end]
+    needle = sig.decode()
+    line = ""
+    for candidate in stderr.decode("utf-8", "replace").splitlines():
+        if needle in candidate.lower():
+            line = candidate
+            break
     cleaned = "".join(c for c in line if c.isprintable()).strip()
     if not cleaned:
         return sig.decode()
@@ -386,9 +388,15 @@ def _detect_degraded(stderr: bytes, *, parse_ok: bool) -> tuple[bool, str]:
     err_lower = stderr.lower()
     for sig in _DEGRADED_STDERR_SIGNALS:
         if sig in err_lower:
+            # NOT "harness failure": every signal still in this table is junie
+            # saying its OWN answer was cut short, and the harness refusals
+            # that used to share this wording are `unavailable`/`harness` now.
+            # An operator reading `degraded_reason` should be sent to the model
+            # run, not to skodun's wrapper.
             return True, (
-                f"junie harness failure in stderr ({sig.decode()}); the "
-                f"review may be truncated and an empty result cannot be trusted"
+                f"junie reported its output was cut short in stderr "
+                f"({sig.decode()}); the review may be incomplete and an empty "
+                f"result cannot be trusted"
             )
     # No completion signal equivalent to EndTurn/SUCCESS. A usable payload is
     # accepted as non-degraded; absence of payload with clean stderr is
