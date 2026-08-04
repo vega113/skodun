@@ -81,6 +81,24 @@ def _record(tmp_path: Path) -> dict:
     return rows[0]
 
 
+def _at(rec: dict, *keys):
+    """Walk nested mappings, returning None the moment one is not there."""
+    node = rec
+    for key in keys:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node
+
+
+def _first_attempt(rec: dict) -> dict:
+    """`attempts[0]`, or an empty dict when there are none."""
+    attempts = rec.get("attempts")
+    if isinstance(attempts, list) and attempts and isinstance(attempts[0], dict):
+        return attempts[0]
+    return {}
+
+
 def _clean(tmp_path, monkeypatch):
     _fake_grok(tmp_path, _emit(CLEAN))
     return _repo(tmp_path)
@@ -124,23 +142,31 @@ def _no_reviewer_could_run(tmp_path, monkeypatch):
 #: while the demotion path it was written for stopped being exercised. That is
 #: the failure mode #79 itself had: the codes were right, and nothing checked
 #: that the interesting paths still reached them.
+#
+# Every predicate reads through `.get()` and never indexes a list directly, so
+# a record whose SHAPE changed returns False and gets the row-specific message
+# below rather than raising a `KeyError` out of a lambda -- which is exactly
+# the moment the message is worth having.
 _MATRIX = (
     ("clean", _clean, 0,
-     lambda r: r["status"] == "clean" and r["findings_total"] == 0),
+     lambda r: r.get("status") == "clean" and r.get("findings_total") == 0),
     ("findings open", _with_findings, 1,
-     lambda r: r["trustworthy"] is True and r["findings_total"] > 0),
+     lambda r: r.get("trustworthy") is True and r.get("findings_total", 0) > 0),
     # parse_ok TRUE beside degraded TRUE: the reviewer answered and the answer
     # validated. Only the degradation axis makes this untrustworthy, which is
     # what made exit 0 plausible enough to be reported.
     ("degraded answer", _degraded, _UNTRUSTWORTHY_EXIT,
-     lambda r: r["degraded"] is True and r["parse_ok"] is True),
+     lambda r: r.get("degraded") is True and r.get("parse_ok") is True),
     # The finder was CLEAN and the pass is what demoted the record.
     ("extra-pass demotion", _skeptic_demotion, _UNTRUSTWORTHY_EXIT,
-     lambda r: (r["status"] == "failed" and r["findings_total"] == 0
-                and r["extra_passes"]["skeptic"]["failed"] is True)),
+     lambda r: (r.get("status") == "failed" and r.get("findings_total") == 0
+                and _at(r, "extra_passes", "skeptic", "failed") is True)),
+    # `rc is None`, NOT falsy: `rc == 0` is a process that ran and exited
+    # cleanly, and this row exists to pin the case where NOTHING executed.
     ("no reviewer could run", _no_reviewer_could_run, _UNTRUSTWORTHY_EXIT,
-     lambda r: (r["status"] == "failed" and not r["attempts"][0]["rc"]
-                and "unavailable" in r["failure_reason"])),
+     lambda r: (r.get("status") == "failed"
+                and _first_attempt(r).get("rc", 0) is None
+                and "unavailable" in r.get("failure_reason", ""))),
 )
 
 _ROWS = [(name, build, code) for name, build, code, _ in _MATRIX]
