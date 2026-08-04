@@ -41,15 +41,117 @@ API_BASE_ENV = "SKODUN_OPENAI_API_BASE"  # override for proxies/tests
 USAGE_PREFIX = "SKODUN_API_USAGE "
 
 
-def _emit_usage(usage: dict) -> None:
-    line = USAGE_PREFIX + json.dumps(usage, separators=(",", ":")) + "\n"
-    sys.stderr.buffer.write(line.encode("utf-8"))
+#: The `finish_reason` values Chat Completions documents. Anything else is
+#: rendered as `_UNRECOGNIZED_FINISH_REASON` rather than repeated.
+#:
+#: An ALLOWLIST, not a charset filter, and the difference is the whole defence.
+#: This value is provider-controlled and reaches stderr twice -- in the
+#: `SKODUN_API_USAGE ` JSON and in the truncation marker -- where the adapter's
+#: unavailability tables scan for `rate_limit`, `unauthorized`, `auth failure`
+#: and friends with unanchored substring matches. A charset filter passes
+#: `rate_limit` through untouched, because it is a perfectly ordinary token;
+#: the run would then classify `unavailable`/`quota`, hop the chain, and cache
+#: a provider-wide outage that never happened. Only values chosen HERE can
+#: reach that scan.
+#:
+#: The cost is that a reason the API adds later is reported as unrecognized
+#: instead of by name. The BEHAVIOUR is unchanged -- anything that is not
+#: `stop` still reads as incomplete -- so what is lost is a word in a
+#: diagnostic, which is the right thing to trade for not being able to
+#: fabricate an outage.
+KNOWN_FINISH_REASONS = frozenset({
+    "stop", "length", "content_filter", "tool_calls", "function_call",
+})
+
+#: What an unlisted reason renders as. Deliberately not a value any table above
+#: matches, and deliberately not empty -- "it stopped early for a reason this
+#: build does not know" is worth saying.
+_UNRECOGNIZED_FINISH_REASON = "unrecognized"
+
+
+def _safe_finish_reason(value: object) -> str:
+    """`value` if the API documents it, else `unrecognized`."""
+    if isinstance(value, str) and value in KNOWN_FINISH_REASONS:
+        return value
+    return _UNRECOGNIZED_FINISH_REASON
+
+
+def _stderr_line(text: str) -> None:
+    """THE way this module writes to stderr, and the reason it is the only one.
+
+    Some of what reaches this stream is the PROVIDER'S -- an HTTP error body,
+    a `finish_reason` -- while skodun's own machine lines on it are recognised
+    by their position at the START of a line: the `SKODUN_API_USAGE ` record
+    the spend ledger reads, and the truncation marker the adapter classifies
+    on. Untrusted text carrying a newline can therefore forge either, or
+    inject a line the adapter's unavailability tables match, turning a
+    truncation into a fabricated `quota` outage.
+
+    Flattening at the single point where bytes leave makes that impossible by
+    construction rather than per call site -- which is what the first version
+    of this defence got wrong, guarding `_fail` and leaving the marker's own
+    writer to interpolate a provider value straight into a formatted line.
+    `test_every_stderr_write_goes_through_the_one_flattening_writer` is what
+    keeps it single.
+    """
+    sys.stderr.buffer.write(
+        (" ".join(str(text).splitlines()).strip() + "\n").encode("utf-8"))
     sys.stderr.buffer.flush()
+
+
+def _emit_usage(usage: dict) -> None:
+    _stderr_line(USAGE_PREFIX + json.dumps(usage, separators=(",", ":")))
+
+
+#: The `finish_reason` that means the model said everything it meant to. Every
+#: other value -- `length` at the token ceiling, `content_filter`, whatever the
+#: API adds next -- means the answer stopped early, so this is an allowlist of
+#: one rather than a list of the bad ones: a reason nobody here has heard of
+#: must read as "incomplete", not as "fine".
+COMPLETE_FINISH_REASON = "stop"
+
+#: Wording the adapter's degradation table matches. Written HERE, by skodun,
+#: which is what makes the signal verifiable -- the table it feeds used to
+#: match `truncated` and `envelope refused`, neither of which anything in this
+#: adapter's path ever wrote (issue #99).
+INCOMPLETE_PREFIX = "openai-api response incomplete"
+
+
+def _emit_incomplete(finish_reason: object) -> None:
+    """Say so on stderr when the API stopped the answer early. No-op for `stop`.
+
+    Also a no-op when the reason is absent: a response that never reached the
+    `choices` array (a network error, an HTTP status) has its own message, and
+    inventing "incomplete" from silence would be the inference-from-absence
+    every adapter's degradation detection is written to avoid.
+    """
+    if not isinstance(finish_reason, str) or not finish_reason:
+        return
+    if finish_reason == COMPLETE_FINISH_REASON:
+        return
+    # Already through `_safe_finish_reason` at capture; re-applied because this
+    # function is reachable on its own and a caller that skipped that step must
+    # not be able to write an unfiltered value.
+    finish_reason = _safe_finish_reason(finish_reason)
+    _stderr_line(f"{INCOMPLETE_PREFIX} (finish_reason={finish_reason})")
 
 
 def _fail(msg: str, rc: int = 2) -> int:
-    sys.stderr.buffer.write((msg.rstrip() + "\n").encode("utf-8"))
-    sys.stderr.buffer.flush()
+    """One line on stderr, always -- and that is a boundary, not formatting.
+
+    Some of what reaches here is the PROVIDER'S: the HTTP branch embeds up to
+    2000 characters of its error body. This stream also carries skodun's own
+    machine lines -- the `SKODUN_API_USAGE ` record the spend ledger reads, and
+    the truncation marker the adapter classifies on -- both of which are
+    recognised by their position at the start of a line. Untrusted text that
+    can contain a newline can therefore forge either of them, and a forged
+    truncation marker turns a provider failure into a `degraded` verdict that
+    stops the fallback chain.
+
+    Flattening happens in `_stderr_line`, the module's single writer, so this
+    function inherits the property rather than implementing it.
+    """
+    _stderr_line(msg)
     return rc
 
 
@@ -131,6 +233,32 @@ def call_chat_completions(
     if status != 200:
         return status, None, usage, f"http {status}"
 
+    # BEFORE the content is touched, and that ordering is the point: the API's
+    # own statement that it stopped early is most useful on exactly the runs
+    # where the content is then unusable. `finish_reason: "length"` truncates
+    # mid-JSON, so `json.loads` below raises and the reason would be lost with
+    # it -- leaving "the model returned garbage" and "the answer was cut off at
+    # the token ceiling" indistinguishable in the record.
+    #
+    # Carried on `usage` rather than in a wider return tuple because that dict
+    # is already the runner's metadata channel (`request_id` rides on it too),
+    # and `chain._record_api_usage` reads four named keys and ignores the rest.
+    # Recorded ONLY when the API really said something. `finish_reason` is
+    # nullable -- it is `null` on a response that is not finalized -- and
+    # coercing that with `str()` produces `"None"`, a non-empty string that is
+    # not `stop` and would therefore be reported as a truncation. That is
+    # inference from absence, and it would demote usable output on the
+    # strength of the API declining to answer.
+    try:
+        reason = doc["choices"][0]["finish_reason"]
+    except (KeyError, IndexError, TypeError):
+        reason = None
+    if isinstance(reason, str) and reason:
+        # Sanitized HERE, at the single point it enters skodun's data, so the
+        # usage JSON and the marker line below cannot disagree and neither can
+        # carry a token the adapter's unavailability tables match.
+        usage["finish_reason"] = _safe_finish_reason(reason)
+
     try:
         choices = doc["choices"]
         content = choices[0]["message"]["content"]
@@ -198,6 +326,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     if usage:
         _emit_usage(usage)
+    # BEFORE the failure branch below, so a truncation that ALSO broke the JSON
+    # is still reported as a truncation. `_fail`'s own message would otherwise
+    # be the only thing on stderr, and it describes the symptom (unparseable)
+    # rather than the cause.
+    _emit_incomplete(usage.get("finish_reason"))
     if rc != 0 or payload is None:
         # Surface rate limits clearly for classify().
         detail = err or "openai api call failed"

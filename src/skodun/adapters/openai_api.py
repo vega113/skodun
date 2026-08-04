@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 from ..config import Defaults, Reviewer
+from .openai_api_runner import INCOMPLETE_PREFIX
 from .base import (
     REVIEW_CONTRACT,
     UNAVAILABLE_RC,
@@ -73,6 +74,43 @@ _MODEL_SIGNALS = (
     b"invalid model",
     b"unknown model",
 )
+
+#: Positive evidence that THIS run's answer stopped early: the runner's own
+#: line, written when the API reports a `finish_reason` other than `stop`.
+#:
+#: One entry, and it is the adapter's own wording rather than a guess at the
+#: provider's. What was here before -- `truncated` and `envelope refused` --
+#: matched nothing this adapter can emit: `envelope refused` belongs to
+#: `junie_runner`, and `openai-api` has no envelope-staging wrapper at all, so
+#: the degradation axis was dead on both signals and a truncated answer that
+#: happened to parse was recorded as a complete, trustworthy review (#99).
+#:
+#: Matched at the START OF A LINE, exactly, and that is not fastidiousness:
+#: on a non-2xx response the runner puts up to 2000 characters of the
+#: PROVIDER'S error body on stderr (`http {code}: {body}`), so this stream is
+#: not skodun's alone. An unanchored substring would let an error body that
+#: merely mentions the phrase read as a truncation, and a leading-whitespace
+#: tolerance would let an indented one do the same.
+#:
+#: The anchor is the second line of defence, not the first. `_fail` flattens
+#: every message it writes to a single line, so untrusted text cannot reach a
+#: line start at all; and the unavailability tables are consulted before this
+#: one, so even a forged marker loses to a real `quota`.
+_DEGRADED_STDERR_SIGNALS: tuple[bytes, ...] = (
+    INCOMPLETE_PREFIX.lower().encode("utf-8"),
+)
+
+
+def _detect_degraded(stderr: bytes) -> tuple[bool, str]:
+    """Whether this run's answer was cut short, and the reason to record."""
+    for line in stderr.lower().splitlines():
+        for sig in _DEGRADED_STDERR_SIGNALS:
+            if line.startswith(sig):
+                return True, (
+                    "the openai-api response stopped before the model "
+                    "finished; the review may be incomplete and an empty "
+                    "result cannot be trusted")
+    return False, ""
 
 
 def parse_usage_line(stderr: bytes) -> dict | None:
@@ -163,6 +201,7 @@ class OpenAIAPIAdapter:
     ) -> ParseResult:
         payload = _extract(stdout, contract.eligible)
         parse_ok = _ask(contract.validate, payload)
+        degraded, degraded_reason = _detect_degraded(stderr)
         return ParseResult(
             parse_ok=parse_ok,
             findings=list(payload["findings"])
@@ -170,8 +209,12 @@ class OpenAIAPIAdapter:
             summary=payload["summary"]
             if parse_ok and contract is REVIEW_CONTRACT else "",
             stop_reason=None,
-            degraded=False,
-            degraded_reason="",
+            # NOT hardcoded any more. A `finish_reason: "length"` answer that
+            # happens to close its JSON cleanly parses fine, so `parse_ok`
+            # alone cannot catch it -- this is the axis that keeps a review the
+            # model stopped writing from being recorded as a complete one.
+            degraded=degraded,
+            degraded_reason=degraded_reason,
             payload=payload if parse_ok else None,
         )
 
@@ -187,25 +230,35 @@ class OpenAIAPIAdapter:
                 "unavailable", "binary",
                 f"binary not found (rc {UNAVAILABLE_RC})")
         payload = _extract(stdout, contract.eligible)
-        if _ask(contract.validate, payload):
-            return ClassifyResult("ok", "", "")
-        diagnostics = stderr.lower()
-        for category, signals in (
-            ("auth", _AUTH_SIGNALS),
-            ("quota", _QUOTA_SIGNALS),
-            ("model", _MODEL_SIGNALS),
-        ):
-            for sig in signals:
-                if sig in diagnostics:
-                    return ClassifyResult(
-                        "unavailable", category,
-                        f"{category} failure in the run's diagnostics "
-                        f"({sig.decode()}) with no usable {contract.name} payload")
-        for sig in (b"truncated", b"envelope refused"):
-            if sig in diagnostics:
-                return ClassifyResult(
-                    "degraded", "",
-                    f"openai-api response incomplete ({sig.decode()})")
+        usable = _ask(contract.validate, payload)
+        if not usable:
+            diagnostics = stderr.lower()
+            for category, signals in (
+                ("auth", _AUTH_SIGNALS),
+                ("quota", _QUOTA_SIGNALS),
+                ("model", _MODEL_SIGNALS),
+            ):
+                for sig in signals:
+                    if sig in diagnostics:
+                        return ClassifyResult(
+                            "unavailable", category,
+                            f"{category} failure in the run's diagnostics "
+                            f"({sig.decode()}) with no usable "
+                            f"{contract.name} payload")
+        # AFTER the unavailability tables, so a 429 whose error body happens to
+        # carry the truncation marker keeps its `quota` verdict: `quota` is the
+        # one category cached provider-wide and the one a fallback chain hops
+        # on, and reading it as `degraded` would stop the chain on a provider
+        # that is simply out of budget.
+        #
+        # But BEFORE the usable-payload return below, which is the whole point:
+        # a payload that validates still cannot be trusted when the API says it
+        # stopped writing early, and that is the one truncation `parse_ok`
+        # cannot see. A valid payload means a 200, so there is no error body on
+        # stderr to collide with on that path.
+        degraded, reason = _detect_degraded(stderr)
+        if degraded:
+            return ClassifyResult("degraded", "", reason)
         # No diagnostic signal: ill-formed payload is parse_ok=False, not a
         # provider outage (model text must not take the provider offline).
         return ClassifyResult("ok", "", "")

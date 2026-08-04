@@ -1,0 +1,51 @@
+openai-api conformance fixtures
+===============================
+
+Witnesses for `tests/adapter_conformance.py`. Format: `rc=<int>`, optional
+`category=` (required on every `*unavailable*` file), then `--- stdout ---`
+and `--- stderr ---`.
+
+What the chain spawns is `python -I -c ... skodun.adapters.openai_api_runner`,
+so these describe the RUNNER's wire format, not the raw Chat Completions
+envelope: a single contract-shaped JSON object on stdout, and on stderr the
+machine `SKODUN_API_USAGE ` line plus any short reason.
+
+That distinction is what this directory got wrong before issue #99. Both
+degraded fixtures asserted wording nothing in this adapter's path can emit —
+`truncated response from upstream`, and `envelope refused`, which belongs to
+`junie_runner` and to an envelope-staging wrapper `openai-api` does not have.
+`test_degraded_fixtures_are_recognised` passed against strings only the
+fixture author had written, which is the circular green tick the
+`unavailable_quota` rule below warns about, on the degradation axis.
+
+Provenance
+----------
+
+healthy.txt / healthy_noisy_stderr.txt / refuter_healthy.txt
+    SYNTHESIZED in the runner's accepted shape. No live capture.
+
+degraded_stderr.txt / degraded_truncated_answer.txt
+    CAPTURED from `openai_api_runner.main` itself, run against a mocked HTTP
+    response carrying `finish_reason: "length"` and a payload cut mid-string;
+    the token counts and the request id are then replaced with plausible ones.
+    So the `rc`, the line ORDER and the wording are the runner's own, not an
+    author's recollection of them -- which is what the first draft of these
+    two got wrong in a small way that matters here more than most: it declared
+    `rc=2` where `main` really exits `1`, in a directory whose entire job is
+    fidelity to the runner's wire behaviour.
+
+    The pair is the two shapes that matter, and they are not the same case.
+    `_truncated_answer` is the one worth having: a payload that VALIDATES
+    beside a runner line saying the model stopped early, which is the only way
+    this adapter can return a review that parses and must not be trusted.
+    `_stderr` is the commoner one, where truncation landed mid-JSON and the
+    extraction failed too.
+
+unavailable_auth.txt / unavailable_model.txt / unavailable_quota.txt
+    SYNTHESIZED from the runner's own `auth failure:` / `model failure:` /
+    `rate limit:` prefixes, which it writes verbatim (see `main`). The wording
+    AFTER those prefixes is the API's, quoted from its documented error
+    strings, not invented to match the table.
+
+    Standing obligation, as for every adapter: when a live failure of each
+    kind is captured, replace these with the sanitized real stderr.
