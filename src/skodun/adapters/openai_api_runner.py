@@ -79,7 +79,24 @@ def _emit_incomplete(finish_reason: object) -> None:
 
 
 def _fail(msg: str, rc: int = 2) -> int:
-    sys.stderr.buffer.write((msg.rstrip() + "\n").encode("utf-8"))
+    """One line on stderr, always -- and that is a boundary, not formatting.
+
+    Some of what reaches here is the PROVIDER'S: the HTTP branch embeds up to
+    2000 characters of its error body. This stream also carries skodun's own
+    machine lines -- the `SKODUN_API_USAGE ` record the spend ledger reads, and
+    the truncation marker the adapter classifies on -- both of which are
+    recognised by their position at the start of a line. Untrusted text that
+    can contain a newline can therefore forge either of them, and a forged
+    truncation marker turns a provider failure into a `degraded` verdict that
+    stops the fallback chain.
+
+    Flattening every message to one line removes the forgery outright rather
+    than leaving each reader to defend itself, and costs nothing: these are
+    short diagnostics, and the newlines in an error body carry no meaning the
+    operator needs.
+    """
+    flat = " ".join(str(msg).splitlines()).strip()
+    sys.stderr.buffer.write((flat + "\n").encode("utf-8"))
     sys.stderr.buffer.flush()
     return rc
 

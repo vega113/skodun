@@ -85,13 +85,17 @@ _MODEL_SIGNALS = (
 #: the degradation axis was dead on both signals and a truncated answer that
 #: happened to parse was recorded as a complete, trustworthy review (#99).
 #:
-#: Matched at the START OF A LINE, not anywhere in stderr, and that is not
-#: fastidiousness: on a non-2xx response the runner puts up to 2000 characters
-#: of the PROVIDER'S error body on stderr (`http {code}: {body}`), so this
-#: stream is not skodun's alone. An unanchored substring would let an error
-#: body that merely mentions the phrase read as a truncation. The runner writes
-#: the marker as a line of its own, so anchoring costs nothing and takes the
-#: accidental collision off the table.
+#: Matched at the START OF A LINE, exactly, and that is not fastidiousness:
+#: on a non-2xx response the runner puts up to 2000 characters of the
+#: PROVIDER'S error body on stderr (`http {code}: {body}`), so this stream is
+#: not skodun's alone. An unanchored substring would let an error body that
+#: merely mentions the phrase read as a truncation, and a leading-whitespace
+#: tolerance would let an indented one do the same.
+#:
+#: The anchor is the second line of defence, not the first. `_fail` flattens
+#: every message it writes to a single line, so untrusted text cannot reach a
+#: line start at all; and the unavailability tables are consulted before this
+#: one, so even a forged marker loses to a real `quota`.
 _DEGRADED_STDERR_SIGNALS: tuple[bytes, ...] = (
     INCOMPLETE_PREFIX.lower().encode("utf-8"),
 )
@@ -101,7 +105,7 @@ def _detect_degraded(stderr: bytes) -> tuple[bool, str]:
     """Whether this run's answer was cut short, and the reason to record."""
     for line in stderr.lower().splitlines():
         for sig in _DEGRADED_STDERR_SIGNALS:
-            if line.strip().startswith(sig):
+            if line.startswith(sig):
                 return True, (
                     "the openai-api response stopped before the model "
                     "finished; the review may be incomplete and an empty "
