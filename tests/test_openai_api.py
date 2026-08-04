@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -95,9 +96,35 @@ def test_estimate_cost_and_limits(tmp_path, monkeypatch):
     assert cost > 0
 
 
+def _freeze_spend_clock(monkeypatch, iso: str) -> None:
+    """Pin the clock `spend` reads to one instant, for the whole test.
+
+    `record_usage(at=None)` and `spent_today_usd(now_iso=None)` both reach
+    `time.gmtime()` in `spend`, and each resolves it SEPARATELY -- the writer
+    when it stamps the row, the reader when it computes which day "today" is.
+    Between those two calls the real clock can cross UTC midnight, and then a
+    row written moments ago is not in today, so `spent_today_usd` returns 0.00
+    and the assertion below fails for a reason that has nothing to do with the
+    ledger.
+
+    The window is a single function call, so this is a once-in-many-years
+    failure -- but it can only ever fire in the small hours, on somebody
+    else's machine, and read as a spend bug. One frozen instant removes it.
+
+    Freezing the SHARED SEAM rather than passing explicit timestamps is the
+    point: both calls still take their default-now branch, which is the branch
+    production uses and the one this test exists to cover. Handing each an
+    explicit `at`/`now_iso` would make the race impossible by never running
+    the code that has it.
+    """
+    frozen = time.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")
+    monkeypatch.setattr(spend.time, "gmtime", lambda *a, **k: frozen)
+
+
 def test_spend_ledger_is_per_utc_day_not_lifetime(tmp_path, monkeypatch):
     """Limit compares only today's rows; yesterday does not burn the budget."""
     monkeypatch.setenv("SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY", "0.01")
+    _freeze_spend_clock(monkeypatch, "2026-08-04T12:00:00Z")
     st = Store.open(tmp_path / "s.db")
     assert SCHEMA_VERSION == 8
     with st:
@@ -735,3 +762,35 @@ def test_the_degraded_fixture_matches_what_the_runner_really_exits_with(
     assert ([line.split(" ")[0] for line in
              fx.stderr.decode().strip().splitlines()]
             == [line.split(" ")[0] for line in real_err.strip().splitlines()])
+
+
+def test_a_row_written_before_midnight_stops_counting_after_it(tmp_path,
+                                                               monkeypatch):
+    """"Per UTC day" at the only moment the phrase means anything.
+
+    The test above pins that YESTERDAY does not count, using a row stamped in
+    2020 -- which any implementation of "today" gets right, including a wrong
+    one. This pins the boundary itself: one second before midnight the row is
+    today's and the cap is blown; one second after, the same row is history
+    and the budget is whole again.
+
+    That rollover is also what made the older test racy. Rather than only
+    removing the race, this asserts the behaviour the race was standing in
+    front of.
+    """
+    monkeypatch.setenv("SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY", "0.01")
+    st = Store.open(tmp_path / "s.db")
+    with st:
+        _freeze_spend_clock(monkeypatch, "2026-08-04T23:59:59Z")
+        spend.record_usage(
+            st, provider=PROVIDER_ID, model=MODEL,
+            prompt_tokens=100, completion_tokens=100, cost_usd=5.00)
+
+        # Still the same UTC day: the spend counts and the cap is blown.
+        assert spend.spent_today_usd(st, PROVIDER_ID) >= 5.00
+        assert spend.would_exceed_limit(st, PROVIDER_ID, additional_usd=0.0)
+
+        # One second later it is tomorrow, and the ledger is per DAY.
+        _freeze_spend_clock(monkeypatch, "2026-08-05T00:00:01Z")
+        assert spend.spent_today_usd(st, PROVIDER_ID) == 0.0
+        assert not spend.would_exceed_limit(st, PROVIDER_ID, additional_usd=0.0)
