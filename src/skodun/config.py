@@ -426,6 +426,20 @@ class Routing:
     * `cross_model` -- whether a finder whose provider family differs from the
       calling client's gets a soft preference. A BONUS, never an exclusion: the
       last available family must still be able to review.
+    * `weights` -- Phase B. The operator's DECLARED share of reviews per
+      provider, `{ xai = 3, google = 1 }`, measured against how many each
+      actually served in the last `weights_window_days`. Keyed by PROVIDER
+      rather than by reviewer name (unlike `pool`) because a weight is a
+      statement about a subscription, and two entries on one provider draw on
+      the same one. Empty (the default) leaves scoring exactly as Phase A's;
+      an unlisted provider in a non-empty table counts as 1. Stored as ordered
+      pairs rather than a dict so this dataclass stays hashable like every
+      other config shape.
+    * `weights_window_days` -- how far back the served counts that `weights`
+      are measured against are read. Seven by default, which is also what
+      `skodun providers` reports over, so the number an operator reads when
+      they ask whether the weights are working is the number the router
+      scored with.
 
     A pin (`--reviewer` / the MCP `reviewer` argument) ignores this table
     entirely, in every mode.
@@ -434,6 +448,8 @@ class Routing:
     mode: str = "off"
     pool: tuple[str, ...] = ()
     cross_model: bool = True
+    weights: tuple[tuple[str, float], ...] = ()
+    weights_window_days: int = 7
 
 
 #: The `[routing]` bool fields, validated as EXACT bools -- `_strict_bool`'s
@@ -487,6 +503,117 @@ def _routing_pool(value: object) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _routing_weights(value: object) -> tuple[tuple[str, float], ...]:
+    """Normalize `[routing] weights` into ordered `(provider, weight)` pairs.
+
+    Every refusal here is a typo that would otherwise do NOTHING, quietly,
+    while the operator believed they had rationed a provider -- which is the
+    same argument `[routing] pool` makes for validating its names.
+
+    Zero and negative are refused rather than clamped. Zero reads as "never
+    route here", and `pool` and `enabled = false` already say that explicitly;
+    accepting it would add a third, silent way to exclude a provider, in a
+    table whose whole job is to express PREFERENCE rather than exclusion.
+
+    `bool` is refused before `int` because `isinstance(True, int)` holds in
+    Python, and `weights = { xai = true }` is not a share of anything.
+
+    Non-finite is refused for a sharper reason than tidiness: TOML has `inf`
+    and `nan` as literals, `inf > 0` is true, and a weight of `inf` makes the
+    router's `target` an `inf / inf` NaN that `round()` raises on. The guard in
+    `routing.auto_route` would then catch that on EVERY routed run and fall
+    back to pre-S5 head selection -- auto-routing silently off, from a config
+    that loaded cleanly. Checked BEFORE the `> 0` test so `nan`, which would
+    otherwise be reported as "not greater than 0" (true, but not the useful
+    thing to say about it), gets the message that names what is wrong.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"[routing] weights: expected a table of provider = number, got "
+            f"{type(value).__name__}")
+    out: list[tuple[str, float]] = []
+    for provider, weight in value.items():
+        if not isinstance(provider, str) or not provider.strip():
+            raise ValueError(
+                "[routing] weights: every key must be a non-empty provider id")
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            raise ValueError(
+                f"[routing] weights: {provider!r} must be a number, got "
+                f"{type(weight).__name__}")
+        try:
+            weight = float(weight)
+        except OverflowError:
+            # TOML integers are arbitrary precision, so `xai = 10**400` is a
+            # perfectly good `int` that no float can hold -- and `math.isfinite`
+            # raises `OverflowError` on it rather than answering. Converted here
+            # so an unusable weight leaves this function the way every other
+            # unusable weight does: as a `ValueError` naming the table and the
+            # key, not as an exception type the callers do not expect.
+            raise ValueError(
+                f"[routing] weights: {provider!r} is too large to be a share; "
+                f"only the RATIO between weights matters, so use smaller "
+                f"numbers") from None
+        if not math.isfinite(weight):
+            raise ValueError(
+                f"[routing] weights: {provider!r} must be a finite number, "
+                f"got {weight!r}; a share of infinity is not a share")
+        if not weight > 0:
+            raise ValueError(
+                f"[routing] weights: {provider!r} must be greater than 0 "
+                f"(use [routing] pool or enabled = false to exclude a "
+                f"provider; a weight of {weight!r} would exclude it silently)")
+        out.append((provider, weight))
+    # The SUM, not just each term. Two finite weights can add to `inf`
+    # (`{ xai = 1e308, openai = 1e308 }`), and the router divides by that
+    # total: every target would come out `0.0`, so the declared ratio would be
+    # gone while `skodun providers` went on reporting the weights as set. Same
+    # failure this function refuses `inf` for, one addition later.
+    #
+    # An upper bound on a single weight would be the policy guess this module
+    # deliberately does not make (see `_bounded_int`'s note on lower bounds
+    # only). This is not one: it is the condition under which the arithmetic
+    # the value exists for still works.
+    # Plain `sum`, not `math.fsum`: fsum RAISES `OverflowError` on exactly the
+    # input this check exists to catch, and a raise from inside a validator is
+    # not the refusal an operator can act on.
+    if out and not math.isfinite(sum(w for _, w in out)):
+        raise ValueError(
+            "[routing] weights: the weights add up to infinity, so every "
+            "provider's share would come out as zero; use smaller numbers "
+            "(only the RATIO between them matters)")
+    return tuple(out)
+
+
+def _validate_routing_weights(routing: Routing,
+                              reviewers: tuple[Reviewer, ...]) -> None:
+    """Refuse a weight for a provider no reviewer entry uses.
+
+    Same reason `pool` validates its names against the merged table: a weight
+    on a provider that cannot be routed to is a typo, and a typo that changes
+    nothing is the one an operator never finds. Checked against EVERY reviewer
+    entry rather than the pool, because the pool is resolved per run (an
+    implicit pool is every enabled finder) and a weight for a finder that is
+    temporarily disabled is a config an operator may well want to keep.
+    """
+    known = {r.provider for r in reviewers}
+    for provider, _ in routing.weights:
+        if provider not in known:
+            raise ValueError(
+                f"[routing] weights: no reviewer uses provider {provider!r}; "
+                f"configured providers are {sorted(known)}")
+
+
+def _bounded_routing_int(key: str, value: object, minimum: int) -> int:
+    """`_bounded_int` for `[routing]`, naming that table in the message."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"[routing] {key}: expected an integer, got {type(value).__name__}")
+    if value < minimum:
+        raise ValueError(
+            f"[routing] {key}: must be >= {minimum}, got {value}")
+    return value
+
+
 def _strict_routing_bool(key: str, value: object) -> bool:
     """`_strict_bool` for `[routing]`, naming that table in the message."""
     if not isinstance(value, bool):
@@ -517,6 +644,7 @@ def _validate_routing(routing: Routing, reviewers: tuple[Reviewer, ...]) -> None
             raise ValueError(
                 f"[routing] pool: reviewer {name!r} has role {entry.role!r}; "
                 f"the pool may only name 'finder' entries")
+    _validate_routing_weights(routing, reviewers)
 
 
 @dataclass(frozen=True)
@@ -786,6 +914,11 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
                                           source="[routing] mode")
     if "pool" in routevals:
         routevals["pool"] = _routing_pool(routevals["pool"])
+    if "weights" in routevals:
+        routevals["weights"] = _routing_weights(routevals["weights"])
+    if "weights_window_days" in routevals:
+        routevals["weights_window_days"] = _bounded_routing_int(
+            "weights_window_days", routevals["weights_window_days"], 1)
     for key in _ROUTING_FLAGS:
         if key in routevals:
             routevals[key] = _strict_routing_bool(key, routevals[key])

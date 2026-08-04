@@ -84,6 +84,16 @@ Load-bearing paths agents cannot safely guess:
 5. **No `anthropic` adapter** unless the owner reopens that product premise.
 6. **Tests prove the shipped path.** No hard-coded expected values that skip the unit under test; no re-implementation of production logic in tests; do not start past the code under test.
 7. **Legacy FG lock** path/name and three-line `owner` format are interop-critical. Do not rename without a dual-hold bridge.
+8. **Routing is OUTSIDE the fail-closed perimeter, deliberately.** `routing.py`
+   degrades loudly to pre-S5 head selection when the store cannot answer —
+   matching `chain._cached_unavailable`'s precedent for the same read — and
+   must not be changed to fail closed. Invariant 1 is about **coverage and
+   trust**: routing cannot touch either, since the model still reviews the real
+   diff, the trust axes come from that run, and the gate reads the same record
+   either way. Failing a review because the load optimiser hiccuped would spend
+   a model call to report a store hiccup, and would let an optional feature
+   take down the loop that works without it. (Decision recorded for epic #69 /
+   #77; see `docs/superpowers/specs/2026-08-04-phase-b-weighted-routing.md` §6.)
 
 ---
 

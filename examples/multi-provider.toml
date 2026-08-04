@@ -82,6 +82,44 @@ pool = ["finder", "finder-openai"]
 # Default true; set false if you would rather score on availability alone.
 cross_model = true
 
+# The DECLARED share of reviews each provider should carry, keyed by PROVIDER
+# id (not reviewer name -- a weight is a statement about a subscription, and
+# two entries on one provider draw on the same one). Commented out because the
+# default -- no weights, every provider equal -- is right until your providers
+# stop being interchangeable: one subscription with three times another's
+# headroom, or a metered key you would rather spend sparingly.
+#
+#   weights = { xai = 3, openai = 1 }
+#
+# Read as a RATIO against what each provider actually served in the last
+# `weights_window_days` (the same counts `skodun providers` prints), so it
+# self-corrects: a provider that got ahead of its share is scored down until
+# the others catch up. In a NON-EMPTY table a provider you do not list counts
+# as 1; leaving the table out entirely is not "everyone equal" -- the share
+# term is not computed at all and the served counts are never read. Zero and
+# negative are refused -- "never route here" is what `pool` and
+# `enabled = false` already say, and a third, silent way to exclude a provider
+# is a trap.
+#
+# BOUNDED, exactly like cross_model and for the same reason: the share term is
+# 24 * (declared - served share), so two candidates differ by at most 48 while
+# a free slot is worth 100 -- no weight can send a review to a busy provider
+# while an idle one is sitting there. Capacity decides; weights break what
+# capacity leaves tied.
+#
+# That 24 is a COEFFICIENT, not a flat bonus: providers weighted 3:1 with
+# nothing served yet are 12 apart, so cross_model's +20 still tips that one. A
+# WIDE declared gap outranks the family preference and a narrow one does not,
+# which is the intended shape -- a marginal difference should be a marginal
+# signal.
+#
+# DECLARED, never inferred. What a weight expresses -- how much of your
+# subscription a review consumes -- is not something skodun can see for a
+# flat-rate CLI: no balance is published and no cost is reported. You know your
+# tiers; skodun would be guessing.
+#
+#   weights_window_days = 7   # default
+
 # --- the finder, with a same-role fallback on a different provider ---------
 #
 # `fallbacks` is tried, in order, only when the head reviewer's OWN attempt
