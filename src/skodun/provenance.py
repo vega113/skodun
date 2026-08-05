@@ -163,6 +163,31 @@ def code_provenance() -> dict:
     return dict(_CACHED)
 
 
+def cached_provenance() -> dict | None:
+    """The answer if it is already known, else None. NEVER computes.
+
+    For callers on a latency-critical path -- the MCP handshake is the one that
+    matters -- where the field is worth having but never worth waiting for. A
+    client that times out its `initialize` has lost the whole session, and no
+    diagnostic is worth that.
+    """
+    return dict(_CACHED) if _CACHED is not None else None
+
+
+def warm_async() -> threading.Thread:
+    """Fill the cache on a daemon thread. Returns it, mostly for tests.
+
+    Started when a long-lived process begins, so the git work is done long
+    before anything asks. It takes ~27ms on a normal checkout, so in practice
+    the answer is ready by the time the first request arrives; on a wedged git
+    the process simply carries on without it, which is the point.
+    """
+    t = threading.Thread(target=code_provenance, name="skodun-provenance",
+                         daemon=True)
+    t.start()
+    return t
+
+
 def stale_against_disk() -> str | None:
     """The on-disk commit when it differs from the running one, else None.
 

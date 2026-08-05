@@ -1278,12 +1278,20 @@ class McpServer:
 
         #: Drift is a standing condition, so it is said once per session
         #: rather than on every tool call.
-        #:
-        #: The commit itself is NOT read here. `initialize` already asks for it
-        #: (it goes in `serverInfo`) and the answer is cached process-wide, so
-        #: reading it at construction would only add a second chance for a
-        #: wedged git to delay the handshake the host is waiting on.
         self._warned_code_moved = False
+        # Warmed on a daemon thread, never read synchronously here or in
+        # `initialize`. Provenance costs two git calls, and while that is ~27ms
+        # on a normal checkout the timeout exists because git can wedge -- a
+        # client that times out its handshake has lost the session, and no
+        # diagnostic field is worth that. By the time `initialize` arrives the
+        # thread has all but certainly finished; if it has not, `serverInfo`
+        # simply goes without the commit.
+        try:
+            from .provenance import warm_async
+
+            warm_async()
+        except Exception:       # pragma: no cover - never worth a failed start
+            pass                # (KeyboardInterrupt deliberately not caught)
 
         #: Whether the `initialize` REQUEST has been answered. This -- not the
         #: notification below -- is what the -32002 gate reads: a client that
@@ -1571,20 +1579,28 @@ class McpServer:
         # before a tool call hits the store. Clients that only read name/version
         # ignore the extra field. Imported lazily so cold `skodun mcp` still
         # avoids paying for sqlite until a tool needs the store.
-        from .provenance import code_provenance
+        from .provenance import cached_provenance
         from .store import SCHEMA_VERSION
         # `commit` beside the version because on an editable install every
         # commit is still 0.4.0 -- so the version alone cannot tell an operator
         # whether THIS SERVER is running the code they just merged. It is what
         # `skodun doctor`'s package line asks them to compare against.
+        #
+        # BEST EFFORT: read from the cache the constructor started warming, and
+        # never computed here. This is the handshake, and a client that times it
+        # out has lost the session -- so on the rare cold read the field is
+        # absent rather than paid for.
+        info = {
+            "name": SERVER_NAME,
+            "version": self._version,
+            "schemaVersion": SCHEMA_VERSION,
+        }
+        warm = cached_provenance()
+        if warm is not None:
+            info["commit"] = warm.get("skodun_commit")
         return {"protocolVersion": negotiated,
                 "capabilities": {"tools": {}, "prompts": {}},
-                "serverInfo": {
-                    "name": SERVER_NAME,
-                    "version": self._version,
-                    "schemaVersion": SCHEMA_VERSION,
-                    "commit": code_provenance().get("skodun_commit"),
-                }}
+                "serverInfo": info}
 
     def _m_ping(self, params: dict, id_) -> dict:
         return {}

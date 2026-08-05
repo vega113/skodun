@@ -450,15 +450,70 @@ def test_the_serverinfo_names_skodun_and_its_own_version():
     from skodun.provenance import code_provenance
     from skodun.store import SCHEMA_VERSION
 
+    warm = code_provenance()      # the state every real server is in by then
+
     code, out, _ = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25"))
     result = _responses(out.data, "initialize")[0]["result"]
     assert result["serverInfo"] == {
         "name": "skodun",
         "version": skodun.__version__,
         "schemaVersion": SCHEMA_VERSION,
-        "commit": code_provenance()["skodun_commit"],
+        "commit": warm["skodun_commit"],
     }
     assert result["capabilities"] == {"tools": {}, "prompts": {}}
+
+
+def test_the_handshake_never_waits_on_git(monkeypatch):
+    """`serverInfo.commit` is best effort, and this is the reason it is.
+
+    Provenance costs two git subprocesses. That is ~27ms on a normal checkout,
+    but the timeout in `provenance` exists because git CAN wedge -- a network
+    filesystem, a stuck index lock -- and `initialize` is the one exchange
+    where paying it is unaffordable: a client that times out its handshake has
+    lost the whole session, not one field. So a cold cache reports no commit
+    rather than blocking for one.
+
+    Regression: an earlier fix took the read off the CONSTRUCTOR on exactly
+    this reasoning, and left `initialize` computing it -- which moved the cost
+    onto the handshake instead of removing it.
+    """
+    from skodun import provenance
+
+    reads: list[str] = []
+    monkeypatch.setattr(provenance, "_CACHED", None)
+    monkeypatch.setattr(provenance, "warm_async", lambda: None)
+    # Records rather than raises: an exception here would be caught by the
+    # server's own error handling, and the test would then be pinning "the
+    # handshake failed" instead of "the handshake did not ask".
+    monkeypatch.setattr(provenance, "_read_commit",
+                        lambda root: reads.append("git") or None)
+
+    code, out, _ = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25"))
+
+    info = _responses(out.data, "initialize")[0]["result"]["serverInfo"]
+    assert reads == [], "the handshake spent git calls it cannot afford"
+    assert info["version"] == skodun.__version__
+    assert "commit" not in info, (
+        "a commit that is not already known must be omitted, not waited for")
+
+
+def test_the_server_warms_provenance_off_the_request_path(monkeypatch):
+    """Omitting the commit is the FALLBACK, not the normal case.
+
+    Construction kicks the read onto a daemon thread, so by the time a client
+    finishes connecting the answer is cached and the handshake reports it
+    without having waited for anything.
+    """
+    from skodun import provenance
+
+    started: list[str] = []
+    monkeypatch.setattr(provenance, "warm_async",
+                        lambda: started.append("warmed"))
+
+    mcpserver.McpServer(registry=[], store_factory=lambda: None)
+
+    assert started == ["warmed"]
+
 
 
 def test_two_long_running_tools_are_refused_at_construction():
