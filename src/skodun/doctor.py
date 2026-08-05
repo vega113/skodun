@@ -80,14 +80,26 @@ def run_doctor(
     # Package / schema this CLI process understands (for CLI↔MCP skew)
     try:
         from . import __version__
+        from .provenance import code_provenance, stale_against_disk
         from .store import SCHEMA_VERSION as _SCHEMA_V
 
-        report.add(
-            "package",
-            True,
-            f"version={__version__} schema_v={_SCHEMA_V} "
-            f"(MCP serverInfo must match after restart)",
-        )
+        # The COMMIT, not just the version. On an editable install every commit
+        # is still 0.4.0, so `version=` alone cannot answer "is this the code I
+        # merged?" -- which is the question an operator actually has after a
+        # pull (#110).
+        commit = code_provenance().get("skodun_commit")
+        running = f" commit={commit[:12]}" if commit else ""
+        moved = stale_against_disk()
+        detail = (f"version={__version__} schema_v={_SCHEMA_V}{running} "
+                  f"(MCP serverInfo must match after restart)")
+        if moved:
+            # Reported, never acted on. A fail-closed gate must not swap its
+            # own code underneath a running review, so this says what a restart
+            # would get and leaves the decision with the operator.
+            detail += (f"; the checkout has since moved to {moved[:12]} -- "
+                       f"this process is still running the code above, and a "
+                       f"restart would pick the new one up")
+        report.add("package", True, detail)
     except Exception as e:
         report.add("package", False, f"{e!r}")
 
