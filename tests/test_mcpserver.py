@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1325,6 +1326,173 @@ def test_a_real_process_answers_a_tool_call_with_one_line_and_no_residue(tmp_pat
     assert [r.get("id") for r in got] == [1, 2]
     assert got[1]["result"]["content"][0]["text"] == "hello"
     assert got[1]["result"]["structuredContent"] == {"status": 0}
+
+
+# --------------------------------------------------------------------------
+# SIGTERM means "cancel", and has to say so when there is nothing to cancel
+# (#113)
+# --------------------------------------------------------------------------
+
+
+def _fire_sigterm(server) -> None:
+    """Run the server's own SIGTERM handler, without signalling the test run.
+
+    `os.kill(os.getpid(), SIGTERM)` would work only while `serve` is inside its
+    try block, and would kill the pytest process outright if the forwarder were
+    ever not installed -- so the failure mode of a broken install would be a
+    dead suite rather than a red test.
+    """
+    import signal
+
+    previous = server._install_sigterm_forwarder()
+    try:
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+    finally:
+        server._restore_sigterm_forwarder(previous)
+
+
+def test_a_sigterm_with_nothing_to_cancel_says_so_rather_than_nothing():
+    """The whole of #113.
+
+    On this server SIGTERM does NOT mean "exit" -- it is how cross-process
+    `review-cancel` reaches a review running on a worker thread, and the
+    default disposition is replaced precisely so the process does not die and
+    orphan the provider group and a `running` row. That is correct and stays.
+
+    What was wrong is the idle case: with no review in flight the handler did
+    nothing whatsoever, so an operator saw a process that would not die and no
+    reason why. Measured on 22 live servers -- every one ignored SIGTERM, and
+    the natural next step is the `kill -9` the README tells people to avoid.
+    """
+    server = _server(stdin=_rpc("ping", 1))
+
+    _fire_sigterm(server)
+    server.serve()
+
+    said = server._stderr.getvalue()
+    assert "SIGTERM" in said, f"the idle signal was still silent:\n{said}"
+    assert "cancel" in said.lower()
+    # It must say what DOES stop a server, or it is only half an explanation.
+    assert "SIGINT" in said or "stdin" in said, said
+
+
+def test_a_sigterm_that_actually_cancels_something_adds_no_note():
+    """The note is for the case where nothing happened. A SIGTERM that cancels
+    a review has done its job, and the operator asked for exactly that -- a
+    line explaining the signal there would be noise on the normal path."""
+    import threading
+
+    server = _server(stdin=_rpc("ping", 1))
+    server._worker_cancel = threading.Event()
+
+    _fire_sigterm(server)
+    server.serve()
+
+    assert server._worker_cancel.is_set(), "the cancel must still happen"
+    assert "SIGTERM" not in server._stderr.getvalue()
+
+
+def test_a_sigterm_after_a_review_finished_still_reports_the_idle_case():
+    """A server that has ever run a review is the normal server, and the fix
+    has to work for it.
+
+    `_start_long_running` stores the worker's cancel token; nothing used to
+    clear it. So a SIGTERM arriving long after that review finished would set
+    a completed Event, count as a real cancellation, and suppress the
+    diagnostic -- leaving the silence intact for every server except one that
+    has never done any work. Found by CodeRabbit on PR #114.
+
+    Driven through the shipped `tools/call` path so the token is stored and
+    cleared exactly as production does it, not by poking the attribute.
+    """
+    done = threading.Event()
+
+    def slow(call):
+        done.set()
+        return HandlerResult(status=0, text="finished", pending_acks=[])
+
+    registry = (HandlerSpec(name="review", long_running=True, input_schema={},
+                            handler=slow, description="a review"),)
+    server = _server(stdin=_HANDSHAKE
+                     + _rpc("tools/call", 1, name="review", arguments={}),
+                     registry=registry)
+    server.serve()                          # runs the review to completion
+    assert done.is_set(), "the review never ran"
+
+    _fire_sigterm(server)
+    server._say_sigterm_did_nothing()       # the loop has already ended
+
+    said = server._stderr.getvalue()
+    assert "SIGTERM arrived with no review in flight" in said, (
+        f"a finished review still counted as cancellable:\n{said}")
+
+
+def test_a_real_idle_server_reports_the_signal_without_being_prodded(tmp_path):
+    """The shipped path, and the whole point of writing from the handler.
+
+    An idle server is BLOCKED IN `readline` -- that is what idle means -- so a
+    note deferred to the next message would never appear in the only situation
+    this diagnostic exists for. Nothing is sent after the signal here, on
+    purpose: the note has to arrive on its own.
+
+    A real process through `skodun mcp`, because the bug this closes was found
+    by signalling 22 real ones, and an in-memory stderr cannot exercise the raw
+    `os.write` that production takes. Found by CodeRabbit on PR #114.
+    """
+    boot = tmp_path / "boot.py"
+    boot.write_text(
+        "import sys\n"
+        "from skodun.mcpserver import serve_stdio\n"
+        "raise SystemExit(serve_stdio(registry=()))\n",
+        encoding="utf-8")
+    proc = subprocess.Popen([sys.executable, str(boot)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=_env(tmp_path))
+    try:
+        proc.stdin.write(_rpc("initialize", 1,
+                              protocolVersion="2025-11-25"))
+        proc.stdin.flush()
+        proc.stdout.readline()              # it is up and now idle
+
+        os.kill(proc.pid, signal.SIGTERM)
+
+        # Read one stderr line with a deadline. No further request is sent.
+        line = _readline_before(proc.stderr, deadline_sec=20)
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+    assert line, "an idle server said nothing at all about the signal"
+    assert b"SIGTERM arrived with no review in flight" in line, line
+    assert b"SIGINT" in line, b"it never says what does stop a server: " + line
+
+
+def _readline_before(stream, *, deadline_sec: float) -> bytes:
+    """One line from `stream`, or `b""` if none arrives in time.
+
+    The read runs on a daemon thread so a server that says nothing fails the
+    assertion above instead of hanging the suite until pytest's own timeout.
+    """
+    got: list[bytes] = []
+    reader = threading.Thread(target=lambda: got.append(stream.readline()),
+                              daemon=True)
+    reader.start()
+    reader.join(deadline_sec)
+    return got[0] if got else b""
+
+
+def test_the_readme_says_which_signal_stops_a_server():
+    """The other half of #113, and the half an operator actually reads.
+
+    `README.md` recommends a graceful host reload "over `kill -9`" without
+    saying that the conventional graceful signal is inert here -- so following
+    that advice leads straight to the hard kill it warns against.
+    """
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8")
+
+    assert "SIGTERM" in readme, "the repurposed signal is undocumented"
+    assert "SIGINT" in readme, "nothing tells an operator what does work"
 
 
 # --------------------------------------------------------------------------
