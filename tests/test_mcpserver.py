@@ -443,7 +443,14 @@ def test_the_registry_types_are_the_pinned_contract():
 
 
 def test_the_serverinfo_names_skodun_and_its_own_version():
+    """`commit` rides beside `version` because on an editable install every
+    commit is still 0.4.0 -- so the version alone cannot tell an operator
+    whether THIS server is running the code they merged. `skodun doctor`'s
+    package line asks them to compare against exactly this field."""
+    from skodun.provenance import code_provenance
     from skodun.store import SCHEMA_VERSION
+
+    warm = code_provenance()      # the state every real server is in by then
 
     code, out, _ = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25"))
     result = _responses(out.data, "initialize")[0]["result"]
@@ -451,8 +458,62 @@ def test_the_serverinfo_names_skodun_and_its_own_version():
         "name": "skodun",
         "version": skodun.__version__,
         "schemaVersion": SCHEMA_VERSION,
+        "commit": warm["skodun_commit"],
     }
     assert result["capabilities"] == {"tools": {}, "prompts": {}}
+
+
+def test_the_handshake_never_waits_on_git(monkeypatch):
+    """`serverInfo.commit` is best effort, and this is the reason it is.
+
+    Provenance costs two git subprocesses. That is ~27ms on a normal checkout,
+    but the timeout in `provenance` exists because git CAN wedge -- a network
+    filesystem, a stuck index lock -- and `initialize` is the one exchange
+    where paying it is unaffordable: a client that times out its handshake has
+    lost the whole session, not one field. So a cold cache reports no commit
+    rather than blocking for one.
+
+    Regression: an earlier fix took the read off the CONSTRUCTOR on exactly
+    this reasoning, and left `initialize` computing it -- which moved the cost
+    onto the handshake instead of removing it.
+    """
+    from skodun import provenance
+
+    reads: list[str] = []
+    monkeypatch.setattr(provenance, "_CACHED", None)
+    monkeypatch.setattr(provenance, "warm_async", lambda: None)
+    # Records rather than raises: an exception here would be caught by the
+    # server's own error handling, and the test would then be pinning "the
+    # handshake failed" instead of "the handshake did not ask".
+    monkeypatch.setattr(provenance, "_read_commit",
+                        lambda root: reads.append("git") or None)
+
+    _, out, _ = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25"))
+
+    info = _responses(out.data, "initialize")[0]["result"]["serverInfo"]
+    assert reads == [], "the handshake spent git calls it cannot afford"
+    assert info["version"] == skodun.__version__
+    assert "commit" not in info, (
+        "a commit that is not already known must be omitted, not waited for")
+
+
+def test_the_server_warms_provenance_off_the_request_path(monkeypatch):
+    """Omitting the commit is the FALLBACK, not the normal case.
+
+    Construction kicks the read onto a daemon thread, so by the time a client
+    finishes connecting the answer is cached and the handshake reports it
+    without having waited for anything.
+    """
+    from skodun import provenance
+
+    started: list[str] = []
+    monkeypatch.setattr(provenance, "warm_async",
+                        lambda: started.append("warmed"))
+
+    mcpserver.McpServer(registry=[], store_factory=lambda: None)
+
+    assert started == ["warmed"]
+
 
 
 def test_two_long_running_tools_are_refused_at_construction():
@@ -1264,3 +1325,212 @@ def test_a_real_process_answers_a_tool_call_with_one_line_and_no_residue(tmp_pat
     assert [r.get("id") for r in got] == [1, 2]
     assert got[1]["result"]["content"][0]["text"] == "hello"
     assert got[1]["result"]["structuredContent"] == {"status": 0}
+
+
+# --------------------------------------------------------------------------
+# the checkout moving under a long-lived server (#110)
+# --------------------------------------------------------------------------
+
+
+def test_a_checkout_that_moved_under_the_server_is_reported_once(monkeypatch):
+    """Drift is detectable HERE and nowhere else.
+
+    `doctor` is a fresh process per run and CLI-only, so it can only ever
+    compare disk against the disk it just read. This server is the thing that
+    stays alive across a `git pull` -- for hours or days, as observed on this
+    machine -- so it is the one that can notice it is serving code the
+    checkout no longer has.
+
+    Driven through the shipped `tools/call` path, and the warning must land on
+    STDERR (the client's log), never on stdout, which is the JSON-RPC stream.
+    """
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    monkeypatch.setattr(provenance, "_read_commit", lambda root: "b" * 40)
+
+    payload = (_rpc("initialize", 1, protocolVersion="2025-11-25")
+               + _rpc("tools/call", 2, name="nope", arguments={})
+               + _rpc("tools/call", 3, name="nope", arguments={}))
+    _, out, err = _drive(payload)
+
+    said = err.getvalue()
+    assert said.count("the checkout has since moved") == 1, (
+        f"expected exactly one standing note, got:\n{said}")
+    assert "aaaaaaaaaaaa" in said and "bbbbbbbbbbbb" in said
+    assert "Restart this MCP server" in said
+    assert b"the checkout has since moved" not in out.data, \
+        "a diagnostic must never reach the JSON-RPC stream"
+
+
+def test_drift_that_arrives_after_the_first_tool_call_is_still_reported(
+        monkeypatch):
+    """The scenario the feature exists for, and the one it used to miss.
+
+    An operator does not `git pull` between a client connecting and its first
+    tool call -- they pull HOURS LATER, in the middle of a long session, which
+    is exactly what #110 describes happening on this machine. Marking the
+    session "already warned" on the first call regardless of what the probe
+    found meant the note could only ever fire for drift that predated the
+    connection, so the real case was silently unreachable.
+
+    Found by Qodo on PR #111.
+    """
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    # The checkout is where we are on the first probe, and somebody pulls
+    # before the second -- the ordinary shape of a long agent session.
+    seen: list[str] = []
+
+    def disk(root):
+        seen.append("probe")
+        return "a" * 40 if len(seen) == 1 else "b" * 40
+
+    monkeypatch.setattr(provenance, "_read_commit", disk)
+
+    *_, err = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
+                     + _rpc("tools/call", 2, name="nope", arguments={})
+                     + _rpc("tools/call", 3, name="nope", arguments={})
+                     + _rpc("tools/call", 4, name="nope", arguments={}))
+
+    said = err.getvalue()
+    assert said.count("the checkout has since moved") == 1, (
+        f"drift arriving mid-session must still be reported, exactly once; "
+        f"got:\n{said}")
+    assert "bbbbbbbbbbbb" in said
+
+
+def test_a_probe_that_cannot_read_the_disk_does_not_claim_it_moved(monkeypatch):
+    """`-unknown` means "we could not establish it", not "it changed".
+
+    `_read_commit` appends that suffix when `status --porcelain` fails -- a
+    transient `index.lock` held by a concurrent commit is enough. Comparing the
+    whole string would read `abc-unknown` as different from `abc` and announce
+    a move that never happened, which is the failure mode this whole module
+    avoids elsewhere: a confident-looking claim built on a failed read.
+    """
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    monkeypatch.setattr(provenance, "_read_commit",
+                        lambda root: "a" * 40 + "-unknown")
+
+    *_, err = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
+                     + _rpc("tools/call", 2, name="nope", arguments={}))
+
+    assert "checkout has since moved" not in err.getvalue()
+
+
+def test_a_probe_that_can_never_answer_is_not_paid_for_twice(monkeypatch):
+    """A probe costs two git subprocesses, and git can wedge.
+
+    `None` means the disk is not a checkout we can read at all -- a wheel
+    install, a missing binary, a git that timed out. None of those becomes
+    readable later in the session, so asking again on every single tool call
+    would spend the whole 2s-per-call timeout budget forever to re-learn the
+    same nothing.
+    """
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    probes: list[str] = []
+
+    def unreadable(root):
+        probes.append("git")
+        return None
+
+    monkeypatch.setattr(provenance, "_read_commit", unreadable)
+
+    _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
+           + _rpc("tools/call", 2, name="nope", arguments={})
+           + _rpc("tools/call", 3, name="nope", arguments={})
+           + _rpc("tools/call", 4, name="nope", arguments={}))
+
+    assert len(probes) == 1, (
+        f"an unanswerable probe was repeated {len(probes)} times")
+
+
+def test_a_probe_that_keeps_failing_is_eventually_given_up_on(monkeypatch):
+    """`unreadable` retries, but not forever.
+
+    A `status --porcelain` wedged on a network filesystem is indistinguishable
+    from a transient `index.lock`, so the retry that makes the transient case
+    work would otherwise charge a stuck git's full 2s timeout to every tool
+    call for the rest of the session -- for a note nobody is waiting on.
+
+    Found by CodeRabbit on PR #111: the docstring claimed a wedged git stopped
+    the polling, and only a wedged `rev-parse` actually did.
+    """
+    from skodun import mcpserver as srv_mod
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    probes: list[str] = []
+
+    def cannot_tell(root):
+        probes.append("git")
+        return "a" * 40 + "-unknown"        # same commit, tree state unknown
+
+    monkeypatch.setattr(provenance, "_read_commit", cannot_tell)
+
+    payload = _rpc("initialize", 1, protocolVersion="2025-11-25")
+    for i in range(2, 12):
+        payload += _rpc("tools/call", i, name="nope", arguments={})
+    _drive(payload)
+
+    assert len(probes) == srv_mod._DRIFT_UNREADABLE_TRIES, (
+        f"10 tool calls made {len(probes)} probes; the budget is "
+        f"{srv_mod._DRIFT_UNREADABLE_TRIES}")
+
+
+def test_a_readable_probe_restores_the_retry_budget(monkeypatch):
+    """A clean read means git is working again, not that we got lucky -- so the
+    next transient failure gets the full allowance rather than the remains of
+    an older one. Without this a long session would accumulate unrelated
+    hiccups until the diagnostic quietly switched itself off."""
+    from skodun import mcpserver as srv_mod
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    probes: list[str] = []
+
+    def flaky(root):
+        probes.append("git")
+        # fail, fail, recover, then fail forever
+        if len(probes) in (1, 2):
+            return "a" * 40 + "-unknown"
+        if len(probes) == 3:
+            return "a" * 40
+        return "a" * 40 + "-unknown"
+
+    monkeypatch.setattr(provenance, "_read_commit", flaky)
+
+    payload = _rpc("initialize", 1, protocolVersion="2025-11-25")
+    for i in range(2, 15):
+        payload += _rpc("tools/call", i, name="nope", arguments={})
+    _drive(payload)
+
+    # 2 failures + 1 clean read + a fresh budget of 3 = 6, then silence.
+    assert len(probes) == 3 + srv_mod._DRIFT_UNREADABLE_TRIES, (
+        f"the clean read did not restore the budget: {len(probes)} probes")
+
+
+def test_a_server_on_the_current_checkout_says_nothing(monkeypatch):
+    """No drift, no line. A diagnostic that always fires is one nobody reads."""
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    monkeypatch.setattr(provenance, "_read_commit", lambda root: "a" * 40)
+
+    *_, err = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
+                     + _rpc("tools/call", 2, name="nope", arguments={}))
+
+    assert "checkout has since moved" not in err.getvalue()

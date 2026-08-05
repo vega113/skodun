@@ -79,6 +79,15 @@ SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26",
 #: `serverInfo.name`. The client shows it; the version travels beside it.
 SERVER_NAME = "skodun"
 
+#: How many consecutive "could not tell" drift probes to tolerate before giving
+#: up on the diagnostic for this session. Each probe is two git subprocesses,
+#: and a `status --porcelain` wedged on a network filesystem is indistinguishable
+#: from a transient `index.lock` held by a concurrent commit -- so an unbounded
+#: retry would spend the whole timeout on every tool call, forever, for a note
+#: nobody is waiting on. Three is enough to ride out contention and small enough
+#: that a genuinely stuck git costs a bounded amount.
+_DRIFT_UNREADABLE_TRIES = 3
+
 #: A line longer than this is drained and refused. 8 MiB is far above any real
 #: `tools/call` (a review argument is a path and a few flags) and far below the
 #: size at which a single line becomes a memory problem for a machine that is
@@ -1276,6 +1285,30 @@ class McpServer:
         self._version = version
         self._on_stdout_lost = on_stdout_lost
 
+        #: Whether drift is still worth probing for. Cleared once the note has
+        #: been said (it is a standing condition, and repeating it on every
+        #: tool call is noise an operator learns to skip) and also when the
+        #: probe reports there is no answer to be had -- see
+        #: `_warn_if_code_moved`, which is where both cost and correctness of
+        #: this live.
+        self._watch_code_moved = True
+        #: Consecutive "could not tell" probes still allowed. See
+        #: `_DRIFT_UNREADABLE_TRIES`.
+        self._drift_unreadable_left = _DRIFT_UNREADABLE_TRIES
+        # Warmed on a daemon thread, never read synchronously here or in
+        # `initialize`. Provenance costs two git calls, and while that is ~27ms
+        # on a normal checkout the timeout exists because git can wedge -- a
+        # client that times out its handshake has lost the session, and no
+        # diagnostic field is worth that. By the time `initialize` arrives the
+        # thread has all but certainly finished; if it has not, `serverInfo`
+        # simply goes without the commit.
+        try:
+            from .provenance import warm_async
+
+            warm_async()
+        except Exception:       # pragma: no cover - never worth a failed start
+            pass                # (KeyboardInterrupt deliberately not caught)
+
         #: Whether the `initialize` REQUEST has been answered. This -- not the
         #: notification below -- is what the -32002 gate reads: a client that
         #: pipelines `tools/list` behind `initialize` without waiting for the
@@ -1562,14 +1595,28 @@ class McpServer:
         # before a tool call hits the store. Clients that only read name/version
         # ignore the extra field. Imported lazily so cold `skodun mcp` still
         # avoids paying for sqlite until a tool needs the store.
+        from .provenance import cached_provenance
         from .store import SCHEMA_VERSION
+        # `commit` beside the version because on an editable install every
+        # commit is still 0.4.0 -- so the version alone cannot tell an operator
+        # whether THIS SERVER is running the code they just merged. It is what
+        # `skodun doctor`'s package line asks them to compare against.
+        #
+        # BEST EFFORT: read from the cache the constructor started warming, and
+        # never computed here. This is the handshake, and a client that times it
+        # out has lost the session -- so on the rare cold read the field is
+        # absent rather than paid for.
+        info = {
+            "name": SERVER_NAME,
+            "version": self._version,
+            "schemaVersion": SCHEMA_VERSION,
+        }
+        warm = cached_provenance()
+        if warm is not None:
+            info["commit"] = warm.get("skodun_commit")
         return {"protocolVersion": negotiated,
                 "capabilities": {"tools": {}, "prompts": {}},
-                "serverInfo": {
-                    "name": SERVER_NAME,
-                    "version": self._version,
-                    "schemaVersion": SCHEMA_VERSION,
-                }}
+                "serverInfo": info}
 
     def _m_ping(self, params: dict, id_) -> dict:
         return {}
@@ -1582,7 +1629,71 @@ class McpServer:
         return {"tools": [{"name": s.name, "description": s.description,
                            "inputSchema": s.input_schema} for s in self._specs]}
 
+    def _warn_if_code_moved(self) -> None:
+        """Say once, on stderr, when the checkout has moved under this server.
+
+        HERE and not in `doctor`, and the difference is the whole point. Every
+        `doctor` run is a fresh process: it fills its provenance cache from
+        disk and would then re-read the same disk, so the two sides always
+        agree and the warning could never fire. Drift only exists inside a
+        process that has been alive across a `git pull` -- which is what this
+        server is, for hours or days at a time.
+
+        Said once, but WATCHED until then. Nobody pulls between a client
+        connecting and its first tool call -- they pull hours later, mid
+        session, which is the case #110 is about. Latching "already handled"
+        on the first probe regardless of what it found made the note reachable
+        only for drift that predated the connection, so the real scenario was
+        silently impossible. The flag is set when a note is EMITTED.
+
+        Watching costs two git subprocesses per tool call, so it has two ways
+        to stop. `DRIFT_UNCOMPARABLE` ends it outright -- a wheel install will
+        never be a checkout. `DRIFT_UNREADABLE` is a probe that failed THIS
+        time, so it says nothing and is asked again, but only
+        `_DRIFT_UNREADABLE_TRIES` times: a `status --porcelain` that wedges on
+        a network filesystem looks exactly like a transient `index.lock`, and
+        retrying it forever would charge its whole timeout to every tool call
+        for the rest of the session. A clean read resets the budget, because
+        that is git working again rather than luck.
+
+        Reported, never acted on. A fail-closed gate must not swap its own code
+        underneath a running review, and this server cannot restart itself --
+        the host owns the pipe -- so it says what a restart would get and
+        leaves the decision where it belongs.
+        """
+        if not self._watch_code_moved:
+            return
+        try:
+            from .provenance import (DRIFT_MOVED, DRIFT_SAME,
+                                     DRIFT_UNCOMPARABLE, DRIFT_UNREADABLE,
+                                     code_provenance, short,
+                                     stale_against_disk)
+
+            state, on_disk = stale_against_disk()
+            if state == DRIFT_UNCOMPARABLE:
+                self._watch_code_moved = False
+            elif state == DRIFT_UNREADABLE:
+                self._drift_unreadable_left -= 1
+                self._watch_code_moved = self._drift_unreadable_left > 0
+            elif state == DRIFT_SAME:
+                self._drift_unreadable_left = _DRIFT_UNREADABLE_TRIES
+            elif state == DRIFT_MOVED:
+                self._watch_code_moved = False
+                running = code_provenance().get("skodun_commit")
+                self._note(
+                    f"note: this server is running "
+                    f"{short(running)}; the checkout has since "
+                    f"moved to {short(on_disk)}. Reviews recorded now are "
+                    f"stamped with the code above. Restart this MCP server to "
+                    f"pick up the new one.")
+        except Exception:       # pragma: no cover - a note is never worth a raise
+            pass                # KeyboardInterrupt deliberately NOT caught:
+                                # `_git` re-raises it so an operator's Ctrl-C
+                                # is not absorbed, and swallowing it one frame
+                                # up here would undo exactly that.
+
     def _m_tools_call(self, params: dict, id_):
+        self._warn_if_code_moved()
         name = params.get("name")
         if not isinstance(name, str) or not name:
             raise _RpcError(INVALID_PARAMS,

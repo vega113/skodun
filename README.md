@@ -860,6 +860,48 @@ printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocol
 If `serverInfo.version` is not the install you just upgraded, the client is still
 holding the old process — restart again.
 
+### Which skodun produced a review
+
+Every artifact records `skodun_version` and `skodun_commit`, so "which code
+produced this verdict?" is answerable from the record itself. It matters
+because the gate is trusted **across time**: a review recorded last week is
+honoured today while the diff identity matches, so a change in how skodun
+classifies or scores would otherwise be invisible in the records it left
+behind.
+
+`skodun_commit` is `null` for an install that is not a checkout — a wheel has
+no commit, and the version still identifies the code. On a checkout it carries
+a suffix when the hash does **not** describe what ran:
+
+| Value | Meaning |
+|---|---|
+| `<sha>` | the tree is exactly that commit |
+| `<sha>-dirty` | it is not, and we know that |
+| `<sha>-unknown` | we could not establish either way |
+
+The suffix is the point. On a development machine the tree is usually
+modified, and a bare hash there would name code that is not what ran — worse
+than saying nothing, because a precise-looking hash invites belief.
+
+**The server tells you when it goes stale.** An editable install makes "a new
+version" just somebody running `git pull`, which can happen while long-lived
+MCP servers are mid-session. On its first tool call after the checkout moves,
+the server says so once:
+
+```text
+note: this server is running 4817d00fd5ba; the checkout has since moved to
+8c7ad1f2e9c4. Reviews recorded now are stamped with the code above. Restart
+this MCP server to pick up the new one.
+```
+
+It is **reported, never acted on**. A fail-closed gate must not swap its own
+code underneath a running review — a verdict produced half by one version and
+half by another certifies nothing — and the server cannot restart itself
+because the host owns the pipe. `initialize` also carries `serverInfo.commit`
+for comparison against `skodun doctor`'s package line, though it is best
+effort: the handshake never waits on git, so on the rare cold read the field
+is absent rather than paid for.
+
 ### Claude Code
 
 ```

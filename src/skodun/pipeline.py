@@ -166,7 +166,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import (batching, budget, capacity, chain, checklist, contextpack, gitio,
-               ids, passes, promptbuild, routing, runner)
+               ids, passes, promptbuild, provenance, routing, runner)
 from .adapters import NORMAL_STOP_REASONS, REFUTER_CONTRACT, get_adapter
 from .config import Config, Defaults, Reviewer
 from .store import Store, _TS_FORMAT
@@ -1391,6 +1391,14 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     lock_cell: dict = {"lock": None}
     capacity_ticket: capacity.Ticket | None = None
 
+    # BEFORE the lock, on purpose. Reading it shells out to git twice on a cold
+    # cache, and the record that needs it is built deep inside the critical
+    # section -- so a wedged git (a network checkout, a stuck index lock) would
+    # spend its whole timeout budget holding the foreground lock, delaying every
+    # peer for work that has nothing to do with the review. It is ~27ms warm and
+    # cached for the rest of the process, so the call site below is free.
+    provenance.code_provenance()
+
     def _try_fg_lock(slice_sec: float) -> bool:
         """One dual-hold attempt: True when this process holds the FG lock."""
         try:
@@ -1516,6 +1524,13 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             diff_hash=diff_hash, mode=mode, model=finder.model,
             adapter=adapter.name, timeout_seconds=d.timeout_sec,
             max_turns=d.max_turns,
+            # WHICH SKODUN ASKED. `adapter`/`model` name who answered and
+            # `route_reason` names how the head was chosen; without this, the
+            # one thing the record cannot say is which code reached that
+            # verdict. It matters because the gate honours a review across
+            # time: a change in how skodun classifies is otherwise invisible
+            # in the records it left behind (#110).
+            **provenance.code_provenance(),
             # WHO WAS ASKED FOR, which is not the same question as who
             # answered. `adapter`/`model` and the `attempts[]` provenance are
             # rewritten by `_apply` to name whoever actually served, so after a
@@ -2115,6 +2130,9 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
         base_sha=base.sha, diff_hash=diff_hash, mode="prepush",
         model=finder.model, adapter=adapter.name, timeout_seconds=d.timeout_sec,
         max_turns=d.max_turns,
+        # The background surface records it too: a pre-push verdict is read by
+        # the same gate and is exactly as long-lived.
+        **provenance.code_provenance(),
         worst_runtime_sec=reserved.get("worst_runtime_sec"),
         pid=reserved.get("pid"),
         # FROM THE RESERVATION, not from a fresh git call. `finalize_review`

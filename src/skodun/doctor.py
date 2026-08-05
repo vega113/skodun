@@ -80,14 +80,31 @@ def run_doctor(
     # Package / schema this CLI process understands (for CLI↔MCP skew)
     try:
         from . import __version__
+        from .provenance import code_provenance, short
         from .store import SCHEMA_VERSION as _SCHEMA_V
 
+        # The COMMIT, not just the version. On an editable install every commit
+        # is still 0.4.0, so `version=` alone cannot answer "is this the code I
+        # merged?" -- which is the question an operator actually has after a
+        # pull (#110).
+        # The commit, not just the version: on an editable install every
+        # commit is still 0.4.0, so `version=` alone cannot answer "is this the
+        # code I merged?".
+        #
+        # Deliberately NOT a drift check. `doctor` is CLI-only (see "Do not
+        # invent" in AGENTS.md) and every run is a fresh process, so it fills
+        # its cache from disk and would immediately re-read the same disk --
+        # the two sides always agree and the warning could never fire. The
+        # drift that matters happens inside a LONG-LIVED MCP server, and that
+        # is where the check lives (`mcpserver._warn_if_code_moved`). What
+        # doctor gives an operator is the CLI's own commit, to compare against
+        # the `serverInfo.commit` their client shows.
+        commit = code_provenance().get("skodun_commit")
+        running = f" commit={short(commit)}" if commit else ""
         report.add(
-            "package",
-            True,
-            f"version={__version__} schema_v={_SCHEMA_V} "
-            f"(MCP serverInfo must match after restart)",
-        )
+            "package", True,
+            f"version={__version__} schema_v={_SCHEMA_V}{running} "
+            f"(compare with serverInfo from `skodun mcp`; restart it to match)")
     except Exception as e:
         report.add("package", False, f"{e!r}")
 
