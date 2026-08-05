@@ -160,6 +160,14 @@ mid-wait re-binding, which is an explicit non-goal (see the design's Phase C).
 Auto-routing narrows the pile-up from "always the same provider" to "only when
 starts collide"; it is not an admission-time scheduler.
 
+**And it has not cost anything yet.** The window is observable from outside:
+`skodun providers --since-days N` splits auto decisions into `auto:free` and
+`auto:wait`, and a wait is what a collision looks like after the fact. Measured
+over the development store -- 6623 artifacts, 205 auto decisions -- `auto:wait`
+has never once been recorded. That is why #109 is closed as not warranted
+rather than as done: the design question stands, and the reason it stays shut
+is data. Re-run that command if concurrency rises.
+
 ### Cancel / status (epic S1 — shipped)
 
 | Surface | Verb |
