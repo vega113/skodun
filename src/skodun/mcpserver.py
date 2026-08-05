@@ -1646,8 +1646,11 @@ class McpServer:
                     f"moved to {short(moved)}. Reviews recorded now are "
                     f"stamped with the code above. Restart this MCP server to "
                     f"pick up the new one.")
-        except BaseException:   # pragma: no cover - a note is never worth a raise
-            pass
+        except Exception:       # pragma: no cover - a note is never worth a raise
+            pass                # KeyboardInterrupt deliberately NOT caught:
+                                # `_git` re-raises it so an operator's Ctrl-C
+                                # is not absorbed, and swallowing it one frame
+                                # up here would undo exactly that.
 
     def _m_tools_call(self, params: dict, id_):
         self._warn_if_code_moved()
