@@ -201,114 +201,26 @@ def test_doctor_is_quiet_when_the_checkout_has_not_moved(tmp_path):
     assert "stale" not in pkg.lower(), pkg
 
 
-def test_doctor_says_so_when_the_checkout_moved_under_the_process(tmp_path,
-                                                                  monkeypatch):
-    """The case this exists for: a long-lived MCP server still serving the code
-    it imported at startup, while `git pull` has moved the checkout on. It
-    reports the commit a restart WOULD get, so the line says what the restart
-    is worth -- and it never acts on it (see `stale_against_disk`)."""
-    from skodun import doctor
+def test_doctor_points_at_serverinfo_rather_than_claiming_to_detect_drift(
+        tmp_path):
+    """`doctor` cannot detect drift and must not imply it can.
 
-    provenance.code_provenance()
-    monkeypatch.setattr(provenance, "_read_commit", lambda root: "beef" + "0" * 36)
+    Every `doctor` run is a FRESH process: it fills its provenance cache from
+    disk and would then re-read the same disk, so the two sides always agree
+    and a drift warning there could never fire for an operator. It is also
+    CLI-only by an explicit rule ("Do not invent" in AGENTS.md), so it never
+    runs inside the long-lived MCP server where drift actually happens.
+
+    What it can honestly give is the CLI's own commit, to compare against the
+    `serverInfo.commit` the client shows -- which is what it now says.
+    """
+    from skodun import doctor
 
     rep = doctor.run_doctor(repo=None, store_path=tmp_path / "s.db")
     pkg = next(l for l in rep.render().splitlines() if "package" in l)
 
-    assert "beef" in pkg and "restart" in pkg.lower(), pkg
-
-
-# --------------------------------------------------------------------------
-# what "dirty" has to cover, and what it may not assume
-# --------------------------------------------------------------------------
-
-
-def _repo_at(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    run = lambda *a: subprocess.run(["git", "-C", str(path), *a],
-                                    capture_output=True, text=True)
-    run("init", "-q", ".")
-    run("config", "user.email", "t@t")
-    run("config", "user.name", "t")
-    (path / "a.txt").write_text("a\n")
-    run("add", "a.txt")
-    run("commit", "-qm", "one")
-    return path
-
-
-@pytest.mark.parametrize("make_dirty, what", [
-    (lambda p: (p / "a.txt").write_text("edited\n"), "an unstaged edit"),
-    (lambda p: (p / "untracked_module.py").write_text("x = 1\n"), "an untracked module"),
-])
-def test_every_shape_of_modification_marks_the_commit_dirty(tmp_path,
-                                                            make_dirty, what):
-    """`git diff --quiet` is not enough, and the gap is not academic: it
-    answers rc=0 for a STAGED change and for an UNTRACKED file. An untracked
-    module is code this process can import, so a bare hash there names a commit
-    that demonstrably did not produce the run.
-    """
-    repo = _repo_at(tmp_path / "r")
-    assert not provenance._read_commit(repo).endswith("-dirty")   # clean first
-
-    make_dirty(repo)
-
-    assert provenance._read_commit(repo).endswith("-dirty"), what
-
-
-def test_a_staged_change_marks_the_commit_dirty(tmp_path):
-    """The shape `git diff --quiet` is blindest to: staged but not committed."""
-    repo = _repo_at(tmp_path / "r")
-    (repo / "a.txt").write_text("staged\n")
-    subprocess.run(["git", "-C", str(repo), "add", "a.txt"], capture_output=True)
-
-    assert provenance._read_commit(repo).endswith("-dirty")
-
-
-def test_being_unable_to_tell_is_not_the_same_as_clean(monkeypatch, tmp_path):
-    """git answers 0 clean, 1 dirty, and 128/129 for "that is not a checkout".
-    Reading anything-but-1 as clean publishes a precise-looking hash on the
-    strength of a failure -- the exact "invites belief" problem `-dirty` exists
-    to avoid, wearing the error path's clothes.
-    """
-    repo = _repo_at(tmp_path / "r")
-    real = provenance._git
-
-    def broken(root, *args):
-        if args and args[0] == "status":
-            return subprocess.CompletedProcess(args, 129, "", "fatal: nope")
-        return real(root, *args)
-
-    monkeypatch.setattr(provenance, "_git", broken)
-
-    got = provenance._read_commit(repo)
-
-    assert got.endswith("-unknown"), got
-    assert not got.endswith("-dirty"), "an error is not a known modification"
-
-
-def test_two_threads_racing_the_cache_agree(monkeypatch):
-    """The cache's contract is ONE answer per process. Unsynchronized, two
-    threads can both find it cold and compute either side of a `git pull`,
-    so one record says the old commit and its neighbour says the new one."""
-    import threading
-
-    seen: list[dict] = []
-    barrier = threading.Barrier(2)
-    calls = iter(["a" * 40, "b" * 40])
-    monkeypatch.setattr(provenance, "_read_commit",
-                        lambda root: next(calls, "c" * 40))
-
-    def go():
-        barrier.wait()
-        seen.append(provenance.code_provenance())
-
-    ts = [threading.Thread(target=go) for _ in range(2)]
-    for t in ts:
-        t.start()
-    for t in ts:
-        t.join()
-
-    assert seen[0] == seen[1], seen
+    assert "serverInfo" in pkg, pkg
+    assert "restart" in pkg.lower(), pkg
 
 
 def test_the_short_form_keeps_the_marker_it_exists_to_show():

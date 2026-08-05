@@ -443,6 +443,11 @@ def test_the_registry_types_are_the_pinned_contract():
 
 
 def test_the_serverinfo_names_skodun_and_its_own_version():
+    """`commit` rides beside `version` because on an editable install every
+    commit is still 0.4.0 -- so the version alone cannot tell an operator
+    whether THIS server is running the code they merged. `skodun doctor`'s
+    package line asks them to compare against exactly this field."""
+    from skodun.provenance import code_provenance
     from skodun.store import SCHEMA_VERSION
 
     code, out, _ = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25"))
@@ -451,6 +456,7 @@ def test_the_serverinfo_names_skodun_and_its_own_version():
         "name": "skodun",
         "version": skodun.__version__,
         "schemaVersion": SCHEMA_VERSION,
+        "commit": code_provenance()["skodun_commit"],
     }
     assert result["capabilities"] == {"tools": {}, "prompts": {}}
 
@@ -1264,3 +1270,54 @@ def test_a_real_process_answers_a_tool_call_with_one_line_and_no_residue(tmp_pat
     assert [r.get("id") for r in got] == [1, 2]
     assert got[1]["result"]["content"][0]["text"] == "hello"
     assert got[1]["result"]["structuredContent"] == {"status": 0}
+
+
+# --------------------------------------------------------------------------
+# the checkout moving under a long-lived server (#110)
+# --------------------------------------------------------------------------
+
+
+def test_a_checkout_that_moved_under_the_server_is_reported_once(monkeypatch):
+    """Drift is detectable HERE and nowhere else.
+
+    `doctor` is a fresh process per run and CLI-only, so it can only ever
+    compare disk against the disk it just read. This server is the thing that
+    stays alive across a `git pull` -- for hours or days, as observed on this
+    machine -- so it is the one that can notice it is serving code the
+    checkout no longer has.
+
+    Driven through the shipped `tools/call` path, and the warning must land on
+    STDERR (the client's log), never on stdout, which is the JSON-RPC stream.
+    """
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    monkeypatch.setattr(provenance, "_read_commit", lambda root: "b" * 40)
+
+    payload = (_rpc("initialize", 1, protocolVersion="2025-11-25")
+               + _rpc("tools/call", 2, name="nope", arguments={})
+               + _rpc("tools/call", 3, name="nope", arguments={}))
+    code, out, err = _drive(payload)
+
+    said = err.getvalue()
+    assert said.count("the checkout has since moved") == 1, (
+        f"expected exactly one standing note, got:\n{said}")
+    assert "aaaaaaaaaaaa" in said and "bbbbbbbbbbbb" in said
+    assert "Restart this MCP server" in said
+    assert b"the checkout has since moved" not in out.data, \
+        "a diagnostic must never reach the JSON-RPC stream"
+
+
+def test_a_server_on_the_current_checkout_says_nothing(monkeypatch):
+    """No drift, no line. A diagnostic that always fires is one nobody reads."""
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    monkeypatch.setattr(provenance, "_read_commit", lambda root: "a" * 40)
+
+    code, out, err = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
+                            + _rpc("tools/call", 2, name="nope", arguments={}))
+
+    assert "checkout has since moved" not in err.getvalue()

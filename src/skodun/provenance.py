@@ -66,6 +66,13 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess | None:
         return subprocess.run(
             ["git", "-C", str(root), *args],
             capture_output=True, text=True, timeout=_GIT_TIMEOUT_SEC)
+    except KeyboardInterrupt:
+        # "Never raises" has one exception, the operator's own interrupt --
+        # the rule `runner._cancelled` and `_sleep_or_cancelled` follow, and
+        # the defect issue #6 was filed for. On a cold cache this runs twice on
+        # the review path, under the FG lock, so a Ctrl-C absorbed here is one
+        # the operator has to send again.
+        raise
     except BaseException:
         # Missing binary, a timeout, a permissions refusal -- all the same
         # answer here, and none of them is worth failing a review over.

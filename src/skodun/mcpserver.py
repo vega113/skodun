@@ -1276,6 +1276,20 @@ class McpServer:
         self._version = version
         self._on_stdout_lost = on_stdout_lost
 
+        #: The commit this SERVER is running, read once at construction. Held
+        #: so the drift note can name both sides -- what is serving now, and
+        #: what a restart would get.
+        self._running_commit = None
+        #: Drift is a standing condition, so it is said once per session
+        #: rather than on every tool call.
+        self._warned_code_moved = False
+        try:
+            from .provenance import code_provenance
+
+            self._running_commit = code_provenance().get("skodun_commit")
+        except BaseException:   # pragma: no cover - never worth a failed start
+            pass
+
         #: Whether the `initialize` REQUEST has been answered. This -- not the
         #: notification below -- is what the -32002 gate reads: a client that
         #: pipelines `tools/list` behind `initialize` without waiting for the
@@ -1562,13 +1576,19 @@ class McpServer:
         # before a tool call hits the store. Clients that only read name/version
         # ignore the extra field. Imported lazily so cold `skodun mcp` still
         # avoids paying for sqlite until a tool needs the store.
+        from .provenance import code_provenance
         from .store import SCHEMA_VERSION
+        # `commit` beside the version because on an editable install every
+        # commit is still 0.4.0 -- so the version alone cannot tell an operator
+        # whether THIS SERVER is running the code they just merged. It is what
+        # `skodun doctor`'s package line asks them to compare against.
         return {"protocolVersion": negotiated,
                 "capabilities": {"tools": {}, "prompts": {}},
                 "serverInfo": {
                     "name": SERVER_NAME,
                     "version": self._version,
                     "schemaVersion": SCHEMA_VERSION,
+                    "commit": code_provenance().get("skodun_commit"),
                 }}
 
     def _m_ping(self, params: dict, id_) -> dict:
@@ -1582,7 +1602,43 @@ class McpServer:
         return {"tools": [{"name": s.name, "description": s.description,
                            "inputSchema": s.input_schema} for s in self._specs]}
 
+    def _warn_if_code_moved(self) -> None:
+        """Say once, on stderr, when the checkout has moved under this server.
+
+        HERE and not in `doctor`, and the difference is the whole point. Every
+        `doctor` run is a fresh process: it fills its provenance cache from
+        disk and would then re-read the same disk, so the two sides always
+        agree and the warning could never fire. Drift only exists inside a
+        process that has been alive across a `git pull` -- which is what this
+        server is, for hours or days at a time.
+
+        Once per session, not per call: it is a standing condition, and a line
+        on every tool call would be noise an operator learns to skip.
+
+        Reported, never acted on. A fail-closed gate must not swap its own code
+        underneath a running review, and this server cannot restart itself --
+        the host owns the pipe -- so it says what a restart would get and
+        leaves the decision where it belongs.
+        """
+        if self._warned_code_moved:
+            return
+        self._warned_code_moved = True
+        try:
+            from .provenance import short, stale_against_disk
+
+            moved = stale_against_disk()
+            if moved:
+                self._note(
+                    f"note: this server is running "
+                    f"{short(self._running_commit)}; the checkout has since "
+                    f"moved to {short(moved)}. Reviews recorded now are "
+                    f"stamped with the code above. Restart this MCP server to "
+                    f"pick up the new one.")
+        except BaseException:   # pragma: no cover - a note is never worth a raise
+            pass
+
     def _m_tools_call(self, params: dict, id_):
+        self._warn_if_code_moved()
         name = params.get("name")
         if not isinstance(name, str) or not name:
             raise _RpcError(INVALID_PARAMS,
