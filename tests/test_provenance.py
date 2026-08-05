@@ -81,6 +81,35 @@ def test_a_frozen_install_reports_no_commit(monkeypatch, tmp_path):
     assert got["skodun_version"] == skodun.__version__
 
 
+def test_an_install_nested_in_someone_else_s_repo_reports_no_commit(
+        monkeypatch, tmp_path):
+    """Git searches ANCESTORS, so "not a checkout" is not what a failed lookup
+    looks like from inside one.
+
+    A wheel lives somewhere like `~/.local/pipx/venvs/skodun/lib/...`, and a
+    dotfiles repository at `~` is enough to make `rev-parse HEAD` succeed and
+    return that project's commit. Stamping artifacts with it would be worse
+    than the `None` a frozen install gets: an unrelated commit is a confident,
+    checkable-looking answer to a question nobody can tell went wrong.
+
+    Found by CodeRabbit on PR #111.
+    """
+    outer = tmp_path / "dotfiles"
+    (outer / "venv" / "lib" / "skodun").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(outer), "init", "-q", "."], check=True)
+    subprocess.run(["git", "-C", str(outer), "-c", "user.email=a@b",
+                    "-c", "user.name=t", "commit", "-q", "--allow-empty",
+                    "-m", "someone else's project"], check=True)
+    nested = outer / "venv" / "lib" / "skodun"
+    # The ancestor really is readable -- otherwise this test proves nothing.
+    assert subprocess.run(["git", "-C", str(nested), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).returncode == 0
+
+    monkeypatch.setattr(provenance, "_package_root", lambda: nested)
+
+    assert provenance.code_provenance()["skodun_commit"] is None
+
+
 def test_git_being_broken_never_raises(monkeypatch, tmp_path):
     """Provenance is a record of what happened, not a precondition for it. A
     machine without git, or with a git that hangs, must still be able to
@@ -233,7 +262,8 @@ def test_doctor_names_the_code_this_process_is_running(tmp_path, monkeypatch):
 
     monkeypatch.setattr(provenance, "_read_commit", lambda root: "abc1234" + "0" * 33)
     rep = doctor.run_doctor(repo=None, store_path=tmp_path / "s.db")
-    line = next(l for l in rep.render().splitlines() if "package" in l)
+    line = next(line for line in rep.render().splitlines()
+                if "package" in line)
 
     assert "abc1234" in line, line
 
@@ -245,7 +275,8 @@ def test_doctor_is_quiet_when_the_checkout_has_not_moved(tmp_path):
 
     provenance.code_provenance()
     rep = doctor.run_doctor(repo=None, store_path=tmp_path / "s.db")
-    pkg = next(l for l in rep.render().splitlines() if "package" in l)
+    pkg = next(line for line in rep.render().splitlines()
+                if "package" in line)
 
     assert "stale" not in pkg.lower(), pkg
 
@@ -266,7 +297,8 @@ def test_doctor_points_at_serverinfo_rather_than_claiming_to_detect_drift(
     from skodun import doctor
 
     rep = doctor.run_doctor(repo=None, store_path=tmp_path / "s.db")
-    pkg = next(l for l in rep.render().splitlines() if "package" in l)
+    pkg = next(line for line in rep.render().splitlines()
+                if "package" in line)
 
     assert "serverInfo" in pkg, pkg
     assert "restart" in pkg.lower(), pkg
@@ -289,7 +321,8 @@ def test_doctor_shows_the_dirty_marker_not_a_bare_hash(tmp_path, monkeypatch):
     monkeypatch.setattr(provenance, "_read_commit",
                         lambda root: "d" * 40 + "-dirty")
     rep = doctor.run_doctor(repo=None, store_path=tmp_path / "s.db")
-    pkg = next(l for l in rep.render().splitlines() if "package" in l)
+    pkg = next(line for line in rep.render().splitlines()
+                if "package" in line)
 
     assert "-dirty" in pkg, pkg
 

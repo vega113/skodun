@@ -488,7 +488,7 @@ def test_the_handshake_never_waits_on_git(monkeypatch):
     monkeypatch.setattr(provenance, "_read_commit",
                         lambda root: reads.append("git") or None)
 
-    code, out, _ = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25"))
+    _, out, _ = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25"))
 
     info = _responses(out.data, "initialize")[0]["result"]["serverInfo"]
     assert reads == [], "the handshake spent git calls it cannot afford"
@@ -1353,7 +1353,7 @@ def test_a_checkout_that_moved_under_the_server_is_reported_once(monkeypatch):
     payload = (_rpc("initialize", 1, protocolVersion="2025-11-25")
                + _rpc("tools/call", 2, name="nope", arguments={})
                + _rpc("tools/call", 3, name="nope", arguments={}))
-    code, out, err = _drive(payload)
+    _, out, err = _drive(payload)
 
     said = err.getvalue()
     assert said.count("the checkout has since moved") == 1, (
@@ -1391,10 +1391,10 @@ def test_drift_that_arrives_after_the_first_tool_call_is_still_reported(
 
     monkeypatch.setattr(provenance, "_read_commit", disk)
 
-    code, out, err = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
-                            + _rpc("tools/call", 2, name="nope", arguments={})
-                            + _rpc("tools/call", 3, name="nope", arguments={})
-                            + _rpc("tools/call", 4, name="nope", arguments={}))
+    *_, err = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
+                     + _rpc("tools/call", 2, name="nope", arguments={})
+                     + _rpc("tools/call", 3, name="nope", arguments={})
+                     + _rpc("tools/call", 4, name="nope", arguments={}))
 
     said = err.getvalue()
     assert said.count("the checkout has since moved") == 1, (
@@ -1419,8 +1419,8 @@ def test_a_probe_that_cannot_read_the_disk_does_not_claim_it_moved(monkeypatch):
     monkeypatch.setattr(provenance, "_read_commit",
                         lambda root: "a" * 40 + "-unknown")
 
-    code, out, err = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
-                            + _rpc("tools/call", 2, name="nope", arguments={}))
+    *_, err = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
+                     + _rpc("tools/call", 2, name="nope", arguments={}))
 
     assert "checkout has since moved" not in err.getvalue()
 
@@ -1455,6 +1455,73 @@ def test_a_probe_that_can_never_answer_is_not_paid_for_twice(monkeypatch):
         f"an unanswerable probe was repeated {len(probes)} times")
 
 
+def test_a_probe_that_keeps_failing_is_eventually_given_up_on(monkeypatch):
+    """`unreadable` retries, but not forever.
+
+    A `status --porcelain` wedged on a network filesystem is indistinguishable
+    from a transient `index.lock`, so the retry that makes the transient case
+    work would otherwise charge a stuck git's full 2s timeout to every tool
+    call for the rest of the session -- for a note nobody is waiting on.
+
+    Found by CodeRabbit on PR #111: the docstring claimed a wedged git stopped
+    the polling, and only a wedged `rev-parse` actually did.
+    """
+    from skodun import mcpserver as srv_mod
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    probes: list[str] = []
+
+    def cannot_tell(root):
+        probes.append("git")
+        return "a" * 40 + "-unknown"        # same commit, tree state unknown
+
+    monkeypatch.setattr(provenance, "_read_commit", cannot_tell)
+
+    payload = _rpc("initialize", 1, protocolVersion="2025-11-25")
+    for i in range(2, 12):
+        payload += _rpc("tools/call", i, name="nope", arguments={})
+    _drive(payload)
+
+    assert len(probes) == srv_mod._DRIFT_UNREADABLE_TRIES, (
+        f"10 tool calls made {len(probes)} probes; the budget is "
+        f"{srv_mod._DRIFT_UNREADABLE_TRIES}")
+
+
+def test_a_readable_probe_restores_the_retry_budget(monkeypatch):
+    """A clean read means git is working again, not that we got lucky -- so the
+    next transient failure gets the full allowance rather than the remains of
+    an older one. Without this a long session would accumulate unrelated
+    hiccups until the diagnostic quietly switched itself off."""
+    from skodun import mcpserver as srv_mod
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    probes: list[str] = []
+
+    def flaky(root):
+        probes.append("git")
+        # fail, fail, recover, then fail forever
+        if len(probes) in (1, 2):
+            return "a" * 40 + "-unknown"
+        if len(probes) == 3:
+            return "a" * 40
+        return "a" * 40 + "-unknown"
+
+    monkeypatch.setattr(provenance, "_read_commit", flaky)
+
+    payload = _rpc("initialize", 1, protocolVersion="2025-11-25")
+    for i in range(2, 15):
+        payload += _rpc("tools/call", i, name="nope", arguments={})
+    _drive(payload)
+
+    # 2 failures + 1 clean read + a fresh budget of 3 = 6, then silence.
+    assert len(probes) == 3 + srv_mod._DRIFT_UNREADABLE_TRIES, (
+        f"the clean read did not restore the budget: {len(probes)} probes")
+
+
 def test_a_server_on_the_current_checkout_says_nothing(monkeypatch):
     """No drift, no line. A diagnostic that always fires is one nobody reads."""
     from skodun import provenance
@@ -1463,7 +1530,7 @@ def test_a_server_on_the_current_checkout_says_nothing(monkeypatch):
                         {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
     monkeypatch.setattr(provenance, "_read_commit", lambda root: "a" * 40)
 
-    code, out, err = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
-                            + _rpc("tools/call", 2, name="nope", arguments={}))
+    *_, err = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
+                     + _rpc("tools/call", 2, name="nope", arguments={}))
 
     assert "checkout has since moved" not in err.getvalue()

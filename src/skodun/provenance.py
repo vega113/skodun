@@ -61,8 +61,10 @@ def _package_root() -> Path:
     """The directory a checkout of this package would have at its root.
 
     `…/src/skodun/provenance.py` → `…` for an editable install or source
-    checkout. For a wheel in site-packages this is a directory that is simply
-    not a git repository, which `_read_commit` answers `None` for.
+    checkout. For a wheel in site-packages this is a directory that is not a
+    checkout of this package -- though it may well sit INSIDE some other
+    repository, which is why `_read_commit` insists the answer's toplevel is
+    this exact directory rather than trusting that git found nothing.
     """
     return Path(__file__).resolve().parents[2]
 
@@ -111,11 +113,28 @@ def _read_commit(root: Path) -> str | None:
     for "that is not a checkout": reading anything-but-1 as clean would publish
     a precise hash on the strength of a failure, which is the same
     invites-belief problem wearing the error path's clothes.
+
+    `--show-toplevel` is asked for in the same breath as `HEAD`, and the answer
+    is REQUIRED to be `root` itself. Git searches ancestors, so a wheel in
+    `~/.local/pipx/venvs/skodun/...` reports the HEAD of whatever repository
+    happens to contain it -- a dotfiles repo at `~` is enough. That is worse
+    than the `None` this returns for a frozen install: an unrelated project's
+    commit is a confident, checkable-looking answer to a question nobody can
+    tell went wrong.
     """
-    head = _git(root, "rev-parse", "HEAD")
+    head = _git(root, "rev-parse", "--show-toplevel", "HEAD")
     if head is None or head.returncode != 0:
         return None
-    commit = head.stdout.strip()
+    # splitlines, not split: a checkout path may contain spaces.
+    lines = [ln.strip() for ln in head.stdout.splitlines() if ln.strip()]
+    if len(lines) != 2:
+        return None
+    toplevel, commit = lines
+    try:
+        if Path(toplevel).resolve() != root.resolve():
+            return None              # a repository, but not this package's
+    except OSError:
+        return None
     if not commit:
         return None
     state = _git(root, "status", "--porcelain")

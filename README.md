@@ -888,7 +888,7 @@ version" just somebody running `git pull`, which can happen while long-lived
 MCP servers are mid-session. On its first tool call after the checkout moves,
 the server says so once:
 
-```
+```text
 note: this server is running 4817d00fd5ba; the checkout has since moved to
 8c7ad1f2e9c4. Reviews recorded now are stamped with the code above. Restart
 this MCP server to pick up the new one.

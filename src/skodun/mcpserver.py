@@ -79,6 +79,15 @@ SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26",
 #: `serverInfo.name`. The client shows it; the version travels beside it.
 SERVER_NAME = "skodun"
 
+#: How many consecutive "could not tell" drift probes to tolerate before giving
+#: up on the diagnostic for this session. Each probe is two git subprocesses,
+#: and a `status --porcelain` wedged on a network filesystem is indistinguishable
+#: from a transient `index.lock` held by a concurrent commit -- so an unbounded
+#: retry would spend the whole timeout on every tool call, forever, for a note
+#: nobody is waiting on. Three is enough to ride out contention and small enough
+#: that a genuinely stuck git costs a bounded amount.
+_DRIFT_UNREADABLE_TRIES = 3
+
 #: A line longer than this is drained and refused. 8 MiB is far above any real
 #: `tools/call` (a review argument is a path and a few flags) and far below the
 #: size at which a single line becomes a memory problem for a machine that is
@@ -1283,6 +1292,9 @@ class McpServer:
         #: `_warn_if_code_moved`, which is where both cost and correctness of
         #: this live.
         self._watch_code_moved = True
+        #: Consecutive "could not tell" probes still allowed. See
+        #: `_DRIFT_UNREADABLE_TRIES`.
+        self._drift_unreadable_left = _DRIFT_UNREADABLE_TRIES
         # Warmed on a daemon thread, never read synchronously here or in
         # `initialize`. Provenance costs two git calls, and while that is ~27ms
         # on a normal checkout the timeout exists because git can wedge -- a
@@ -1634,11 +1646,15 @@ class McpServer:
         only for drift that predated the connection, so the real scenario was
         silently impossible. The flag is set when a note is EMITTED.
 
-        Watching costs two git subprocesses per tool call, which is why
-        `DRIFT_UNCOMPARABLE` stops it: a wheel install and a wedged git both
-        say "there is no answer here", and neither becomes answerable later.
-        `DRIFT_UNREADABLE` is the opposite -- a probe that failed this time
-        says nothing and is asked again.
+        Watching costs two git subprocesses per tool call, so it has two ways
+        to stop. `DRIFT_UNCOMPARABLE` ends it outright -- a wheel install will
+        never be a checkout. `DRIFT_UNREADABLE` is a probe that failed THIS
+        time, so it says nothing and is asked again, but only
+        `_DRIFT_UNREADABLE_TRIES` times: a `status --porcelain` that wedges on
+        a network filesystem looks exactly like a transient `index.lock`, and
+        retrying it forever would charge its whole timeout to every tool call
+        for the rest of the session. A clean read resets the budget, because
+        that is git working again rather than luck.
 
         Reported, never acted on. A fail-closed gate must not swap its own code
         underneath a running review, and this server cannot restart itself --
@@ -1648,13 +1664,19 @@ class McpServer:
         if not self._watch_code_moved:
             return
         try:
-            from .provenance import (DRIFT_MOVED, DRIFT_UNCOMPARABLE,
+            from .provenance import (DRIFT_MOVED, DRIFT_SAME,
+                                     DRIFT_UNCOMPARABLE, DRIFT_UNREADABLE,
                                      code_provenance, short,
                                      stale_against_disk)
 
             state, on_disk = stale_against_disk()
             if state == DRIFT_UNCOMPARABLE:
                 self._watch_code_moved = False
+            elif state == DRIFT_UNREADABLE:
+                self._drift_unreadable_left -= 1
+                self._watch_code_moved = self._drift_unreadable_left > 0
+            elif state == DRIFT_SAME:
+                self._drift_unreadable_left = _DRIFT_UNREADABLE_TRIES
             elif state == DRIFT_MOVED:
                 self._watch_code_moved = False
                 running = code_provenance().get("skodun_commit")
