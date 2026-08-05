@@ -58,7 +58,12 @@ def test_a_modified_checkout_says_so():
     usually modified, and a bare commit would name code that is not what ran --
     which is worse than saying nothing, because it invites belief."""
     src = Path(skodun.__file__).resolve().parents[2]
-    clean = subprocess.run(["git", "-C", str(src), "diff", "--quiet"]).returncode == 0
+    # `status --porcelain` is the question "is this tree exactly HEAD", and it
+    # is the one production asks -- `diff --quiet` here would disagree with it
+    # on a tree whose only change is staged or untracked.
+    clean = not subprocess.run(
+        ["git", "-C", str(src), "status", "--porcelain"],
+        capture_output=True, text=True).stdout.strip()
     commit = provenance.code_provenance()["skodun_commit"]
 
     assert commit.endswith("-dirty") is (not clean), (
@@ -211,3 +216,118 @@ def test_doctor_says_so_when_the_checkout_moved_under_the_process(tmp_path,
     pkg = next(l for l in rep.render().splitlines() if "package" in l)
 
     assert "beef" in pkg and "restart" in pkg.lower(), pkg
+
+
+# --------------------------------------------------------------------------
+# what "dirty" has to cover, and what it may not assume
+# --------------------------------------------------------------------------
+
+
+def _repo_at(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    run = lambda *a: subprocess.run(["git", "-C", str(path), *a],
+                                    capture_output=True, text=True)
+    run("init", "-q", ".")
+    run("config", "user.email", "t@t")
+    run("config", "user.name", "t")
+    (path / "a.txt").write_text("a\n")
+    run("add", "a.txt")
+    run("commit", "-qm", "one")
+    return path
+
+
+@pytest.mark.parametrize("make_dirty, what", [
+    (lambda p: (p / "a.txt").write_text("edited\n"), "an unstaged edit"),
+    (lambda p: (p / "untracked_module.py").write_text("x = 1\n"), "an untracked module"),
+])
+def test_every_shape_of_modification_marks_the_commit_dirty(tmp_path,
+                                                            make_dirty, what):
+    """`git diff --quiet` is not enough, and the gap is not academic: it
+    answers rc=0 for a STAGED change and for an UNTRACKED file. An untracked
+    module is code this process can import, so a bare hash there names a commit
+    that demonstrably did not produce the run.
+    """
+    repo = _repo_at(tmp_path / "r")
+    assert not provenance._read_commit(repo).endswith("-dirty")   # clean first
+
+    make_dirty(repo)
+
+    assert provenance._read_commit(repo).endswith("-dirty"), what
+
+
+def test_a_staged_change_marks_the_commit_dirty(tmp_path):
+    """The shape `git diff --quiet` is blindest to: staged but not committed."""
+    repo = _repo_at(tmp_path / "r")
+    (repo / "a.txt").write_text("staged\n")
+    subprocess.run(["git", "-C", str(repo), "add", "a.txt"], capture_output=True)
+
+    assert provenance._read_commit(repo).endswith("-dirty")
+
+
+def test_being_unable_to_tell_is_not_the_same_as_clean(monkeypatch, tmp_path):
+    """git answers 0 clean, 1 dirty, and 128/129 for "that is not a checkout".
+    Reading anything-but-1 as clean publishes a precise-looking hash on the
+    strength of a failure -- the exact "invites belief" problem `-dirty` exists
+    to avoid, wearing the error path's clothes.
+    """
+    repo = _repo_at(tmp_path / "r")
+    real = provenance._git
+
+    def broken(root, *args):
+        if args and args[0] == "status":
+            return subprocess.CompletedProcess(args, 129, "", "fatal: nope")
+        return real(root, *args)
+
+    monkeypatch.setattr(provenance, "_git", broken)
+
+    got = provenance._read_commit(repo)
+
+    assert got.endswith("-unknown"), got
+    assert not got.endswith("-dirty"), "an error is not a known modification"
+
+
+def test_two_threads_racing_the_cache_agree(monkeypatch):
+    """The cache's contract is ONE answer per process. Unsynchronized, two
+    threads can both find it cold and compute either side of a `git pull`,
+    so one record says the old commit and its neighbour says the new one."""
+    import threading
+
+    seen: list[dict] = []
+    barrier = threading.Barrier(2)
+    calls = iter(["a" * 40, "b" * 40])
+    monkeypatch.setattr(provenance, "_read_commit",
+                        lambda root: next(calls, "c" * 40))
+
+    def go():
+        barrier.wait()
+        seen.append(provenance.code_provenance())
+
+    ts = [threading.Thread(target=go) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+    assert seen[0] == seen[1], seen
+
+
+def test_the_short_form_keeps_the_marker_it_exists_to_show():
+    """Truncating the whole string drops `-dirty`/`-unknown` -- so the short
+    form would read as a clean exact commit at the one moment that is least
+    true. Found by running `doctor` on a modified tree and seeing a bare hash.
+    """
+    assert provenance.short("a" * 40) == "a" * 12
+    assert provenance.short("a" * 40 + "-dirty") == "a" * 12 + "-dirty"
+    assert provenance.short("a" * 40 + "-unknown") == "a" * 12 + "-unknown"
+    assert provenance.short(None) == "unknown"
+
+
+def test_doctor_shows_the_dirty_marker_not_a_bare_hash(tmp_path, monkeypatch):
+    from skodun import doctor
+
+    monkeypatch.setattr(provenance, "_read_commit",
+                        lambda root: "d" * 40 + "-dirty")
+    rep = doctor.run_doctor(repo=None, store_path=tmp_path / "s.db")
+    pkg = next(l for l in rep.render().splitlines() if "package" in l)
+
+    assert "-dirty" in pkg, pkg

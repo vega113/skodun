@@ -27,6 +27,7 @@ precondition for it, and a machine without git must still be able to review.
 from __future__ import annotations
 
 import subprocess
+import threading
 from pathlib import Path
 
 from . import __version__
@@ -39,6 +40,14 @@ _GIT_TIMEOUT_SEC = 5.0
 #: The answer for THIS PROCESS, computed once. `None` means "not asked yet".
 #: Tests reset it; nothing else may.
 _CACHED: dict | None = None
+
+#: Guards the one-time fill of `_CACHED`. The contract is ONE answer per
+#: process, and unsynchronized lazy init does not give that: two threads can
+#: both find it cold and compute either side of a `git pull`, so one record
+#: says the old commit and its neighbour says the new one. The MCP server runs
+#: one review at a time today, but `run_review` is called on a worker thread
+#: and nothing here should depend on that staying true.
+_LOCK = threading.Lock()
 
 
 def _package_root() -> Path:
@@ -64,12 +73,30 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess | None:
 
 
 def _read_commit(root: Path) -> str | None:
-    """`HEAD` of the checkout at `root`, `-dirty` when it has edits, else None.
+    """`HEAD` at `root`, suffixed when it does not describe the code, else None.
+
+    Three answers, and the third is the one that is easy to get wrong:
+
+    * `<sha>`          the checkout is exactly this commit
+    * `<sha>-dirty`    it is not, and we know that
+    * `<sha>-unknown`  we could not establish either way
 
     The `-dirty` suffix is git-describe's convention and it earns its place: on
     a development machine the tree is usually modified, and a bare commit would
     name code that is not what ran. That is worse than saying nothing, because
     a precise-looking hash invites belief.
+
+    `status --porcelain`, NOT `diff --quiet`. The latter compares the worktree
+    against the index only, so it answers "clean" for a STAGED change and for
+    an UNTRACKED file -- and an untracked module is code this process can
+    import, so a bare hash there names a commit that demonstrably did not
+    produce the run. `--porcelain` covers all three and honours `.gitignore`,
+    so build droppings do not count as modifications.
+
+    `-unknown` exists because git returns 0 for clean, 1 for dirty and 128/129
+    for "that is not a checkout": reading anything-but-1 as clean would publish
+    a precise hash on the strength of a failure, which is the same
+    invites-belief problem wearing the error path's clothes.
     """
     head = _git(root, "rev-parse", "HEAD")
     if head is None or head.returncode != 0:
@@ -77,12 +104,23 @@ def _read_commit(root: Path) -> str | None:
     commit = head.stdout.strip()
     if not commit:
         return None
-    # A failure to ANSWER "is it dirty" is not a claim that it is clean, so an
-    # unusable result leaves the suffix off rather than guessing either way.
-    edits = _git(root, "diff", "--quiet")
-    if edits is not None and edits.returncode == 1:
-        return f"{commit}-dirty"
-    return commit
+    state = _git(root, "status", "--porcelain")
+    if state is None or state.returncode != 0:
+        return f"{commit}-unknown"
+    return commit if not state.stdout.strip() else f"{commit}-dirty"
+
+
+def short(commit: str | None, width: int = 12) -> str:
+    """A commit abbreviated for a one-line diagnostic, KEEPING its suffix.
+
+    Truncating the whole string drops `-dirty` / `-unknown`, which is precisely
+    the part that says the hash does not describe the running code -- so the
+    short form would read as a clean, exact commit whenever it is least true.
+    """
+    if not commit:
+        return "unknown"
+    sha, _, mark = commit.partition("-")
+    return f"{sha[:width]}-{mark}" if mark else sha[:width]
 
 
 def code_provenance() -> dict:
@@ -102,10 +140,15 @@ def code_provenance() -> dict:
     """
     global _CACHED
     if _CACHED is None:
-        _CACHED = {
-            "skodun_version": __version__,
-            "skodun_commit": _read_commit(_package_root()),
-        }
+        with _LOCK:
+            # Re-checked under the lock: two threads can both have seen it cold
+            # above, and the second must take the first's answer rather than
+            # compute its own on the other side of a `git pull`.
+            if _CACHED is None:
+                _CACHED = {
+                    "skodun_version": __version__,
+                    "skodun_commit": _read_commit(_package_root()),
+                }
     return dict(_CACHED)
 
 
