@@ -1325,6 +1325,11 @@ class McpServer:
         #: wrong by lying: the worst a bad guess buys is a +20 tie-break.
         self._client_name: str | None = None
         self._stdout_lost = False
+        #: Set by the SIGTERM forwarder when the signal found nothing to
+        #: cancel; cleared by `_say_sigterm_did_nothing` once it has been
+        #: explained. Written from a signal handler, so nothing may read it
+        #: under a lock.
+        self._sigterm_found_nothing = False
         self._write_lock = threading.Lock()
         self._slot_lock = threading.Lock()
         #: Occupancy of the single review slot: True while a long-running
@@ -1395,13 +1400,24 @@ class McpServer:
         from . import pipeline
 
         def handler(signum, frame):         # pragma: no cover - driven by signal
+            cancelled = 0
             cancel = self._worker_cancel
             if cancel is not None:
                 cancel.set()
+                cancelled += 1
             try:
-                pipeline.request_cancel_all()
+                cancelled += pipeline.request_cancel_all()
             except BaseException:
                 pass
+            if cancelled == 0:
+                # Nothing to cancel, so from outside this signal did NOTHING --
+                # see `_say_sigterm_did_nothing`. A bare attribute store, and
+                # deliberately not the note itself: this runs on the main
+                # thread between bytecodes, and writing to a buffered stream
+                # the interrupted frame may already hold the lock for is the
+                # same non-reentrant deadlock the `_slot_lock` note above
+                # avoids.
+                self._sigterm_found_nothing = True
 
         try:
             return signal.signal(signal.SIGTERM, handler)
@@ -1429,6 +1445,7 @@ class McpServer:
         # of work, and taking the write lock on every iteration would serialise
         # the read loop behind the review thread's response.
         while not self._stdout_lost:
+            self._say_sigterm_did_nothing()
             try:
                 chunk = self._stdin.readline(MAX_LINE_BYTES + 1)
             except BaseException as e:
@@ -1451,6 +1468,35 @@ class McpServer:
                     f"limit")
                 continue
             self._handle_line(chunk)
+
+    def _say_sigterm_did_nothing(self) -> None:
+        """Explain a SIGTERM that cancelled nothing, once per signal.
+
+        SIGTERM here means "cancel the running review" -- that is how
+        cross-process `review-cancel` reaches a review on a worker thread, and
+        why the default disposition is replaced at all (see `serve`). With no
+        review in flight it therefore does nothing, and USED TO SAY NOTHING:
+        an operator saw a process that would not die and no reason why, whose
+        natural next step is the `kill -9` the README warns against. Measured
+        on 22 live servers, every one ignored SIGTERM (#113).
+
+        Said from the read loop rather than the handler, so it is a plain
+        buffered write on a frame that owns no locks. The cost is that it
+        appears when the next line arrives rather than the instant the signal
+        lands -- acceptable, because stderr here is the host's log, not a
+        terminal anybody is watching. An operator at a shell never sees this
+        line; the README is what answers them, and it says the same thing.
+        """
+        if not self._sigterm_found_nothing:
+            return
+        self._sigterm_found_nothing = False   # per signal, not per iteration
+        self._note(
+            "note: SIGTERM arrived with no review in flight, so nothing was "
+            "cancelled and this server is still serving. On `skodun mcp` "
+            "SIGTERM means \"cancel the running review\" -- it is how "
+            "cross-process `skodun review-cancel` reaches one -- and never "
+            "\"exit\". To stop this server: close its stdin (restart the MCP "
+            "entry in your host), or send SIGINT.")
 
     def _drain_oversized_line(self) -> None:
         while True:

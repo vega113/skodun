@@ -846,6 +846,24 @@ How to restart (host-specific):
 Prefer a **graceful** host reload over `kill -9` (a hard kill mid-review can
 leave a `running` row until stale recovery).
 
+**`SIGTERM` will not stop a `skodun mcp`, by design.** On this server it means
+*cancel the running review* — it is how cross-process `skodun review-cancel`
+reaches a review that is executing on a worker thread, where a signal handler
+cannot be installed. The default disposition is replaced precisely so the
+process does **not** die and orphan the provider process group and a `running`
+row. With no review in flight it therefore does nothing at all, and the process
+keeps serving.
+
+| Want | Send |
+|---|---|
+| Cancel the review, keep the server | `SIGTERM`, or `skodun review-cancel <id>` |
+| Stop the server | close its stdin — restart the MCP entry in your host |
+| Stop the server, out of band | `SIGINT` (it unwinds through the same shutdown as stdin EOF) |
+| Nothing you should need | `kill -9` — no cleanup, may strand a `running` row |
+
+A server that gets a `SIGTERM` with nothing to cancel now says so in the host's
+log rather than ignoring it silently.
+
 Confirm after restart:
 
 ```bash
