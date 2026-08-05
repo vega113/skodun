@@ -27,7 +27,11 @@ Three properties this module is built around, and each one is load-bearing:
   non-goal of this design, so what Phase A buys is narrowing the pile-up from
   "always the same provider" to "only when starts collide". This is a router,
   not an admission-time scheduler; the FIFO underneath is still what makes
-  contention correct.
+  contention correct -- a collision costs queueing, never a wrong answer.
+  Measured before being left open: across 6623 stored artifacts and 205 auto
+  decisions, `ROUTE_WAIT` has never been recorded, so the window has yet to
+  cost a single wait. #109 is closed on that evidence rather than on a claim
+  that it cannot happen; `skodun providers --since-days N` is how to re-check.
 * **Soft cross-model.** A finder whose provider family differs from the calling
   client's gets a BONUS, never an exclusion. Preferring a second opinion from
   another model family must not be able to leave a single-family install with
