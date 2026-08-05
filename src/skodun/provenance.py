@@ -32,10 +32,14 @@ from pathlib import Path
 
 from . import __version__
 
-#: `git rev-parse` is a local read, but it is on the path of every process
-#: start. A ceiling keeps a wedged git (a network filesystem, a stuck index
-#: lock) from turning provenance into a hang.
-_GIT_TIMEOUT_SEC = 5.0
+#: `git rev-parse` and `git status` are local reads -- ~27ms together on a
+#: normal checkout -- but they sit on the path of every process start, and
+#: `run_review` warms this cache immediately before taking the foreground lock.
+#: The ceiling is what a WEDGED git costs (a network filesystem, a stuck index
+#: lock): two calls, so the worst case is twice this. Kept low deliberately --
+#: nobody is waiting on provenance, and a diagnostic field is never worth
+#: seconds of a review's wall clock.
+_GIT_TIMEOUT_SEC = 2.0
 
 #: The answer for THIS PROCESS, computed once. `None` means "not asked yet".
 #: Tests reset it; nothing else may.

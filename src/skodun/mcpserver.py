@@ -1276,19 +1276,14 @@ class McpServer:
         self._version = version
         self._on_stdout_lost = on_stdout_lost
 
-        #: The commit this SERVER is running, read once at construction. Held
-        #: so the drift note can name both sides -- what is serving now, and
-        #: what a restart would get.
-        self._running_commit = None
         #: Drift is a standing condition, so it is said once per session
         #: rather than on every tool call.
+        #:
+        #: The commit itself is NOT read here. `initialize` already asks for it
+        #: (it goes in `serverInfo`) and the answer is cached process-wide, so
+        #: reading it at construction would only add a second chance for a
+        #: wedged git to delay the handshake the host is waiting on.
         self._warned_code_moved = False
-        try:
-            from .provenance import code_provenance
-
-            self._running_commit = code_provenance().get("skodun_commit")
-        except BaseException:   # pragma: no cover - never worth a failed start
-            pass
 
         #: Whether the `initialize` REQUEST has been answered. This -- not the
         #: notification below -- is what the -32002 gate reads: a client that
@@ -1624,13 +1619,14 @@ class McpServer:
             return
         self._warned_code_moved = True
         try:
-            from .provenance import short, stale_against_disk
+            from .provenance import code_provenance, short, stale_against_disk
 
+            running = code_provenance().get("skodun_commit")
             moved = stale_against_disk()
             if moved:
                 self._note(
                     f"note: this server is running "
-                    f"{short(self._running_commit)}; the checkout has since "
+                    f"{short(running)}; the checkout has since "
                     f"moved to {short(moved)}. Reviews recorded now are "
                     f"stamped with the code above. Restart this MCP server to "
                     f"pick up the new one.")

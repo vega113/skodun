@@ -1391,6 +1391,14 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     lock_cell: dict = {"lock": None}
     capacity_ticket: capacity.Ticket | None = None
 
+    # BEFORE the lock, on purpose. Reading it shells out to git twice on a cold
+    # cache, and the record that needs it is built deep inside the critical
+    # section -- so a wedged git (a network checkout, a stuck index lock) would
+    # spend its whole timeout budget holding the foreground lock, delaying every
+    # peer for work that has nothing to do with the review. It is ~27ms warm and
+    # cached for the rest of the process, so the call site below is free.
+    provenance.code_provenance()
+
     def _try_fg_lock(slice_sec: float) -> bool:
         """One dual-hold attempt: True when this process holds the FG lock."""
         try:

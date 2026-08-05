@@ -243,3 +243,40 @@ def test_doctor_shows_the_dirty_marker_not_a_bare_hash(tmp_path, monkeypatch):
     pkg = next(l for l in rep.render().splitlines() if "package" in l)
 
     assert "-dirty" in pkg, pkg
+
+
+def test_provenance_is_read_before_the_foreground_lock_is_taken(tmp_path,
+                                                                monkeypatch,
+                                                                capsys):
+    """Two git subprocesses is unbudgeted work, and it must not happen while
+    holding the lock every other review is queued behind.
+
+    On a normal checkout it is ~27ms, but the timeout exists because git can
+    wedge -- a network filesystem, a stuck index lock -- and that whole budget
+    would otherwise be spent inside the critical section, delaying peers for
+    work that has nothing to do with reviewing. Warming the cache first is
+    free: the record built deep inside the lock then reads it from memory.
+    """
+    from skodun import pipeline
+    from tests.test_pipeline import CLEAN, _emit, _fake_grok, _repo, _run, _store
+
+    order: list[str] = []
+    real_lock = pipeline._acquire_fg_lock
+    real_prov = provenance.code_provenance
+
+    def spy_lock(*a, **k):
+        order.append("lock")
+        return real_lock(*a, **k)
+
+    def spy_prov():
+        order.append("provenance")
+        return real_prov()
+
+    monkeypatch.setattr(pipeline, "_acquire_fg_lock", spy_lock)
+    monkeypatch.setattr(pipeline.provenance, "code_provenance", spy_prov)
+    _fake_grok(tmp_path, _emit(CLEAN))
+
+    _run(_repo(tmp_path), _store(tmp_path))
+
+    assert "provenance" in order and "lock" in order
+    assert order.index("provenance") < order.index("lock"), order
