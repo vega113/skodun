@@ -1,7 +1,10 @@
 # Epic S5 — Provider auto-route (load balance across finders)
 
 > **Live issue:** https://github.com/vega113/skodun/issues/69
-> **Status:** Phase A implemented (default `mode = "off"`); Phase B not started.
+> **Status:** Shipped. Phase A (PR #83, default `mode = "off"`), routing
+> telemetry (PR #85) and Phase B weights (PR #97) are all on `main` and
+> #69 is closed. Phase C is closed as not warranted rather than as done —
+> see the Phase C section below.
 > **Plan:** `docs/superpowers/plans/2026-08-03-s5-provider-auto-route.md`  
 > **Depends on:** S4 provider slots + `provider_state` (shipped).  
 > **Related:** [`s4-multi-slot-provider-concurrency.md`](s4-multi-slot-provider-concurrency.md),
@@ -68,15 +71,25 @@ an oversight): the background pre-push worker. It is a different surface with a
 reserved, identity-pinned record; the design's diagram covers the foreground
 loop.
 
-### Phase B — Weights (later)
+### Phase B — Weights (shipped, PR #97, tracked as #77)
 
-- [ ] Per-provider weight or daily credit/spend share (openai-api already has
+- [x] Per-provider weight or daily credit/spend share (openai-api already has
       spend; subscriptions may use soft quotas or operator %).
-- [ ] Weighted least-loaded selection, not only free-slot.
+- [x] Weighted least-loaded selection, not only free-slot.
+
+Weights are **declared, never inferred**: what they express — how much of a
+subscription a review consumes — is not observable to skodun for a flat-rate
+CLI, so a router that inferred one would be acting on a number it made up.
 
 ### Phase C — (optional, non-goal for A)
 
-- [ ] Mid-wait rebind to another provider (hard; cancel/re-admit). Out of MVP.
+- [x] Mid-wait rebind to another provider (hard; cancel/re-admit). **Closed as
+      not warranted** (#109), on the measurement that issue named rather than
+      on a claim that the collision cannot happen: across 6623 stored artifacts
+      and 205 auto decisions, `auto:wait` has never once been recorded. The
+      counter is live and pinned end to end, so the zero is a real zero.
+      `skodun providers --since-days N` is how to re-check if concurrency
+      rises.
 - [ ] Parallel multi-provider voting on one diff. Still non-goal.
 
 ---
