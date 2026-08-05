@@ -1364,6 +1364,97 @@ def test_a_checkout_that_moved_under_the_server_is_reported_once(monkeypatch):
         "a diagnostic must never reach the JSON-RPC stream"
 
 
+def test_drift_that_arrives_after_the_first_tool_call_is_still_reported(
+        monkeypatch):
+    """The scenario the feature exists for, and the one it used to miss.
+
+    An operator does not `git pull` between a client connecting and its first
+    tool call -- they pull HOURS LATER, in the middle of a long session, which
+    is exactly what #110 describes happening on this machine. Marking the
+    session "already warned" on the first call regardless of what the probe
+    found meant the note could only ever fire for drift that predated the
+    connection, so the real case was silently unreachable.
+
+    Found by Qodo on PR #111.
+    """
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    # The checkout is where we are on the first probe, and somebody pulls
+    # before the second -- the ordinary shape of a long agent session.
+    seen: list[str] = []
+
+    def disk(root):
+        seen.append("probe")
+        return "a" * 40 if len(seen) == 1 else "b" * 40
+
+    monkeypatch.setattr(provenance, "_read_commit", disk)
+
+    code, out, err = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
+                            + _rpc("tools/call", 2, name="nope", arguments={})
+                            + _rpc("tools/call", 3, name="nope", arguments={})
+                            + _rpc("tools/call", 4, name="nope", arguments={}))
+
+    said = err.getvalue()
+    assert said.count("the checkout has since moved") == 1, (
+        f"drift arriving mid-session must still be reported, exactly once; "
+        f"got:\n{said}")
+    assert "bbbbbbbbbbbb" in said
+
+
+def test_a_probe_that_cannot_read_the_disk_does_not_claim_it_moved(monkeypatch):
+    """`-unknown` means "we could not establish it", not "it changed".
+
+    `_read_commit` appends that suffix when `status --porcelain` fails -- a
+    transient `index.lock` held by a concurrent commit is enough. Comparing the
+    whole string would read `abc-unknown` as different from `abc` and announce
+    a move that never happened, which is the failure mode this whole module
+    avoids elsewhere: a confident-looking claim built on a failed read.
+    """
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    monkeypatch.setattr(provenance, "_read_commit",
+                        lambda root: "a" * 40 + "-unknown")
+
+    code, out, err = _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
+                            + _rpc("tools/call", 2, name="nope", arguments={}))
+
+    assert "checkout has since moved" not in err.getvalue()
+
+
+def test_a_probe_that_can_never_answer_is_not_paid_for_twice(monkeypatch):
+    """A probe costs two git subprocesses, and git can wedge.
+
+    `None` means the disk is not a checkout we can read at all -- a wheel
+    install, a missing binary, a git that timed out. None of those becomes
+    readable later in the session, so asking again on every single tool call
+    would spend the whole 2s-per-call timeout budget forever to re-learn the
+    same nothing.
+    """
+    from skodun import provenance
+
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    probes: list[str] = []
+
+    def unreadable(root):
+        probes.append("git")
+        return None
+
+    monkeypatch.setattr(provenance, "_read_commit", unreadable)
+
+    _drive(_rpc("initialize", 1, protocolVersion="2025-11-25")
+           + _rpc("tools/call", 2, name="nope", arguments={})
+           + _rpc("tools/call", 3, name="nope", arguments={})
+           + _rpc("tools/call", 4, name="nope", arguments={}))
+
+    assert len(probes) == 1, (
+        f"an unanswerable probe was repeated {len(probes)} times")
+
+
 def test_a_server_on_the_current_checkout_says_nothing(monkeypatch):
     """No drift, no line. A diagnostic that always fires is one nobody reads."""
     from skodun import provenance

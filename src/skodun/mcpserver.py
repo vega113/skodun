@@ -1276,9 +1276,13 @@ class McpServer:
         self._version = version
         self._on_stdout_lost = on_stdout_lost
 
-        #: Drift is a standing condition, so it is said once per session
-        #: rather than on every tool call.
-        self._warned_code_moved = False
+        #: Whether drift is still worth probing for. Cleared once the note has
+        #: been said (it is a standing condition, and repeating it on every
+        #: tool call is noise an operator learns to skip) and also when the
+        #: probe reports there is no answer to be had -- see
+        #: `_warn_if_code_moved`, which is where both cost and correctness of
+        #: this live.
+        self._watch_code_moved = True
         # Warmed on a daemon thread, never read synchronously here or in
         # `initialize`. Provenance costs two git calls, and while that is ~27ms
         # on a normal checkout the timeout exists because git can wedge -- a
@@ -1623,27 +1627,41 @@ class McpServer:
         process that has been alive across a `git pull` -- which is what this
         server is, for hours or days at a time.
 
-        Once per session, not per call: it is a standing condition, and a line
-        on every tool call would be noise an operator learns to skip.
+        Said once, but WATCHED until then. Nobody pulls between a client
+        connecting and its first tool call -- they pull hours later, mid
+        session, which is the case #110 is about. Latching "already handled"
+        on the first probe regardless of what it found made the note reachable
+        only for drift that predated the connection, so the real scenario was
+        silently impossible. The flag is set when a note is EMITTED.
+
+        Watching costs two git subprocesses per tool call, which is why
+        `DRIFT_UNCOMPARABLE` stops it: a wheel install and a wedged git both
+        say "there is no answer here", and neither becomes answerable later.
+        `DRIFT_UNREADABLE` is the opposite -- a probe that failed this time
+        says nothing and is asked again.
 
         Reported, never acted on. A fail-closed gate must not swap its own code
         underneath a running review, and this server cannot restart itself --
         the host owns the pipe -- so it says what a restart would get and
         leaves the decision where it belongs.
         """
-        if self._warned_code_moved:
+        if not self._watch_code_moved:
             return
-        self._warned_code_moved = True
         try:
-            from .provenance import code_provenance, short, stale_against_disk
+            from .provenance import (DRIFT_MOVED, DRIFT_UNCOMPARABLE,
+                                     code_provenance, short,
+                                     stale_against_disk)
 
-            running = code_provenance().get("skodun_commit")
-            moved = stale_against_disk()
-            if moved:
+            state, on_disk = stale_against_disk()
+            if state == DRIFT_UNCOMPARABLE:
+                self._watch_code_moved = False
+            elif state == DRIFT_MOVED:
+                self._watch_code_moved = False
+                running = code_provenance().get("skodun_commit")
                 self._note(
                     f"note: this server is running "
                     f"{short(running)}; the checkout has since "
-                    f"moved to {short(moved)}. Reviews recorded now are "
+                    f"moved to {short(on_disk)}. Reviews recorded now are "
                     f"stamped with the code above. Restart this MCP server to "
                     f"pick up the new one.")
         except Exception:       # pragma: no cover - a note is never worth a raise

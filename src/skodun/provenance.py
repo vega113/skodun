@@ -17,8 +17,11 @@ Two questions, and they are deliberately different:
 * `code_provenance()` — the identity of the code THIS PROCESS is running.
   Cached, because that is what it means. It goes on the artifact.
 * `stale_against_disk()` — whether the checkout has moved since. Uncached, by
-  definition. It is a diagnostic, and it is never acted on automatically: see
-  the note on auto-update below.
+  definition. It answers in three parts, not two: moved, unchanged, and *we
+  could not tell* — because a caller that reads a failed probe as "unchanged"
+  either announces a move that never happened or goes on paying two
+  subprocesses a call to re-learn the same nothing. It is a diagnostic, and it
+  is never acted on automatically: see the note on auto-update below.
 
 Nothing here may raise or block. Provenance is a record of what happened, not a
 precondition for it, and a machine without git must still be able to review.
@@ -188,8 +191,27 @@ def warm_async() -> threading.Thread:
     return t
 
 
-def stale_against_disk() -> str | None:
-    """The on-disk commit when it differs from the running one, else None.
+#: What one drift probe learned. The four answers are kept apart because a
+#: caller has to do something DIFFERENT with each, and collapsing them is what
+#: made the first version of this both noisy and blind:
+#:
+#: * `DRIFT_SAME`      the disk is what we are running -- ask again later
+#: * `DRIFT_MOVED`     it is not, and we can say what it is now -- report once
+#: * `DRIFT_UNREADABLE` the probe failed this time -- say nothing, ask again
+#: * `DRIFT_UNCOMPARABLE` there is no answer to be had, ever -- stop asking
+DRIFT_SAME = "same"
+DRIFT_MOVED = "moved"
+DRIFT_UNREADABLE = "unreadable"
+DRIFT_UNCOMPARABLE = "uncomparable"
+
+
+def _sha(commit: str) -> str:
+    """The hash without its `-dirty` / `-unknown` marker."""
+    return commit.partition("-")[0]
+
+
+def stale_against_disk() -> tuple[str, str | None]:
+    """One drift probe: `(state, the commit on disk)`.
 
     Diagnostic only. It is deliberately NOT wired to any automatic update or
     restart: a fail-closed gate must not swap its own code underneath a running
@@ -198,13 +220,37 @@ def stale_against_disk() -> str | None:
     itself either -- the host owns the pipe -- so "auto-restart" reduces to
     exiting and hoping, which turns an upgrade into a silent tool outage.
 
-    Returns the value an operator would get by restarting, so the line they
-    read tells them what the restart is worth.
+    UNCACHED, unlike `code_provenance`: the whole question is what the disk
+    says NOW. The commit returned is what an operator would get by restarting,
+    so the line they read tells them what the restart is worth.
+
+    Two answers are easy to get wrong, and both were:
+
+    * An `-unknown` on EITHER side means we could not establish that tree's
+      state. Comparing the strings would read `abc-unknown` as different from
+      `abc` and announce a move that never happened -- a transient
+      `index.lock` from a concurrent commit is enough to trigger it. So when
+      either side is unknown, only the hashes are compared: a different hash is
+      still a real move, and the same hash means we simply cannot tell.
+    * `DRIFT_UNCOMPARABLE` is not a quieter `DRIFT_SAME`. It means "stop
+      asking", and a caller that read it as "no drift" would go on paying two
+      subprocesses per call to re-learn the same nothing. A wheel install gives
+      it because it will never be a checkout; a git that TIMED OUT gives it
+      too, and that one is a deliberate trade -- a timeout may well be
+      transient, but re-probing a wedged git spends the whole 2s-per-call
+      budget on every request, and an operator whose git is stalling has a
+      louder problem than a missing diagnostic.
     """
     running = code_provenance().get("skodun_commit")
     if running is None:
-        return None                      # a frozen install cannot drift
+        return DRIFT_UNCOMPARABLE, None  # a frozen install cannot drift
     on_disk = _read_commit(_package_root())
-    if on_disk is None or on_disk == running:
-        return None
-    return on_disk
+    if on_disk is None:
+        return DRIFT_UNCOMPARABLE, None  # not a checkout we can read, ever
+    if on_disk == running:
+        return DRIFT_SAME, on_disk
+    if running.endswith("-unknown") or on_disk.endswith("-unknown"):
+        if _sha(on_disk) != _sha(running):
+            return DRIFT_MOVED, on_disk  # a different commit is a real move
+        return DRIFT_UNREADABLE, None    # same commit, tree state unestablished
+    return DRIFT_MOVED, on_disk

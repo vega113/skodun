@@ -109,14 +109,15 @@ def test_the_answer_is_the_code_this_process_started_with(monkeypatch):
 
 
 def test_drift_is_reported_only_when_the_disk_really_moved(monkeypatch):
-    """The detection half. Same commit -> silence; a different one -> the
-    on-disk commit, so an operator can see what they would get by restarting."""
+    """The detection half. Same commit -> `same`; a different one -> `moved`
+    WITH the on-disk commit, so an operator sees what a restart would get."""
     provenance.code_provenance()                       # pin the startup answer
-    assert provenance.stale_against_disk() is None
+    assert provenance.stale_against_disk()[0] == provenance.DRIFT_SAME
 
     monkeypatch.setattr(provenance, "_read_commit", lambda root: "f" * 40)
 
-    assert provenance.stale_against_disk() == "f" * 40
+    assert provenance.stale_against_disk() == (provenance.DRIFT_MOVED,
+                                               "f" * 40)
 
 
 def test_drift_is_silent_when_there_is_no_commit_to_compare(monkeypatch,
@@ -125,7 +126,55 @@ def test_drift_is_silent_when_there_is_no_commit_to_compare(monkeypatch,
     monkeypatch.setattr(provenance, "_package_root", lambda: tmp_path)
     provenance.code_provenance()
 
-    assert provenance.stale_against_disk() is None
+    assert provenance.stale_against_disk() == (provenance.DRIFT_UNCOMPARABLE,
+                                               None)
+
+
+def test_a_failed_disk_read_is_not_a_move(monkeypatch):
+    """`-unknown` says we could not establish the tree's state, so comparing
+    the whole string would read `abc-unknown` as different from `abc` and
+    announce a move that never happened. One transient `index.lock` from a
+    concurrent commit is enough to produce it, and the resulting line would be
+    a confident claim built on a failed read -- the exact thing the `-unknown`
+    suffix exists to prevent."""
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    monkeypatch.setattr(provenance, "_read_commit",
+                        lambda root: "a" * 40 + "-unknown")
+
+    assert provenance.stale_against_disk() == (provenance.DRIFT_UNREADABLE,
+                                               None)
+
+
+def test_a_different_commit_is_a_move_even_when_the_tree_state_is_unknown():
+    """The other half of that rule: `-unknown` costs us the TREE state, not the
+    hash. A different hash is a real move and must still be reported, or a
+    checkout that moved during a failed `status` read would go unnoticed."""
+    import skodun
+    from unittest import mock
+
+    with mock.patch.object(provenance, "_CACHED",
+                           {"skodun_version": skodun.__version__,
+                            "skodun_commit": "a" * 40}), \
+         mock.patch.object(provenance, "_read_commit",
+                           lambda root: "b" * 40 + "-unknown"):
+        state, on_disk = provenance.stale_against_disk()
+
+    assert (state, on_disk) == (provenance.DRIFT_MOVED, "b" * 40 + "-unknown")
+
+
+def test_an_unreadable_checkout_says_stop_asking_not_all_is_well(monkeypatch):
+    """`uncomparable` is not a quieter `same`, and a caller must be able to
+    tell them apart: each probe costs two subprocesses, and a wheel install or
+    a wedged git will never become answerable later in the session. A poller
+    that read this as "no drift" would pay the whole timeout budget forever to
+    re-learn the same nothing."""
+    monkeypatch.setattr(provenance, "_CACHED",
+                        {"skodun_version": "0.4.0", "skodun_commit": "a" * 40})
+    monkeypatch.setattr(provenance, "_read_commit", lambda root: None)
+
+    assert provenance.stale_against_disk() == (provenance.DRIFT_UNCOMPARABLE,
+                                               None)
 
 
 # --------------------------------------------------------------------------
