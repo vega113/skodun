@@ -88,6 +88,19 @@ SERVER_NAME = "skodun"
 #: that a genuinely stuck git costs a bounded amount.
 _DRIFT_UNREADABLE_TRIES = 3
 
+#: Said when SIGTERM finds nothing to cancel. Pre-encoded because it is written
+#: from a SIGNAL HANDLER with a raw `os.write`: that is one syscall taking no
+#: Python-level lock, where `print` to a buffered stream could deadlock against
+#: the very frame the signal interrupted. An idle server spends all its time
+#: blocked in `readline`, so a note deferred to the next message is a note the
+#: idle case -- the only case this fires in -- would never actually show.
+_IDLE_SIGTERM_NOTE = (
+    b"skodun mcp: note: SIGTERM arrived with no review in flight, so nothing "
+    b"was cancelled and this server is still serving. On `skodun mcp` SIGTERM "
+    b'means "cancel the running review" -- it is how cross-process `skodun '
+    b'review-cancel` reaches one -- and never "exit". To stop this server: '
+    b"close its stdin (restart the MCP entry in your host), or send SIGINT.\n")
+
 #: A line longer than this is drained and refused. 8 MiB is far above any real
 #: `tools/call` (a review argument is a path and a few flags) and far below the
 #: size at which a single line becomes a memory problem for a machine that is
@@ -1330,6 +1343,9 @@ class McpServer:
         #: explained. Written from a signal handler, so nothing may read it
         #: under a lock.
         self._sigterm_found_nothing = False
+        #: stderr's raw fd when it has one, resolved when the SIGTERM
+        #: forwarder is installed. See `_IDLE_SIGTERM_NOTE`.
+        self._stderr_fd: int | None = None
         self._write_lock = threading.Lock()
         self._slot_lock = threading.Lock()
         #: Occupancy of the single review slot: True while a long-running
@@ -1399,6 +1415,15 @@ class McpServer:
 
         from . import pipeline
 
+        # Resolved HERE, not in the handler: `fileno()` on a wrapped stream can
+        # take that stream's lock, which is the one thing the handler must not
+        # do. `None` means "no raw fd", and the deferred path covers it.
+        try:
+            fd = self._stderr.fileno()
+            self._stderr_fd = fd if isinstance(fd, int) and fd >= 0 else None
+        except BaseException:
+            self._stderr_fd = None
+
         def handler(signum, frame):         # pragma: no cover - driven by signal
             cancelled = 0
             cancel = self._worker_cancel
@@ -1410,13 +1435,25 @@ class McpServer:
             except BaseException:
                 pass
             if cancelled == 0:
-                # Nothing to cancel, so from outside this signal did NOTHING --
-                # see `_say_sigterm_did_nothing`. A bare attribute store, and
-                # deliberately not the note itself: this runs on the main
-                # thread between bytecodes, and writing to a buffered stream
-                # the interrupted frame may already hold the lock for is the
-                # same non-reentrant deadlock the `_slot_lock` note above
-                # avoids.
+                # Nothing to cancel, so from outside this signal did NOTHING.
+                # Say so NOW, with a raw write to the stderr fd resolved
+                # below: an idle server is by definition blocked in `readline`,
+                # so anything deferred to the next message would not be seen in
+                # the only situation this fires in.
+                #
+                # `os.write` and not `_note`: this runs on the main thread
+                # between bytecodes, and a buffered stream's lock may be held
+                # by the very frame the signal interrupted -- the same
+                # non-reentrant deadlock the `_slot_lock` note above avoids.
+                fd = self._stderr_fd
+                if fd is not None:
+                    try:
+                        os.write(fd, _IDLE_SIGTERM_NOTE)
+                        return
+                    except BaseException:
+                        pass        # fall through to the deferred path
+                # No usable fd (a wrapped or in-memory stderr): leave it to the
+                # read loop, which writes it the ordinary way.
                 self._sigterm_found_nothing = True
 
         try:
@@ -1480,12 +1517,16 @@ class McpServer:
         natural next step is the `kill -9` the README warns against. Measured
         on 22 live servers, every one ignored SIGTERM (#113).
 
-        Said from the read loop rather than the handler, so it is a plain
-        buffered write on a frame that owns no locks. The cost is that it
-        appears when the next line arrives rather than the instant the signal
-        lands -- acceptable, because stderr here is the host's log, not a
-        terminal anybody is watching. An operator at a shell never sees this
-        line; the README is what answers them, and it says the same thing.
+        THE FALLBACK PATH. The handler normally writes `_IDLE_SIGTERM_NOTE`
+        straight to the stderr fd, because an idle server is blocked in
+        `readline` and a note deferred to the next message would not appear in
+        the only case this fires in. This covers a stderr with no raw fd -- an
+        in-memory or wrapped stream -- where the deferral is the price of
+        saying it at all.
+
+        An operator at a shell never sees either version: stderr here is the
+        host's log. The README is what answers them, and it says the same
+        thing.
         """
         if not self._sigterm_found_nothing:
             return
@@ -1847,6 +1888,18 @@ class McpServer:
             # `_shutdown` joins from `_workers` rather than from this flag.
             with self._slot_lock:
                 self._review_active = False
+                # And the token goes with the slot. It is what the SIGTERM
+                # forwarder reads to decide whether the signal had anything to
+                # cancel, so a completed Event left in place would make every
+                # later idle SIGTERM look like a real cancellation -- silently
+                # restoring the #113 silence for every server except one that
+                # has never run a review.
+                #
+                # `is`, not truthiness: the next review may already have stored
+                # ITS token by the time this thread gets the lock, and clearing
+                # that one would disarm a cancel for a review actually running.
+                if self._worker_cancel is cancel:
+                    self._worker_cancel = None
         try:
             self._respond_tool(id_, res)
         except BaseException as e:

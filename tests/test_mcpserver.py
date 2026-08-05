@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1389,6 +1390,95 @@ def test_a_sigterm_that_actually_cancels_something_adds_no_note():
 
     assert server._worker_cancel.is_set(), "the cancel must still happen"
     assert "SIGTERM" not in server._stderr.getvalue()
+
+
+def test_a_sigterm_after_a_review_finished_still_reports_the_idle_case():
+    """A server that has ever run a review is the normal server, and the fix
+    has to work for it.
+
+    `_start_long_running` stores the worker's cancel token; nothing used to
+    clear it. So a SIGTERM arriving long after that review finished would set
+    a completed Event, count as a real cancellation, and suppress the
+    diagnostic -- leaving the silence intact for every server except one that
+    has never done any work. Found by CodeRabbit on PR #114.
+
+    Driven through the shipped `tools/call` path so the token is stored and
+    cleared exactly as production does it, not by poking the attribute.
+    """
+    done = threading.Event()
+
+    def slow(call):
+        done.set()
+        return HandlerResult(status=0, text="finished", pending_acks=[])
+
+    registry = (HandlerSpec(name="review", long_running=True, input_schema={},
+                            handler=slow, description="a review"),)
+    server = _server(stdin=_HANDSHAKE
+                     + _rpc("tools/call", 1, name="review", arguments={}),
+                     registry=registry)
+    server.serve()                          # runs the review to completion
+    assert done.is_set(), "the review never ran"
+
+    _fire_sigterm(server)
+    server._say_sigterm_did_nothing()       # the loop has already ended
+
+    said = server._stderr.getvalue()
+    assert "SIGTERM arrived with no review in flight" in said, (
+        f"a finished review still counted as cancellable:\n{said}")
+
+
+def test_a_real_idle_server_reports_the_signal_without_being_prodded(tmp_path):
+    """The shipped path, and the whole point of writing from the handler.
+
+    An idle server is BLOCKED IN `readline` -- that is what idle means -- so a
+    note deferred to the next message would never appear in the only situation
+    this diagnostic exists for. Nothing is sent after the signal here, on
+    purpose: the note has to arrive on its own.
+
+    A real process through `skodun mcp`, because the bug this closes was found
+    by signalling 22 real ones, and an in-memory stderr cannot exercise the raw
+    `os.write` that production takes. Found by CodeRabbit on PR #114.
+    """
+    boot = tmp_path / "boot.py"
+    boot.write_text(
+        "import sys\n"
+        "from skodun.mcpserver import serve_stdio\n"
+        "raise SystemExit(serve_stdio(registry=()))\n",
+        encoding="utf-8")
+    proc = subprocess.Popen([sys.executable, str(boot)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=_env(tmp_path))
+    try:
+        proc.stdin.write(_rpc("initialize", 1,
+                              protocolVersion="2025-11-25"))
+        proc.stdin.flush()
+        proc.stdout.readline()              # it is up and now idle
+
+        os.kill(proc.pid, signal.SIGTERM)
+
+        # Read one stderr line with a deadline. No further request is sent.
+        line = _readline_before(proc.stderr, deadline_sec=20)
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+    assert line, "an idle server said nothing at all about the signal"
+    assert b"SIGTERM arrived with no review in flight" in line, line
+    assert b"SIGINT" in line, b"it never says what does stop a server: " + line
+
+
+def _readline_before(stream, *, deadline_sec: float) -> bytes:
+    """One line from `stream`, or `b""` if none arrives in time.
+
+    The read runs on a daemon thread so a server that says nothing fails the
+    assertion above instead of hanging the suite until pytest's own timeout.
+    """
+    got: list[bytes] = []
+    reader = threading.Thread(target=lambda: got.append(stream.readline()),
+                              daemon=True)
+    reader.start()
+    reader.join(deadline_sec)
+    return got[0] if got else b""
 
 
 def test_the_readme_says_which_signal_stops_a_server():
