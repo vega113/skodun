@@ -115,6 +115,13 @@ def test_untrustworthy_candidate_is_never_reused(tmp_path):
         assert reuse.find_exact_candidate(store, identity) is None
 
 
+def test_disabled_context_pack_can_match_without_a_context_hash(tmp_path):
+    identity = _identity(context_hash=None)
+    with Store.open(tmp_path / "reuse.db") as store:
+        store.save_review(_record(identity, context_hash=""))
+        assert reuse.find_exact_candidate(store, identity)["id"] == "r1"
+
+
 def test_projection_recomputes_open_findings_from_current_triage(tmp_path):
     identity = _identity()
     finding = {

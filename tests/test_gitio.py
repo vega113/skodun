@@ -116,6 +116,15 @@ def test_tree_fingerprint_changes_for_dirty_worktree_without_head_change(tmp_pat
     assert before != after
 
 
+def test_tree_fingerprint_changes_when_the_same_dirty_file_changes_again(tmp_path):
+    repo = _mkrepo(tmp_path)
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    first_dirty = tree_fingerprint(repo)
+    (repo / "a.txt").write_text("three\n", encoding="utf-8")
+    second_dirty = tree_fingerprint(repo)
+    assert first_dirty != second_dirty
+
+
 def test_diff_identity_strips_trailing_newlines_like_shell():
     assert diff_identity(b"diff --git a b\n+x\n\n\n") == diff_identity(
         b"diff --git a b\n+x"

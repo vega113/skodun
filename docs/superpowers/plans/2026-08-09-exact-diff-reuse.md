@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: Add the persisted reuse audit and tree fingerprint primitives
+## Task 1: Add the persisted reuse audit and tree fingerprint primitives
 
 **Files:**
 - Modify: `src/skodun/store.py`
@@ -20,10 +20,10 @@
 
 - [x] **Step 1: Write failing tests** for schema v10, append-only reuse event rows, and a tree fingerprint that changes for dirty edits while HEAD remains unchanged.
 - [x] **Step 2: Run the focused tests and confirm they fail because the migration, store method, and fingerprint function do not exist.**
-- [x] **Step 3: Implement the additive v10 migration, validated append-only `reuse_events` methods, and a SHA-256 fingerprint over HEAD plus NUL-delimited porcelain status.
+- [x] **Step 3: Implement the additive v10 migration, validated append-only `reuse_events` methods, and a SHA-256 fingerprint over HEAD, NUL-delimited porcelain status, and changed-file content.
 - [x] **Step 4: Run the focused store and git tests and confirm they pass.**
 
-### Task 2: Define the exact reuse probe and read-only result projection
+## Task 2: Define the exact reuse probe and read-only result projection
 
 **Files:**
 - Create: `src/skodun/reuse.py`
@@ -34,7 +34,7 @@
 - [x] **Step 3: Implement current identity capture, checklist/context identity calculation using the existing dispatcher context rules, strict candidate validation, the tree recheck, and the banner/status projection without saving or mutating the candidate artifact.
 - [x] **Step 4: Run the focused reuse tests and confirm they pass.**
 
-### Task 3: Wire opt-in reuse through the shared service and both transports
+## Task 3: Wire opt-in reuse through the shared service and both transports
 
 **Files:**
 - Modify: `src/skodun/pipeline.py`
@@ -52,7 +52,7 @@
 - [x] **Step 3: Add `tree_fingerprint` to normal foreground artifacts, add the opt-in service probe before `_svc_review_once`, append hit/miss/bypass/error audit rows, and preserve the existing fresh path and wording. Return the reused review ID in CLI/MCP text and structured metadata.
 - [x] **Step 4: Run the focused service, pipeline, CLI, and MCP tests and confirm they pass.**
 
-### Task 4: Add telemetry coverage and perform delivery verification
+## Task 4: Add telemetry coverage and perform delivery verification
 
 **Files:**
 - Modify: `src/skodun/stats.py`

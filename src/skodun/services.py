@@ -317,6 +317,8 @@ def _reuse_audit(store, probe, *, outcome: str, reason: str,
             requested_reviewer=reviewer, client_family=client_family,
             matched_review_id=(None if probe is None or probe.candidate is None
                                else probe.candidate.get("id")))
+    except KeyboardInterrupt:
+        raise
     except BaseException:
         # Reuse is optional optimization telemetry. A failed audit must never
         # turn a safe fresh review into a refusal.

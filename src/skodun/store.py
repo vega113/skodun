@@ -50,6 +50,7 @@ SKODUN_SOURCE = "skodun"
 #: The record status a reservation writes, and the only status a conditional
 #: transition (finalize, stale recovery, pid attach) will act on.
 RUNNING = "running"
+_REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
@@ -997,6 +998,9 @@ class Store:
         """Append one foreground reuse probe event and return its stored row."""
         at = _require_ts("at", at)
         outcome = _require_text("outcome", outcome)
+        if outcome not in _REUSE_OUTCOMES:
+            raise ValueError(
+                "outcome must be one of: hit, miss, bypass, error")
         reason = _require_text("reason", reason)
         values = {
             "repo_id": repo_id, "worktree_root": worktree_root,
@@ -2161,7 +2165,7 @@ class Store:
             "SELECT outcome FROM reuse_events WHERE at>=?", (since_iso,)
         ).fetchall()
         reuse_hits = sum(r["outcome"] == "hit" for r in reuse_rows)
-        reuse_misses = sum(r["outcome"] != "hit" for r in reuse_rows)
+        reuse_misses = sum(r["outcome"] == "miss" for r in reuse_rows)
         return {
             "since": since_iso,
             "reviews": {

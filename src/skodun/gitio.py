@@ -37,6 +37,8 @@ in `tests/test_gitio.py`.
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -538,20 +540,46 @@ def head_sha(repo: Path) -> str:
 
 
 def tree_fingerprint(repo: Path) -> str:
-    """Fingerprint the checked-out tree, including dirty index/worktree state.
+    """Fingerprint the checked-out tree, including dirty file contents.
 
     HEAD alone is insufficient for foreground coverage: staged, unstaged, and
-    untracked edits can change the reviewed tree without moving the commit.
-    Git's NUL-delimited porcelain stream is the stable local snapshot used here
-    so filenames cannot be confused with status text.
+    untracked edits can change the reviewed tree without moving the commit, and
+    status alone cannot distinguish two versions of the same dirty file. Git's
+    NUL-delimited porcelain stream identifies the changed paths; their content
+    (or symlink target/type) is hashed alongside that status snapshot.
     """
-    status = _run(
-        Path(repo), "status", "--porcelain=v1", "-z", "--untracked-files=all"
-    ).stdout
+    root = Path(repo)
+    status = _run(root, "status", "--porcelain=v1", "-z",
+                  "--untracked-files=all").stdout
     h = hashlib.sha256()
-    h.update(head_sha(Path(repo)).encode("ascii"))
-    h.update(b"\0")
+    h.update(head_sha(root).encode("ascii"))
+    h.update(b"\0status\0")
     h.update(status)
+    paths = []
+    for token in _paths(status):
+        if not token:
+            continue
+        paths.append(token[3:] if len(token) >= 3 and token[2] == " "
+                     else token)
+    for name in paths:
+        encoded = name.encode("utf-8", "surrogateescape")
+        h.update(len(encoded).to_bytes(8, "big"))
+        h.update(encoded)
+        path = root / name
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            h.update(b"\0missing")
+            continue
+        h.update(b"\0mode\0" + info.st_mode.to_bytes(4, "big"))
+        if stat.S_ISLNK(info.st_mode):
+            target = os.readlink(path).encode("utf-8", "surrogateescape")
+            h.update(b"\0symlink\0" + target)
+        elif stat.S_ISREG(info.st_mode):
+            h.update(b"\0content\0")
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    h.update(chunk)
     return h.hexdigest()
 
 

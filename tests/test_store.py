@@ -1066,6 +1066,14 @@ def test_reuse_events_are_append_only_and_return_stored_rows(tmp_path):
     assert rows[1]["matched_review_id"] == "r1"
 
 
+def test_reuse_event_rejects_unknown_outcome(tmp_path):
+    with Store.open(tmp_path / "reuse.db") as st:
+        with pytest.raises(ValueError, match="outcome must be one of"):
+            st.append_reuse_event(
+                at="2026-08-09T00:00:00Z", outcome="unexpected",
+                reason="invalid event")
+
+
 def test_migration_ladder_is_ordered_and_reaches_schema_version():
     """A delta added out of order, or a delta added without bumping
     SCHEMA_VERSION, would run on the wrong databases or never be stamped."""

@@ -113,9 +113,17 @@ def _candidate_matches(candidate: dict, identity: ReuseIdentity) -> bool:
         return False
     required = (
         "repo_id", "worktree_root", "base_sha", "diff_hash",
-        "context_hash", "checklist_hash", "tree_fingerprint")
+        "checklist_hash", "tree_fingerprint")
     if any(not isinstance(candidate.get(key), str)
            or not candidate[key].strip() for key in required):
+        return False
+    candidate_context = candidate.get("context_hash")
+    if identity.context_hash is None:
+        if candidate_context not in (None, ""):
+            return False
+    elif (not isinstance(candidate_context, str)
+          or not candidate_context.strip()
+          or candidate_context != identity.context_hash):
         return False
     return all(candidate[key] == getattr(identity, key) for key in required)
 
