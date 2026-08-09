@@ -141,6 +141,28 @@ def test_disabled_context_pack_can_match_without_a_context_hash(tmp_path):
         assert reuse.find_exact_candidate(store, identity)["id"] == "r1"
 
 
+def test_skeptic_switch_changes_the_reuse_identity(tmp_path, monkeypatch):
+    repo = _mkrepo(tmp_path)
+    (repo / ".skodun.toml").write_text(
+        '[[reviewers]]\nname = "finder"\nprovider = "xai"\nmodel = "m"\n',
+        encoding="utf-8")
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    cfg = load_config(repo)
+    base = resolve_base(repo)
+    diff = capture_diff(repo, base.sha, cfg.defaults.untracked_max)
+    monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "0")
+    without_skeptic = reuse._identity_for(
+        repo, cfg, base, diff, branch=current_branch(repo),
+        reviewer_name="finder")
+    monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    with_skeptic = reuse._identity_for(
+        repo, cfg, base, diff, branch=current_branch(repo),
+        reviewer_name="finder")
+    assert without_skeptic.security_policy_hash != \
+        with_skeptic.security_policy_hash
+
+
 def test_oversized_identity_has_deterministic_batched_hashes(tmp_path):
     repo = _mkrepo(tmp_path)
     (repo / ".skodun.toml").write_text(

@@ -389,6 +389,7 @@ def test_an_empty_outgoing_change_is_not_sent_to_the_model(tmp_path, capsys):
     assert _calls(tmp_path) == 0
     assert rec["trustworthy"] is True and rec["findings_total"] == 0
     assert rec["summary"] == "no outgoing changes"
+    assert rec["checklist_hash"] and len(rec["checklist_hash"]) == 64
     assert _verdict(rec, capsys).startswith("SKODUN VERDICT: trustworthy=true")
 
 

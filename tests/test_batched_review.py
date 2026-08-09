@@ -342,6 +342,15 @@ def test_an_over_budget_diff_is_reviewed_in_batches_and_recorded_once(tmp_path,
     assert rec["context_hash"] and len(rec["context_hash"]) == 64
 
 
+def test_batched_foreground_with_context_disabled_persists_empty_context_identity(
+        tmp_path, capsys):
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _oversized(tmp_path, extra_cfg="context_pack = false\n")
+    rec = _run(repo, _store(tmp_path))
+    assert rec["context_hash"] == ""
+    assert rec["checklist_hash"] and len(rec["checklist_hash"]) == 64
+
+
 def test_a_trustworthy_aggregate_satisfies_the_gate_it_was_taken_for(tmp_path,
                                                                     capsys):
     _fake_grok(tmp_path, _emit(CLEAN))

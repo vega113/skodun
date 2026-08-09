@@ -1606,10 +1606,17 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             # recorded so the run leaves a trace, and it certifies nothing the
             # gate does not already grant: the gate PASSes an empty change
             # before it ever looks a review up.
+            empty_identity = reuse._identity_for(
+                repo, cfg, base, diff, branch=branch,
+                reviewer_name=finder.name)
             _note("no outgoing changes vs " + (base.ref or "HEAD^"))
             rec = dict(common, status="clean", parse_ok=True, degraded=False,
                        degraded_reason="", stop_reason=None,
-                       diff_truncated=False, context_hash="",
+                       diff_truncated=False,
+                       context_hash=(empty_identity.context_hash
+                                     if empty_identity.context_hash is not None
+                                     else ""),
+                       checklist_hash=empty_identity.checklist_hash or "",
                        files_changed=[], diff_bytes=0, prompt_bytes=0,
                        checklist_sections=[], checklist_bytes=0,
                        checklist_note="", checklist_degraded=False,
@@ -3038,7 +3045,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         # Background artifacts stay outside the foreground reuse contract;
         # their legacy dedup policy intentionally retains empty identities.
         context_hash=(reuse.aggregate_context_identity(
-            context_hashes, enabled=d.context_pack)
+            context_hashes, enabled=d.context_pack) or ""
             if rec.get("mode") == "now" else ""),
         checklist_hash=(reuse.aggregate_checklist_identity(checklist_selections)
                         if rec.get("mode") == "now" else ""),

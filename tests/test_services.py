@@ -25,6 +25,7 @@ from __future__ import annotations
 import inspect
 import re
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -137,6 +138,39 @@ def test_opt_in_reuse_returns_existing_review_without_running_pipeline(
     assert "review_id=r1" in text
     assert metadata["reuse"]["review_id"] == "r1"
     assert events[0]["outcome"] == "hit"
+
+
+def test_opt_in_reuse_honors_cancellation_before_and_during_a_probe(
+        tmp_path, monkeypatch):
+    cancel = threading.Event()
+    cancel.set()
+    monkeypatch.setattr(
+        reuse, "probe",
+        lambda *args, **kwargs: pytest.fail("cancelled reuse was probed"))
+    with Store.open(tmp_path / "before.db") as store:
+        status, text, _metadata = services.svc_review_detailed(
+            store, tmp_path, reuse_trusted=True, cancel=cancel)
+    assert status == 4 and "review cancelled" in text
+
+    identity = reuse.ReuseIdentity(
+        repo_id="/repo/.git", worktree_root="/repo", branch="feature",
+        head="h" * 40, base_sha="b" * 40, diff_hash="d" * 40,
+        context_hash="c" * 64, checklist_hash="k" * 64,
+        tree_fingerprint="t" * 64, security_policy_hash="p" * 64)
+    candidate = {"id": "r1"}
+    cancel.clear()
+
+    def probe_and_cancel(*args, **kwargs):
+        cancel.set()
+        return reuse.ReuseProbe(candidate, identity, "exact identity match")
+
+    monkeypatch.setattr(reuse, "probe", probe_and_cancel)
+    monkeypatch.setattr("skodun.cli._repo_root", lambda repo: repo)
+    monkeypatch.setattr("skodun.config.load_config", lambda root: object())
+    with Store.open(tmp_path / "during.db") as store:
+        status, text, _metadata = services.svc_review_detailed(
+            store, tmp_path, reuse_trusted=True, cancel=cancel)
+    assert status == 4 and "review cancelled" in text
 
 
 def test_no_service_opens_a_store_of_its_own():

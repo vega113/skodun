@@ -83,6 +83,7 @@ def security_policy_identity(cfg) -> str:
         "basename_patterns": list(cfg.defaults.security_basename_patterns),
         "prompt_slots": list(cfg.defaults.security_prompt_slots),
         "kill_switch": os.environ.get("SKODUN_SECURITY_PASS", "1"),
+        "skeptic_switch": os.environ.get("SKODUN_SKEPTIC_PASS", "1"),
         "reviewers": reviewers,
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(body.encode("utf-8")).hexdigest()

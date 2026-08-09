@@ -355,7 +355,8 @@ def _reuse_audit(store, probe, *, outcome: str, reason: str,
 
 
 def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
-               reviewer=None, client_family=None, intent_client_family=None):
+               reviewer=None, client_family=None, intent_client_family=None,
+               cancel=None):
     """Return a reused verdict or a diagnostic to prefix to a fresh review."""
     from . import reuse
     if not reuse_trusted:
@@ -372,6 +373,11 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
                      reviewer=reviewer, client_family=intent_client_family)
         return None, f"SKODUN REUSE: bypass reason={reason}", {
             "reuse": {"hit": False, "reason": reason}}
+    if cancel is not None and cancel.is_set():
+        from .trust import banner_failure
+        reason = REVIEW_CANCELLED_REASON
+        return (4, banner_failure(reason)), None, {
+            "reuse": {"hit": False, "reason": reason}}
     result = None
     try:
         from .cli import _repo_root
@@ -382,6 +388,13 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
         result = reuse.probe(
             store, root, cfg=cfg, client_family=client_family,
             intent_client_family=intent_client_family)
+        if (result.candidate is not None and cancel is not None
+                and cancel.is_set()):
+            reason = REVIEW_CANCELLED_REASON
+            _reuse_audit(store, result, outcome="bypass", reason=reason)
+            from .trust import banner_failure
+            return (4, banner_failure(reason)), None, {
+                "reuse": {"hit": False, "reason": reason}}
         _reuse_audit(store, result, outcome="hit" if result.candidate else "miss",
                      reason=result.reason)
         if result.candidate is None:
@@ -390,6 +403,11 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
         status, verdict = reuse.project(
             store, result.candidate, branch=result.identity.branch,
             base_sha=result.identity.base_sha)
+        if cancel is not None and cancel.is_set():
+            reason = REVIEW_CANCELLED_REASON
+            from .trust import banner_failure
+            return (4, banner_failure(reason)), None, {
+                "reuse": {"hit": False, "reason": reason}}
         text = (f"SKODUN REUSE: review_id={result.candidate['id']} "
                 f"reason={result.reason}\n{verdict}")
         return (status, text), None, {
@@ -491,7 +509,8 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         reviewer=reviewer, client_family=client_family,
         intent_client_family=(client_family
                               if reuse_client_family is _REUSE_INTENT_UNSET
-                              else reuse_client_family))
+                              else reuse_client_family),
+        cancel=cancel)
     if reuse_result is not None:
         return (*reuse_result, reuse_metadata)
     if not recover:
