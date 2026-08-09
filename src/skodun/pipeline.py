@@ -3047,7 +3047,10 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         context_hash=(reuse.aggregate_context_identity(
             context_hashes, enabled=d.context_pack) or ""
             if rec.get("mode") == "now" else ""),
-        checklist_hash=(reuse.aggregate_checklist_identity(checklist_selections)
+        checklist_hash=(reuse.aggregate_checklist_identity(
+            checklist_selections,
+            batch_boundaries=[gitio.diff_identity(batch.data)
+                              for batch in batches])
                         if rec.get("mode") == "now" else ""),
     )
     if integration is not None:

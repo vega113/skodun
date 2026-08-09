@@ -395,9 +395,8 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
             from .trust import banner_failure
             return (4, banner_failure(reason)), None, {
                 "reuse": {"hit": False, "reason": reason}}
-        _reuse_audit(store, result, outcome="hit" if result.candidate else "miss",
-                     reason=result.reason)
         if result.candidate is None:
+            _reuse_audit(store, result, outcome="miss", reason=result.reason)
             return None, f"SKODUN REUSE: miss reason={result.reason}", {
                 "reuse": {"hit": False, "reason": result.reason}}
         status, verdict = reuse.project(
@@ -408,6 +407,7 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
             from .trust import banner_failure
             return (4, banner_failure(reason)), None, {
                 "reuse": {"hit": False, "reason": reason}}
+        _reuse_audit(store, result, outcome="hit", reason=result.reason)
         text = (f"SKODUN REUSE: review_id={result.candidate['id']} "
                 f"reason={result.reason}\n{verdict}")
         return (status, text), None, {

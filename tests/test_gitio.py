@@ -125,6 +125,22 @@ def test_tree_fingerprint_changes_when_the_same_dirty_file_changes_again(tmp_pat
     assert first_dirty != second_dirty
 
 
+def test_tree_fingerprint_changes_when_the_same_submodule_file_changes_again(
+        tmp_path):
+    (tmp_path / "inner").mkdir()
+    (tmp_path / "outer").mkdir()
+    inner = _mkrepo(tmp_path / "inner")
+    outer = _mkrepo(tmp_path / "outer")
+    _git(outer, "-c", "protocol.file.allow=always", "submodule", "add",
+         str(inner), "mod")
+    _git(outer, "commit", "-m", "add submodule")
+    (outer / "mod" / "a.txt").write_text("two\n", encoding="utf-8")
+    first_dirty = tree_fingerprint(outer)
+    (outer / "mod" / "a.txt").write_text("three\n", encoding="utf-8")
+    second_dirty = tree_fingerprint(outer)
+    assert first_dirty != second_dirty
+
+
 def test_tree_fingerprint_can_be_limited_to_reviewed_paths(tmp_path):
     repo = _mkrepo(tmp_path)
     (repo / "a.txt").write_text("two\n", encoding="utf-8")

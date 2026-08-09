@@ -210,6 +210,17 @@ def test_oversized_identity_has_deterministic_batched_hashes(tmp_path):
     assert first.context_hash == second.context_hash
 
 
+def test_aggregate_checklist_identity_includes_batch_boundaries():
+    from skodun.checklist import Selection
+
+    selection = Selection(("core",), 0, False)
+    first = reuse.aggregate_checklist_identity(
+        [selection], batch_boundaries=["first"])
+    second = reuse.aggregate_checklist_identity(
+        [selection], batch_boundaries=["second"])
+    assert first != second
+
+
 def test_projection_recomputes_open_findings_from_current_triage(tmp_path):
     identity = _identity()
     finding = {

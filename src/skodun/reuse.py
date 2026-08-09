@@ -54,12 +54,15 @@ def checklist_identity(selection: checklist.Selection) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
-def aggregate_checklist_identity(selections) -> str | None:
-    """Hash the ordered checklist selections used by a batched review."""
+def aggregate_checklist_identity(selections, *, batch_boundaries=()) -> str | None:
+    """Hash checklist selections and deterministic batch boundaries."""
     identities = [checklist_identity(selection) for selection in selections]
     if not identities:
         return None
-    body = json.dumps(identities, separators=(",", ":"))
+    body = json.dumps({
+        "selections": identities,
+        "batch_boundaries": list(batch_boundaries),
+    }, separators=(",", ":"))
     return hashlib.sha256(body.encode("ascii")).hexdigest()
 
 
@@ -178,7 +181,10 @@ def _batched_identities(root: Path, diff, cfg, reviewer):
             defaults.checklist_map, defaults.test_path_patterns))
     return (aggregate_context_identity(
                 context_hashes, enabled=defaults.context_pack),
-            aggregate_checklist_identity(selections))
+            aggregate_checklist_identity(
+                selections,
+                batch_boundaries=[gitio.diff_identity(batch.data)
+                                  for batch in batches]))
 
 
 def _under(root: Path, relative: str) -> Path:

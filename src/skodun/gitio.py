@@ -597,14 +597,18 @@ def tree_fingerprint(repo: Path, *, paths=None) -> str:
             h.update(b"\0symlink\0" + target)
         elif stat.S_ISREG(info.st_mode):
             h.update(b"\0content\0")
-            if not hasattr(os, "O_NOFOLLOW"):
-                raise GitError("tree fingerprint requires O_NOFOLLOW")
+            if (not hasattr(os, "O_NOFOLLOW")
+                    or not hasattr(os, "O_NONBLOCK")
+                    or not hasattr(os, "set_blocking")):
+                raise GitError(
+                    "tree fingerprint requires safe nonblocking opens")
             fd = None
             try:
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
                 opened = os.fstat(fd)
                 if not stat.S_ISREG(opened.st_mode):
                     raise GitError(f"tree fingerprint found unsafe path: {name}")
+                os.set_blocking(fd, True)
                 with os.fdopen(fd, "rb") as stream:
                     fd = None
                     for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -622,10 +626,15 @@ def tree_fingerprint(repo: Path, *, paths=None) -> str:
                 raise GitError(f"tree fingerprint found unsafe path: {name}")
             h.update(b"\0gitlink\0" + staged)
             try:
-                current = _out(path, "rev-parse", "HEAD")
-            except GitError:
-                current = "uninitialized"
-            h.update(current.encode("utf-8", "surrogateescape"))
+                initialized = os.path.lexists(path / ".git")
+            except OSError as exc:
+                raise GitError(
+                    f"tree fingerprint could not inspect gitlink {name}: {exc}") \
+                    from exc
+            if not initialized:
+                h.update(b"\0uninitialized")
+            else:
+                h.update(b"\0nested\0" + tree_fingerprint(path).encode("ascii"))
         else:
             raise GitError(f"tree fingerprint found unsafe path: {name}")
     return h.hexdigest()
