@@ -125,6 +125,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "from a different family when one is free "
                              "(default: $SKODUN_CLIENT_FAMILY, else none)")
 
+    stats = sub.add_parser(
+        "stats", help="show operational review and capacity telemetry")
+    stats.add_argument(
+        "--since-days", type=int, default=7, dest="since_days",
+        help="include telemetry from the last N UTC days (default: 7)")
+    stats.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="render the same statistics as machine-readable JSON")
+
     # Epic S1: observe / cancel without a second gate. Hyphenated CLI names
     # match install-hooks / import-legacy; MCP tools use underscores like the
     # rest of the tool surface (review_status, review_cancel).
@@ -722,6 +731,22 @@ def _cmd_review(args) -> int:
             store, Path(args.repo),
             reviewer=getattr(args, "reviewer", None),
             client_family=getattr(args, "client_family", None))
+    return _emit(text, code)
+
+
+def _cmd_stats(args) -> int:
+    """Read operational telemetry; this command never mutates gate/trust."""
+    from .services import svc_stats
+    from .store import Store
+
+    try:
+        store = Store.open(_store_path())
+    except BaseException as e:
+        return _emit(f"skodun stats: could not open the store: {e!r}", 2)
+    with store:
+        code, text = svc_stats(
+            store, getattr(args, "since_days", 7),
+            "json" if getattr(args, "json_output", False) else "text")
     return _emit(text, code)
 
 
@@ -1981,6 +2006,8 @@ def main(argv: list[str] | None = None) -> int:
                 # this carve-out does not name is "nothing ran", which 2
                 # already says correctly.
                 return 130
+        if args.command == "stats":
+            return _cmd_stats(args)
         if args.command == "providers":
             return _cmd_providers(args)
         if args.command == "import-legacy":

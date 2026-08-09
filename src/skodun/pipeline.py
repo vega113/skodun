@@ -1518,8 +1518,11 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             _note(f"this diff needs {planned} batch(es); the lock's published "
                   f"budget is now {int(needs)}s")
 
+        review_started_at = _iso_now()
         common = dict(
-            id=rid, reviewed_at=_iso_now(), source="skodun",
+            id=rid, reviewed_at=review_started_at,
+            review_started_at=review_started_at,
+            source="skodun",
             branch=branch, head=head, base_ref=base.ref, base_sha=base.sha,
             diff_hash=diff_hash, mode=mode, model=finder.model,
             adapter=adapter.name, timeout_seconds=d.timeout_sec,
@@ -1562,7 +1565,9 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             # and all of its linked worktrees agree on one value -- and so a
             # scoped reader cannot tell two checkouts of the same repository
             # apart, which is the intended equivalence.
-            repo=str(gitio.git_common_dir(repo)),
+            repo=scope,
+            repo_id=scope,
+            worktree_root=str(root),
             # Process identity for cancel-by-id (S1). Background workers already
             # attach a pid via the reservation lease; foreground rows need it
             # too so a peer can SIGTERM a live holder or demote a dead one.
@@ -2144,6 +2149,10 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
         # `worst_runtime_sec` is: it is a fact about the reservation, and a
         # worker recomputing it could disagree with the row it is finalizing.
         repo=reserved.get("repo"),
+        repo_id=reserved.get("repo_id") or reserved.get("repo"),
+        worktree_root=str(root),
+        review_started_at=reserved.get("review_started_at")
+                           or reserved.get("reviewed_at"),
     )
     #: `(threshold, foreground cap)`, or None when the two caps coincide.
     large_prompt = (cfg.dispatch.large_prompt_bytes, cfg.defaults.timeout_sec)

@@ -351,6 +351,22 @@ def svc_log(store, branch, limit, repo=None) -> tuple[int, str]:
     return 0, "\n".join(lines)
 
 
+def svc_stats(store, since_days=7, fmt="text") -> tuple[int, str]:
+    """Render CLI-only operational statistics from the store read model."""
+    from . import stats
+
+    try:
+        lower = stats.since_iso(since_days)
+        data = store.telemetry_stats(since_iso=lower)
+        return 0, stats.render(data, fmt=fmt)
+    except KeyboardInterrupt:
+        raise
+    except (TypeError, ValueError) as e:
+        return 2, f"skodun stats: refused: {e}"
+    except BaseException as e:
+        return 2, f"skodun stats: could not read the store: {e!r}"
+
+
 # --- surface ----------------------------------------------------------------
 
 

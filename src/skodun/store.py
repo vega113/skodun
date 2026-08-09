@@ -53,7 +53,7 @@ RUNNING = "running"
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def schema_too_new_message(store_version: int) -> str:
@@ -327,6 +327,30 @@ CREATE INDEX IF NOT EXISTS ix_api_spend_provider_day
   ON api_spend_events(provider, at);
 """
 
+# --- v9: explicit stage telemetry and repository identity -----------------
+#
+# These are additive read-model fields.  Existing rows stay NULL so stats can
+# report legacy coverage instead of pretending that an old timestamp had a
+# completion meaning it never had.  The tuple is transactional because every
+# ALTER TABLE is non-replayable after a partial crash.
+_MIGRATION_V9: tuple[str, ...] = (
+    "ALTER TABLE reviews ADD COLUMN review_started_at TEXT",
+    "ALTER TABLE reviews ADD COLUMN review_completed_at TEXT",
+    "ALTER TABLE reviews ADD COLUMN repo_id TEXT",
+    "ALTER TABLE reviews ADD COLUMN worktree_root TEXT",
+    "ALTER TABLE reviews ADD COLUMN orchestration_id TEXT",
+    "ALTER TABLE reviews ADD COLUMN attempt_ordinal INTEGER",
+    "ALTER TABLE reviews ADD COLUMN terminal_reason TEXT",
+    "ALTER TABLE reviews ADD COLUMN outcome TEXT",
+    "ALTER TABLE capacity_admissions ADD COLUMN queue_wait_ms INTEGER",
+    "ALTER TABLE capacity_admissions ADD COLUMN run_ms INTEGER",
+    "ALTER TABLE capacity_admissions ADD COLUMN total_admission_ms INTEGER",
+    """CREATE INDEX IF NOT EXISTS ix_reviews_repo_id_started
+       ON reviews(repo_id, review_started_at)""",
+    """CREATE INDEX IF NOT EXISTS ix_reviews_orchestration
+       ON reviews(orchestration_id, attempt_ordinal)""",
+)
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -354,6 +378,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (6, _MIGRATION_V6),
     (7, _MIGRATION_V7),
     (8, _MIGRATION_V8),
+    (9, _MIGRATION_V9),
 )
 
 
@@ -394,19 +419,34 @@ def _iso_now() -> str:
 
 def _wait_ms(queued_at: object, ended_at: object) -> int | None:
     """Milliseconds between two canonical store timestamps, or None if junk."""
+    return _duration_ms(queued_at, ended_at)
+
+
+def _duration_ms(start_at: object, end_at: object) -> int | None:
+    """Non-negative milliseconds between two canonical timestamps."""
     import calendar
 
-    if not isinstance(queued_at, str) or not isinstance(ended_at, str):
+    if not isinstance(start_at, str) or not isinstance(end_at, str):
         return None
-    if not _is_canonical_ts(queued_at) or not _is_canonical_ts(ended_at):
+    if not _is_canonical_ts(start_at) or not _is_canonical_ts(end_at):
         return None
     try:
-        q = time.strptime(queued_at, _TS_FORMAT)
-        e = time.strptime(ended_at, _TS_FORMAT)
+        start = time.strptime(start_at, _TS_FORMAT)
+        end = time.strptime(end_at, _TS_FORMAT)
     except ValueError:
         return None
-    delta = int((calendar.timegm(e) - calendar.timegm(q)) * 1000)
+    delta = int((calendar.timegm(end) - calendar.timegm(start)) * 1000)
     return max(0, delta)
+
+
+def _capacity_metrics(row: Mapping, ended_at: str) -> tuple[int | None, int | None,
+                                                            int | None]:
+    """Return queue-only, model-run, and compatibility-total durations."""
+    values = dict(row)
+    queue_wait = _duration_ms(values.get("queued_at"), values.get("admitted_at"))
+    run_ms = _duration_ms(values.get("started_at"), ended_at)
+    total = _duration_ms(values.get("queued_at"), ended_at)
+    return queue_wait, run_ms, total
 
 
 def _opt_positive_int(value: object) -> int | None:
@@ -640,6 +680,47 @@ def _normalize_record(rec: dict, *, label: str) -> dict:
             f"{label}: usable_output is required on a {SKODUN_SOURCE} "
             f"{PREPUSH_MODE} record (it is the only field that can tell a clean "
             f"round from a round that produced no answer at all)")
+    # v9 telemetry is additive.  New callers may omit the derived fields, but
+    # when a canonical legacy timestamp is available it is safe to identify it
+    # as the start of the recorded round.  Completion is assigned only for a
+    # terminal write; old rows remain NULL because migrations never backfill.
+    started = rec.get("review_started_at")
+    if started is None and _is_canonical_ts(rec.get("reviewed_at")):
+        rec["review_started_at"] = rec["reviewed_at"]
+    elif started is not None:
+        rec["review_started_at"] = _require_ts(
+            f"{label}: review_started_at", started)
+    if rec.get("status") != RUNNING and rec.get("review_completed_at") is None:
+        rec["review_completed_at"] = _iso_now()
+    elif rec.get("review_completed_at") is not None:
+        rec["review_completed_at"] = _require_ts(
+            f"{label}: review_completed_at", rec["review_completed_at"])
+    if rec.get("repo_id") is None and rec.get("repo") is not None:
+        rec["repo_id"] = rec["repo"]
+    if rec.get("repo_id") is not None:
+        rec["repo_id"] = _require_text(f"{label}: repo_id", rec["repo_id"])
+    if rec.get("worktree_root") is not None:
+        rec["worktree_root"] = _require_text(
+            f"{label}: worktree_root", rec["worktree_root"])
+    if rec.get("orchestration_id") is not None:
+        rec["orchestration_id"] = _require_text(
+            f"{label}: orchestration_id", rec["orchestration_id"])
+    ordinal = rec.get("attempt_ordinal")
+    if ordinal is not None and (
+            isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0):
+        raise ValueError(
+            f"{label}: attempt_ordinal must be a non-negative int, got {ordinal!r}")
+    if rec.get("terminal_reason") is not None:
+        rec["terminal_reason"] = _require_text(
+            f"{label}: terminal_reason", rec["terminal_reason"])
+    elif rec.get("status") != RUNNING:
+        reason = rec.get("failure_reason") or rec.get("stop_reason")
+        if isinstance(reason, str) and reason.strip():
+            rec["terminal_reason"] = reason.strip()
+    if rec.get("outcome") is not None:
+        rec["outcome"] = _require_text(f"{label}: outcome", rec["outcome"])
+    elif rec.get("status") != RUNNING and isinstance(rec.get("status"), str):
+        rec["outcome"] = rec["status"]
     return rec
 
 
@@ -652,6 +733,8 @@ _REVIEW_COLUMNS = (
     "diff_truncated", "trustworthy", "stop_reason", "findings_total", "sev_high",
     "sev_medium", "sev_low", "summary", "source", "artifact_json",
     "worst_runtime_sec", "pid", "superseded_by", "repo",
+    "review_started_at", "review_completed_at", "repo_id", "worktree_root",
+    "orchestration_id", "attempt_ordinal", "terminal_reason", "outcome",
 )
 
 
@@ -682,6 +765,10 @@ def _review_values(rec: Mapping) -> tuple:
         _opt_positive_int(rec.get("worst_runtime_sec")),
         _opt_positive_int(rec.get("pid")), rec.get("superseded_by"),
         rec.get("repo"),
+        rec.get("review_started_at"), rec.get("review_completed_at"),
+        rec.get("repo_id"), rec.get("worktree_root"),
+        rec.get("orchestration_id"), rec.get("attempt_ordinal"),
+        rec.get("terminal_reason"), rec.get("outcome"),
     )
 
 
@@ -1627,13 +1714,17 @@ class Store:
                 )
                 if reason is None:
                     continue
-                wait_ms = _wait_ms(row["queued_at"], ended_at)
+                queue_wait_ms, run_ms, total_admission_ms = _capacity_metrics(
+                    row, ended_at)
+                wait_ms = total_admission_ms
                 self._c.execute(
                     """UPDATE capacity_admissions
                        SET status='rejected', ended_at=?, wait_ms=?,
+                           queue_wait_ms=?, run_ms=?, total_admission_ms=?,
                            expire_reason=?
                        WHERE id=? AND status IN (?,?,?)""",
-                    (ended_at, wait_ms, reason, row["id"],
+                    (ended_at, wait_ms, queue_wait_ms, run_ms,
+                     total_admission_ms, reason, row["id"],
                      *self._CAPACITY_ACTIVE))
                 if self._c.execute("SELECT changes()").fetchone()[0]:
                     reclaimed.append(row["id"])
@@ -1778,12 +1869,16 @@ class Store:
             if row["status"] in self._CAPACITY_TERMINAL:
                 self._c.execute("COMMIT")
                 return dict(row)
-            wait_ms = _wait_ms(row["queued_at"], ended_at)
+            queue_wait_ms, run_ms, total_admission_ms = _capacity_metrics(
+                row, ended_at)
+            wait_ms = total_admission_ms
             self._c.execute(
                 """UPDATE capacity_admissions
-                   SET status=?, ended_at=?, wait_ms=?, expire_reason=?
+                   SET status=?, ended_at=?, wait_ms=?, queue_wait_ms=?,
+                       run_ms=?, total_admission_ms=?, expire_reason=?
                    WHERE id=?""",
-                (status, ended_at, wait_ms, expire_reason, admission_id))
+                (status, ended_at, wait_ms, queue_wait_ms, run_ms,
+                 total_admission_ms, expire_reason, admission_id))
             self._c.execute("COMMIT")
         except BaseException:
             try:
@@ -1872,6 +1967,132 @@ class Store:
                        ORDER BY reviewed_at DESC LIMIT 1"""
                 ).fetchone()
         return json.loads(row["artifact_json"]) if row else None
+
+    def telemetry_stats(self, *, since_iso: str) -> dict:
+        """Read the v9 operational telemetry model without mutating the store.
+
+        Timing aggregates use only explicitly named v9 fields.  A NULL is
+        coverage information, not an invitation to reinterpret the old
+        ``reviewed_at`` or ``wait_ms`` columns.
+        """
+        since_iso = _require_ts("since_iso", since_iso)
+
+        def percentile(values: list[int], p: float) -> int | None:
+            if not values:
+                return None
+            ordered = sorted(values)
+            # Nearest-rank percentiles are deterministic for small operational
+            # samples and avoid interpolating a value the store never observed.
+            rank = max(1, int((len(ordered) * p) + 0.999999999))
+            return ordered[rank - 1]
+
+        def timing(values: list[int]) -> dict:
+            return {"count": len(values), "p50_ms": percentile(values, .50),
+                    "p90_ms": percentile(values, .90),
+                    "total_ms": sum(values)}
+
+        review_rows = self._c.execute(
+            """SELECT review_started_at, review_completed_at, reviewed_at,
+                      repo_id, repo, trustworthy, findings_total,
+                      orchestration_id, attempt_ordinal, outcome, terminal_reason
+                 FROM reviews
+                WHERE COALESCE(review_started_at, reviewed_at) >= ?
+                ORDER BY COALESCE(review_started_at, reviewed_at), id""",
+            (since_iso,)).fetchall()
+        review_total = len(review_rows)
+        complete = [r for r in review_rows
+                    if r["review_started_at"] is not None
+                    and r["review_completed_at"] is not None]
+        trustworthy = sum(r["trustworthy"] == 1 for r in review_rows)
+        findings = sum(int(r["findings_total"] or 0) for r in review_rows)
+        by_repo: dict[str, dict] = {}
+        for row in review_rows:
+            repo_id = row["repo_id"] or "legacy:unresolved"
+            bucket = by_repo.setdefault(repo_id, {
+                "repo_id": repo_id, "reviews": 0, "trustworthy": 0,
+                "findings": 0, "legacy_rows": 0,
+            })
+            bucket["reviews"] += 1
+            bucket["trustworthy"] += int(row["trustworthy"] == 1)
+            bucket["findings"] += int(row["findings_total"] or 0)
+            bucket["legacy_rows"] += int(row["repo_id"] is None)
+        for bucket in by_repo.values():
+            bucket["trustworthy_rate"] = (
+                bucket["trustworthy"] / bucket["reviews"]
+                if bucket["reviews"] else None)
+
+        capacity_rows = self._c.execute(
+            """SELECT resource_class, status, queue_wait_ms, run_ms,
+                      total_admission_ms, wait_ms, expire_reason
+                 FROM capacity_admissions
+                WHERE queued_at >= ?""", (since_iso,)).fetchall()
+        queue = [int(r["queue_wait_ms"]) for r in capacity_rows
+                 if r["queue_wait_ms"] is not None]
+        run = [int(r["run_ms"]) for r in capacity_rows
+               if r["run_ms"] is not None]
+        total = [int(r["total_admission_ms"]) for r in capacity_rows
+                 if r["total_admission_ms"] is not None]
+        capacity_by_resource: dict[str, dict] = {}
+        for row in capacity_rows:
+            bucket = capacity_by_resource.setdefault(row["resource_class"], {
+                "resource_class": row["resource_class"], "rows": 0,
+                "expired": 0, "rejected": 0, "telemetry_rows": 0,
+            })
+            bucket["rows"] += 1
+            bucket["expired"] += int(row["status"] == "expired")
+            bucket["rejected"] += int(row["status"] == "rejected")
+            bucket["telemetry_rows"] += int(
+                row["queue_wait_ms"] is not None
+                and row["run_ms"] is not None
+                and row["total_admission_ms"] is not None)
+
+        return {
+            "since": since_iso,
+            "reviews": {
+                "total": review_total,
+                "telemetry_rows": len(complete),
+                "legacy_rows": review_total - len(complete),
+                "repo_coverage": sum(r["repo_id"] is not None for r in review_rows),
+                "trustworthy": trustworthy,
+                "trustworthy_rate": trustworthy / review_total
+                    if review_total else None,
+                "findings": findings,
+                "by_repo": sorted(by_repo.values(), key=lambda r: r["repo_id"]),
+            },
+            "timing": {
+                "review_ms": timing([
+                    d for r in complete
+                    for d in [_duration_ms(r["review_started_at"],
+                                           r["review_completed_at"])]
+                    if d is not None]),
+                "capacity_queue_ms": timing(queue),
+                "capacity_run_ms": timing(run),
+                "capacity_total_admission_ms": timing(total),
+            },
+            "capacity": {
+                "rows": len(capacity_rows),
+                "telemetry_rows": len(total),
+                "expired": sum(r["status"] == "expired" for r in capacity_rows),
+                "rejected": sum(r["status"] == "rejected" for r in capacity_rows),
+                "by_resource": sorted(capacity_by_resource.values(),
+                                      key=lambda r: r["resource_class"]),
+            },
+            "identities": {
+                "first_trust": sum(r["attempt_ordinal"] == 0
+                                    for r in review_rows),
+                "recovered": sum(r["attempt_ordinal"] is not None
+                                  and r["attempt_ordinal"] > 0
+                                  and r["trustworthy"] == 1
+                                  for r in review_rows),
+                "never_trustworthy": sum(
+                    r["orchestration_id"] is not None and r["trustworthy"] != 1
+                    for r in review_rows),
+            },
+            "reuse": {
+                "hits": sum(r["outcome"] == "reuse" for r in review_rows),
+                "misses": sum(r["outcome"] == "reuse_miss" for r in review_rows),
+            },
+        }
 
     # --- feedback ledger (v7; non-gate) ------------------------------------
 

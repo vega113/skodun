@@ -519,6 +519,16 @@ def git_common_dir(repo: Path) -> Path:
     return Path(_out(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
 
 
+def repository_identity(repo: Path) -> str:
+    """Stable local identity for a repository and all linked worktrees."""
+    return str(git_common_dir(Path(repo)))
+
+
+def observed_worktree_root(repo: Path) -> str:
+    """Resolved checkout root retained alongside ``repository_identity``."""
+    return str(_worktree_root(Path(repo)).resolve())
+
+
 def current_branch(repo: Path) -> str:
     return _out(repo, "rev-parse", "--abbrev-ref", "HEAD")
 
