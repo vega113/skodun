@@ -103,7 +103,7 @@ def test_opt_in_reuse_returns_existing_review_without_running_pipeline(
         repo_id="/repo/.git", worktree_root="/repo", branch="feature",
         head="h" * 40, base_sha="b" * 40, diff_hash="d" * 40,
         context_hash="c" * 64, checklist_hash="k" * 64,
-        tree_fingerprint="t" * 64)
+        tree_fingerprint="t" * 64, security_policy_hash="p" * 64)
     candidate = {
         "id": "r1", "reviewed_at": "2026-08-09T00:00:00Z",
         "branch": "feature", "head": identity.head, "base_ref": "main",
@@ -111,6 +111,7 @@ def test_opt_in_reuse_returns_existing_review_without_running_pipeline(
         "context_hash": identity.context_hash,
         "checklist_hash": identity.checklist_hash,
         "tree_fingerprint": identity.tree_fingerprint,
+        "security_policy_hash": identity.security_policy_hash,
         "repo_id": identity.repo_id, "worktree_root": identity.worktree_root,
         "mode": "now", "source": "skodun", "status": "clean",
         "parse_ok": True, "degraded": False, "diff_truncated": False,

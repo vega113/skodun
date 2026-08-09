@@ -54,7 +54,7 @@ _REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def schema_too_new_message(store_version: int) -> str:
@@ -381,6 +381,11 @@ _MIGRATION_V10: tuple[str, ...] = (
    ON reuse_events(matched_review_id, at DESC)""",
 )
 
+# --- v11: security-pass identity for exact foreground reuse ---------------
+_MIGRATION_V11: tuple[str, ...] = (
+    "ALTER TABLE reuse_events ADD COLUMN security_policy_hash TEXT",
+)
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -410,6 +415,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (8, _MIGRATION_V8),
     (9, _MIGRATION_V9),
     (10, _MIGRATION_V10),
+    (11, _MIGRATION_V11),
 )
 
 
@@ -992,6 +998,7 @@ class Store:
             diff_hash: str | None = None, context_hash: str | None = None,
             checklist_hash: str | None = None,
             tree_fingerprint: str | None = None,
+            security_policy_hash: str | None = None,
             requested_reviewer: str | None = None,
             client_family: str | None = None,
             matched_review_id: str | None = None) -> dict:
@@ -1007,6 +1014,7 @@ class Store:
             "branch": branch, "base_sha": base_sha, "diff_hash": diff_hash,
             "context_hash": context_hash, "checklist_hash": checklist_hash,
             "tree_fingerprint": tree_fingerprint,
+            "security_policy_hash": security_policy_hash,
             "requested_reviewer": requested_reviewer,
             "client_family": client_family,
             "matched_review_id": matched_review_id,
@@ -1018,12 +1026,14 @@ class Store:
             """INSERT INTO reuse_events
                (at, outcome, reason, repo_id, worktree_root, branch, base_sha,
                 diff_hash, context_hash, checklist_hash, tree_fingerprint,
-                requested_reviewer, client_family, matched_review_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                security_policy_hash, requested_reviewer, client_family,
+                matched_review_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (at, outcome, reason, values["repo_id"], values["worktree_root"],
              values["branch"], values["base_sha"], values["diff_hash"],
              values["context_hash"], values["checklist_hash"],
-             values["tree_fingerprint"], values["requested_reviewer"],
+             values["tree_fingerprint"], values["security_policy_hash"],
+             values["requested_reviewer"],
              values["client_family"], values["matched_review_id"]))
         seq = int(cur.lastrowid)
         row = self._c.execute(

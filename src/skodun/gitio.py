@@ -554,22 +554,28 @@ def tree_fingerprint(repo: Path, *, paths=None) -> str:
     h = hashlib.sha256()
     h.update(head_sha(root).encode("ascii"))
     h.update(b"\0status\0")
-    status_tokens = _paths(status)
-    changed_paths = []
-    for token in status_tokens:
-        if token:
-            changed_paths.append(
-                token[3:] if len(token) >= 3 and token[2] == " " else token)
+    tokens = [token for token in _paths(status) if token]
+    entries = []
+    pending = iter(tokens)
+    for token in pending:
+        if len(token) < 3 or token[2] != " ":
+            raise GitError("malformed git status record")
+        code, name = token[:2], token[3:]
+        entry_paths = [name]
+        if "R" in code or "C" in code:
+            source = next(pending, None)
+            if source is None:
+                raise GitError("incomplete git rename status record")
+            entry_paths.append(source)
+        entries.append((token, entry_paths))
+    changed_paths = [name for _, names in entries for name in names]
     fingerprint_paths = (changed_paths if paths is None else list(paths))
     if paths is None:
         h.update(status)
     else:
         wanted = set(fingerprint_paths)
-        for token in status_tokens:
-            if not token:
-                continue
-            name = token[3:] if len(token) >= 3 and token[2] == " " else token
-            if name in wanted:
+        for token, entry_paths in entries:
+            if any(name in wanted for name in entry_paths):
                 h.update(token.encode("utf-8", "surrogateescape"))
                 h.update(b"\0")
     for name in fingerprint_paths:
@@ -582,6 +588,9 @@ def tree_fingerprint(repo: Path, *, paths=None) -> str:
         except FileNotFoundError:
             h.update(b"\0missing")
             continue
+        except OSError as exc:
+            raise GitError(
+                f"tree fingerprint could not stat {name}: {exc}") from exc
         h.update(b"\0mode\0" + info.st_mode.to_bytes(4, "big"))
         if stat.S_ISLNK(info.st_mode):
             target = os.readlink(path).encode("utf-8", "surrogateescape")
@@ -607,6 +616,16 @@ def tree_fingerprint(repo: Path, *, paths=None) -> str:
             finally:
                 if fd is not None:
                     os.close(fd)
+        elif stat.S_ISDIR(info.st_mode):
+            staged = _run(root, "ls-files", "--stage", "--", name).stdout
+            if not staged.startswith(b"160000 "):
+                raise GitError(f"tree fingerprint found unsafe path: {name}")
+            h.update(b"\0gitlink\0" + staged)
+            try:
+                current = _out(path, "rev-parse", "HEAD")
+            except GitError:
+                current = "uninitialized"
+            h.update(current.encode("utf-8", "surrogateescape"))
         else:
             raise GitError(f"tree fingerprint found unsafe path: {name}")
     return h.hexdigest()

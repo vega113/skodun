@@ -49,7 +49,7 @@
 
 - [x] **Step 1: Write failing service, CLI parser, MCP handler, and schema tests** for `--reuse-trusted`, `--fresh`, `reuse_trusted`, and `fresh`, including no provider invocation/capacity acquisition on a hit and current-triage status on a hit.
 - [x] **Step 2: Run the focused tests and confirm they fail because the flags and service seam are absent.**
-- [x] **Step 3: Add `tree_fingerprint` and deterministic batched checklist/context identities to foreground artifacts, add the opt-in service probe before `_svc_review_once`, append hit/miss/bypass/error audit rows, and preserve the existing fresh path and wording. Return the reused review ID in CLI/MCP text and structured metadata.
+- [x] **Step 3: Add `tree_fingerprint`, deterministic batched checklist/context identities, and security-pass policy identity to foreground artifacts, add the opt-in service probe before `_svc_review_once`, append hit/miss/bypass/error audit rows, and preserve the existing fresh path and wording. Return the reused review ID in CLI/MCP text and structured metadata.
 - [x] **Step 4: Run the focused service, pipeline, CLI, and MCP tests and confirm they pass.**
 
 ## Task 4: Add telemetry coverage and perform delivery verification

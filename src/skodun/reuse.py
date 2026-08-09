@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import (batching, budget, checklist, contextpack, gitio, passes,
@@ -30,6 +30,7 @@ class ReuseIdentity:
     context_hash: str | None
     checklist_hash: str | None
     tree_fingerprint: str
+    security_policy_hash: str
 
 
 @dataclass(frozen=True)
@@ -69,9 +70,22 @@ def aggregate_context_identity(context_hashes, *, enabled: bool) -> str | None:
     if (not context_hashes
             or any(not isinstance(value, str) or not value.strip()
                    for value in context_hashes)):
-        return None
+        return ""
     body = json.dumps(list(context_hashes), separators=(",", ":"))
     return hashlib.sha256(body.encode("ascii")).hexdigest()
+
+
+def security_policy_identity(cfg) -> str:
+    """Hash security-pass inputs that can change coverage of this diff."""
+    reviewers = [asdict(reviewer) for reviewer in cfg.reviewers]
+    body = json.dumps({
+        "path_segments": list(cfg.defaults.security_path_segments),
+        "basename_patterns": list(cfg.defaults.security_basename_patterns),
+        "prompt_slots": list(cfg.defaults.security_prompt_slots),
+        "kill_switch": os.environ.get("SKODUN_SECURITY_PASS", "1"),
+        "reviewers": reviewers,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def _reviewer_by_name(cfg, name: object):
@@ -84,8 +98,10 @@ def _reviewer_by_name(cfg, name: object):
 
 
 def _context_hash(root: Path, diff, cfg, reviewer):
-    if not cfg.defaults.context_pack or reviewer is None:
+    if not cfg.defaults.context_pack:
         return None
+    if reviewer is None:
+        return ""
     max_bytes = budget.prompt_budget(cfg.defaults, reviewer)
     headroom = promptbuild.context_headroom(
         max_bytes, len(diff.data), packing=True)
@@ -93,7 +109,7 @@ def _context_hash(root: Path, diff, cfg, reviewer):
         root, list(diff.files), dict(diff.statuses), headroom,
         pack_large_added=False)
     value = pack.sha256
-    return value if isinstance(value, str) and value.strip() else None
+    return value if isinstance(value, str) and value.strip() else ""
 
 
 def _identity_for(repo: Path, cfg, base, diff, *, branch: str,
@@ -123,6 +139,7 @@ def _identity_for(repo: Path, cfg, base, diff, *, branch: str,
         context_hash=context_hash,
         checklist_hash=checklist_hash,
         tree_fingerprint=gitio.tree_fingerprint(root, paths=diff.files),
+        security_policy_hash=security_policy_identity(cfg),
     )
 
 
@@ -178,7 +195,7 @@ def _candidate_matches(candidate: dict, identity: ReuseIdentity) -> bool:
         return False
     required = (
         "repo_id", "worktree_root", "base_sha", "diff_hash",
-        "checklist_hash", "tree_fingerprint")
+        "checklist_hash", "tree_fingerprint", "security_policy_hash")
     if any(not isinstance(candidate.get(key), str)
            or not candidate[key].strip() for key in required):
         return False
@@ -186,7 +203,8 @@ def _candidate_matches(candidate: dict, identity: ReuseIdentity) -> bool:
     if identity.context_hash is None:
         if candidate_context not in (None, ""):
             return False
-    elif (not isinstance(candidate_context, str)
+    elif (not identity.context_hash
+          or not isinstance(candidate_context, str)
           or not candidate_context.strip()
           or candidate_context != identity.context_hash):
         return False

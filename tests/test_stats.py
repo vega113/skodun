@@ -42,14 +42,15 @@ def test_v9_migration_adds_nullable_telemetry_columns(tmp_path):
     raw.close()
 
     st = Store.open(db)
-    assert SCHEMA_VERSION == 10
+    assert SCHEMA_VERSION == 11
     cols = {r[1] for r in st._c.execute("PRAGMA table_info(reviews)")}
     assert {"review_started_at", "review_completed_at", "repo_id",
             "worktree_root", "orchestration_id", "attempt_ordinal",
             "terminal_reason", "outcome"} <= cols
     reuse_cols = {r[1] for r in st._c.execute(
         "PRAGMA table_info(reuse_events)")}
-    assert {"at", "outcome", "reason", "matched_review_id"} <= reuse_cols
+    assert {"at", "outcome", "reason", "matched_review_id",
+            "security_policy_hash"} <= reuse_cols
     row = st._c.execute(
         "SELECT review_started_at, repo_id FROM reviews WHERE id='legacy'").fetchone()
     assert row["review_started_at"] is None and row["repo_id"] is None

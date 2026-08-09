@@ -1543,6 +1543,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             branch=branch, head=head, base_ref=base.ref, base_sha=base.sha,
             diff_hash=diff_hash, mode=mode, model=finder.model,
             tree_fingerprint=tree_fingerprint, checklist_hash="",
+            security_policy_hash=reuse.security_policy_identity(cfg),
             adapter=adapter.name, timeout_seconds=d.timeout_sec,
             max_turns=d.max_turns,
             # WHICH SKODUN ASKED. `adapter`/`model` name who answered and

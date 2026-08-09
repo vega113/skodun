@@ -1035,7 +1035,7 @@ def test_schema_is_frozen_at_the_phase1_baseline():
 def test_fresh_db_lands_at_schema_version(tmp_path):
     db = tmp_path / "s.db"
     st = Store.open(db)
-    assert SCHEMA_VERSION == 10
+    assert SCHEMA_VERSION == 11
     assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert ("table", "provider_state") in _objects(db)
     assert V6_TABLE in _objects(db)
@@ -1568,7 +1568,7 @@ def test_no_non_transactional_delta_carries_a_non_idempotent_statement():
             assert isinstance(delta, tuple) and all(isinstance(s, str) for s in delta)
     # The last rung is what a fresh store is stamped with. v8 is the
     # replay-idempotent str lane; v9 is transactional because it adds columns.
-    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 10
+    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 11
     assert isinstance(_MIGRATIONS[-1][1], tuple)
     assert any(isinstance(d, tuple) for _, d in _MIGRATIONS)
 
@@ -1607,7 +1607,7 @@ def test_a_v3_store_gains_the_widened_vocabulary_and_the_reference_column(tmp_pa
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 10
+    assert _user_version(db) == SCHEMA_VERSION == 11
     # A v3 store climbs v4–v9 in one open: v5 index + capacity, feedback,
     # spend, and telemetry indexes.
     assert _objects(db) == before | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS, (
@@ -1911,7 +1911,7 @@ def test_a_v4_store_gains_the_repo_column_and_its_index(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 10
+    assert _user_version(db) == SCHEMA_VERSION == 11
     assert "repo" in _columns(db, "reviews")
     row = st._c.execute("SELECT repo FROM reviews WHERE id='r1'").fetchone()
     assert row["repo"] is None, "a pre-v5 row must not be backfilled"
@@ -1935,7 +1935,7 @@ def test_a_v5_store_gains_capacity_admissions(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 10
+    assert _user_version(db) == SCHEMA_VERSION == 11
     assert _objects(db) - before == V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS
     assert "repo" in _columns(db, "reviews")
     st.close()
@@ -1964,7 +1964,7 @@ def test_a_v6_store_gains_feedback_events(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 10
+    assert _user_version(db) == SCHEMA_VERSION == 11
     assert _objects(db) - before == V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS
     st.close()
 

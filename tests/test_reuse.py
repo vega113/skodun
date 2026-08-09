@@ -15,7 +15,7 @@ def _identity(**changes):
         repo_id="/repo/.git", worktree_root="/repo", branch="feature",
         head="h" * 40, base_sha="b" * 40, diff_hash="d" * 40,
         context_hash="c" * 64, checklist_hash="k" * 64,
-        tree_fingerprint="t" * 64,
+        tree_fingerprint="t" * 64, security_policy_hash="p" * 64,
     )
     values.update(changes)
     return reuse.ReuseIdentity(**values)
@@ -28,6 +28,7 @@ def _record(identity: reuse.ReuseIdentity, **changes):
         diff_hash=identity.diff_hash, context_hash=identity.context_hash,
         checklist_hash=identity.checklist_hash,
         tree_fingerprint=identity.tree_fingerprint,
+        security_policy_hash=identity.security_policy_hash,
         repo_id=identity.repo_id, worktree_root=identity.worktree_root,
         mode="now", source="skodun", status="clean", parse_ok=True,
         degraded=False, diff_truncated=False, findings=[], findings_total=0,
@@ -105,7 +106,8 @@ def test_each_identity_mismatch_is_a_miss(tmp_path):
     with Store.open(db) as store:
         store.save_review(_record(identity))
         for field in ("repo_id", "base_sha", "diff_hash", "context_hash",
-                      "checklist_hash", "tree_fingerprint"):
+                      "checklist_hash", "tree_fingerprint",
+                      "security_policy_hash"):
             changed = identity.__dict__.copy()
             changed[field] = "x" * len(changed[field])
             assert reuse.find_exact_candidate(
@@ -120,7 +122,20 @@ def test_untrustworthy_candidate_is_never_reused(tmp_path):
 
 
 def test_disabled_context_pack_can_match_without_a_context_hash(tmp_path):
-    identity = _identity(context_hash=None)
+    repo = _mkrepo(tmp_path)
+    (repo / ".skodun.toml").write_text(
+        '[[reviewers]]\nname = "finder"\nprovider = "xai"\nmodel = "m"\n',
+        encoding="utf-8")
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    cfg = load_config(repo)
+    cfg = replace(cfg, defaults=replace(cfg.defaults, context_pack=False))
+    base = resolve_base(repo)
+    diff = capture_diff(repo, base.sha, cfg.defaults.untracked_max)
+    identity = reuse._identity_for(
+        repo, cfg, base, diff, branch=current_branch(repo),
+        reviewer_name="finder")
+    assert identity.context_hash is None
     with Store.open(tmp_path / "reuse.db") as store:
         store.save_review(_record(identity, context_hash=""))
         assert reuse.find_exact_candidate(store, identity)["id"] == "r1"
