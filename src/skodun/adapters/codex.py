@@ -459,9 +459,9 @@ class CodexAdapter:
                     if sig in diagnostics:
                         return ClassifyResult(
                             "unavailable", category,
-                            _sanitized_diagnostic(
+                            (_sanitized_diagnostic(
                                 diagnostics, rc=rc) + f" [{category}: "
-                                f"{sig.decode()}]")
+                                f"{sig.decode()}]")[:_DIAGNOSTIC_LIMIT])
             if rc != 0 and not events and not stdout:
                 for category, signals in (
                         ("invocation", _INVOCATION_SIGNALS),

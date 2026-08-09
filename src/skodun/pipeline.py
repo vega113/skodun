@@ -1088,6 +1088,7 @@ def resolve_review_head(cfg: Config, store: Store, *,
                         requested: str | None = None,
                         client_family: str | None = None,
                         avoid_providers: set[str] | None = None,
+                        prompt_size: int | None = None,
                         ) -> tuple[Reviewer, dict]:
     """The entry that heads THIS run's chain, and the audit of how it was chosen.
 
@@ -1127,7 +1128,8 @@ def resolve_review_head(cfg: Config, store: Store, *,
     elif cfg.routing.mode == "auto":
         route = routing.auto_route(
             cfg, store, client_family=client_family,
-            excluded_providers=avoid_providers)
+            excluded_providers=avoid_providers,
+            prompt_size=prompt_size)
         if route is None:
             # Nothing routable: an empty pool, every candidate blacked out, or a
             # store that could not answer. A configured head still runs and
@@ -1762,6 +1764,36 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 prompt = promptbuild.build(
                     branch, base.ref, base.sha, f"{head} (working tree)",
                     diff.data, mdb, selection, pack_body)
+
+                # The first route happens before the diff and prompt exist so
+                # it can participate in preflight. Once the shipped prompt is
+                # rendered, run the same auto-router with its real size. This
+                # closes the argv-bound candidate gap without moving routing
+                # into the model-call path. A small safety margin covers the
+                # candidate-specific head label and invocation framing.
+                if (requested is None and cfg.routing.mode == "auto"):
+                    reroute = routing.auto_route(
+                        cfg, store, client_family=client_family,
+                        excluded_providers=avoid_providers,
+                        prompt_size=prompt.prompt_bytes + 256)
+                    if (reroute is not None
+                            and reroute.reviewer.name != finder.name):
+                        finder = reroute.reviewer
+                        route_meta = {
+                            "requested_reviewer": requested,
+                            "routed_reviewer": finder.name,
+                            "route_reason": reroute.reason,
+                            "client_family": client_family,
+                        }
+                        routed_pool = quota_pool_for(finder)
+                        if routed_pool != finder.provider:
+                            route_meta["quota_pool"] = routed_pool
+                        adapter = _adapter_for(finder)
+                        common.update(model=finder.model, adapter=adapter.name,
+                                      **route_meta)
+                        prompt = promptbuild.build(
+                            branch, base.ref, base.sha, f"{head} (working tree)",
+                            diff.data, mdb, selection, pack_body)
                 if prompt.diff_truncated:
                     # Reachable only for a diff that is over the envelope and
                     # was NOT batched, i.e. one this build refused to split.

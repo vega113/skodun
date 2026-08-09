@@ -54,7 +54,7 @@ _REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 def schema_too_new_message(store_version: int) -> str:
@@ -386,6 +386,16 @@ _MIGRATION_V11: tuple[str, ...] = (
     "ALTER TABLE reuse_events ADD COLUMN security_policy_hash TEXT",
 )
 
+# --- v12: quota-pool provider-state contract ------------------------------
+#
+# Pool identity is encoded in the existing provider_state key so v11 stores
+# remain readable without a destructive table rebuild. The version bump is
+# still required: older processes must refuse a store that contains the new
+# logical rows rather than silently treating a pool-specific blackout as a
+# provider-wide one. There is no DDL to apply; the empty transactional delta
+# records that compatibility boundary in the migration ladder.
+_MIGRATION_V12: tuple[str, ...] = ()
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -416,6 +426,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (9, _MIGRATION_V9),
     (10, _MIGRATION_V10),
     (11, _MIGRATION_V11),
+    (12, _MIGRATION_V12),
 )
 
 

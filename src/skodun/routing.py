@@ -550,7 +550,11 @@ def _argmax(pool: Sequence[Reviewer], loads: Mapping[str, ProviderLoad], *,
             continue
         score = score_candidate(
             entry, load, client_family=client_family, cross_model=cross_model,
-            share=None if shares is None else shares.get(quota_pool_for(entry)))
+            # Weights express a share of the provider subscription. Capacity
+            # and blackout state are pool-scoped, but the share term remains
+            # provider-scoped so a provider split into multiple quota pools
+            # does not silently receive the default weight once per pool.
+            share=None if shares is None else shares.get(entry.provider))
         # STRICTLY greater, so an equal score leaves the earlier candidate in
         # place: that is the first-listed tie-break, and it is one comparison
         # rather than a sort key nobody would read the same way twice.
@@ -639,10 +643,9 @@ def provider_loads(store, pool: Sequence[Reviewer], *,
                    ) -> dict[str, ProviderLoad]:
     """Store-visible load for every provider named in `pool`.
 
-    One entry per DISTINCT provider: two reviewer entries on the same provider
-    share one `provider:<id>` FIFO, so they share one picture of it, and
-    counting it twice would make a provider look busier the more ways an
-    operator configured it.
+    One entry per DISTINCT quota pool: reviewer entries on the same pool share
+    one `provider:<pool>` FIFO, while separate pools on one adapter get
+    independent capacity and blackout state.
 
     Best-effort per provider, and that posture is the point: a store that cannot
     answer about one provider must not fail a review. Such a provider is marked
@@ -808,10 +811,14 @@ def _shares_for(cfg: Config, pool: Sequence[Reviewer],
     weights = dict(cfg.routing.weights)
     if not weights:
         return None
-    providers = [
-        p for p in dict.fromkeys(quota_pool_for(e) for e in pool)
-        if p in loads and not loads[p].unavailable
-    ]
+    # The candidate set is pool-aware for availability, but weights and served
+    # history are deliberately provider-scoped. A Google reviewer can have a
+    # Gemini pool blacked out while its Claude/GPT pool remains eligible; the
+    # provider still belongs in the denominator exactly once.
+    providers = list(dict.fromkeys(
+        entry.provider for entry in pool
+        if (quota_pool_for(entry) in loads
+            and not loads[quota_pool_for(entry)].unavailable)))
     served = provider_served(
         store, providers, window_days=cfg.routing.weights_window_days)
     if served is None:

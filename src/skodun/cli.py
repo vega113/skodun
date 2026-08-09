@@ -1458,11 +1458,19 @@ def _cmd_providers(args) -> int:
                          if pool_states else "")
             shown_binary = _shown_binary(binary, shown_field,
                                          MAX_ANNOTATION_DISPLAY_CHARS)
-            # S4: cheap active holder count for provider:<id> (admitted+running).
+            # S4: active holders are keyed by the same quota pool used by
+            # routing and chain admission. Report the aggregate on the
+            # provider line while keeping pool state details beside it.
             try:
                 from . import capacity as capacity_mod
-                holders = store.capacity_holder_count(
-                    capacity_mod.provider_resource_class(provider), provider)
+                holder_pools = tuple(configured_pools) or (provider,)
+                holder_values = [
+                    store.capacity_holder_count(
+                        capacity_mod.provider_resource_class(provider, pool),
+                        pool)
+                    for pool in holder_pools
+                ]
+                holders = sum(int(value) for value in holder_values)
             except Exception:
                 holders = None
             holders_bit = (f" | holders={holders}"

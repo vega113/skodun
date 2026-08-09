@@ -227,6 +227,24 @@ def test_google_quota_pools_route_independently(store):
     assert route.reviewer.name == "gemini"
 
 
+def test_google_quota_pools_share_one_provider_weight(store):
+    gemini = Reviewer(name="gemini", provider="google",
+                      model="gemini-3.6-flash", role="finder")
+    claude = Reviewer(name="claude", provider="google",
+                      model="claude-sonnet-4-6", role="finder")
+    xai = _entry("xai", "xai")
+    _seed_served(store, {"agy": 3, "grok": 1})
+    cfg = _cfg(gemini, claude, xai,
+               weights=(("google", 9), ("xai", 1)))
+
+    shares = routing._shares_for(
+        cfg, resolve_pool(cfg), provider_loads(store, resolve_pool(cfg)), store)
+
+    assert set(shares) == {"google", "xai"}
+    assert shares["google"].target == pytest.approx(0.9)
+    assert shares["google"].actual == pytest.approx(0.75)
+
+
 def test_auto_route_includes_confined_junie_when_feasible(monkeypatch, store,
                                                           tmp_path):
     monkeypatch.setattr("skodun.adapters.junie.sys.platform", "darwin")
@@ -554,6 +572,20 @@ def test_mode_auto_routes_off_the_busy_provider_and_records_why(store):
     assert meta == {"requested_reviewer": None,
                     "routed_reviewer": "finder-codex",
                     "route_reason": ROUTE_FREE, "client_family": None}
+
+
+def test_head_resolution_forwards_prompt_size_to_auto_router(store, monkeypatch):
+    cfg = _cfg(_entry("finder-grok", "xai"), _entry("finder-codex", "openai"))
+    seen = {}
+
+    def fake_auto_route(_cfg, _store, **kwargs):
+        seen.update(kwargs)
+        return routing.Route(cfg.reviewers[0], ROUTE_FREE)
+
+    monkeypatch.setattr(routing, "auto_route", fake_auto_route)
+    _head(cfg, store, prompt_size=12345)
+
+    assert seen["prompt_size"] == 12345
 
 
 def test_recovery_exclusion_does_not_fall_back_to_a_terminal_provider(store):

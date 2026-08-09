@@ -544,7 +544,7 @@ def test_nonzero_empty_output_unknown_failure_stays_untrusted_but_is_bounded():
         REVIEW_CONTRACT)
     assert res.kind == "ok"
     assert res.detail
-    assert len(res.detail) <= 500
+    assert len(res.detail) <= 400
 
 
 def test_auth_capture_is_unavailable_auth():
