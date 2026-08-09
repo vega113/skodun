@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -187,6 +188,22 @@ class JunieAdapter:
     def prompt_limit(self) -> int | None:
         """No ceiling: the prompt travels as a file into the capsule, then stdin."""
         return None
+
+    def routing_eligibility(self) -> tuple[bool, str]:
+        """Cheap auto-route check that never offers an unconfined fallback."""
+        if sys.platform != "darwin":
+            return False, "junie confinement requires macOS"
+        try:
+            from .junie_sanitized import resolve_sandbox_exec
+            resolve_sandbox_exec()
+        except Exception as exc:  # noqa: BLE001 - routing must stay best effort
+            return False, str(exc)
+        binary = self.resolve_binary()
+        present = (os.path.exists(binary) if os.path.sep in binary
+                   else shutil.which(binary) is not None)
+        if not present:
+            return False, f"junie binary is unavailable: {binary}"
+        return True, ""
 
     def build_cmd(
         self,

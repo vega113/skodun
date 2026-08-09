@@ -35,7 +35,7 @@ from . import capacity, runner
 from .adapters import (PROMPT_TOO_LARGE_CATEGORY, REVIEW_CONTRACT,
                        UNAVAILABLE_RC, ClassifyResult, OutputContract,
                        ParseResult, PromptTooLarge, get_adapter)
-from .config import Config, Defaults, Reviewer
+from .config import Config, Defaults, Reviewer, quota_pool_for
 from .store import Store, _TS_FORMAT
 
 #: Default provider-slot wait when ``SKODUN_ADMISSION_WAIT_SECONDS`` is unset.
@@ -140,7 +140,8 @@ def _binary_is_absent(binary: str) -> bool:
     return shutil.which(binary) is None
 
 
-def _cached_unavailable(store: Store, provider: str) -> str | None:
+def _cached_unavailable(store: Store, provider: str,
+                        quota_pool: str | None = None) -> str | None:
     """The cached reason to skip `provider` right now, or None.
 
     Guarded: the cache is an optimisation that saves a doomed model call, so a
@@ -150,7 +151,11 @@ def _cached_unavailable(store: Store, provider: str) -> str | None:
     """
     from .pipeline import _iso_now, _note
     try:
-        return store.provider_unavailable_reason(provider, _iso_now())
+        now = _iso_now()
+        if quota_pool is None or quota_pool == provider:
+            return store.provider_unavailable_reason(provider, now)
+        return store.provider_unavailable_reason(provider, now,
+                                                 quota_pool=quota_pool)
     except Exception as e:      # pragma: no cover - defensive
         _note(f"could not read the provider-availability cache: {e!r}")
         return None
@@ -168,7 +173,8 @@ def _iso_at(epoch: float) -> str:
     return time.strftime(_TS_FORMAT, time.gmtime(epoch))
 
 
-def _remember_unavailable(store: Store, provider: str, verdict) -> None:
+def _remember_unavailable(store: Store, provider: str, verdict,
+                          quota_pool: str | None = None) -> None:
     """Cache an `unavailable` verdict — but ONLY when it is a `quota` one.
 
     `quota` is the one category that is a property of the PROVIDER as a whole,
@@ -186,20 +192,25 @@ def _remember_unavailable(store: Store, provider: str, verdict) -> None:
     until = _iso_at(time.time() + PROVIDER_UNAVAILABLE_TTL_SEC)
     reason = verdict.detail or "provider reported a quota outage"
     try:
-        store.mark_provider_unavailable(provider, reason, "quota", until)
+        if quota_pool is None or quota_pool == provider:
+            store.mark_provider_unavailable(provider, reason, "quota", until)
+        else:
+            store.mark_provider_unavailable(provider, reason, "quota", until,
+                                            quota_pool=quota_pool)
     except Exception as e:      # pragma: no cover - defensive
         _note(f"could not record the {provider} quota outage: {e!r}")
         return
     _note(f"marking provider {provider} unavailable until {until} ({reason})")
 
 
-def _effective_provider_capacity(store: Store, provider: str) -> int:
+def _effective_provider_capacity(store: Store, provider: str,
+                                 quota_pool: str | None = None) -> int:
     """max_in_flight for ``provider``, or 0 while quota backoff is active.
 
     Cross-process: active ``provider_state`` (TTL) forces effective capacity
     0 so no new inference admits for that provider until the TTL expires.
     """
-    if _cached_unavailable(store, provider) is not None:
+    if _cached_unavailable(store, provider, quota_pool) is not None:
         return 0
     return capacity.provider_max_in_flight_from_env()
 
@@ -292,7 +303,7 @@ def _release_provider_slot(store: Store,
 
 
 def _acquire_provider_slot(
-        store: Store, provider: str, *,
+        store: Store, provider: str, *, quota_pool: str | None = None,
         wait_sec: float,
         cancel: "threading.Event | None",
         on_progress) -> capacity.Ticket:
@@ -304,10 +315,11 @@ def _acquire_provider_slot(
     """
     return capacity.acquire(
         store,
-        scope=provider,
-        resource_class=capacity.provider_resource_class(provider),
+        scope=quota_pool or provider,
+        resource_class=capacity.provider_resource_class(provider, quota_pool),
         # capacity_fn re-checks provider_state each poll (pressure reduction).
-        capacity_fn=lambda: _effective_provider_capacity(store, provider),
+        capacity_fn=lambda: _effective_provider_capacity(
+            store, provider, quota_pool),
         wait_sec=float(wait_sec),
         cancel=cancel,
         on_progress=on_progress,
@@ -422,8 +434,9 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
             raise runner.ReviewCancelled(
                 f"the review was cancelled before reviewer {entry.name!r} ran")
         adapter = get_adapter(entry.provider)
+        quota_pool = quota_pool_for(entry)
 
-        cached = _cached_unavailable(store, entry.provider)
+        cached = _cached_unavailable(store, entry.provider, quota_pool)
         if cached is not None:
             n += 1
             _note(f"skipping {entry.name} ({entry.provider}): {cached}")
@@ -470,7 +483,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
         try:
             try:
                 provider_ticket = _acquire_provider_slot(
-                    store, entry.provider, wait_sec=wait_sec,
+                    store, entry.provider, quota_pool=quota_pool,
+                    wait_sec=wait_sec,
                     cancel=cancel, on_progress=_note)
             except capacity.AdmissionCancelled as e:
                 raise runner.ReviewCancelled(str(e)) from e
@@ -607,7 +621,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                 if verdict.kind == "unavailable":
                     # Quota shrinks effective max_in_flight to 0 via
                     # provider_state; release this slot before hopping.
-                    _remember_unavailable(store, entry.provider, verdict)
+                    _remember_unavailable(store, entry.provider, verdict,
+                                          quota_pool)
                     _note(f"{entry.name} ({entry.provider}) is unavailable "
                           f"({verdict.category}): {verdict.detail}")
                     exhausted.append(

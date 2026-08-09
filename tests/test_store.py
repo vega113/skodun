@@ -2141,6 +2141,22 @@ def test_provider_state_is_per_provider(tmp_path):
                                           env={}) is None
 
 
+def test_provider_state_is_per_quota_pool(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    st.mark_provider_unavailable("google", "claude quota", "quota",
+                                 "2026-07-28T12:00:00Z",
+                                 quota_pool="google:claude-gpt")
+    assert st.provider_unavailable_reason(
+        "google", "2026-07-28T11:00:00Z", env={},
+        quota_pool="google:claude-gpt") == "claude quota"
+    assert st.provider_unavailable_reason(
+        "google", "2026-07-28T11:00:00Z", env={},
+        quota_pool="google:gemini") is None
+    rows = st.provider_state_rows("2026-07-28T11:00:00Z")
+    assert rows[0]["provider"] == "google"
+    assert rows[0]["quota_pool"] == "google:claude-gpt"
+
+
 def test_provider_state_survives_reopen(tmp_path):
     db = tmp_path / "s.db"
     Store.open(db).mark_provider_unavailable("openai", "quota", "quota",

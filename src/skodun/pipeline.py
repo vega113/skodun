@@ -168,7 +168,7 @@ from pathlib import Path
 from . import (batching, budget, capacity, chain, checklist, contextpack, gitio,
                ids, passes, promptbuild, provenance, reuse, routing, runner)
 from .adapters import NORMAL_STOP_REASONS, REFUTER_CONTRACT, get_adapter
-from .config import Config, Defaults, Reviewer
+from .config import Config, Defaults, Reviewer, quota_pool_for
 from .store import Store, _TS_FORMAT
 from .trust import is_trustworthy
 
@@ -1151,12 +1151,16 @@ def resolve_review_head(cfg: Config, store: Store, *,
         _note(f"routing: {reason} -> {head.name} ({head.provider})")
     else:
         head, reason = _default_head(cfg), routing.ROUTE_CONFIG_FINDER
-    return head, {
+    meta = {
         "requested_reviewer": requested,
         "routed_reviewer": head.name,
         "route_reason": reason,
         "client_family": client_family,
     }
+    pool = quota_pool_for(head)
+    if pool != head.provider:
+        meta["quota_pool"] = pool
+    return head, meta
 
 
 def _adapter_for(reviewer: Reviewer):
@@ -1980,7 +1984,12 @@ def _finder_chain_unavailable(store: Store, cfg: Config,
     now = _iso_now()
     parts: list[str] = []
     for entry in chain_entries:
-        reason = store.provider_unavailable_reason(entry.provider, now)
+        pool = quota_pool_for(entry)
+        if pool == entry.provider:
+            reason = store.provider_unavailable_reason(entry.provider, now)
+        else:
+            reason = store.provider_unavailable_reason(
+                entry.provider, now, quota_pool=pool)
         if reason is None:
             return None
         parts.append(f"{entry.provider}: {reason}")

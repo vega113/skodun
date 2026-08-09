@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -162,6 +163,32 @@ _QUOTA_SIGNALS: tuple[bytes, ...] = (
     b"spend cap",
     b"payment required",
 )
+
+_INVOCATION_SIGNALS: tuple[bytes, ...] = (
+    b"failed to spawn", b"spawn failed", b"permission denied",
+    b"no such file", b"executable", b"cannot execute",
+)
+_TRANSPORT_SIGNALS: tuple[bytes, ...] = (
+    b"failed to connect", b"connection refused", b"connection reset",
+    b"websocket", b"stream disconnected", b"stream closed",
+    b"timed out", b"timeout", b"transport error",
+)
+_DIAGNOSTIC_LIMIT = 400
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\x80-\x9f]+")
+_SECRET_RE = re.compile(
+    r"(?i)(bearer\s+|api[_ -]?key\s*[:=]\s*|token\s*[:=]\s*)[^\s,;]+")
+
+
+def _sanitized_diagnostic(raw: bytes, *, rc: int) -> str:
+    """Bound and redact provider text before it reaches an attempt artifact."""
+    text = raw.decode("utf-8", "replace")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    detail = lines[0] if lines else "no diagnostic output"
+    detail = _CONTROL_RE.sub(" ", detail)
+    detail = _SECRET_RE.sub(r"\1<redacted>", detail)
+    detail = " ".join(detail.split())
+    prefix = f"codex exited rc={rc} without a usable review payload: "
+    return (prefix + detail)[:_DIAGNOSTIC_LIMIT]
 
 # Canonical effort (`config.EFFORTS`) -> the CLI's `model_reasoning_effort`.
 #
@@ -432,9 +459,22 @@ class CodexAdapter:
                     if sig in diagnostics:
                         return ClassifyResult(
                             "unavailable", category,
-                            f"{category} failure in the run's diagnostics "
-                            f"({sig.decode()}) with no usable "
-                            f"{contract.name} payload")
+                            _sanitized_diagnostic(
+                                diagnostics, rc=rc) + f" [{category}: "
+                                f"{sig.decode()}]")
+            if rc != 0 and not events and not stdout:
+                for category, signals in (
+                        ("invocation", _INVOCATION_SIGNALS),
+                        ("transport", _TRANSPORT_SIGNALS)):
+                    if any(sig in diagnostics for sig in signals):
+                        return ClassifyResult(
+                            "unavailable", category,
+                            _sanitized_diagnostic(diagnostics, rc=rc))
+                # Unknown failures must not advance a fallback chain merely
+                # because the process was nonzero. They are still visibly
+                # diagnosable and parse_ok remains false, so trust fails closed.
+                return ClassifyResult(
+                    "ok", "", _sanitized_diagnostic(diagnostics, rc=rc))
         degraded, reason = _detect_degraded(events, terminal, stderr)
         if degraded:
             return ClassifyResult("degraded", "", reason)

@@ -7,7 +7,7 @@ from skodun.config import (
     _DEFAULTS_MINIMUMS, _DISPATCH_FLAGS, _DISPATCH_MINIMUMS,
     SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOT_NAMES, SECURITY_PROMPT_SLOTS,
     _ROUTING_FLAGS, ROUTING_MODE_ENV,
-    Defaults, Dispatch, Reviewer, Routing, load_config,
+    Defaults, Dispatch, Reviewer, Routing, load_config, quota_pool_for,
 )
 
 
@@ -68,6 +68,38 @@ def test_missing_global_config_file_degrades_to_defaults(tmp_path):
     cfg = load_config(None, global_path=missing)
     assert cfg.defaults == Defaults()
     assert cfg.reviewers == ()
+
+
+def test_quota_pool_defaults_separate_google_models():
+    assert quota_pool_for(Reviewer(name="gemini", provider="google",
+                                   model="gemini-3.6-flash")) == "google:gemini"
+    assert quota_pool_for(Reviewer(name="claude", provider="google",
+                                   model="claude-sonnet-4-6")) == "google:claude-gpt"
+    assert quota_pool_for(Reviewer(name="codex", provider="openai",
+                                   model="gpt-5.4")) == "openai"
+
+
+def test_explicit_quota_pool_is_preserved_and_validated(tmp_path):
+    path = _write(tmp_path / "g.toml", """
+[[reviewers]]
+name = "gemini"
+provider = "google"
+model = "gemini-3.6-flash"
+quota_pool = "google:custom"
+""")
+    cfg = load_config(None, global_path=path)
+    assert cfg.reviewers[0].quota_pool == "google:custom"
+    assert quota_pool_for(cfg.reviewers[0]) == "google:custom"
+
+    bad = _write(tmp_path / "bad.toml", """
+[[reviewers]]
+name = "gemini"
+provider = "google"
+model = "gemini-3.6-flash"
+quota_pool = "   "
+""")
+    with pytest.raises(ValueError, match="quota_pool"):
+        load_config(None, global_path=bad)
 
 
 def test_unknown_defaults_key_rejected(tmp_path):

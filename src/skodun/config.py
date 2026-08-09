@@ -279,6 +279,29 @@ class Reviewer:
     #: DOES walk each member's own `fallbacks` transitively, so a mutual (or
     #: longer) cycle is rejected at load time rather than discovered mid-run.
     fallbacks: tuple[str, ...] = ()
+    #: Operational quota bucket. ``None`` preserves legacy configs and is
+    #: resolved by :func:`quota_pool_for` from provider/model.
+    quota_pool: str | None = None
+
+
+def quota_pool_for(reviewer: Reviewer) -> str:
+    """Return the quota bucket used by state, routing and capacity.
+
+    AGY exposes Gemini and Claude/GPT subscription pools through the same
+    adapter/provider id. Existing configs did not have a pool field, so their
+    model is the compatibility mapping; an explicit value always wins.
+    """
+    if reviewer.quota_pool is not None:
+        if not isinstance(reviewer.quota_pool, str):
+            raise ValueError("reviewer quota_pool must be a string")
+        if reviewer.quota_pool.strip():
+            return reviewer.quota_pool.strip()
+        raise ValueError("reviewer quota_pool must be a non-empty string")
+    provider = reviewer.provider.strip()
+    if provider == "google":
+        model = reviewer.model.strip().lower()
+        return "google:gemini" if model.startswith("gemini") else "google:claude-gpt"
+    return provider
 
 @dataclass(frozen=True)
 class Retention:
@@ -757,6 +780,10 @@ def _validate(r: Reviewer) -> Reviewer:
         raise ValueError(f"reviewer {r.name!r}: unknown role {r.role!r}")
     if not r.provider or not r.model:
         raise ValueError(f"reviewer {r.name!r}: provider and model are required")
+    if r.quota_pool is not None and (
+            not isinstance(r.quota_pool, str) or not r.quota_pool.strip()):
+        raise ValueError(
+            f"reviewer {r.name!r}: quota_pool must be a non-empty string")
     return r
 
 def _fallback_tuple(name: str, value: object) -> tuple[str, ...]:

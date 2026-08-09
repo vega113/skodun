@@ -450,6 +450,25 @@ def _require_text(label: str, value: object) -> str:
     return value.strip()
 
 
+def _state_key(provider: str, quota_pool: str | None) -> str:
+    """Encode a non-legacy pool in the existing provider_state key column."""
+    provider = _require_text("provider", provider)
+    if quota_pool is None:
+        return provider
+    quota_pool = _require_text("quota_pool", quota_pool)
+    if quota_pool == provider:
+        return provider
+    return f"{provider}::{quota_pool}"
+
+
+def _decode_state_key(key: str) -> tuple[str, str | None]:
+    """Decode a pool-aware key; old provider-only rows remain unchanged."""
+    if "::" not in key:
+        return key, None
+    provider, pool = key.split("::", 1)
+    return provider, pool or None
+
+
 def _iso_now() -> str:
     return time.strftime(_TS_FORMAT, time.gmtime())
 
@@ -1653,7 +1672,8 @@ class Store:
 
     def mark_provider_unavailable(self, provider: str, reason: str, category: str,
                                   until_iso: str,
-                                  recorded_at: str | None = None) -> None:
+                                  recorded_at: str | None = None,
+                                  quota_pool: str | None = None) -> None:
         """Record that `provider` is unusable until `until_iso`.
 
         Everything is validated at the door so the read path only ever has to
@@ -1662,6 +1682,7 @@ class Store:
         becomes eligible again on its own.
         """
         provider = _require_text("provider", provider)
+        state_key = _state_key(provider, quota_pool)
         reason = _require_text("reason", reason)
         category = _require_text("category", category)
         until_iso = _require_ts("until_iso", until_iso)
@@ -1675,10 +1696,11 @@ class Store:
                  unavailable_until=excluded.unavailable_until,
                  reason=excluded.reason, category=excluded.category,
                  recorded_at=excluded.recorded_at""",
-            (provider, until_iso, reason, category, recorded_at))
+            (state_key, until_iso, reason, category, recorded_at))
 
     def provider_unavailable_reason(self, provider: str, now_iso: str,
-                                    env: Mapping[str, str] = os.environ) -> str | None:
+                                    env: Mapping[str, str] = os.environ,
+                                    quota_pool: str | None = None) -> str | None:
         """Why a fallback chain should skip `provider` right now, or None.
 
         `env` defaults to the live `os.environ` mapping rather than a snapshot,
@@ -1693,12 +1715,19 @@ class Store:
         now_iso = _require_ts("now_iso", now_iso)
         if _provider_state_bypassed(env):
             return None
-        row = self._c.execute(
-            "SELECT unavailable_until, reason FROM provider_state WHERE provider=?",
-            (provider,)).fetchone()
-        if row is None or not _still_unavailable(row["unavailable_until"], now_iso):
-            return None
-        return row["reason"] or "provider marked unavailable"
+        provider = _require_text("provider", provider)
+        keys = [_state_key(provider, quota_pool)]
+        if keys[0] != provider:
+            # A legacy provider-wide row remains authoritative until expiry.
+            keys.append(provider)
+        for key in keys:
+            row = self._c.execute(
+                "SELECT unavailable_until, reason FROM provider_state WHERE provider=?",
+                (key,)).fetchone()
+            if row is not None and _still_unavailable(
+                    row["unavailable_until"], now_iso):
+                return row["reason"] or "provider marked unavailable"
+        return None
 
     def provider_state_rows(self, now_iso: str) -> list[dict]:
         """Every row, expired ones included, each flagged `active`.
@@ -1711,11 +1740,17 @@ class Store:
         rows = self._c.execute(
             "SELECT provider, unavailable_until, reason, category FROM provider_state"
             " ORDER BY provider").fetchall()
-        return [{"provider": r["provider"],
-                 "unavailable_until": r["unavailable_until"],
-                 "reason": r["reason"], "category": r["category"],
-                 "active": _still_unavailable(r["unavailable_until"], now_iso)}
-                for r in rows]
+        out = []
+        for r in rows:
+            provider, pool = _decode_state_key(r["provider"])
+            row = {"provider": provider,
+                   "unavailable_until": r["unavailable_until"],
+                   "reason": r["reason"], "category": r["category"],
+                   "active": _still_unavailable(r["unavailable_until"], now_iso)}
+            if pool is not None:
+                row["quota_pool"] = pool
+            out.append(row)
+        return out
 
     # --- capacity admissions (epic S3) -------------------------------------
 
