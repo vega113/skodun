@@ -1778,22 +1778,48 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                         prompt_size=prompt.prompt_bytes + 256)
                     if (reroute is not None
                             and reroute.reviewer.name != finder.name):
-                        finder = reroute.reviewer
-                        route_meta = {
-                            "requested_reviewer": requested,
-                            "routed_reviewer": finder.name,
-                            "route_reason": reroute.reason,
-                            "client_family": client_family,
-                        }
-                        routed_pool = quota_pool_for(finder)
-                        if routed_pool != finder.provider:
-                            route_meta["quota_pool"] = routed_pool
-                        adapter = _adapter_for(finder)
-                        common.update(model=finder.model, adapter=adapter.name,
-                                      **route_meta)
-                        prompt = promptbuild.build(
-                            branch, base.ref, base.sha, f"{head} (working tree)",
-                            diff.data, mdb, selection, pack_body)
+                        candidate = reroute.reviewer
+                        candidate_mdb = budget.prompt_budget(d, candidate)
+                        candidate_plan = batch_plan(diff.data, d, candidate)
+                        if candidate_plan is not None:
+                            # This branch is already inside the unbatched
+                            # orchestration path. A reviewer whose own
+                            # envelope would require batches cannot be swapped
+                            # in after planning; retain the initial route and
+                            # let the normal chain handle it safely.
+                            _note(
+                                f"routing: keeping {finder.name}; {candidate.name} "
+                                "requires a different batch plan")
+                        else:
+                            previous_mdb = mdb
+                            finder = candidate
+                            mdb = candidate_mdb
+                            route_meta = {
+                                "requested_reviewer": requested,
+                                "routed_reviewer": finder.name,
+                                "route_reason": reroute.reason,
+                                "client_family": client_family,
+                            }
+                            routed_pool = quota_pool_for(finder)
+                            if routed_pool != finder.provider:
+                                route_meta["quota_pool"] = routed_pool
+                            adapter = _adapter_for(finder)
+                            common.update(model=finder.model, adapter=adapter.name,
+                                          **route_meta)
+                            if candidate_mdb != previous_mdb:
+                                pack = None
+                                pack_body = None
+                                if d.context_pack:
+                                    headroom = promptbuild.context_headroom(
+                                        mdb, len(diff.data), packing=True)
+                                    pack = contextpack.pack(
+                                        root, diff.files, diff.statuses,
+                                        headroom, pack_large_added=False)
+                                    pack_body = pack.body
+                                prompt = promptbuild.build(
+                                    branch, base.ref,
+                                    base.sha, f"{head} (working tree)",
+                                    diff.data, mdb, selection, pack_body)
                 if prompt.diff_truncated:
                     # Reachable only for a diff that is over the envelope and
                     # was NOT batched, i.e. one this build refused to split.
