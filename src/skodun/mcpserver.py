@@ -47,6 +47,7 @@ bug the delivery ledger exists to remove.
 """
 
 import json
+import math
 import os
 import sys
 import threading
@@ -236,6 +237,7 @@ class HandlerResult:
     status: int
     text: str
     pending_acks: list[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -388,11 +390,25 @@ def _string_arg(params: dict, name: str, tool: str) -> tuple[str, str]:
 
 def _int_arg(params: dict, name: str, tool: str) -> tuple[int | None, str]:
     """`(value, "")` or `(None, refusal)`. Rejects `bool`, which is an `int`."""
+    if name not in params or params[name] is None:
+        return None, ""
     value = params.get(name)
     if isinstance(value, bool) or not isinstance(value, int):
         return None, (f"skodun {tool}: {name} must be an integer; got "
                       f"{value!r}")
     return value, ""
+
+
+def _float_arg(params: dict, name: str, tool: str) -> tuple[float | None, str]:
+    """Optional finite JSON number, rejecting bool and string coercion."""
+    if name not in params or params[name] is None:
+        return None, ""
+    value = params[name]
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))):
+        return None, (f"skodun {tool}: {name} must be a finite number; got "
+                      f"{value!r}")
+    return float(value), ""
 
 
 def _bool_arg(params: dict, name: str, tool: str,
@@ -566,11 +582,29 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
     if refusal:
         return HandlerResult(status=2, text=refusal)
     family = routing.resolve_client_family(family, client_name=call.client_name)
+    recover, refusal = _bool_arg(call.params, "recover", "review")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    max_attempts, refusal = _int_arg(call.params, "max_attempts", "review")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    max_wall_seconds, refusal = _float_arg(
+        call.params, "max_wall_seconds", "review")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
     with call.store_factory() as store:
-        status, text = services.svc_review(store, repo, cancel=call.cancel,
-                                           reviewer=reviewer,
-                                           client_family=family)
-    return HandlerResult(status=status, text=text)
+        if recover:
+            status, text, metadata = services.svc_review_detailed(
+                store, repo, cancel=call.cancel, reviewer=reviewer,
+                client_family=family, recover=True,
+                max_attempts=max_attempts,
+                max_wall_seconds=max_wall_seconds)
+        else:
+            status, text = services.svc_review(
+                store, repo, cancel=call.cancel, reviewer=reviewer,
+                client_family=family)
+            metadata = {}
+    return HandlerResult(status=status, text=text, metadata=metadata)
 
 
 def _handle_log(call: "HandlerCall") -> "HandlerResult":
@@ -903,6 +937,19 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                                    "review without a reviewer. Defaults to "
                                    "$SKODUN_CLIENT_FAMILY, else to a guess "
                                    "from the client name in the handshake"},
+                "recover": {
+                    "type": "boolean",
+                    "description": "opt into bounded fresh recovery attempts "
+                                   "when the first review is not trustworthy "
+                                   "(default false)"},
+                "max_attempts": {
+                    "type": "integer", "minimum": 1, "maximum": 8,
+                    "description": "maximum recovery attempts including the "
+                                   "first (default 3)"},
+                "max_wall_seconds": {
+                    "type": "number", "exclusiveMinimum": 0,
+                    "description": "maximum recovery wall-clock budget in "
+                                   "seconds (default 900; maximum 86400)"},
             }),
             handler=_handle_review,
             description="Review the outgoing change NOW, in the foreground, and "
@@ -1237,6 +1284,8 @@ def _validate_result(res) -> str | None:
         return "pending_acks is not a list"
     if any(not isinstance(i, str) or not i for i in res.pending_acks):
         return "pending_acks holds something that is not a review id"
+    if not isinstance(res.metadata, dict):
+        return "metadata is not a dict"
     return None
 
 
@@ -1249,9 +1298,10 @@ def tool_result(res: HandlerResult) -> dict:
     response -- never a JSON-RPC error, because an agent that got a protocol
     error would have no refusal text to read and nothing to do about it.
     """
+    structured = {"status": int(res.status), **res.metadata}
     return {"content": [{"type": "text", "text": res.text}],
             "isError": res.status != 0,
-            "structuredContent": {"status": int(res.status)}}
+            "structuredContent": structured}
 
 
 class McpServer:

@@ -1087,6 +1087,7 @@ def _auto_fallback_head(cfg: Config) -> Reviewer:
 def resolve_review_head(cfg: Config, store: Store, *,
                         requested: str | None = None,
                         client_family: str | None = None,
+                        avoid_providers: set[str] | None = None,
                         ) -> tuple[Reviewer, dict]:
     """The entry that heads THIS run's chain, and the audit of how it was chosen.
 
@@ -1124,15 +1125,27 @@ def resolve_review_head(cfg: Config, store: Store, *,
         head = _requested_head(cfg, requested)
         reason = routing.ROUTE_PINNED
     elif cfg.routing.mode == "auto":
-        route = routing.auto_route(cfg, store, client_family=client_family)
+        route = routing.auto_route(
+            cfg, store, client_family=client_family,
+            excluded_providers=avoid_providers)
         if route is None:
             # Nothing routable: an empty pool, every candidate blacked out, or a
             # store that could not answer. A configured head still runs and
             # `_finder_chain_unavailable` below still fails fast in its own
             # words if the outage is real -- a router that refused here would
             # replace a diagnosis with a shrug.
-            head, reason = (_auto_fallback_head(cfg),
-                            routing.ROUTE_DEFAULT_FINDER)
+            head = _auto_fallback_head(cfg)
+            if avoid_providers and head.provider in avoid_providers:
+                alternatives = tuple(
+                    reviewer for reviewer in routing.resolve_pool(cfg)
+                    if reviewer.provider not in avoid_providers)
+                if not alternatives:
+                    raise PreflightRefused(
+                        "recovery found no alternative reviewer provider; "
+                        "the configured providers already reached terminal "
+                        "attempts")
+                head = alternatives[0]
+            reason = routing.ROUTE_DEFAULT_FINDER
         else:
             head, reason = route.reviewer, route.reason
         _note(f"routing: {reason} -> {head.name} ({head.provider})")
@@ -1174,7 +1187,8 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                progress_sink=None,
                cancel: "threading.Event | None" = None,
                reviewer: str | None = None,
-               client_family: str | None = None) -> dict:
+               client_family: str | None = None,
+               avoid_providers: set[str] | None = None) -> dict:
     """Run one foreground review and return the record that was persisted.
 
     WRITES NOTHING TO STDOUT. Progress goes to stderr (or to `progress_sink`);
@@ -1250,7 +1264,7 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
     try:
         return _run_review(repo, cfg, store, mode, lock_wait, lock_poll,
                            id_prefix, lock_stale, cancel, d, reviewer,
-                           client_family)
+                           client_family, avoid_providers)
     finally:
         if progress_sink is not None:
             _PROGRESS.sink = None
@@ -1261,7 +1275,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 id_prefix: str, lock_stale: float | None,
                 cancel: "threading.Event | None", d: Defaults,
                 requested: str | None = None,
-                client_family: str | None = None) -> dict:
+                client_family: str | None = None,
+                avoid_providers: set[str] | None = None) -> dict:
     """`run_review`'s body. Split off ONLY so the progress sink can be installed
     and removed around it without wrapping 400 lines in another indent level."""
 
@@ -1280,7 +1295,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     # here the run is shaped exactly as any other however it was chosen.
     client_family = routing.resolve_client_family(client_family)
     finder, route_meta = resolve_review_head(
-        cfg, store, requested=requested, client_family=client_family)
+        cfg, store, requested=requested, client_family=client_family,
+        avoid_providers=avoid_providers)
     # Resolved here, before anything is locked or persisted: an unknown
     # provider is a config error, not a review failure. EVERY reviewer this run
     # may reach for is resolved now, not just the finder's — a bad provider on a

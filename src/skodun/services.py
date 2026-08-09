@@ -145,8 +145,9 @@ def svc_gate(store, repo) -> tuple[int, str]:
 # --- review -----------------------------------------------------------------
 
 
-def svc_review(store, repo, *, progress_sink=None, cancel=None,
-               reviewer=None, client_family=None) -> tuple[int, str]:
+def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
+                     reviewer=None, client_family=None,
+                     avoid_providers=None) -> tuple[int, str]:
     """Run one foreground review. `(code, banner)`. Exit codes, and why:
 
       0  trustworthy and clean            3  gave up waiting for the lock
@@ -244,7 +245,8 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
     try:
         rec = run_review(root, cfg, store, progress_sink=progress_sink,
                          cancel=cancel, reviewer=reviewer,
-                         client_family=client_family)
+                         client_family=client_family,
+                         avoid_providers=avoid_providers)
     except PreflightRefused as e:
         return 2, banner_failure(str(e))
     except LockTimeout as e:
@@ -284,6 +286,220 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
     except (TypeError, ValueError):
         total = 1     # an uncountable findings list is not a clean review
     return (1 if total > 0 else 0), text
+
+
+# --- bounded recovery ------------------------------------------------------
+
+_RECOVERY_DEFAULT_ATTEMPTS = 3
+_RECOVERY_MAX_ATTEMPTS = 8
+_RECOVERY_DEFAULT_WALL_SECONDS = 900
+
+
+def _recovery_identity(repo):
+    """Capture the exact local review identity used between attempts."""
+    from .cli import _repo_root
+    from .config import load_config
+    from . import gitio
+
+    root = _repo_root(Path(repo))
+    cfg = load_config(root)
+    base = gitio.resolve_base(root)
+    diff = gitio.capture_diff(root, base.sha, cfg.defaults.untracked_max)
+    return (str(gitio.repository_identity(root)),
+            str(gitio.observed_worktree_root(root)),
+            gitio.current_branch(root), gitio.head_sha(root), base.sha,
+            gitio.diff_identity(diff.data))
+
+
+def _recovery_review_id(text: str) -> str | None:
+    import re
+
+    match = re.search(r"(?:^| )id=([^ ]+)", text)
+    return match.group(1) if match else None
+
+
+def _annotate_recovery_attempt(store, text: str, orchestration_id: str,
+                               ordinal: int) -> tuple[dict | None, str | None]:
+    """Persist v9 orchestration metadata without changing trust axes."""
+    review_id = _recovery_review_id(text)
+    if review_id is None:
+        return None, None
+    rec = store.get_review(review_id)
+    if rec is None:
+        return None, review_id
+    trustworthy = rec.get("trustworthy") is True
+    rec["orchestration_id"] = orchestration_id
+    rec["attempt_ordinal"] = ordinal
+    rec["outcome"] = "trustworthy" if trustworthy else "untrustworthy"
+    store.save_review(rec)
+    return store.get_review(review_id), review_id
+
+
+def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
+                        reviewer=None, client_family=None, recover=False,
+                        max_attempts=None, max_wall_seconds=None) -> tuple[int, str, dict]:
+    """Shared review surface plus recovery metadata for MCP structured output."""
+    import math
+
+    if not recover:
+        status, text = _svc_review_once(
+            store, repo, progress_sink=progress_sink, cancel=cancel,
+            reviewer=reviewer, client_family=client_family)
+        return status, text, {}
+
+    if max_attempts is None:
+        max_attempts = _RECOVERY_DEFAULT_ATTEMPTS
+    if (isinstance(max_attempts, bool) or not isinstance(max_attempts, int)
+            or not 1 <= max_attempts <= _RECOVERY_MAX_ATTEMPTS):
+        reason = (f"max_attempts must be an int from 1 to "
+                  f"{_RECOVERY_MAX_ATTEMPTS}, got {max_attempts!r}")
+        from .trust import banner_failure
+        return 2, banner_failure(reason), {"recovery": {"terminal_reason": reason}}
+    if max_wall_seconds is None:
+        max_wall_seconds = _RECOVERY_DEFAULT_WALL_SECONDS
+    if (isinstance(max_wall_seconds, bool)
+            or not isinstance(max_wall_seconds, (int, float))
+            or not math.isfinite(float(max_wall_seconds))
+            or max_wall_seconds <= 0 or max_wall_seconds > 86400):
+        reason = ("max_wall_seconds must be a positive number no greater than "
+                  f"86400, got {max_wall_seconds!r}")
+        from .trust import banner_failure
+        return 2, banner_failure(reason), {"recovery": {"terminal_reason": reason}}
+
+    import time
+    from . import ids
+    from .store import RUNNING
+    from .trust import banner_failure
+
+    orchestration_id = ids.new_review_id("sk_orch_")
+    deadline = time.monotonic() + float(max_wall_seconds)
+    initial_identity = None
+    try:
+        initial_identity = _recovery_identity(repo)
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        # The normal attempt owns the canonical preflight wording. Recovery
+        # only uses identity capture to decide whether a second attempt is safe.
+        pass
+
+    review_ids: list[str] = []
+    attempt_count = 0
+    terminal_providers: set[str] = set()
+    last_status, last_text = 4, banner_failure("no review was recorded")
+    last_rec: dict | None = None
+    terminal_reason = ""
+    for ordinal in range(max_attempts):
+        if cancel is not None and cancel.is_set():
+            last_status, last_text = 4, banner_failure(REVIEW_CANCELLED_REASON)
+            terminal_reason = REVIEW_CANCELLED_REASON
+            break
+        if ordinal and initial_identity is not None:
+            try:
+                if _recovery_identity(repo) != initial_identity:
+                    terminal_reason = "repository identity or diff moved between recovery attempts"
+                    break
+            except KeyboardInterrupt:
+                raise
+            except BaseException as e:
+                terminal_reason = f"could not recheck identity before recovery: {e!r}"
+                break
+        if time.monotonic() >= deadline:
+            terminal_reason = "recovery wall budget exhausted"
+            break
+
+        attempt_count += 1
+        last_status, last_text = _svc_review_once(
+            store, repo, progress_sink=progress_sink, cancel=cancel,
+            reviewer=reviewer, client_family=client_family,
+            avoid_providers=(set(terminal_providers)
+                             if reviewer is None else set()))
+        try:
+            last_rec, review_id = _annotate_recovery_attempt(
+                store, last_text, orchestration_id, ordinal)
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:
+            terminal_reason = f"could not persist recovery metadata: {e!r}"
+            break
+        if review_id is not None:
+            review_ids.append(review_id)
+        if last_rec is None:
+            terminal_reason = (
+                REVIEW_CANCELLED_REASON if "cancel" in last_text.lower()
+                else "preflight or persistence refusal; recovery stopped")
+            break
+        if last_rec.get("status") == RUNNING:
+            terminal_reason = "review remained running; recovery stopped"
+            break
+        if last_rec.get("trustworthy") is True:
+            terminal_reason = "trustworthy review reached"
+            break
+        failure = str(last_rec.get("failure_reason")
+                      or last_rec.get("degraded_reason")
+                      or last_rec.get("stop_reason") or "")
+        if last_status in (2, 3) or "cancel" in failure.lower():
+            terminal_reason = failure or "terminal refusal; recovery stopped"
+            break
+        if initial_identity is None:
+            terminal_reason = ("could not establish recovery identity; "
+                               "recovery stopped")
+            break
+        if last_rec.get("adapter") and reviewer is None:
+            terminal_providers.add(str(last_rec["adapter"]))
+        try:
+            if initial_identity is not None and _recovery_identity(repo) != initial_identity:
+                terminal_reason = "repository identity or diff moved after recovery attempt"
+                break
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:
+            terminal_reason = f"could not recheck identity after recovery: {e!r}"
+            break
+        terminal_reason = "recovery attempt was untrustworthy"
+
+    if not terminal_reason:
+        terminal_reason = "recovery attempt budget exhausted"
+    if last_rec is not None:
+        try:
+            last_rec["terminal_reason"] = terminal_reason
+            last_rec["outcome"] = (
+                "trustworthy" if last_rec.get("trustworthy") is True
+                else "recovery_terminal")
+            store.save_review(last_rec)
+            last_text = _render_review_banner(last_rec)
+        except KeyboardInterrupt:
+            raise
+        except BaseException:
+            pass
+    prefix = (f"SKODUN RECOVERY: orchestration_id={orchestration_id} "
+              f"attempts={attempt_count} "
+              f"review_ids={','.join(review_ids) or '-'} "
+              f"terminal_reason={terminal_reason}")
+    metadata = {"recovery": {
+        "orchestration_id": orchestration_id,
+        "review_ids": review_ids,
+        "attempts": attempt_count,
+        "terminal_reason": terminal_reason,
+        "recovered": bool(last_rec and last_rec.get("trustworthy") is True
+                           and len(review_ids) > 1),
+    }}
+    return last_status, f"{prefix}\n{last_text}", metadata
+
+
+def _render_review_banner(rec: dict) -> str:
+    from .trust import banner
+    return banner(rec)
+
+
+def svc_review(store, repo, *, progress_sink=None, cancel=None,
+               reviewer=None, client_family=None, recover=False,
+               max_attempts=None, max_wall_seconds=None) -> tuple[int, str]:
+    status, text, _ = svc_review_detailed(
+        store, repo, progress_sink=progress_sink, cancel=cancel,
+        reviewer=reviewer, client_family=client_family, recover=recover,
+        max_attempts=max_attempts, max_wall_seconds=max_wall_seconds)
+    return status, text
 
 
 # --- log --------------------------------------------------------------------

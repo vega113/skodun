@@ -437,7 +437,7 @@ def test_the_registry_types_are_the_pinned_contract():
     assert HandlerCall(params={}, store_factory=lambda: None,
                        cancel=threading.Event()).client_name is None
     assert [f.name for f in dataclasses.fields(HandlerResult)] == \
-        ["status", "text", "pending_acks"]
+        ["status", "text", "pending_acks", "metadata"]
     # `pending_acks` defaults to empty: a tool with nothing to acknowledge
     # should not have to say so.
     assert HandlerResult(status=0, text="x").pending_acks == []

@@ -42,7 +42,7 @@ from tests.test_gitio import _git, _mkrepo
 STORE_BACKED = ["svc_gate", "svc_review", "svc_log", "svc_surface",
                 "svc_triage_list", "svc_triage_dismiss", "svc_adopt_refuter",
                 "svc_triage_reopen", "svc_triage_defer", "svc_deferrals",
-                "svc_review_status", "svc_review_cancel"]
+                "svc_review_status", "svc_review_cancel", "svc_review_detailed"]
 
 #: A deferral needs a filed reference and a reason that clears the same audit
 #: floor a dismissal's does -- both, or the service refuses.
@@ -135,6 +135,106 @@ def test_the_services_module_is_importable_without_sqlite_or_git():
     toplevel = [line for line in src.splitlines()
                 if re.match(r"^(import|from)\s", line)]
     assert toplevel == ["from pathlib import Path"], toplevel
+
+
+def test_bounded_recovery_records_each_attempt_and_avoids_terminal_provider(
+        tmp_path, monkeypatch):
+    """Recovery retries fresh records and keeps the request-level audit link."""
+    from skodun.trust import banner
+
+    first = _artifact([], review_id="first", degraded=True,
+                      trustworthy=False, status="degraded")
+    second = _artifact([], review_id="second")
+    attempts = [first, second]
+    calls = []
+    identity = ("repo", "feat", "h" * 20, "s" * 40, "d" * 40)
+    monkeypatch.setattr(services, "_recovery_identity", lambda repo: identity)
+
+    def fake_once(store, repo, **kwargs):
+        calls.append(kwargs)
+        rec = attempts.pop(0)
+        store.save_review(rec)
+        return (4 if rec["trustworthy"] is not True else 0, banner(rec))
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "recovery.db") as store:
+        status, text, metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True, max_attempts=3,
+            max_wall_seconds=30)
+        rows = [store.get_review("first"), store.get_review("second")]
+
+    assert status == 0
+    assert metadata["recovery"]["attempts"] == 2
+    assert metadata["recovery"]["recovered"] is True
+    assert metadata["recovery"]["review_ids"] == ["first", "second"]
+    assert "trustworthy review reached" in text
+    assert calls[0]["avoid_providers"] == set()
+    assert calls[1]["avoid_providers"] == {"grok"}
+    assert rows[0]["orchestration_id"] == rows[1]["orchestration_id"]
+    assert rows[0]["attempt_ordinal"] == 0
+    assert rows[1]["attempt_ordinal"] == 1
+
+
+def test_bounded_recovery_stops_when_identity_moves(tmp_path, monkeypatch):
+    from skodun.trust import banner
+
+    rec = _artifact([], review_id="only", degraded=True,
+                    trustworthy=False, status="degraded")
+    identities = iter([
+        ("repo", "feat", "h" * 20, "s" * 40, "d" * 40),
+        ("repo", "feat", "h" * 20, "s" * 40, "changed" * 8),
+    ])
+    calls = []
+    monkeypatch.setattr(services, "_recovery_identity",
+                        lambda repo: next(identities))
+
+    def fake_once(store, repo, **kwargs):
+        calls.append(kwargs)
+        store.save_review(rec)
+        return 4, banner(rec)
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "moved.db") as store:
+        status, text, metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True, max_attempts=3)
+        saved = store.get_review("only")
+
+    assert status == 4
+    assert len(calls) == 1
+    assert metadata["recovery"]["attempts"] == 1
+    assert "moved" in metadata["recovery"]["terminal_reason"]
+    assert "moved" in saved["terminal_reason"]
+
+
+def test_bounded_recovery_rejects_bool_limits_and_preserves_explicit_pin(
+        tmp_path, monkeypatch):
+    from skodun.trust import banner
+
+    status, text, metadata = services.svc_review_detailed(
+        object(), tmp_path, recover=True, max_attempts=True)
+    assert status == 2 and "max_attempts" in text
+    assert metadata["recovery"]["terminal_reason"]
+
+    first = _artifact([], review_id="p1", degraded=True,
+                      trustworthy=False, status="degraded")
+    second = _artifact([], review_id="p2")
+    attempts = [first, second]
+    calls = []
+    monkeypatch.setattr(services, "_recovery_identity",
+                        lambda repo: ("repo", "feat", "h", "s", "d"))
+
+    def fake_once(store, repo, **kwargs):
+        calls.append(kwargs)
+        rec = attempts.pop(0)
+        store.save_review(rec)
+        return (4 if rec["trustworthy"] is not True else 0, banner(rec))
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "pinned.db") as store:
+        status, _text, _metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True, reviewer="deliberate")
+    assert status == 0
+    assert all(call["avoid_providers"] == set() for call in calls)
 
 
 # ==========================================================================

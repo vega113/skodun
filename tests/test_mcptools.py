@@ -701,7 +701,8 @@ def test_the_review_tool_takes_a_reviewer_by_name_in_its_schema():
     selection. Optional: absent means the config's own finder heads the chain."""
     spec = _specs()["review"]
     props = spec.input_schema["properties"]
-    assert set(props) == {"repo", "reviewer", "client_family"}
+    assert set(props) == {"repo", "reviewer", "client_family", "recover",
+                          "max_attempts", "max_wall_seconds"}
     assert props["reviewer"]["type"] == "string"
     assert props["reviewer"]["description"]
     assert spec.input_schema["required"] == []

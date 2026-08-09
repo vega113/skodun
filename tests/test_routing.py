@@ -519,6 +519,17 @@ def test_mode_auto_routes_off_the_busy_provider_and_records_why(store):
                     "route_reason": ROUTE_FREE, "client_family": None}
 
 
+def test_recovery_exclusion_does_not_fall_back_to_a_terminal_provider(store):
+    from skodun.pipeline import PreflightRefused
+
+    cfg = _cfg(_entry("finder-grok", "xai"), _entry("finder-codex", "openai"))
+    head, _meta = _head(cfg, store, avoid_providers={"xai"})
+    assert head.provider == "openai"
+
+    with pytest.raises(PreflightRefused, match="no alternative reviewer provider"):
+        _head(cfg, store, avoid_providers={"xai", "openai"})
+
+
 def test_mode_auto_records_the_declared_client_family_either_way(store):
     """The field describes the CALLER, so it is recorded whether or not it tipped."""
     cfg = _cfg(_entry("finder-grok", "xai"), _entry("finder-codex", "openai"))
