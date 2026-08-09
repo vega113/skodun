@@ -3268,11 +3268,29 @@ def test_an_omitted_client_family_is_not_a_declaration(tmp_path, monkeypatch,
     assert seen["client_family"] is None
 
 
+def test_reuse_flags_reach_the_shared_service(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    seen = _svc_review_kwargs(
+        monkeypatch,
+        ["review", "--repo", str(tmp_path), "--reuse-trusted", "--fresh"],
+        capsys)
+    assert seen["reuse_trusted"] is True
+    assert seen["fresh"] is True
+
+
 def test_review_help_documents_the_flag_and_its_env_fallback(capsys):
     main(["review", "--help"])
     out = capsys.readouterr().out
     assert "--client-family" in out
     assert "SKODUN_CLIENT_FAMILY" in out
+
+
+def test_review_parser_exposes_opt_in_reuse_and_fresh_flags():
+    from skodun.cli import build_parser
+    args = build_parser().parse_args(
+        ["review", "--reuse-trusted", "--fresh"])
+    assert args.reuse_trusted is True
+    assert args.fresh is True
 
 
 # --- providers: routing telemetry (S5) --------------------------------------

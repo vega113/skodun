@@ -537,6 +537,24 @@ def head_sha(repo: Path) -> str:
     return _out(repo, "rev-parse", "HEAD")
 
 
+def tree_fingerprint(repo: Path) -> str:
+    """Fingerprint the checked-out tree, including dirty index/worktree state.
+
+    HEAD alone is insufficient for foreground coverage: staged, unstaged, and
+    untracked edits can change the reviewed tree without moving the commit.
+    Git's NUL-delimited porcelain stream is the stable local snapshot used here
+    so filenames cannot be confused with status text.
+    """
+    status = _run(
+        Path(repo), "status", "--porcelain=v1", "-z", "--untracked-files=all"
+    ).stdout
+    h = hashlib.sha256()
+    h.update(head_sha(Path(repo)).encode("ascii"))
+    h.update(b"\0")
+    h.update(status)
+    return h.hexdigest()
+
+
 def is_primary_checkout(repo: Path) -> bool:
     """True iff `repo` is the primary checkout rather than a linked worktree.
 

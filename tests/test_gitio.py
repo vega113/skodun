@@ -29,6 +29,7 @@ from skodun.gitio import (
     git_common_dir,
     head_sha,
     is_primary_checkout,
+    tree_fingerprint,
     resolve_base,
     resolve_ref_base,
 )
@@ -103,6 +104,16 @@ def test_blob_sha1_matches_git(tmp_path):
         ["git", "hash-object", "--stdin"], input=data, capture_output=True, check=True
     ).stdout.decode().strip()
     assert blob_sha1(data) == expected
+
+
+def test_tree_fingerprint_changes_for_dirty_worktree_without_head_change(tmp_path):
+    repo = _mkrepo(tmp_path)
+    before = tree_fingerprint(repo)
+    head = head_sha(repo)
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    after = tree_fingerprint(repo)
+    assert head_sha(repo) == head
+    assert before != after
 
 
 def test_diff_identity_strips_trailing_newlines_like_shell():

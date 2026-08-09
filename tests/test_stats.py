@@ -42,7 +42,7 @@ def test_v9_migration_adds_nullable_telemetry_columns(tmp_path):
     raw.close()
 
     st = Store.open(db)
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION == 10
     cols = {r[1] for r in st._c.execute("PRAGMA table_info(reviews)")}
     assert {"review_started_at", "review_completed_at", "repo_id",
             "worktree_root", "orchestration_id", "attempt_ordinal",
@@ -100,6 +100,18 @@ def test_stats_use_explicit_stage_and_capacity_fields(tmp_path):
     assert json.loads(render(data, fmt="json")) == data
     assert "review_ms=count:1 p50:2000 p90:2000" in render(data)
     st.close()
+
+
+def test_stats_count_append_only_reuse_events(tmp_path):
+    with Store.open(tmp_path / "stats.db") as st:
+        st.append_reuse_event(
+            at="2026-08-09T00:00:00Z", outcome="hit",
+            reason="exact identity match", matched_review_id="r1")
+        st.append_reuse_event(
+            at="2026-08-09T00:00:01Z", outcome="miss",
+            reason="tree changed")
+        data = st.telemetry_stats(since_iso="2026-08-08T00:00:00Z")
+    assert data["reuse"] == {"hits": 1, "misses": 1}
 
 
 def test_stats_rejects_bool_days_and_parser_exposes_json(tmp_path):

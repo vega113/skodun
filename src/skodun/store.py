@@ -53,7 +53,7 @@ RUNNING = "running"
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def schema_too_new_message(store_version: int) -> str:
@@ -351,6 +351,35 @@ _MIGRATION_V9: tuple[str, ...] = (
        ON reviews(orchestration_id, attempt_ordinal)""",
 )
 
+# --- v10: foreground exact-reuse audit -------------------------------------
+#
+# Reuse is a separate optimization from dispatcher suppression.  Its event
+# stream records every opt-in probe, including misses and explicit bypasses,
+# without rewriting the durable review it considered.
+_MIGRATION_V10: tuple[str, ...] = (
+"""CREATE TABLE IF NOT EXISTS reuse_events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  repo_id TEXT,
+  worktree_root TEXT,
+  branch TEXT,
+  base_sha TEXT,
+  diff_hash TEXT,
+  context_hash TEXT,
+  checklist_hash TEXT,
+  tree_fingerprint TEXT,
+  requested_reviewer TEXT,
+  client_family TEXT,
+  matched_review_id TEXT
+)""",
+"""CREATE INDEX IF NOT EXISTS ix_reuse_events_at
+   ON reuse_events(at DESC, seq DESC)""",
+"""CREATE INDEX IF NOT EXISTS ix_reuse_events_match
+   ON reuse_events(matched_review_id, at DESC)""",
+)
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -379,6 +408,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (7, _MIGRATION_V7),
     (8, _MIGRATION_V8),
     (9, _MIGRATION_V9),
+    (10, _MIGRATION_V10),
 )
 
 
@@ -931,6 +961,87 @@ class Store:
         row = self._c.execute("SELECT artifact_json FROM reviews WHERE id=?",
                               (review_id,)).fetchone()
         return json.loads(row["artifact_json"]) if row else None
+
+    def reuse_candidates(self, repo_id: str, base_sha: str,
+                         diff_hash: str) -> list[dict]:
+        """Read possible exact-reuse candidates; validation stays in reuse.py."""
+        repo_id = _require_text("repo_id", repo_id)
+        base_sha = _require_text("base_sha", base_sha)
+        diff_hash = _require_text("diff_hash", diff_hash)
+        rows = self._c.execute(
+            """SELECT artifact_json FROM reviews
+               WHERE repo_id=? AND base_sha=? AND diff_hash=?
+                 AND trustworthy=1 AND COALESCE(status, '') <> ?
+               ORDER BY reviewed_at DESC, id DESC""",
+            (repo_id, base_sha, diff_hash, RUNNING)).fetchall()
+        out = []
+        for row in rows:
+            try:
+                value = json.loads(row["artifact_json"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, dict):
+                out.append(value)
+        return out
+
+    def append_reuse_event(
+            self, *, at: str, outcome: str, reason: str,
+            repo_id: str | None = None, worktree_root: str | None = None,
+            branch: str | None = None, base_sha: str | None = None,
+            diff_hash: str | None = None, context_hash: str | None = None,
+            checklist_hash: str | None = None,
+            tree_fingerprint: str | None = None,
+            requested_reviewer: str | None = None,
+            client_family: str | None = None,
+            matched_review_id: str | None = None) -> dict:
+        """Append one foreground reuse probe event and return its stored row."""
+        at = _require_ts("at", at)
+        outcome = _require_text("outcome", outcome)
+        reason = _require_text("reason", reason)
+        values = {
+            "repo_id": repo_id, "worktree_root": worktree_root,
+            "branch": branch, "base_sha": base_sha, "diff_hash": diff_hash,
+            "context_hash": context_hash, "checklist_hash": checklist_hash,
+            "tree_fingerprint": tree_fingerprint,
+            "requested_reviewer": requested_reviewer,
+            "client_family": client_family,
+            "matched_review_id": matched_review_id,
+        }
+        for name, value in values.items():
+            if value is not None:
+                values[name] = _require_text(name, value)
+        cur = self._c.execute(
+            """INSERT INTO reuse_events
+               (at, outcome, reason, repo_id, worktree_root, branch, base_sha,
+                diff_hash, context_hash, checklist_hash, tree_fingerprint,
+                requested_reviewer, client_family, matched_review_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (at, outcome, reason, values["repo_id"], values["worktree_root"],
+             values["branch"], values["base_sha"], values["diff_hash"],
+             values["context_hash"], values["checklist_hash"],
+             values["tree_fingerprint"], values["requested_reviewer"],
+             values["client_family"], values["matched_review_id"]))
+        seq = int(cur.lastrowid)
+        row = self._c.execute(
+            "SELECT * FROM reuse_events WHERE seq=?", (seq,)).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def reuse_events(self, *, since_iso: str | None = None,
+                     limit: int = 100) -> list[dict]:
+        """Read reuse events newest first without changing the audit stream."""
+        if since_iso is not None:
+            since_iso = _require_ts("since_iso", since_iso)
+        if (isinstance(limit, bool) or not isinstance(limit, int)
+                or limit < 1):
+            limit = 100
+        limit = min(limit, 1000)
+        where = " WHERE at>=?" if since_iso is not None else ""
+        args: tuple = (since_iso, limit) if since_iso is not None else (limit,)
+        rows = self._c.execute(
+            f"SELECT * FROM reuse_events{where} ORDER BY at DESC, seq DESC LIMIT ?",
+            args).fetchall()
+        return [dict(row) for row in rows]
 
     def latest_trustworthy_for(self, diff_hash: str) -> dict | None:
         row = self._c.execute(
@@ -2046,6 +2157,11 @@ class Store:
                 and row["run_ms"] is not None
                 and row["total_admission_ms"] is not None)
 
+        reuse_rows = self._c.execute(
+            "SELECT outcome FROM reuse_events WHERE at>=?", (since_iso,)
+        ).fetchall()
+        reuse_hits = sum(r["outcome"] == "hit" for r in reuse_rows)
+        reuse_misses = sum(r["outcome"] != "hit" for r in reuse_rows)
         return {
             "since": since_iso,
             "reviews": {
@@ -2089,8 +2205,10 @@ class Store:
                     for r in review_rows),
             },
             "reuse": {
-                "hits": sum(r["outcome"] == "reuse" for r in review_rows),
-                "misses": sum(r["outcome"] == "reuse_miss" for r in review_rows),
+                "hits": reuse_hits + sum(r["outcome"] == "reuse"
+                                        for r in review_rows),
+                "misses": reuse_misses + sum(r["outcome"] == "reuse_miss"
+                                             for r in review_rows),
             },
         }
 

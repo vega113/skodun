@@ -166,7 +166,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import (batching, budget, capacity, chain, checklist, contextpack, gitio,
-               ids, passes, promptbuild, provenance, routing, runner)
+               ids, passes, promptbuild, provenance, reuse, routing, runner)
 from .adapters import NORMAL_STOP_REASONS, REFUTER_CONTRACT, get_adapter
 from .config import Config, Defaults, Reviewer
 from .store import Store, _TS_FORMAT
@@ -1510,6 +1510,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         diff_hash = gitio.diff_identity(diff.data)
         branch = gitio.current_branch(repo)
         head = gitio.head_sha(repo)
+        tree_fingerprint = gitio.tree_fingerprint(repo)
 
         # STAGE TWO of the two-stage ordering: the AUTHORITATIVE batch plan,
         # built from the capture above — the only diff this review persists
@@ -1541,6 +1542,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             source="skodun",
             branch=branch, head=head, base_ref=base.ref, base_sha=base.sha,
             diff_hash=diff_hash, mode=mode, model=finder.model,
+            tree_fingerprint=tree_fingerprint, checklist_hash="",
             adapter=adapter.name, timeout_seconds=d.timeout_sec,
             max_turns=d.max_turns,
             # WHICH SKODUN ASKED. `adapter`/`model` name who answered and
@@ -1758,6 +1760,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 rec = dict(
                     common,
                     context_hash=pack.sha256 if pack is not None else "",
+                    checklist_hash=reuse.checklist_identity(selection),
                     status="running",
                     parse_ok=False, degraded=False, degraded_reason="",
                     stop_reason=None, diff_truncated=prompt.diff_truncated,

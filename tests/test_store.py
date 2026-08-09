@@ -944,6 +944,11 @@ V9_INDEXES = {
     ("index", "ix_reviews_orchestration"),
 }
 V9_OBJECTS = V9_INDEXES
+V10_OBJECTS = {
+    ("table", "reuse_events"),
+    ("index", "ix_reuse_events_at"),
+    ("index", "ix_reuse_events_match"),
+}
 
 #: One legacy `triage` row, in the shipped single-row-per-ledger-key shape the
 #: v3 migration has to seed an event from.
@@ -1030,7 +1035,7 @@ def test_schema_is_frozen_at_the_phase1_baseline():
 def test_fresh_db_lands_at_schema_version(tmp_path):
     db = tmp_path / "s.db"
     st = Store.open(db)
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION == 10
     assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert ("table", "provider_state") in _objects(db)
     assert V6_TABLE in _objects(db)
@@ -1040,6 +1045,25 @@ def test_fresh_db_lands_at_schema_version(tmp_path):
     for table in V3_TABLES:
         assert ("table", table) in _objects(db)
     assert V3_REVIEW_COLUMNS <= set(_columns(db, "reviews"))
+
+
+def test_reuse_events_are_append_only_and_return_stored_rows(tmp_path):
+    with Store.open(tmp_path / "reuse.db") as st:
+        first = st.append_reuse_event(
+            at="2026-08-09T00:00:00Z", outcome="hit", reason="exact match",
+            repo_id="/repo/.git", base_sha="b" * 40, diff_hash="d" * 40,
+            context_hash="c" * 64, checklist_hash="k" * 64,
+            tree_fingerprint="t" * 64, requested_reviewer=None,
+            client_family=None, matched_review_id="r1")
+        second = st.append_reuse_event(
+            at="2026-08-09T00:00:01Z", outcome="miss", reason="tree changed",
+            repo_id="/repo/.git", base_sha="b" * 40, diff_hash="d" * 40,
+            context_hash=None, checklist_hash=None, tree_fingerprint="u" * 64,
+            requested_reviewer=None, client_family=None, matched_review_id=None)
+        rows = st.reuse_events()
+    assert first["seq"] < second["seq"]
+    assert [row["outcome"] for row in rows] == ["miss", "hit"]
+    assert rows[1]["matched_review_id"] == "r1"
 
 
 def test_migration_ladder_is_ordered_and_reaches_schema_version():
@@ -1083,7 +1107,7 @@ def test_phase1_store_upgrade_preserves_every_table_index_and_row(tmp_path):
     after = _objects(db)
     assert before <= after, before - after            # nothing dropped
     assert after - before == {("table", "provider_state"), V5_INDEX} | {
-        ("table", t) for t in V3_TABLES} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS  # nothing else
+        ("table", t) for t in V3_TABLES} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS  # nothing else
     assert sorted(r["id"] for r in st.list_reviews(None, 100)) == ["r1", "r2", "r3"]
     assert st.triage_for("b", "s" * 40)["k1"]["dismissed_reason"] == "wontfix"
     assert st._c.execute("SELECT count(*) FROM gate_events").fetchone()[0] == 1
@@ -1228,7 +1252,7 @@ def test_a_v2_store_gains_every_v3_delta(tmp_path):
     assert _user_version(db) == SCHEMA_VERSION
     assert before <= _objects(db)                          # nothing dropped
     assert _objects(db) - before == (
-        {("table", t) for t in V3_TABLES} | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS)
+        {("table", t) for t in V3_TABLES} | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS)
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     assert _columns(db, "dedup_events") == V3_DEDUP_EVENT_COLUMNS
     assert _columns(db, "deliveries") == V3_DELIVERY_COLUMNS
@@ -1536,7 +1560,7 @@ def test_no_non_transactional_delta_carries_a_non_idempotent_statement():
             assert isinstance(delta, tuple) and all(isinstance(s, str) for s in delta)
     # The last rung is what a fresh store is stamped with. v8 is the
     # replay-idempotent str lane; v9 is transactional because it adds columns.
-    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 9
+    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 10
     assert isinstance(_MIGRATIONS[-1][1], tuple)
     assert any(isinstance(d, tuple) for _, d in _MIGRATIONS)
 
@@ -1575,10 +1599,10 @@ def test_a_v3_store_gains_the_widened_vocabulary_and_the_reference_column(tmp_pa
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 9
+    assert _user_version(db) == SCHEMA_VERSION == 10
     # A v3 store climbs v4–v9 in one open: v5 index + capacity, feedback,
     # spend, and telemetry indexes.
-    assert _objects(db) == before | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS, (
+    assert _objects(db) == before | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS, (
         "the rebuild added or dropped an object")
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     # The seeded legacy dismissal came through the rebuild intact...
@@ -1879,7 +1903,7 @@ def test_a_v4_store_gains_the_repo_column_and_its_index(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 9
+    assert _user_version(db) == SCHEMA_VERSION == 10
     assert "repo" in _columns(db, "reviews")
     row = st._c.execute("SELECT repo FROM reviews WHERE id='r1'").fetchone()
     assert row["repo"] is None, "a pre-v5 row must not be backfilled"
@@ -1903,8 +1927,8 @@ def test_a_v5_store_gains_capacity_admissions(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 9
-    assert _objects(db) - before == V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS
+    assert _user_version(db) == SCHEMA_VERSION == 10
+    assert _objects(db) - before == V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS
     assert "repo" in _columns(db, "reviews")
     st.close()
 
@@ -1932,8 +1956,8 @@ def test_a_v6_store_gains_feedback_events(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 9
-    assert _objects(db) - before == V7_OBJECTS | V8_OBJECTS | V9_OBJECTS
+    assert _user_version(db) == SCHEMA_VERSION == 10
+    assert _objects(db) - before == V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS
     st.close()
 
 
@@ -2352,6 +2376,7 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_review_exit_matrix.py",
     "tests/test_provenance.py",
     "tests/test_stats.py",
+    "tests/test_reuse.py",
 )
 
 #: Store-touching modules deliberately kept OUT of the subprocess sweep, with

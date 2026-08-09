@@ -30,7 +30,7 @@ from pathlib import Path
 import pytest
 
 import skodun
-from skodun import services
+from skodun import services, reuse
 from skodun.store import Store
 from tests.test_cli import _annotation, _artifact, _finding, _loud_round, _round
 from tests.test_gitio import _git, _mkrepo
@@ -95,6 +95,47 @@ def test_every_store_backed_service_takes_the_store_first():
         params = list(inspect.signature(fn).parameters.values())
         assert params[0].name == "store", (name, params[0].name)
         assert params[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD, name
+
+
+def test_opt_in_reuse_returns_existing_review_without_running_pipeline(
+        tmp_path, monkeypatch):
+    identity = reuse.ReuseIdentity(
+        repo_id="/repo/.git", worktree_root="/repo", branch="feature",
+        head="h" * 40, base_sha="b" * 40, diff_hash="d" * 40,
+        context_hash="c" * 64, checklist_hash="k" * 64,
+        tree_fingerprint="t" * 64)
+    candidate = {
+        "id": "r1", "reviewed_at": "2026-08-09T00:00:00Z",
+        "branch": "feature", "head": identity.head, "base_ref": "main",
+        "base_sha": identity.base_sha, "diff_hash": identity.diff_hash,
+        "context_hash": identity.context_hash,
+        "checklist_hash": identity.checklist_hash,
+        "tree_fingerprint": identity.tree_fingerprint,
+        "repo_id": identity.repo_id, "worktree_root": identity.worktree_root,
+        "mode": "now", "source": "skodun", "status": "clean",
+        "parse_ok": True, "degraded": False, "diff_truncated": False,
+        "findings": [], "findings_total": 0, "summary": "clean",
+        "severity": {"high": 0, "medium": 0, "low": 0},
+        "requested_reviewer": None, "client_family": None,
+    }
+    with Store.open(tmp_path / "reuse.db") as store:
+        store.save_review(candidate)
+        monkeypatch.setattr("skodun.cli._repo_root", lambda repo: repo)
+        monkeypatch.setattr("skodun.config.load_config", lambda root: object())
+        monkeypatch.setattr(
+            reuse, "probe",
+            lambda *args, **kwargs: reuse.ReuseProbe(
+                candidate, identity, "exact identity match"))
+        monkeypatch.setattr(
+            services, "_svc_review_once",
+            lambda *args, **kwargs: pytest.fail("provider pipeline was called"))
+        status, text, metadata = services.svc_review_detailed(
+            store, tmp_path, reuse_trusted=True)
+        events = store.reuse_events()
+    assert status == 0
+    assert "review_id=r1" in text
+    assert metadata["reuse"]["review_id"] == "r1"
+    assert events[0]["outcome"] == "hit"
 
 
 def test_no_service_opens_a_store_of_its_own():

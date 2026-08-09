@@ -11,7 +11,7 @@ from skodun.store import SCHEMA_VERSION, Store
 
 def test_schema_has_feedback_events(tmp_path):
     st = Store.open(tmp_path / "s.db")
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION == 10
     names = {
         r[0]
         for r in st._c.execute(
