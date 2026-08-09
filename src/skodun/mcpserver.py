@@ -599,17 +599,40 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
         call.params, "max_wall_seconds", "review")
     if refusal:
         return HandlerResult(status=2, text=refusal)
+    reuse_trusted, refusal = _bool_arg(
+        call.params, "reuse_trusted", "review")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    fresh, refusal = _bool_arg(call.params, "fresh", "review")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
     with call.store_factory() as store:
         if recover:
             status, text, metadata = services.svc_review_detailed(
                 store, repo, cancel=call.cancel, reviewer=reviewer,
                 client_family=family, recover=True,
                 max_attempts=max_attempts,
-                max_wall_seconds=max_wall_seconds)
+                max_wall_seconds=max_wall_seconds,
+                reuse_trusted=reuse_trusted, fresh=fresh,
+                reuse_client_family=(
+                    family if call.params.get("client_family") is not None
+                    else None))
+        elif reuse_trusted or fresh:
+            status, text, metadata = services.svc_review_detailed(
+                store, repo, cancel=call.cancel, reviewer=reviewer,
+                client_family=family, reuse_trusted=reuse_trusted,
+                fresh=fresh,
+                reuse_client_family=(
+                    family if call.params.get("client_family") is not None
+                    else None))
         else:
             status, text = services.svc_review(
                 store, repo, cancel=call.cancel, reviewer=reviewer,
-                client_family=family)
+                client_family=family, reuse_trusted=reuse_trusted,
+                fresh=fresh,
+                reuse_client_family=(
+                    family if call.params.get("client_family") is not None
+                    else None))
             metadata = {}
     return HandlerResult(status=status, text=text, metadata=metadata)
 
@@ -957,6 +980,15 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                     "type": "number", "exclusiveMinimum": 0,
                     "description": "maximum recovery wall-clock budget in "
                                    "seconds (default 900; maximum 86400)"},
+                "reuse_trusted": {
+                    "type": "boolean",
+                    "description": "opt into reuse of an exact trustworthy "
+                                   "foreground review; misses run a fresh "
+                                   "review (default false)"},
+                "fresh": {
+                    "type": "boolean",
+                    "description": "always run a fresh review, bypassing "
+                                   "trusted reuse; useful for a second opinion"},
             }),
             handler=_handle_review,
             description="Review the outgoing change NOW, in the foreground, and "

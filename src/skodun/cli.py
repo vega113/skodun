@@ -133,6 +133,12 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument(
         "--max-wall-seconds", type=float, default=None, dest="max_wall_seconds",
         help="recovery wall-clock budget (default: 900 seconds)")
+    review.add_argument(
+        "--reuse-trusted", action="store_true", dest="reuse_trusted",
+        help="reuse an exact trustworthy foreground review when available")
+    review.add_argument(
+        "--fresh", action="store_true", dest="fresh",
+        help="always run a real review, even when trusted reuse is enabled")
 
     stats = sub.add_parser(
         "stats", help="show operational review and capacity telemetry")
@@ -742,7 +748,9 @@ def _cmd_review(args) -> int:
             client_family=getattr(args, "client_family", None),
             recover=getattr(args, "recover", False),
             max_attempts=getattr(args, "max_attempts", None),
-            max_wall_seconds=getattr(args, "max_wall_seconds", None))
+            max_wall_seconds=getattr(args, "max_wall_seconds", None),
+            reuse_trusted=getattr(args, "reuse_trusted", False),
+            fresh=getattr(args, "fresh", False))
     return _emit(text, code)
 
 

@@ -37,6 +37,8 @@ in `tests/test_gitio.py`.
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -535,6 +537,111 @@ def current_branch(repo: Path) -> str:
 
 def head_sha(repo: Path) -> str:
     return _out(repo, "rev-parse", "HEAD")
+
+
+def tree_fingerprint(repo: Path, *, paths=None) -> str:
+    """Fingerprint the checked-out tree, including dirty file contents.
+
+    HEAD alone is insufficient for foreground coverage: staged, unstaged, and
+    untracked edits can change the reviewed tree without moving the commit, and
+    status alone cannot distinguish two versions of the same dirty file. Git's
+    NUL-delimited porcelain stream identifies the changed paths; their content
+    (or symlink target/type) is hashed alongside that status snapshot.
+    """
+    root = Path(repo)
+    status = _run(root, "status", "--porcelain=v1", "-z",
+                  "--untracked-files=all").stdout
+    h = hashlib.sha256()
+    h.update(head_sha(root).encode("ascii"))
+    h.update(b"\0status\0")
+    tokens = [token for token in _paths(status) if token]
+    entries = []
+    pending = iter(tokens)
+    for token in pending:
+        if len(token) < 3 or token[2] != " ":
+            raise GitError("malformed git status record")
+        code, name = token[:2], token[3:]
+        entry_paths = [name]
+        if "R" in code or "C" in code:
+            source = next(pending, None)
+            if source is None:
+                raise GitError("incomplete git rename status record")
+            entry_paths.append(source)
+        entries.append((token, entry_paths))
+    changed_paths = [name for _, names in entries for name in names]
+    fingerprint_paths = (changed_paths if paths is None else list(paths))
+    if paths is None:
+        h.update(status)
+    else:
+        wanted = set(fingerprint_paths)
+        for token, entry_paths in entries:
+            if any(name in wanted for name in entry_paths):
+                h.update(token.encode("utf-8", "surrogateescape"))
+                h.update(b"\0")
+    for name in fingerprint_paths:
+        encoded = name.encode("utf-8", "surrogateescape")
+        h.update(len(encoded).to_bytes(8, "big"))
+        h.update(encoded)
+        path = root / name
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            h.update(b"\0missing")
+            continue
+        except OSError as exc:
+            raise GitError(
+                f"tree fingerprint could not stat {name}: {exc}") from exc
+        h.update(b"\0mode\0" + info.st_mode.to_bytes(4, "big"))
+        if stat.S_ISLNK(info.st_mode):
+            target = os.readlink(path).encode("utf-8", "surrogateescape")
+            h.update(b"\0symlink\0" + target)
+        elif stat.S_ISREG(info.st_mode):
+            h.update(b"\0content\0")
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            nonblock = getattr(os, "O_NONBLOCK", 0)
+            if not hasattr(os, "set_blocking"):
+                raise GitError("tree fingerprint requires descriptor blocking control")
+            if not nofollow and os.path.islink(path):
+                raise GitError(f"tree fingerprint found unsafe path: {name}")
+            fd = None
+            try:
+                fd = os.open(path, os.O_RDONLY | nofollow | nonblock)
+                opened = os.fstat(fd)
+                if not stat.S_ISREG(opened.st_mode):
+                    raise GitError(f"tree fingerprint found unsafe path: {name}")
+                if nonblock:
+                    os.set_blocking(fd, True)
+                if not nofollow and os.path.islink(path):
+                    raise GitError(f"tree fingerprint found unsafe path: {name}")
+                with os.fdopen(fd, "rb") as stream:
+                    fd = None
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        h.update(chunk)
+            except OSError as exc:
+                raise GitError(
+                    f"tree fingerprint could not safely read {name}: {exc}") \
+                    from exc
+            finally:
+                if fd is not None:
+                    os.close(fd)
+        elif stat.S_ISDIR(info.st_mode):
+            staged = _run(root, "ls-files", "--stage", "--", name).stdout
+            if not staged.startswith(b"160000 "):
+                raise GitError(f"tree fingerprint found unsafe path: {name}")
+            h.update(b"\0gitlink\0" + staged)
+            try:
+                initialized = os.path.lexists(path / ".git")
+            except OSError as exc:
+                raise GitError(
+                    f"tree fingerprint could not inspect gitlink {name}: {exc}") \
+                    from exc
+            if not initialized:
+                h.update(b"\0uninitialized")
+            else:
+                h.update(b"\0nested\0" + tree_fingerprint(path).encode("ascii"))
+        else:
+            raise GitError(f"tree fingerprint found unsafe path: {name}")
+    return h.hexdigest()
 
 
 def is_primary_checkout(repo: Path) -> bool:

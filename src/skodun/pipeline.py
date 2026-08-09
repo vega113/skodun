@@ -166,7 +166,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import (batching, budget, capacity, chain, checklist, contextpack, gitio,
-               ids, passes, promptbuild, provenance, routing, runner)
+               ids, passes, promptbuild, provenance, reuse, routing, runner)
 from .adapters import NORMAL_STOP_REASONS, REFUTER_CONTRACT, get_adapter
 from .config import Config, Defaults, Reviewer
 from .store import Store, _TS_FORMAT
@@ -1510,6 +1510,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         diff_hash = gitio.diff_identity(diff.data)
         branch = gitio.current_branch(repo)
         head = gitio.head_sha(repo)
+        tree_fingerprint = gitio.tree_fingerprint(repo, paths=diff.files)
 
         # STAGE TWO of the two-stage ordering: the AUTHORITATIVE batch plan,
         # built from the capture above — the only diff this review persists
@@ -1541,6 +1542,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             source="skodun",
             branch=branch, head=head, base_ref=base.ref, base_sha=base.sha,
             diff_hash=diff_hash, mode=mode, model=finder.model,
+            tree_fingerprint=tree_fingerprint, checklist_hash="",
+            security_policy_hash=reuse.security_policy_identity(cfg),
             adapter=adapter.name, timeout_seconds=d.timeout_sec,
             max_turns=d.max_turns,
             # WHICH SKODUN ASKED. `adapter`/`model` name who answered and
@@ -1603,10 +1606,17 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             # recorded so the run leaves a trace, and it certifies nothing the
             # gate does not already grant: the gate PASSes an empty change
             # before it ever looks a review up.
+            empty_identity = reuse._identity_for(
+                repo, cfg, base, diff, branch=branch,
+                reviewer_name=finder.name)
             _note("no outgoing changes vs " + (base.ref or "HEAD^"))
             rec = dict(common, status="clean", parse_ok=True, degraded=False,
                        degraded_reason="", stop_reason=None,
-                       diff_truncated=False, context_hash="",
+                       diff_truncated=False,
+                       context_hash=(empty_identity.context_hash
+                                     if empty_identity.context_hash is not None
+                                     else ""),
+                       checklist_hash=empty_identity.checklist_hash or "",
                        files_changed=[], diff_bytes=0, prompt_bytes=0,
                        checklist_sections=[], checklist_bytes=0,
                        checklist_note="", checklist_degraded=False,
@@ -1758,6 +1768,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 rec = dict(
                     common,
                     context_hash=pack.sha256 if pack is not None else "",
+                    checklist_hash=reuse.checklist_identity(selection),
                     status="running",
                     parse_ok=False, degraded=False, degraded_reason="",
                     stop_reason=None, diff_truncated=prompt.diff_truncated,
@@ -2795,6 +2806,8 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
     checklist_bytes = 0
     checklist_notes: list[str] = []
     checklist_degraded = False
+    checklist_selections = []
+    context_hashes = []
 
     def _fold_checklist(selection) -> None:
         """Fold one prompt's selection into the aggregate's checklist telemetry.
@@ -2826,6 +2839,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         selection = checklist.select(
             batch.files, mode, _under(root, d.checklist_dir),
             _under(root, d.rules_json), d.checklist_map, d.test_path_patterns)
+        checklist_selections.append(selection)
         _fold_checklist(selection)
 
         pack = None
@@ -2843,6 +2857,8 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                  if f in diff.statuses},
                 headroom, source=context_source, oid=context_oid,
                 pack_large_added=not sole)
+            context_hashes.append(
+                pack.sha256 if isinstance(pack.sha256, str) else None)
             ctx_bytes += pack.bytes_total
             for name in pack.included:
                 if name not in ctx_files:
@@ -2906,6 +2922,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             diff.files, passes.INTEGRATION_CHECKLIST_MODE,
             _under(root, d.checklist_dir), _under(root, d.rules_json),
             d.checklist_map, d.test_path_patterns)
+        checklist_selections.append(selection)
         _fold_checklist(selection)
         meta_checklist = passes.checklist_meta(
             passes.INTEGRATION_CHECKLIST_MODE, selection)
@@ -3025,12 +3042,16 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         context_bytes=ctx_bytes,
         context_files=ctx_files,
         context_omitted_files=ctx_omitted,
-        # DELIBERATE: a batched aggregate is never dedup-suppressible. There is
-        # no single canonical context pack behind it -- each batch packed its own
-        # files -- so publishing one hash would certify context nothing was
-        # reviewed against. The cost is a redundant re-review of a rare
-        # oversized diff; the alternative risks certifying unpacked context.
-        context_hash="",
+        # Background artifacts stay outside the foreground reuse contract;
+        # their legacy dedup policy intentionally retains empty identities.
+        context_hash=(reuse.aggregate_context_identity(
+            context_hashes, enabled=d.context_pack) or ""
+            if rec.get("mode") == "now" else ""),
+        checklist_hash=(reuse.aggregate_checklist_identity(
+            checklist_selections,
+            batch_boundaries=[gitio.diff_identity(batch.data)
+                              for batch in batches])
+                        if rec.get("mode") == "now" else ""),
     )
     if integration is not None:
         out["integration"] = integration

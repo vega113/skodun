@@ -702,7 +702,8 @@ def test_the_review_tool_takes_a_reviewer_by_name_in_its_schema():
     spec = _specs()["review"]
     props = spec.input_schema["properties"]
     assert set(props) == {"repo", "reviewer", "client_family", "recover",
-                          "max_attempts", "max_wall_seconds"}
+                          "max_attempts", "max_wall_seconds",
+                          "reuse_trusted", "fresh"}
     assert props["reviewer"]["type"] == "string"
     assert props["reviewer"]["description"]
     assert spec.input_schema["required"] == []
@@ -845,6 +846,39 @@ def test_the_handshake_client_name_is_the_last_resort_default(tmp_path,
     assert _review_family(monkeypatch, db, repo=str(tmp_path),
                           client_name="Grok CLI",
                           client_family="junie") == "junie"
+
+
+def test_reuse_does_not_treat_handshake_family_as_explicit_intent(
+        tmp_path, monkeypatch):
+    seen: dict = {}
+
+    def fake_detailed(store, repo, **kw):
+        seen.update(kw)
+        return 0, "SKODUN VERDICT: trustworthy=true findings=0", {}
+
+    monkeypatch.setattr(services, "svc_review_detailed", fake_detailed)
+    monkeypatch.chdir(tmp_path)
+    _specs()["review"].handler(HandlerCall(
+        params={"repo": str(tmp_path), "reuse_trusted": True},
+        store_factory=lambda: Store.open(tmp_path / "s.db"),
+        cancel=threading.Event(), client_name="Grok CLI"))
+    assert seen["client_family"] == "xai"
+    assert seen["reuse_client_family"] is None
+
+
+def test_mcp_reuse_hit_preserves_structured_metadata_without_recovery(
+        tmp_path, monkeypatch):
+    def fake_detailed(store, repo, **kw):
+        assert kw["reuse_trusted"] is True
+        return 0, "SKODUN REUSE: review_id=r1", {
+            "reuse": {"hit": True, "review_id": "r1"}}
+
+    monkeypatch.setattr(services, "svc_review_detailed", fake_detailed)
+    result = _specs()["review"].handler(HandlerCall(
+        params={"repo": str(tmp_path), "reuse_trusted": True},
+        store_factory=lambda: Store.open(tmp_path / "s.db"),
+        cancel=threading.Event()))
+    assert result.metadata == {"reuse": {"hit": True, "review_id": "r1"}}
 
 
 def test_a_client_name_nothing_recognises_leaves_the_family_undeclared(

@@ -25,12 +25,13 @@ from __future__ import annotations
 import inspect
 import re
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 import skodun
-from skodun import services
+from skodun import services, reuse
 from skodun.store import Store
 from tests.test_cli import _annotation, _artifact, _finding, _loud_round, _round
 from tests.test_gitio import _git, _mkrepo
@@ -95,6 +96,81 @@ def test_every_store_backed_service_takes_the_store_first():
         params = list(inspect.signature(fn).parameters.values())
         assert params[0].name == "store", (name, params[0].name)
         assert params[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD, name
+
+
+def test_opt_in_reuse_returns_existing_review_without_running_pipeline(
+        tmp_path, monkeypatch):
+    identity = reuse.ReuseIdentity(
+        repo_id="/repo/.git", worktree_root="/repo", branch="feature",
+        head="h" * 40, base_sha="b" * 40, diff_hash="d" * 40,
+        context_hash="c" * 64, checklist_hash="k" * 64,
+        tree_fingerprint="t" * 64, security_policy_hash="p" * 64)
+    candidate = {
+        "id": "r1", "reviewed_at": "2026-08-09T00:00:00Z",
+        "branch": "feature", "head": identity.head, "base_ref": "main",
+        "base_sha": identity.base_sha, "diff_hash": identity.diff_hash,
+        "context_hash": identity.context_hash,
+        "checklist_hash": identity.checklist_hash,
+        "tree_fingerprint": identity.tree_fingerprint,
+        "security_policy_hash": identity.security_policy_hash,
+        "repo_id": identity.repo_id, "worktree_root": identity.worktree_root,
+        "mode": "now", "source": "skodun", "status": "clean",
+        "parse_ok": True, "degraded": False, "diff_truncated": False,
+        "findings": [], "findings_total": 0, "summary": "clean",
+        "severity": {"high": 0, "medium": 0, "low": 0},
+        "requested_reviewer": None, "client_family": None,
+    }
+    with Store.open(tmp_path / "reuse.db") as store:
+        store.save_review(candidate)
+        monkeypatch.setattr("skodun.cli._repo_root", lambda repo: repo)
+        monkeypatch.setattr("skodun.config.load_config", lambda root: object())
+        monkeypatch.setattr(
+            reuse, "probe",
+            lambda *args, **kwargs: reuse.ReuseProbe(
+                candidate, identity, "exact identity match"))
+        monkeypatch.setattr(
+            services, "_svc_review_once",
+            lambda *args, **kwargs: pytest.fail("provider pipeline was called"))
+        status, text, metadata = services.svc_review_detailed(
+            store, tmp_path, reuse_trusted=True)
+        events = store.reuse_events()
+    assert status == 0
+    assert "review_id=r1" in text
+    assert metadata["reuse"]["review_id"] == "r1"
+    assert events[0]["outcome"] == "hit"
+
+
+def test_opt_in_reuse_honors_cancellation_before_and_during_a_probe(
+        tmp_path, monkeypatch):
+    cancel = threading.Event()
+    cancel.set()
+    monkeypatch.setattr(
+        reuse, "probe",
+        lambda *args, **kwargs: pytest.fail("cancelled reuse was probed"))
+    with Store.open(tmp_path / "before.db") as store:
+        status, text, _metadata = services.svc_review_detailed(
+            store, tmp_path, reuse_trusted=True, cancel=cancel)
+    assert status == 4 and "review cancelled" in text
+
+    identity = reuse.ReuseIdentity(
+        repo_id="/repo/.git", worktree_root="/repo", branch="feature",
+        head="h" * 40, base_sha="b" * 40, diff_hash="d" * 40,
+        context_hash="c" * 64, checklist_hash="k" * 64,
+        tree_fingerprint="t" * 64, security_policy_hash="p" * 64)
+    candidate = {"id": "r1"}
+    cancel.clear()
+
+    def probe_and_cancel(*args, **kwargs):
+        cancel.set()
+        return reuse.ReuseProbe(candidate, identity, "exact identity match")
+
+    monkeypatch.setattr(reuse, "probe", probe_and_cancel)
+    monkeypatch.setattr("skodun.cli._repo_root", lambda repo: repo)
+    monkeypatch.setattr("skodun.config.load_config", lambda root: object())
+    with Store.open(tmp_path / "during.db") as store:
+        status, text, _metadata = services.svc_review_detailed(
+            store, tmp_path, reuse_trusted=True, cancel=cancel)
+    assert status == 4 and "review cancelled" in text
 
 
 def test_no_service_opens_a_store_of_its_own():
@@ -249,6 +325,19 @@ def test_bounded_recovery_rejects_bool_limits_and_preserves_explicit_pin(
             store, tmp_path, recover=True, reviewer="deliberate")
     assert status == 0
     assert all(call["avoid_providers"] == set() for call in calls)
+
+
+def test_recovery_limits_are_validated_before_reuse_probe(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        services, "_try_reuse",
+        lambda *args, **kwargs: pytest.fail("reuse probe ran before validation"))
+    with Store.open(tmp_path / "recovery.db") as store:
+        status, text, metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True, max_attempts=0,
+            reuse_trusted=True)
+    assert status == 2
+    assert "max_attempts" in text
+    assert metadata["recovery"]["terminal_reason"]
 
 
 def test_bounded_recovery_rejects_float_overflow(tmp_path):

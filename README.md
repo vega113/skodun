@@ -64,7 +64,7 @@ Background:
 
 | Command | What it does | Exit codes |
 | --- | --- | --- |
-| `skodun review [--repo DIR] [--reviewer NAME] [--recover] [--max-attempts N] [--max-wall-seconds S]` | Run a foreground review and record it. `--reviewer` heads this run's chain with a named `[[reviewers]]` entry; opt-in `--recover` makes bounded fresh attempts after an untrustworthy result, with each attempt retained and correlated. | `0` trustworthy and clean · `1` trustworthy, findings open · `2` preflight refusal (nothing ran) · `3` gave up waiting for the lock · `4` no trustworthy review was recorded · `130` interrupted with Ctrl-C (stdout is left empty on purpose — an operator's own interruption, not a refusal). |
+| `skodun review [--repo DIR] [--reviewer NAME] [--client-family FAMILY] [--recover] [--max-attempts N] [--max-wall-seconds S] [--reuse-trusted] [--fresh]` | Run a foreground review and record it. `--reviewer` heads this run's chain with a named `[[reviewers]]` entry; opt-in `--recover` makes bounded fresh attempts after an untrustworthy result, while opt-in `--reuse-trusted` reuses only an exact trustworthy foreground artifact. `--fresh` bypasses reuse for a deliberate second opinion; explicit reviewer and client-family intent also force a real review. | `0` trustworthy and clean · `1` trustworthy, findings open · `2` preflight refusal (nothing ran) · `3` gave up waiting for the lock · `4` no trustworthy review was recorded · `130` interrupted with Ctrl-C (stdout is left empty on purpose — an operator's own interruption, not a refusal). |
 | `skodun gate [--repo DIR]` | Fail closed unless a trustworthy review already covers this exact diff; every decision is written to the audit log. Wire it into pre-push or CI. | `0` clean or every finding triaged · `1` findings open · `2` no trustworthy review covers this diff. Every unexpected exception maps to `2`, never `1`. |
 | `skodun providers [--repo DIR]` | List every registered provider adapter, whether its CLI binary is resolvable and executable right now, and its cached availability state. Read-only; never gates anything. | `0` always, even with missing binaries — that is exactly what this command exists to report · `1` a reviewer in the loaded config (enabled or not) names a `provider` with no registered adapter · `2` `--repo`/config/store could not be read at all. |
 | `skodun stats [--since-days N] [--json]` | Report explicit review-stage and capacity telemetry: canonical repository coverage, queue-only wait, model runtime, total admission time, trust/findings counts, and legacy coverage. `--json` is the machine-readable projection of the same read model. CLI-only; it never gates or mutates the store. | `0` report produced · `2` invalid window/format or the store could not be read. |
@@ -774,7 +774,7 @@ implementation both call. (Pinned by `tests/test_mcptools.py` `EXPECTED_TOOLS`.)
 | Tool | Role |
 |---|---|
 | `gate` | Does a trustworthy review cover this tree? Status 0/1/2 |
-| `review` | Foreground review (long-running; optional `reviewer` **entry name**, `recover`, and bounded recovery limits) |
+| `review` | Foreground review (long-running; optional `reviewer` **entry name**, bounded recovery limits, and opt-in `reuse_trusted` / `fresh`) |
 | `log` | Recent reviews (history; not a gate) |
 | `surface` | Undelivered background rounds (history; not a gate) |
 | `review_status` | Lifecycle of a review by id or current for `repo` (not a gate) |

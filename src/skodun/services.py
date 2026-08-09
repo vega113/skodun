@@ -293,6 +293,133 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
 _RECOVERY_DEFAULT_ATTEMPTS = 3
 _RECOVERY_MAX_ATTEMPTS = 8
 _RECOVERY_DEFAULT_WALL_SECONDS = 900
+_REUSE_INTENT_UNSET = object()
+
+
+def _validate_recovery_limits(max_attempts, max_wall_seconds):
+    import math
+
+    if max_attempts is None:
+        max_attempts = _RECOVERY_DEFAULT_ATTEMPTS
+    if (isinstance(max_attempts, bool) or not isinstance(max_attempts, int)
+            or not 1 <= max_attempts <= _RECOVERY_MAX_ATTEMPTS):
+        return max_attempts, None, (
+            f"max_attempts must be an int from 1 to "
+            f"{_RECOVERY_MAX_ATTEMPTS}, got {max_attempts!r}")
+    if max_wall_seconds is None:
+        max_wall_seconds = _RECOVERY_DEFAULT_WALL_SECONDS
+    wall_seconds = None
+    if (not isinstance(max_wall_seconds, bool)
+            and isinstance(max_wall_seconds, (int, float))):
+        try:
+            wall_seconds = float(max_wall_seconds)
+        except (OverflowError, ValueError):
+            wall_seconds = None
+    if (wall_seconds is None or not math.isfinite(wall_seconds)
+            or wall_seconds <= 0 or wall_seconds > 86400):
+        return max_attempts, None, (
+            "max_wall_seconds must be a positive number no greater than "
+            f"86400, got {max_wall_seconds!r}")
+    return max_attempts, wall_seconds, None
+
+
+def _reuse_audit(store, probe, *, outcome: str, reason: str,
+                 reviewer=None, client_family=None) -> None:
+    import time
+
+    identity = None if probe is None else probe.identity
+    try:
+        store.append_reuse_event(
+            at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            outcome=outcome, reason=reason,
+            repo_id=None if identity is None else identity.repo_id,
+            worktree_root=None if identity is None else identity.worktree_root,
+            branch=None if identity is None else identity.branch,
+            base_sha=None if identity is None else identity.base_sha,
+            diff_hash=None if identity is None else identity.diff_hash,
+            context_hash=None if identity is None else identity.context_hash,
+            checklist_hash=None if identity is None else identity.checklist_hash,
+            tree_fingerprint=None if identity is None
+            else identity.tree_fingerprint,
+            security_policy_hash=None if identity is None
+            else identity.security_policy_hash,
+            requested_reviewer=reviewer, client_family=client_family,
+            matched_review_id=(None if probe is None or probe.candidate is None
+                               else probe.candidate.get("id")))
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        # Reuse is optional optimization telemetry. A failed audit must never
+        # turn a safe fresh review into a refusal.
+        pass
+
+
+def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
+               reviewer=None, client_family=None, intent_client_family=None,
+               cancel=None):
+    """Return a reused verdict or a diagnostic to prefix to a fresh review."""
+    from . import reuse
+    if not reuse_trusted:
+        return None, None, {}
+    if fresh:
+        reason = "explicit fresh requested"
+        _reuse_audit(store, None, outcome="bypass", reason=reason,
+                     reviewer=reviewer, client_family=client_family)
+        return None, f"SKODUN REUSE: bypass reason={reason}", {
+            "reuse": {"hit": False, "reason": reason}}
+    if reviewer is not None or intent_client_family is not None:
+        reason = "explicit reviewer or client-family intent requested"
+        _reuse_audit(store, None, outcome="bypass", reason=reason,
+                     reviewer=reviewer, client_family=intent_client_family)
+        return None, f"SKODUN REUSE: bypass reason={reason}", {
+            "reuse": {"hit": False, "reason": reason}}
+    if cancel is not None and cancel.is_set():
+        from .trust import banner_failure
+        reason = REVIEW_CANCELLED_REASON
+        return (4, banner_failure(reason)), None, {
+            "reuse": {"hit": False, "reason": reason}}
+    result = None
+    try:
+        from .cli import _repo_root
+        from .config import load_config
+
+        root = _repo_root(Path(repo))
+        cfg = load_config(root)
+        result = reuse.probe(
+            store, root, cfg=cfg, client_family=client_family,
+            intent_client_family=intent_client_family)
+        if (result.candidate is not None and cancel is not None
+                and cancel.is_set()):
+            reason = REVIEW_CANCELLED_REASON
+            _reuse_audit(store, result, outcome="bypass", reason=reason)
+            from .trust import banner_failure
+            return (4, banner_failure(reason)), None, {
+                "reuse": {"hit": False, "reason": reason}}
+        if result.candidate is None:
+            _reuse_audit(store, result, outcome="miss", reason=result.reason)
+            return None, f"SKODUN REUSE: miss reason={result.reason}", {
+                "reuse": {"hit": False, "reason": result.reason}}
+        status, verdict = reuse.project(
+            store, result.candidate, branch=result.identity.branch,
+            base_sha=result.identity.base_sha)
+        if cancel is not None and cancel.is_set():
+            reason = REVIEW_CANCELLED_REASON
+            from .trust import banner_failure
+            return (4, banner_failure(reason)), None, {
+                "reuse": {"hit": False, "reason": reason}}
+        _reuse_audit(store, result, outcome="hit", reason=result.reason)
+        text = (f"SKODUN REUSE: review_id={result.candidate['id']} "
+                f"reason={result.reason}\n{verdict}")
+        return (status, text), None, {
+            "reuse": {"hit": True, "review_id": result.candidate["id"]}}
+    except KeyboardInterrupt:
+        raise
+    except BaseException as exc:
+        reason = f"probe failed ({type(exc).__name__}: {exc})"
+        _reuse_audit(store, result, outcome="error", reason=reason,
+                     reviewer=reviewer, client_family=client_family)
+        return None, f"SKODUN REUSE: error reason={reason}", {
+            "reuse": {"hit": False, "reason": reason}}
 
 
 def _recovery_identity(repo):
@@ -361,41 +488,38 @@ def _recovery_attempt_provider(rec: dict) -> str | None:
 
 def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         reviewer=None, client_family=None, recover=False,
-                        max_attempts=None, max_wall_seconds=None) -> tuple[int, str, dict]:
+                        max_attempts=None, max_wall_seconds=None,
+                        reuse_trusted=False, fresh=False,
+                        reuse_client_family=_REUSE_INTENT_UNSET
+                        ) -> tuple[int, str, dict]:
     """Shared review surface plus recovery metadata for MCP structured output."""
-    import math
     import threading
     import time
 
+    if recover:
+        max_attempts, wall_seconds, reason = _validate_recovery_limits(
+            max_attempts, max_wall_seconds)
+        if reason:
+            from .trust import banner_failure
+            return 2, banner_failure(reason), {
+                "recovery": {"terminal_reason": reason}}
+
+    reuse_result, reuse_note, reuse_metadata = _try_reuse(
+        store, repo, reuse_trusted=reuse_trusted, fresh=fresh,
+        reviewer=reviewer, client_family=client_family,
+        intent_client_family=(client_family
+                              if reuse_client_family is _REUSE_INTENT_UNSET
+                              else reuse_client_family),
+        cancel=cancel)
+    if reuse_result is not None:
+        return (*reuse_result, reuse_metadata)
     if not recover:
         status, text = _svc_review_once(
             store, repo, progress_sink=progress_sink, cancel=cancel,
             reviewer=reviewer, client_family=client_family)
-        return status, text, {}
-
-    if max_attempts is None:
-        max_attempts = _RECOVERY_DEFAULT_ATTEMPTS
-    if (isinstance(max_attempts, bool) or not isinstance(max_attempts, int)
-            or not 1 <= max_attempts <= _RECOVERY_MAX_ATTEMPTS):
-        reason = (f"max_attempts must be an int from 1 to "
-                  f"{_RECOVERY_MAX_ATTEMPTS}, got {max_attempts!r}")
-        from .trust import banner_failure
-        return 2, banner_failure(reason), {"recovery": {"terminal_reason": reason}}
-    if max_wall_seconds is None:
-        max_wall_seconds = _RECOVERY_DEFAULT_WALL_SECONDS
-    wall_seconds = None
-    if (not isinstance(max_wall_seconds, bool)
-            and isinstance(max_wall_seconds, (int, float))):
-        try:
-            wall_seconds = float(max_wall_seconds)
-        except (OverflowError, ValueError):
-            wall_seconds = None
-    if (wall_seconds is None or not math.isfinite(wall_seconds)
-            or wall_seconds <= 0 or wall_seconds > 86400):
-        reason = ("max_wall_seconds must be a positive number no greater than "
-                  f"86400, got {max_wall_seconds!r}")
-        from .trust import banner_failure
-        return 2, banner_failure(reason), {"recovery": {"terminal_reason": reason}}
+        if reuse_note:
+            text = f"{reuse_note}\n{text}"
+        return status, text, reuse_metadata
 
     from . import ids
     from .store import RUNNING
@@ -575,7 +699,10 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         "recovered": bool(last_rec and last_rec.get("trustworthy") is True
                            and len(review_ids) > 1),
     }}
-    return last_status, f"{prefix}\n{last_text}", metadata
+    if reuse_note:
+        prefix = f"{reuse_note}\n{prefix}"
+    return last_status, f"{prefix}\n{last_text}", {
+        **reuse_metadata, **metadata}
 
 
 def _render_review_banner(rec: dict) -> str:
@@ -585,11 +712,15 @@ def _render_review_banner(rec: dict) -> str:
 
 def svc_review(store, repo, *, progress_sink=None, cancel=None,
                reviewer=None, client_family=None, recover=False,
-               max_attempts=None, max_wall_seconds=None) -> tuple[int, str]:
+               max_attempts=None, max_wall_seconds=None,
+               reuse_trusted=False, fresh=False,
+               reuse_client_family=_REUSE_INTENT_UNSET) -> tuple[int, str]:
     status, text, _ = svc_review_detailed(
         store, repo, progress_sink=progress_sink, cancel=cancel,
         reviewer=reviewer, client_family=client_family, recover=recover,
-        max_attempts=max_attempts, max_wall_seconds=max_wall_seconds)
+        max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
+        reuse_trusted=reuse_trusted, fresh=fresh,
+        reuse_client_family=reuse_client_family)
     return status, text
 
 

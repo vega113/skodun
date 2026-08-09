@@ -29,6 +29,7 @@ from skodun.gitio import (
     git_common_dir,
     head_sha,
     is_primary_checkout,
+    tree_fingerprint,
     resolve_base,
     resolve_ref_base,
 )
@@ -103,6 +104,65 @@ def test_blob_sha1_matches_git(tmp_path):
         ["git", "hash-object", "--stdin"], input=data, capture_output=True, check=True
     ).stdout.decode().strip()
     assert blob_sha1(data) == expected
+
+
+def test_tree_fingerprint_changes_for_dirty_worktree_without_head_change(tmp_path):
+    repo = _mkrepo(tmp_path)
+    before = tree_fingerprint(repo)
+    head = head_sha(repo)
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    after = tree_fingerprint(repo)
+    assert head_sha(repo) == head
+    assert before != after
+
+
+def test_tree_fingerprint_changes_when_the_same_dirty_file_changes_again(tmp_path):
+    repo = _mkrepo(tmp_path)
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    first_dirty = tree_fingerprint(repo)
+    (repo / "a.txt").write_text("three\n", encoding="utf-8")
+    second_dirty = tree_fingerprint(repo)
+    assert first_dirty != second_dirty
+
+
+def test_tree_fingerprint_changes_when_the_same_submodule_file_changes_again(
+        tmp_path):
+    (tmp_path / "inner").mkdir()
+    (tmp_path / "outer").mkdir()
+    inner = _mkrepo(tmp_path / "inner")
+    outer = _mkrepo(tmp_path / "outer")
+    _git(outer, "-c", "protocol.file.allow=always", "submodule", "add",
+         str(inner), "mod")
+    _git(outer, "commit", "-m", "add submodule")
+    (outer / "mod" / "a.txt").write_text("two\n", encoding="utf-8")
+    first_dirty = tree_fingerprint(outer)
+    (outer / "mod" / "a.txt").write_text("three\n", encoding="utf-8")
+    second_dirty = tree_fingerprint(outer)
+    assert first_dirty != second_dirty
+
+
+def test_tree_fingerprint_can_be_limited_to_reviewed_paths(tmp_path):
+    repo = _mkrepo(tmp_path)
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    before = tree_fingerprint(repo, paths=["a.txt"])
+    (repo / "unreviewed.txt").write_text("outside the captured diff\n",
+                                          encoding="utf-8")
+    after = tree_fingerprint(repo, paths=["a.txt"])
+    assert before == after
+
+
+def test_tree_fingerprint_rejects_a_replaced_path(tmp_path, monkeypatch):
+    import errno
+
+    repo = _mkrepo(tmp_path)
+    (repo / "a.txt").write_text("dirty\n", encoding="utf-8")
+
+    def replaced_path(*args, **kwargs):
+        raise OSError(errno.ELOOP, "too many symbolic links")
+
+    monkeypatch.setattr(os, "open", replaced_path)
+    with pytest.raises(GitError, match="could not safely read"):
+        tree_fingerprint(repo)
 
 
 def test_diff_identity_strips_trailing_newlines_like_shell():

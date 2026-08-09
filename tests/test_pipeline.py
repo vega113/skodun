@@ -286,6 +286,8 @@ def test_persisted_record_carries_the_full_artifact_schema(tmp_path, capsys):
     assert isinstance(rec["context_files"], list)
     assert isinstance(rec["context_omitted_files"], list)
     assert rec["context_hash"] and len(rec["context_hash"]) == 64
+    assert rec["checklist_hash"] and len(rec["checklist_hash"]) == 64
+    assert rec["tree_fingerprint"] and len(rec["tree_fingerprint"]) == 64
     assert [a["n"] for a in rec["attempts"]] == [1]
     assert rec["severity"] == {"high": 1, "medium": 0, "low": 0}
     assert rec["rule_ids"] == ["no-foo"]
@@ -387,6 +389,7 @@ def test_an_empty_outgoing_change_is_not_sent_to_the_model(tmp_path, capsys):
     assert _calls(tmp_path) == 0
     assert rec["trustworthy"] is True and rec["findings_total"] == 0
     assert rec["summary"] == "no outgoing changes"
+    assert rec["checklist_hash"] and len(rec["checklist_hash"]) == 64
     assert _verdict(rec, capsys).startswith("SKODUN VERDICT: trustworthy=true")
 
 
