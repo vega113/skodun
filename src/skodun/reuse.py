@@ -254,6 +254,9 @@ def probe(store, repo, *, cfg, reviewer: str | None = None,
         current_reviewer = None if default is None else default.name
     identity = _identity_for(
         root, cfg, base, diff, branch=branch, reviewer_name=current_reviewer)
+    if diff.truncated_untracked:
+        return ReuseProbe(
+            None, identity, "untracked scan truncated; reuse refused")
     candidates = store.reuse_candidates(
         identity.repo_id, identity.base_sha, identity.diff_hash)
     candidate = None
@@ -278,6 +281,9 @@ def probe(store, repo, *, cfg, reviewer: str | None = None,
             break
     current_diff = gitio.capture_diff(
         root, base.sha, cfg.defaults.untracked_max)
+    if current_diff.truncated_untracked:
+        return ReuseProbe(
+            None, identity, "untracked scan truncated; reuse refused")
     if gitio.diff_identity(current_diff.data) != identity.diff_hash:
         return ReuseProbe(None, identity, "tree moved during reuse probe")
     if gitio.tree_fingerprint(root, paths=current_diff.files) != \

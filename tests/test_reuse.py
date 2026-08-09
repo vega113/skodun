@@ -185,6 +185,33 @@ def test_refuter_switch_changes_the_reuse_identity(tmp_path, monkeypatch):
         with_refuter.security_policy_hash
 
 
+def test_truncated_untracked_scan_never_reuses_a_partial_identity(
+        tmp_path, monkeypatch):
+    repo = _mkrepo(tmp_path)
+    (repo / ".skodun.toml").write_text(
+        '[defaults]\nuntracked_max = 1\n'
+        '[[reviewers]]\nname = "finder"\nprovider = "xai"\nmodel = "m"\n',
+        encoding="utf-8")
+    _git(repo, "add", ".skodun.toml")
+    _git(repo, "commit", "-m", "config")
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "b.txt").write_text("first\n", encoding="utf-8")
+    cfg = load_config(repo)
+    base = resolve_base(repo)
+    diff = capture_diff(repo, base.sha, cfg.defaults.untracked_max)
+    assert diff.truncated_untracked is False
+    identity = reuse._identity_for(
+        repo, cfg, base, diff, branch=current_branch(repo),
+        reviewer_name="finder")
+    (repo / "c.txt").write_text("second\n", encoding="utf-8")
+    monkeypatch.setenv("SKODUN_ALLOW_MAIN", "1")
+    with Store.open(tmp_path / "reuse.db") as store:
+        store.save_review(_record(identity, routed_reviewer="finder"))
+        result = reuse.probe(store, repo, cfg=cfg)
+    assert result.candidate is None
+    assert "truncated" in result.reason
+
+
 def test_oversized_identity_has_deterministic_batched_hashes(tmp_path):
     repo = _mkrepo(tmp_path)
     (repo / ".skodun.toml").write_text(

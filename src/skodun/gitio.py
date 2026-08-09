@@ -597,18 +597,22 @@ def tree_fingerprint(repo: Path, *, paths=None) -> str:
             h.update(b"\0symlink\0" + target)
         elif stat.S_ISREG(info.st_mode):
             h.update(b"\0content\0")
-            if (not hasattr(os, "O_NOFOLLOW")
-                    or not hasattr(os, "O_NONBLOCK")
-                    or not hasattr(os, "set_blocking")):
-                raise GitError(
-                    "tree fingerprint requires safe nonblocking opens")
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            nonblock = getattr(os, "O_NONBLOCK", 0)
+            if not hasattr(os, "set_blocking"):
+                raise GitError("tree fingerprint requires descriptor blocking control")
+            if not nofollow and os.path.islink(path):
+                raise GitError(f"tree fingerprint found unsafe path: {name}")
             fd = None
             try:
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                fd = os.open(path, os.O_RDONLY | nofollow | nonblock)
                 opened = os.fstat(fd)
                 if not stat.S_ISREG(opened.st_mode):
                     raise GitError(f"tree fingerprint found unsafe path: {name}")
-                os.set_blocking(fd, True)
+                if nonblock:
+                    os.set_blocking(fd, True)
+                if not nofollow and os.path.islink(path):
+                    raise GitError(f"tree fingerprint found unsafe path: {name}")
                 with os.fdopen(fd, "rb") as stream:
                     fd = None
                     for chunk in iter(lambda: stream.read(1024 * 1024), b""):
