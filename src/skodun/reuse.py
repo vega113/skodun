@@ -14,7 +14,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import budget, checklist, contextpack, gitio, promptbuild, triage
+from . import (batching, budget, checklist, contextpack, gitio, passes,
+               promptbuild, triage)
 from .trust import banner, is_trustworthy
 
 
@@ -52,6 +53,27 @@ def checklist_identity(selection: checklist.Selection) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+def aggregate_checklist_identity(selections) -> str | None:
+    """Hash the ordered checklist selections used by a batched review."""
+    identities = [checklist_identity(selection) for selection in selections]
+    if not identities:
+        return None
+    body = json.dumps(identities, separators=(",", ":"))
+    return hashlib.sha256(body.encode("ascii")).hexdigest()
+
+
+def aggregate_context_identity(context_hashes, *, enabled: bool) -> str | None:
+    """Hash the ordered context packs used by a batched review."""
+    if not enabled:
+        return None
+    if (not context_hashes
+            or any(not isinstance(value, str) or not value.strip()
+                   for value in context_hashes)):
+        return None
+    body = json.dumps(list(context_hashes), separators=(",", ":"))
+    return hashlib.sha256(body.encode("ascii")).hexdigest()
+
+
 def _reviewer_by_name(cfg, name: object):
     if not isinstance(name, str) or not name:
         return None
@@ -84,6 +106,13 @@ def _identity_for(repo: Path, cfg, base, diff, *, branch: str,
     routed = (candidate or {}).get("routed_reviewer")
     reviewer = _reviewer_by_name(cfg, routed) or _reviewer_by_name(
         cfg, reviewer_name)
+    if reviewer is not None and len(diff.data) > budget.prompt_budget(
+            cfg.defaults, reviewer):
+        context_hash, checklist_hash = _batched_identities(
+            root, diff, cfg, reviewer)
+    else:
+        context_hash = _context_hash(root, diff, cfg, reviewer)
+        checklist_hash = checklist_identity(selection)
     return ReuseIdentity(
         repo_id=gitio.repository_identity(root),
         worktree_root=gitio.observed_worktree_root(root),
@@ -91,10 +120,46 @@ def _identity_for(repo: Path, cfg, base, diff, *, branch: str,
         head=gitio.head_sha(root),
         base_sha=base.sha,
         diff_hash=gitio.diff_identity(diff.data),
-        context_hash=_context_hash(root, diff, cfg, reviewer),
-        checklist_hash=checklist_identity(selection),
+        context_hash=context_hash,
+        checklist_hash=checklist_hash,
         tree_fingerprint=gitio.tree_fingerprint(root),
     )
+
+
+def _batched_identities(root: Path, diff, cfg, reviewer):
+    """Reproduce the pipeline's deterministic batch checklist/context identity."""
+    defaults = cfg.defaults
+    envelope = budget.prompt_budget(defaults, reviewer)
+    batch_budget = envelope // 2 if defaults.context_pack else envelope
+    batches = batching.split(diff.data, max(1, batch_budget))
+    mode = passes.batch_checklist_mode(len(batches))
+    sole = len(batches) == 1
+    selections = []
+    context_hashes = []
+    for batch in batches:
+        selection = checklist.select(
+            batch.files, mode, _under(root, defaults.checklist_dir),
+            _under(root, defaults.rules_json), defaults.checklist_map,
+            defaults.test_path_patterns)
+        selections.append(selection)
+        if defaults.context_pack:
+            headroom = promptbuild.context_headroom(
+                envelope, len(batch.data), packing=True)
+            pack = contextpack.pack(
+                root, list(batch.files),
+                {f: diff.statuses[f] for f in batch.files
+                 if f in diff.statuses}, headroom,
+                pack_large_added=not sole)
+            context_hashes.append(
+                pack.sha256 if isinstance(pack.sha256, str) else None)
+    if passes.should_run_integration(len(batches)):
+        selections.append(checklist.select(
+            diff.files, passes.INTEGRATION_CHECKLIST_MODE,
+            _under(root, defaults.checklist_dir), _under(root, defaults.rules_json),
+            defaults.checklist_map, defaults.test_path_patterns))
+    return (aggregate_context_identity(
+                context_hashes, enabled=defaults.context_pack),
+            aggregate_checklist_identity(selections))
 
 
 def _under(root: Path, relative: str) -> Path:

@@ -617,6 +617,14 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
                 reuse_client_family=(
                     family if call.params.get("client_family") is not None
                     else None))
+        elif reuse_trusted or fresh:
+            status, text, metadata = services.svc_review_detailed(
+                store, repo, cancel=call.cancel, reviewer=reviewer,
+                client_family=family, reuse_trusted=reuse_trusted,
+                fresh=fresh,
+                reuse_client_family=(
+                    family if call.params.get("client_family") is not None
+                    else None))
         else:
             status, text = services.svc_review(
                 store, repo, cancel=call.cancel, reviewer=reviewer,

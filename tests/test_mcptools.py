@@ -852,11 +852,11 @@ def test_reuse_does_not_treat_handshake_family_as_explicit_intent(
         tmp_path, monkeypatch):
     seen: dict = {}
 
-    def fake(store, repo, **kw):
+    def fake_detailed(store, repo, **kw):
         seen.update(kw)
-        return 0, "SKODUN VERDICT: trustworthy=true findings=0"
+        return 0, "SKODUN VERDICT: trustworthy=true findings=0", {}
 
-    monkeypatch.setattr(services, "svc_review", fake)
+    monkeypatch.setattr(services, "svc_review_detailed", fake_detailed)
     monkeypatch.chdir(tmp_path)
     _specs()["review"].handler(HandlerCall(
         params={"repo": str(tmp_path), "reuse_trusted": True},
@@ -864,6 +864,21 @@ def test_reuse_does_not_treat_handshake_family_as_explicit_intent(
         cancel=threading.Event(), client_name="Grok CLI"))
     assert seen["client_family"] == "xai"
     assert seen["reuse_client_family"] is None
+
+
+def test_mcp_reuse_hit_preserves_structured_metadata_without_recovery(
+        tmp_path, monkeypatch):
+    def fake_detailed(store, repo, **kw):
+        assert kw["reuse_trusted"] is True
+        return 0, "SKODUN REUSE: review_id=r1", {
+            "reuse": {"hit": True, "review_id": "r1"}}
+
+    monkeypatch.setattr(services, "svc_review_detailed", fake_detailed)
+    result = _specs()["review"].handler(HandlerCall(
+        params={"repo": str(tmp_path), "reuse_trusted": True},
+        store_factory=lambda: Store.open(tmp_path / "s.db"),
+        cancel=threading.Event()))
+    assert result.metadata == {"reuse": {"hit": True, "review_id": "r1"}}
 
 
 def test_a_client_name_nothing_recognises_leaves_the_family_undeclared(

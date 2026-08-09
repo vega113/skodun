@@ -2798,6 +2798,8 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
     checklist_bytes = 0
     checklist_notes: list[str] = []
     checklist_degraded = False
+    checklist_selections = []
+    context_hashes = []
 
     def _fold_checklist(selection) -> None:
         """Fold one prompt's selection into the aggregate's checklist telemetry.
@@ -2829,6 +2831,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         selection = checklist.select(
             batch.files, mode, _under(root, d.checklist_dir),
             _under(root, d.rules_json), d.checklist_map, d.test_path_patterns)
+        checklist_selections.append(selection)
         _fold_checklist(selection)
 
         pack = None
@@ -2846,6 +2849,8 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                  if f in diff.statuses},
                 headroom, source=context_source, oid=context_oid,
                 pack_large_added=not sole)
+            context_hashes.append(
+                pack.sha256 if isinstance(pack.sha256, str) else None)
             ctx_bytes += pack.bytes_total
             for name in pack.included:
                 if name not in ctx_files:
@@ -2909,6 +2914,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             diff.files, passes.INTEGRATION_CHECKLIST_MODE,
             _under(root, d.checklist_dir), _under(root, d.rules_json),
             d.checklist_map, d.test_path_patterns)
+        checklist_selections.append(selection)
         _fold_checklist(selection)
         meta_checklist = passes.checklist_meta(
             passes.INTEGRATION_CHECKLIST_MODE, selection)
@@ -3028,12 +3034,13 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         context_bytes=ctx_bytes,
         context_files=ctx_files,
         context_omitted_files=ctx_omitted,
-        # DELIBERATE: a batched aggregate is never dedup-suppressible. There is
-        # no single canonical context pack behind it -- each batch packed its own
-        # files -- so publishing one hash would certify context nothing was
-        # reviewed against. The cost is a redundant re-review of a rare
-        # oversized diff; the alternative risks certifying unpacked context.
-        context_hash="",
+        # Background artifacts stay outside the foreground reuse contract;
+        # their legacy dedup policy intentionally retains empty identities.
+        context_hash=(reuse.aggregate_context_identity(
+            context_hashes, enabled=d.context_pack)
+            if rec.get("mode") == "now" else ""),
+        checklist_hash=(reuse.aggregate_checklist_identity(checklist_selections)
+                        if rec.get("mode") == "now" else ""),
     )
     if integration is not None:
         out["integration"] = integration

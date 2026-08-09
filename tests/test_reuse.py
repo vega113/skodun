@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
+
 from skodun import reuse
 from skodun.config import load_config
 from skodun.gitio import capture_diff, current_branch, resolve_base
@@ -120,6 +123,31 @@ def test_disabled_context_pack_can_match_without_a_context_hash(tmp_path):
     with Store.open(tmp_path / "reuse.db") as store:
         store.save_review(_record(identity, context_hash=""))
         assert reuse.find_exact_candidate(store, identity)["id"] == "r1"
+
+
+def test_oversized_identity_has_deterministic_batched_hashes(tmp_path):
+    repo = _mkrepo(tmp_path)
+    (repo / ".skodun.toml").write_text(
+        '[[reviewers]]\nname = "finder"\nprovider = "xai"\nmodel = "m"\n',
+        encoding="utf-8")
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    cfg = load_config(repo)
+    cfg = replace(cfg, defaults=replace(cfg.defaults, max_diff_bytes=1000))
+    base = resolve_base(repo)
+    diff = SimpleNamespace(
+        data=(b"diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-" + b"x" * 1800
+              + b"\n+two\n"),
+        files=["a.txt"], statuses={"a.txt": "M"})
+    first = reuse._identity_for(
+        repo, cfg, base, diff, branch=current_branch(repo),
+        reviewer_name="finder")
+    second = reuse._identity_for(
+        repo, cfg, base, diff, branch=current_branch(repo),
+        reviewer_name="finder")
+    assert first.checklist_hash and first.context_hash
+    assert first.checklist_hash == second.checklist_hash
+    assert first.context_hash == second.context_hash
 
 
 def test_projection_recomputes_open_findings_from_current_triage(tmp_path):
