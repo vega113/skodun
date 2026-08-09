@@ -106,7 +106,7 @@ def test_each_identity_mismatch_is_a_miss(tmp_path):
     with Store.open(db) as store:
         store.save_review(_record(identity))
         for field in ("repo_id", "base_sha", "diff_hash", "context_hash",
-                      "checklist_hash", "tree_fingerprint",
+                      "branch", "checklist_hash", "tree_fingerprint",
                       "security_policy_hash"):
             changed = identity.__dict__.copy()
             changed[field] = "x" * len(changed[field])
@@ -161,6 +161,28 @@ def test_skeptic_switch_changes_the_reuse_identity(tmp_path, monkeypatch):
         reviewer_name="finder")
     assert without_skeptic.security_policy_hash != \
         with_skeptic.security_policy_hash
+
+
+def test_refuter_switch_changes_the_reuse_identity(tmp_path, monkeypatch):
+    repo = _mkrepo(tmp_path)
+    (repo / ".skodun.toml").write_text(
+        '[[reviewers]]\nname = "finder"\nprovider = "xai"\nmodel = "m"\n',
+        encoding="utf-8")
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    cfg = load_config(repo)
+    base = resolve_base(repo)
+    diff = capture_diff(repo, base.sha, cfg.defaults.untracked_max)
+    monkeypatch.setenv("SKODUN_REFUTER_PASS", "0")
+    without_refuter = reuse._identity_for(
+        repo, cfg, base, diff, branch=current_branch(repo),
+        reviewer_name="finder")
+    monkeypatch.setenv("SKODUN_REFUTER_PASS", "1")
+    with_refuter = reuse._identity_for(
+        repo, cfg, base, diff, branch=current_branch(repo),
+        reviewer_name="finder")
+    assert without_refuter.security_policy_hash != \
+        with_refuter.security_policy_hash
 
 
 def test_oversized_identity_has_deterministic_batched_hashes(tmp_path):

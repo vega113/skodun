@@ -84,6 +84,7 @@ def security_policy_identity(cfg) -> str:
         "prompt_slots": list(cfg.defaults.security_prompt_slots),
         "kill_switch": os.environ.get("SKODUN_SECURITY_PASS", "1"),
         "skeptic_switch": os.environ.get("SKODUN_SKEPTIC_PASS", "1"),
+        "refuter_switch": os.environ.get("SKODUN_REFUTER_PASS", "1"),
         "reviewers": reviewers,
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
@@ -195,7 +196,7 @@ def _candidate_matches(candidate: dict, identity: ReuseIdentity) -> bool:
     if not is_trustworthy(*axes) or candidate.get("trustworthy") is not True:
         return False
     required = (
-        "repo_id", "worktree_root", "base_sha", "diff_hash",
+        "repo_id", "worktree_root", "branch", "base_sha", "diff_hash",
         "checklist_hash", "tree_fingerprint", "security_policy_hash")
     if any(not isinstance(candidate.get(key), str)
            or not candidate[key].strip() for key in required):
