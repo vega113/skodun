@@ -939,6 +939,11 @@ V7_OBJECTS = {V7_TABLE} | V7_INDEXES
 V8_TABLE = ("table", "api_spend_events")
 V8_INDEX = ("index", "ix_api_spend_provider_day")
 V8_OBJECTS = {V8_TABLE, V8_INDEX}
+V9_INDEXES = {
+    ("index", "ix_reviews_repo_id_started"),
+    ("index", "ix_reviews_orchestration"),
+}
+V9_OBJECTS = V9_INDEXES
 
 #: One legacy `triage` row, in the shipped single-row-per-ledger-key shape the
 #: v3 migration has to seed an event from.
@@ -1025,7 +1030,7 @@ def test_schema_is_frozen_at_the_phase1_baseline():
 def test_fresh_db_lands_at_schema_version(tmp_path):
     db = tmp_path / "s.db"
     st = Store.open(db)
-    assert SCHEMA_VERSION == 8
+    assert SCHEMA_VERSION == 9
     assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert ("table", "provider_state") in _objects(db)
     assert V6_TABLE in _objects(db)
@@ -1078,7 +1083,7 @@ def test_phase1_store_upgrade_preserves_every_table_index_and_row(tmp_path):
     after = _objects(db)
     assert before <= after, before - after            # nothing dropped
     assert after - before == {("table", "provider_state"), V5_INDEX} | {
-        ("table", t) for t in V3_TABLES} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS  # nothing else
+        ("table", t) for t in V3_TABLES} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS  # nothing else
     assert sorted(r["id"] for r in st.list_reviews(None, 100)) == ["r1", "r2", "r3"]
     assert st.triage_for("b", "s" * 40)["k1"]["dismissed_reason"] == "wontfix"
     assert st._c.execute("SELECT count(*) FROM gate_events").fetchone()[0] == 1
@@ -1223,7 +1228,7 @@ def test_a_v2_store_gains_every_v3_delta(tmp_path):
     assert _user_version(db) == SCHEMA_VERSION
     assert before <= _objects(db)                          # nothing dropped
     assert _objects(db) - before == (
-        {("table", t) for t in V3_TABLES} | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS)
+        {("table", t) for t in V3_TABLES} | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS)
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     assert _columns(db, "dedup_events") == V3_DEDUP_EVENT_COLUMNS
     assert _columns(db, "deliveries") == V3_DELIVERY_COLUMNS
@@ -1529,11 +1534,10 @@ def test_no_non_transactional_delta_carries_a_non_idempotent_statement():
             assert "ALTER TABLE" not in delta.upper(), target
         else:
             assert isinstance(delta, tuple) and all(isinstance(s, str) for s in delta)
-    # The last rung is what a fresh store is stamped with. v6 is the
-    # replay-idempotent str lane (capacity_admissions); earlier ALTER/rebuild
-    # rungs remain tuples.
-    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 8
-    assert isinstance(_MIGRATIONS[-1][1], str)
+    # The last rung is what a fresh store is stamped with. v8 is the
+    # replay-idempotent str lane; v9 is transactional because it adds columns.
+    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 9
+    assert isinstance(_MIGRATIONS[-1][1], tuple)
     assert any(isinstance(d, tuple) for _, d in _MIGRATIONS)
 
 
@@ -1571,9 +1575,10 @@ def test_a_v3_store_gains_the_widened_vocabulary_and_the_reference_column(tmp_pa
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 8
-    # A v3 store climbs v4–v7 in one open: v5 index + v6 capacity + v7 feedback.
-    assert _objects(db) == before | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS, (
+    assert _user_version(db) == SCHEMA_VERSION == 9
+    # A v3 store climbs v4–v9 in one open: v5 index + capacity, feedback,
+    # spend, and telemetry indexes.
+    assert _objects(db) == before | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS, (
         "the rebuild added or dropped an object")
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     # The seeded legacy dismissal came through the rebuild intact...
@@ -1874,7 +1879,7 @@ def test_a_v4_store_gains_the_repo_column_and_its_index(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 8
+    assert _user_version(db) == SCHEMA_VERSION == 9
     assert "repo" in _columns(db, "reviews")
     row = st._c.execute("SELECT repo FROM reviews WHERE id='r1'").fetchone()
     assert row["repo"] is None, "a pre-v5 row must not be backfilled"
@@ -1898,8 +1903,8 @@ def test_a_v5_store_gains_capacity_admissions(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 8
-    assert _objects(db) - before == V6_OBJECTS | V7_OBJECTS | V8_OBJECTS
+    assert _user_version(db) == SCHEMA_VERSION == 9
+    assert _objects(db) - before == V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS
     assert "repo" in _columns(db, "reviews")
     st.close()
 
@@ -1927,8 +1932,8 @@ def test_a_v6_store_gains_feedback_events(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 8
-    assert _objects(db) - before == V7_OBJECTS | V8_OBJECTS
+    assert _user_version(db) == SCHEMA_VERSION == 9
+    assert _objects(db) - before == V7_OBJECTS | V8_OBJECTS | V9_OBJECTS
     st.close()
 
 
@@ -2346,6 +2351,7 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_openai_api.py",
     "tests/test_review_exit_matrix.py",
     "tests/test_provenance.py",
+    "tests/test_stats.py",
 )
 
 #: Store-touching modules deliberately kept OUT of the subprocess sweep, with
@@ -2496,6 +2502,7 @@ RESERVED_KEYS = {
     "mode", "source", "status", "parse_ok", "degraded", "diff_truncated",
     "findings", "findings_total", "summary", "failure_reason", "usable_output",
     "worst_runtime_sec", "pid", "superseded_by", "repo",
+    "review_started_at", "repo_id",
     # Computed at the chokepoint from the three axes, never caller-supplied.
     "trustworthy",
 }
