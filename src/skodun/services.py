@@ -296,6 +296,33 @@ _RECOVERY_DEFAULT_WALL_SECONDS = 900
 _REUSE_INTENT_UNSET = object()
 
 
+def _validate_recovery_limits(max_attempts, max_wall_seconds):
+    import math
+
+    if max_attempts is None:
+        max_attempts = _RECOVERY_DEFAULT_ATTEMPTS
+    if (isinstance(max_attempts, bool) or not isinstance(max_attempts, int)
+            or not 1 <= max_attempts <= _RECOVERY_MAX_ATTEMPTS):
+        return max_attempts, None, (
+            f"max_attempts must be an int from 1 to "
+            f"{_RECOVERY_MAX_ATTEMPTS}, got {max_attempts!r}")
+    if max_wall_seconds is None:
+        max_wall_seconds = _RECOVERY_DEFAULT_WALL_SECONDS
+    wall_seconds = None
+    if (not isinstance(max_wall_seconds, bool)
+            and isinstance(max_wall_seconds, (int, float))):
+        try:
+            wall_seconds = float(max_wall_seconds)
+        except (OverflowError, ValueError):
+            wall_seconds = None
+    if (wall_seconds is None or not math.isfinite(wall_seconds)
+            or wall_seconds <= 0 or wall_seconds > 86400):
+        return max_attempts, None, (
+            "max_wall_seconds must be a positive number no greater than "
+            f"86400, got {max_wall_seconds!r}")
+    return max_attempts, wall_seconds, None
+
+
 def _reuse_audit(store, probe, *, outcome: str, reason: str,
                  reviewer=None, client_family=None) -> None:
     import time
@@ -446,9 +473,16 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         reuse_client_family=_REUSE_INTENT_UNSET
                         ) -> tuple[int, str, dict]:
     """Shared review surface plus recovery metadata for MCP structured output."""
-    import math
     import threading
     import time
+
+    if recover:
+        max_attempts, wall_seconds, reason = _validate_recovery_limits(
+            max_attempts, max_wall_seconds)
+        if reason:
+            from .trust import banner_failure
+            return 2, banner_failure(reason), {
+                "recovery": {"terminal_reason": reason}}
 
     reuse_result, reuse_note, reuse_metadata = _try_reuse(
         store, repo, reuse_trusted=reuse_trusted, fresh=fresh,
@@ -465,32 +499,6 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         if reuse_note:
             text = f"{reuse_note}\n{text}"
         return status, text, reuse_metadata
-
-    if max_attempts is None:
-        max_attempts = _RECOVERY_DEFAULT_ATTEMPTS
-    if (isinstance(max_attempts, bool) or not isinstance(max_attempts, int)
-            or not 1 <= max_attempts <= _RECOVERY_MAX_ATTEMPTS):
-        reason = (f"max_attempts must be an int from 1 to "
-                  f"{_RECOVERY_MAX_ATTEMPTS}, got {max_attempts!r}")
-        from .trust import banner_failure
-        return 2, banner_failure(reason), {
-            **reuse_metadata, "recovery": {"terminal_reason": reason}}
-    if max_wall_seconds is None:
-        max_wall_seconds = _RECOVERY_DEFAULT_WALL_SECONDS
-    wall_seconds = None
-    if (not isinstance(max_wall_seconds, bool)
-            and isinstance(max_wall_seconds, (int, float))):
-        try:
-            wall_seconds = float(max_wall_seconds)
-        except (OverflowError, ValueError):
-            wall_seconds = None
-    if (wall_seconds is None or not math.isfinite(wall_seconds)
-            or wall_seconds <= 0 or wall_seconds > 86400):
-        reason = ("max_wall_seconds must be a positive number no greater than "
-                  f"86400, got {max_wall_seconds!r}")
-        from .trust import banner_failure
-        return 2, banner_failure(reason), {
-            **reuse_metadata, "recovery": {"terminal_reason": reason}}
 
     from . import ids
     from .store import RUNNING

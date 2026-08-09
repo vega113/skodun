@@ -292,6 +292,19 @@ def test_bounded_recovery_rejects_bool_limits_and_preserves_explicit_pin(
     assert all(call["avoid_providers"] == set() for call in calls)
 
 
+def test_recovery_limits_are_validated_before_reuse_probe(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        services, "_try_reuse",
+        lambda *args, **kwargs: pytest.fail("reuse probe ran before validation"))
+    with Store.open(tmp_path / "recovery.db") as store:
+        status, text, metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True, max_attempts=0,
+            reuse_trusted=True)
+    assert status == 2
+    assert "max_attempts" in text
+    assert metadata["recovery"]["terminal_reason"]
+
+
 def test_bounded_recovery_rejects_float_overflow(tmp_path):
     status, text, _metadata = services.svc_review_detailed(
         object(), tmp_path, recover=True, max_wall_seconds=10 ** 1000)

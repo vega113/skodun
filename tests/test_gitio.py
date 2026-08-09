@@ -125,6 +125,20 @@ def test_tree_fingerprint_changes_when_the_same_dirty_file_changes_again(tmp_pat
     assert first_dirty != second_dirty
 
 
+def test_tree_fingerprint_rejects_a_replaced_path(tmp_path, monkeypatch):
+    import errno
+
+    repo = _mkrepo(tmp_path)
+    (repo / "a.txt").write_text("dirty\n", encoding="utf-8")
+
+    def replaced_path(*args, **kwargs):
+        raise OSError(errno.ELOOP, "too many symbolic links")
+
+    monkeypatch.setattr(os, "open", replaced_path)
+    with pytest.raises(GitError, match="could not safely read"):
+        tree_fingerprint(repo)
+
+
 def test_diff_identity_strips_trailing_newlines_like_shell():
     assert diff_identity(b"diff --git a b\n+x\n\n\n") == diff_identity(
         b"diff --git a b\n+x"
