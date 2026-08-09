@@ -539,7 +539,7 @@ def head_sha(repo: Path) -> str:
     return _out(repo, "rev-parse", "HEAD")
 
 
-def tree_fingerprint(repo: Path) -> str:
+def tree_fingerprint(repo: Path, *, paths=None) -> str:
     """Fingerprint the checked-out tree, including dirty file contents.
 
     HEAD alone is insufficient for foreground coverage: staged, unstaged, and
@@ -554,14 +554,25 @@ def tree_fingerprint(repo: Path) -> str:
     h = hashlib.sha256()
     h.update(head_sha(root).encode("ascii"))
     h.update(b"\0status\0")
-    h.update(status)
-    paths = []
-    for token in _paths(status):
-        if not token:
-            continue
-        paths.append(token[3:] if len(token) >= 3 and token[2] == " "
-                     else token)
-    for name in paths:
+    status_tokens = _paths(status)
+    changed_paths = []
+    for token in status_tokens:
+        if token:
+            changed_paths.append(
+                token[3:] if len(token) >= 3 and token[2] == " " else token)
+    fingerprint_paths = (changed_paths if paths is None else list(paths))
+    if paths is None:
+        h.update(status)
+    else:
+        wanted = set(fingerprint_paths)
+        for token in status_tokens:
+            if not token:
+                continue
+            name = token[3:] if len(token) >= 3 and token[2] == " " else token
+            if name in wanted:
+                h.update(token.encode("utf-8", "surrogateescape"))
+                h.update(b"\0")
+    for name in fingerprint_paths:
         encoded = name.encode("utf-8", "surrogateescape")
         h.update(len(encoded).to_bytes(8, "big"))
         h.update(encoded)

@@ -125,6 +125,16 @@ def test_tree_fingerprint_changes_when_the_same_dirty_file_changes_again(tmp_pat
     assert first_dirty != second_dirty
 
 
+def test_tree_fingerprint_can_be_limited_to_reviewed_paths(tmp_path):
+    repo = _mkrepo(tmp_path)
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    before = tree_fingerprint(repo, paths=["a.txt"])
+    (repo / "unreviewed.txt").write_text("outside the captured diff\n",
+                                          encoding="utf-8")
+    after = tree_fingerprint(repo, paths=["a.txt"])
+    assert before == after
+
+
 def test_tree_fingerprint_rejects_a_replaced_path(tmp_path, monkeypatch):
     import errno
 

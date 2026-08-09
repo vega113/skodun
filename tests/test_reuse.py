@@ -79,8 +79,9 @@ def test_tree_movement_during_probe_forces_a_miss(tmp_path, monkeypatch):
         calls = iter((identity.tree_fingerprint,
                       identity.tree_fingerprint,
                       "moved-" + identity.tree_fingerprint[6:]))
-        monkeypatch.setattr(reuse.gitio, "tree_fingerprint",
-                            lambda repo: next(calls))
+        monkeypatch.setattr(
+            reuse.gitio, "tree_fingerprint",
+            lambda repo, **kwargs: next(calls))
         result = reuse.probe(store, repo, cfg=cfg)
     assert result.candidate is None
     assert "tree moved" in result.reason

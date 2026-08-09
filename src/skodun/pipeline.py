@@ -1510,7 +1510,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         diff_hash = gitio.diff_identity(diff.data)
         branch = gitio.current_branch(repo)
         head = gitio.head_sha(repo)
-        tree_fingerprint = gitio.tree_fingerprint(repo)
+        tree_fingerprint = gitio.tree_fingerprint(repo, paths=diff.files)
 
         # STAGE TWO of the two-stage ordering: the AUTHORITATIVE batch plan,
         # built from the capture above — the only diff this review persists

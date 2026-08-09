@@ -122,7 +122,7 @@ def _identity_for(repo: Path, cfg, base, diff, *, branch: str,
         diff_hash=gitio.diff_identity(diff.data),
         context_hash=context_hash,
         checklist_hash=checklist_hash,
-        tree_fingerprint=gitio.tree_fingerprint(root),
+        tree_fingerprint=gitio.tree_fingerprint(root, paths=diff.files),
     )
 
 
@@ -250,7 +250,12 @@ def probe(store, repo, *, cfg, reviewer: str | None = None,
             identity = candidate_identity
             candidate = loaded
             break
-    if gitio.tree_fingerprint(root) != identity.tree_fingerprint:
+    current_diff = gitio.capture_diff(
+        root, base.sha, cfg.defaults.untracked_max)
+    if gitio.diff_identity(current_diff.data) != identity.diff_hash:
+        return ReuseProbe(None, identity, "tree moved during reuse probe")
+    if gitio.tree_fingerprint(root, paths=current_diff.files) != \
+            identity.tree_fingerprint:
         return ReuseProbe(None, identity, "tree moved during reuse probe")
     if candidate is None:
         return ReuseProbe(None, identity, "no exact trustworthy review matched")
