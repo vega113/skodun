@@ -124,6 +124,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "mode=auto and no --reviewer, prefers a finder "
                              "from a different family when one is free "
                              "(default: $SKODUN_CLIENT_FAMILY, else none)")
+    review.add_argument(
+        "--recover", action="store_true",
+        help="make a bounded sequence of fresh attempts until one is trustworthy")
+    review.add_argument(
+        "--max-attempts", type=int, default=None, dest="max_attempts",
+        help="recovery attempt limit, including the first attempt (default: 3)")
+    review.add_argument(
+        "--max-wall-seconds", type=float, default=None, dest="max_wall_seconds",
+        help="recovery wall-clock budget (default: 900 seconds)")
 
     stats = sub.add_parser(
         "stats", help="show operational review and capacity telemetry")
@@ -730,7 +739,10 @@ def _cmd_review(args) -> int:
         code, text = svc_review(
             store, Path(args.repo),
             reviewer=getattr(args, "reviewer", None),
-            client_family=getattr(args, "client_family", None))
+            client_family=getattr(args, "client_family", None),
+            recover=getattr(args, "recover", False),
+            max_attempts=getattr(args, "max_attempts", None),
+            max_wall_seconds=getattr(args, "max_wall_seconds", None))
     return _emit(text, code)
 
 

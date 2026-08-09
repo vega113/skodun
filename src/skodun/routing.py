@@ -778,7 +778,8 @@ def _shares_for(cfg: Config, pool: Sequence[Reviewer],
 
 
 def auto_route(cfg: Config, store, *,
-               client_family: str | None = None) -> Route | None:
+               client_family: str | None = None,
+               excluded_providers: set[str] | None = None) -> Route | None:
     """Score the configured pool against live load. None -> caller decides.
 
     The one call the pipeline makes. Guarded end to end for the reason
@@ -788,7 +789,9 @@ def auto_route(cfg: Config, store, *,
     that fell back in silence would be indistinguishable from one that decided.
     """
     try:
-        pool = resolve_pool(cfg)
+        excluded = set(excluded_providers or ())
+        pool = tuple(r for r in resolve_pool(cfg)
+                     if r.provider not in excluded)
         if not pool:
             return None
         _warn_inert_client_family(cfg, pool, client_family)
