@@ -516,6 +516,8 @@ def test_provider_max_in_flight_from_env_defaults():
 def test_provider_resource_class_naming():
     assert capacity.provider_resource_class("xai") == "provider:xai"
     assert capacity.provider_resource_class("openai") == "provider:openai"
+    assert capacity.provider_resource_class("xai", "shared") \
+        != capacity.provider_resource_class("openai", "shared")
     with pytest.raises(ValueError):
         capacity.provider_resource_class("")
 

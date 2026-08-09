@@ -159,14 +159,22 @@ def provider_max_in_flight_from_env(env: Mapping[str, str] | None = None) -> int
 
 
 def provider_resource_class(provider_id: str, quota_pool: str | None = None) -> str:
-    """``provider:<quota-pool>`` while preserving provider-only callers."""
+    """Return a provider-namespaced capacity class for one quota pool.
+
+    Automatically derived pools already carry their provider prefix (for
+    example ``google:gemini``), so retain that compact legacy spelling. An
+    explicit pool may be shared by configurations from different providers;
+    namespace that form to prevent cross-provider admission collisions.
+    """
     pid = str(provider_id or "").strip()
     if not pid:
         raise ValueError("provider_id must be a non-empty string")
     pool = str(quota_pool or pid).strip()
     if not pool:
         raise ValueError("quota_pool must be a non-empty string")
-    return f"{PROVIDER_CLASS_PREFIX}{pool}"
+    key = (pool if pool == pid or pool.startswith(f"{pid}:")
+           else f"{pid}:{pool}")
+    return f"{PROVIDER_CLASS_PREFIX}{key}"
 
 
 def wait_eta_p50_ms(samples: Sequence[int], *, min_samples: int = ETA_MIN_SAMPLES,

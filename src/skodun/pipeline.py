@@ -1804,6 +1804,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                             if routed_pool != finder.provider:
                                 route_meta["quota_pool"] = routed_pool
                             adapter = _adapter_for(finder)
+                            common.pop("quota_pool", None)
                             common.update(model=finder.model, adapter=adapter.name,
                                           **route_meta)
                             if candidate_mdb != previous_mdb:
