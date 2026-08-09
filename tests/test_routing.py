@@ -215,6 +215,61 @@ def test_a_provider_with_no_load_view_at_all_is_excluded():
     assert pick_finder(pool, loads).reviewer.name == "known"
 
 
+def test_google_quota_pools_route_independently(store):
+    gemini = Reviewer(name="gemini", provider="google",
+                      model="gemini-3.6-flash", role="finder")
+    claude = Reviewer(name="claude", provider="google",
+                      model="claude-sonnet-4-6", role="finder")
+    until = time.strftime(_TS_FORMAT, time.gmtime(time.time() + 600))
+    store.mark_provider_unavailable("google", "claude quota", "quota", until,
+                                   quota_pool="google:claude-gpt")
+    route = auto_route(_cfg(gemini, claude), store)
+    assert route.reviewer.name == "gemini"
+
+
+def test_google_quota_pools_share_one_provider_weight(store):
+    gemini = Reviewer(name="gemini", provider="google",
+                      model="gemini-3.6-flash", role="finder")
+    claude = Reviewer(name="claude", provider="google",
+                      model="claude-sonnet-4-6", role="finder")
+    xai = _entry("xai", "xai")
+    _seed_served(store, {"agy": 3, "grok": 1})
+    cfg = _cfg(gemini, claude, xai,
+               weights=(("google", 9), ("xai", 1)))
+
+    shares = routing._shares_for(
+        cfg, resolve_pool(cfg), provider_loads(store, resolve_pool(cfg)), store)
+
+    assert set(shares) == {"google", "xai"}
+    assert shares["google"].target == pytest.approx(0.9)
+    assert shares["google"].actual == pytest.approx(0.75)
+
+
+def test_auto_route_includes_confined_junie_when_feasible(monkeypatch, store,
+                                                          tmp_path):
+    monkeypatch.setattr("skodun.adapters.junie.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "skodun.adapters.junie_sanitized.resolve_sandbox_exec",
+        lambda: "/usr/bin/sandbox-exec")
+    binary = tmp_path / "junie"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("SKODUN_JUNIE_BIN", str(binary))
+    junie = _entry("finder-junie-luna", "junie")
+    fallback = _entry("finder-fallback", "xai")
+    junie = Reviewer(**{**junie.__dict__, "fallbacks": (fallback.name,)})
+    cfg = _cfg(junie, fallback)
+    route = auto_route(cfg, store)
+    assert route.reviewer.name == "finder-junie-luna"
+
+
+def test_prompt_size_excludes_only_the_argv_bound_candidate(store):
+    agy = _entry("finder-agy", "google")
+    openai = _entry("finder-openai", "openai")
+    route = auto_route(_cfg(agy, openai), store, prompt_size=200_000)
+    assert route.reviewer.name == "finder-openai"
+
+
 def test_cross_model_breaks_a_tie_between_two_equally_free_providers():
     pool = [_entry("same", "xai"), _entry("other", "openai")]
     loads = {"xai": ProviderLoad(free_slots=1),
@@ -517,6 +572,20 @@ def test_mode_auto_routes_off_the_busy_provider_and_records_why(store):
     assert meta == {"requested_reviewer": None,
                     "routed_reviewer": "finder-codex",
                     "route_reason": ROUTE_FREE, "client_family": None}
+
+
+def test_head_resolution_forwards_prompt_size_to_auto_router(store, monkeypatch):
+    cfg = _cfg(_entry("finder-grok", "xai"), _entry("finder-codex", "openai"))
+    seen = {}
+
+    def fake_auto_route(_cfg, _store, **kwargs):
+        seen.update(kwargs)
+        return routing.Route(cfg.reviewers[0], ROUTE_FREE)
+
+    monkeypatch.setattr(routing, "auto_route", fake_auto_route)
+    _head(cfg, store, prompt_size=12345)
+
+    assert seen["prompt_size"] == 12345
 
 
 def test_recovery_exclusion_does_not_fall_back_to_a_terminal_provider(store):

@@ -60,7 +60,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
-from .config import Config, Reviewer
+from .config import Config, Reviewer, quota_pool_for
 
 #: The caller's own model family, when it cares to say. Lowest-priority source
 #: after an explicit CLI flag / MCP argument (see `resolve_client_family`).
@@ -306,6 +306,10 @@ class Route:
     reviewer: Reviewer
     reason: str
 
+    @property
+    def quota_pool(self) -> str:
+        return quota_pool_for(self.reviewer)
+
 
 def resolve_pool(cfg: Config) -> tuple[Reviewer, ...]:
     """The `[[reviewers]]` entries the router may choose between.
@@ -541,11 +545,15 @@ def _argmax(pool: Sequence[Reviewer], loads: Mapping[str, ProviderLoad], *,
     best: int | None = None
     chosen: tuple[Reviewer, ProviderLoad] | None = None
     for entry in pool:
-        load = loads.get(entry.provider)
+        load = loads.get(quota_pool_for(entry))
         if load is None or load.unavailable:
             continue
         score = score_candidate(
             entry, load, client_family=client_family, cross_model=cross_model,
+            # Weights express a share of the provider subscription. Capacity
+            # and blackout state are pool-scoped, but the share term remains
+            # provider-scoped so a provider split into multiple quota pools
+            # does not silently receive the default weight once per pool.
             share=None if shares is None else shares.get(entry.provider))
         # STRICTLY greater, so an equal score leaves the earlier candidate in
         # place: that is the first-listed tie-break, and it is one comparison
@@ -598,21 +606,46 @@ def _provider_blackout(store, entry: Reviewer) -> bool:
     """
     from . import chain
 
-    if chain._cached_unavailable(store, entry.provider) is not None:
+    pool = quota_pool_for(entry)
+    if chain._cached_unavailable(store, entry.provider, pool) is not None:
         return True
     return chain._api_spend_blocked(store, entry)
+
+
+def _candidate_unavailable(entry: Reviewer,
+                           prompt_size: int | None = None) -> str | None:
+    """Return a candidate-local reason before auto-routing it, if known."""
+    from .adapters import get_adapter
+
+    try:
+        adapter = get_adapter(entry.provider)
+        if getattr(adapter, "routing_eligibility", None) is not None:
+            eligible, reason = adapter.routing_eligibility()
+            if not eligible:
+                return reason or "adapter is not eligible for automatic routing"
+        # Existing routing tests and deployments intentionally allow a missing
+        # non-Junie binary to be selected so the chain can record its normal
+        # binary-unavailable attempt. Junie's confinement gate is different:
+        # its adapter explicitly opts into this cheap check above.
+        limit = adapter.prompt_limit()
+        if (prompt_size is not None and limit is not None
+                and prompt_size > limit):
+            return f"prompt is {prompt_size} bytes; candidate limit is {limit}"
+    except Exception as exc:  # a routing hint cannot fail the review
+        return f"candidate readiness check failed: {exc!r}"
+    return None
 
 
 def provider_loads(store, pool: Sequence[Reviewer], *,
                    max_in_flight: int | None = None,
                    blackout_fn: Callable[[object, Reviewer], bool] | None = None,
+                   prompt_size: int | None = None,
                    ) -> dict[str, ProviderLoad]:
     """Store-visible load for every provider named in `pool`.
 
-    One entry per DISTINCT provider: two reviewer entries on the same provider
-    share one `provider:<id>` FIFO, so they share one picture of it, and
-    counting it twice would make a provider look busier the more ways an
-    operator configured it.
+    One entry per DISTINCT quota pool: reviewer entries on the same pool share
+    one `provider:<pool>` FIFO, while separate pools on one adapter get
+    independent capacity and blackout state.
 
     Best-effort per provider, and that posture is the point: a store that cannot
     answer about one provider must not fail a review. Such a provider is marked
@@ -650,32 +683,39 @@ def provider_loads(store, pool: Sequence[Reviewer], *,
     out: dict[str, ProviderLoad] = {}
     for entry in pool:
         provider = entry.provider
-        if provider in out:
+        pool_key = quota_pool_for(entry)
+        if pool_key in out:
             continue
         if provider not in _REGISTRY:
             # A config error, and one the pipeline's own preflight refuses in
             # its own words. Excluded here so the router cannot PICK it and turn
             # a refusal that names the misconfigured entry into one that names
             # an entry the caller never asked for.
-            out[provider] = ProviderLoad(unavailable=True)
+            out[pool_key] = ProviderLoad(unavailable=True)
             continue
         try:
-            if blackout(store, entry):
-                out[provider] = ProviderLoad(unavailable=True)
+            local_reason = _candidate_unavailable(entry, prompt_size)
+            if local_reason is not None:
+                _note(f"routing: skipping {entry.name} ({provider}): "
+                      f"{local_reason}")
+                out[pool_key] = ProviderLoad(unavailable=True)
                 continue
-            resource_class = capacity.provider_resource_class(provider)
-            holders = store.capacity_holder_count(resource_class, provider)
-            views = store.capacity_active_views(resource_class, provider)
+            if blackout(store, entry):
+                out[pool_key] = ProviderLoad(unavailable=True)
+                continue
+            resource_class = capacity.provider_resource_class(provider, pool_key)
+            holders = store.capacity_holder_count(resource_class, pool_key)
+            views = store.capacity_active_views(resource_class, pool_key)
             queued = sum(1 for v in views
                          if v.status == capacity.STATUS_QUEUED)
-            out[provider] = ProviderLoad(
+            out[pool_key] = ProviderLoad(
                 free_slots=max(0, int(max_in_flight) - int(holders)),
                 queue_depth=queued,
             )
         except Exception as e:
             _note(f"routing: could not read load for provider {provider}: "
                   f"{e!r}; excluding it from this run's candidates")
-            out[provider] = ProviderLoad(unavailable=True)
+            out[pool_key] = ProviderLoad(unavailable=True)
     return out
 
 
@@ -728,9 +768,14 @@ def provider_served(store, providers: Sequence[str], *,
     # would go quietly inert while the config still said they were on.
     wanted = set(providers)
     by_adapter: dict[str, str] = {}
+    provider_pools: dict[str, list[str]] = {}
+    for p in wanted:
+        provider_pools.setdefault(p.split(":", 1)[0], []).append(p)
     for p in wanted:
         try:
-            by_adapter[get_adapter(p).name] = p
+            provider = p.split(":", 1)[0]
+            if len(provider_pools[provider]) == 1:
+                by_adapter[get_adapter(provider).name] = p
         except ValueError:
             # No adapter for this provider. `provider_loads` has already
             # excluded it, so it is not a candidate and its share is nobody's.
@@ -766,10 +811,14 @@ def _shares_for(cfg: Config, pool: Sequence[Reviewer],
     weights = dict(cfg.routing.weights)
     if not weights:
         return None
-    providers = [
-        p for p in dict.fromkeys(e.provider for e in pool)
-        if p in loads and not loads[p].unavailable
-    ]
+    # The candidate set is pool-aware for availability, but weights and served
+    # history are deliberately provider-scoped. A Google reviewer can have a
+    # Gemini pool blacked out while its Claude/GPT pool remains eligible; the
+    # provider still belongs in the denominator exactly once.
+    providers = list(dict.fromkeys(
+        entry.provider for entry in pool
+        if (quota_pool_for(entry) in loads
+            and not loads[quota_pool_for(entry)].unavailable)))
     served = provider_served(
         store, providers, window_days=cfg.routing.weights_window_days)
     if served is None:
@@ -779,7 +828,8 @@ def _shares_for(cfg: Config, pool: Sequence[Reviewer],
 
 def auto_route(cfg: Config, store, *,
                client_family: str | None = None,
-               excluded_providers: set[str] | None = None) -> Route | None:
+               excluded_providers: set[str] | None = None,
+               prompt_size: int | None = None) -> Route | None:
     """Score the configured pool against live load. None -> caller decides.
 
     The one call the pipeline makes. Guarded end to end for the reason
@@ -790,12 +840,17 @@ def auto_route(cfg: Config, store, *,
     """
     try:
         excluded = set(excluded_providers or ())
-        pool = tuple(r for r in resolve_pool(cfg)
-                     if r.provider not in excluded)
+        by_name = {r.name: r for r in cfg.reviewers}
+        pool = tuple(
+            r for r in resolve_pool(cfg)
+            if r.provider not in excluded
+            and (r.provider != "junie" or any(
+                by_name[name].provider != "junie" for name in r.fallbacks
+                if name in by_name)))
         if not pool:
             return None
         _warn_inert_client_family(cfg, pool, client_family)
-        loads = provider_loads(store, pool)
+        loads = provider_loads(store, pool, prompt_size=prompt_size)
         # AFTER the loads, because the share denominators are the providers
         # this run can actually choose between -- see `_shares_for`.
         return pick_finder(pool, loads, client_family=client_family,

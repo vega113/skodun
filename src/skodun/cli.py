@@ -1361,7 +1361,7 @@ def _cmd_providers(args) -> int:
     """
     from . import store as store_mod
     from .adapters import _REGISTRY
-    from .config import load_config
+    from .config import load_config, quota_pool_for
     from .store import Store
     from .triage import MAX_ANNOTATION_DISPLAY_CHARS, shown_field
 
@@ -1399,8 +1399,9 @@ def _cmd_providers(args) -> int:
     with store:
         now = time.strftime(store_mod._TS_FORMAT, time.gmtime())
         try:
-            state_rows = {row["provider"]: row
-                          for row in store.provider_state_rows(now)}
+            state_rows = {
+                (row["provider"], row.get("quota_pool", row["provider"])): row
+                for row in store.provider_state_rows(now)}
         except BaseException as e:
             return _emit(f"skodun providers: could not read provider state: {e!r}", 2)
 
@@ -1440,14 +1441,36 @@ def _cmd_providers(args) -> int:
             adapter = _REGISTRY[provider]()
             binary = adapter.resolve_binary()
             status = _fmt_binary(binary)
-            state = _fmt_provider_state(state_rows.get(provider), shown_field)
+            configured_pools = sorted({
+                quota_pool_for(r) for r in cfg.reviewers
+                if r.provider == provider
+            })
+            state = _fmt_provider_state(
+                state_rows.get((provider, provider)), shown_field)
+            pool_states = []
+            for pool in configured_pools:
+                if pool == provider:
+                    continue
+                pool_states.append(
+                    f"{shown_field(pool)}={_fmt_provider_state(
+                        state_rows.get((provider, pool)), shown_field)}")
+            pools_bit = (f" | pools={','.join(pool_states)}"
+                         if pool_states else "")
             shown_binary = _shown_binary(binary, shown_field,
                                          MAX_ANNOTATION_DISPLAY_CHARS)
-            # S4: cheap active holder count for provider:<id> (admitted+running).
+            # S4: active holders are keyed by the same quota pool used by
+            # routing and chain admission. Report the aggregate on the
+            # provider line while keeping pool state details beside it.
             try:
                 from . import capacity as capacity_mod
-                holders = store.capacity_holder_count(
-                    capacity_mod.provider_resource_class(provider), provider)
+                holder_pools = tuple(configured_pools) or (provider,)
+                holder_values = [
+                    store.capacity_holder_count(
+                        capacity_mod.provider_resource_class(provider, pool),
+                        pool)
+                    for pool in holder_pools
+                ]
+                holders = sum(int(value) for value in holder_values)
             except Exception:
                 holders = None
             holders_bit = (f" | holders={holders}"
@@ -1458,10 +1481,10 @@ def _cmd_providers(args) -> int:
             served_bit = ("" if tally is None else _fmt_served(
                 tally["served"].get(adapter.name, {}), tally["total"]))
             _emit(f"{provider} | adapter={adapter.name} | "
-                  f"binary={shown_binary} ({status}) | state={state}"
+                  f"binary={shown_binary} ({status}) | state={state}{pools_bit}"
                   f"{holders_bit}{served_bit}", 0)
 
-        for provider, row in sorted(state_rows.items()):
+        for (provider, _pool), row in sorted(state_rows.items()):
             if provider not in _REGISTRY:
                 _emit(f"skodun providers: NOTE cached provider_state for "
                       f"{shown_field(provider)!r} has no registered adapter -- "

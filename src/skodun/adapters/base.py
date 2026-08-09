@@ -134,7 +134,7 @@ class ClassifyResult:
     """
 
     kind: Literal["ok", "degraded", "unavailable"]
-    # for unavailable: quota|auth|binary|model|harness|other
+    # for unavailable: quota|auth|binary|model|harness|invocation|transport|other
     category: str = ""
     detail: str = ""
 

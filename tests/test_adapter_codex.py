@@ -529,6 +529,24 @@ def test_missing_binary():
     assert res.kind == "unavailable" and res.category == "binary"
 
 
+def test_nonzero_empty_output_with_invocation_diagnostic_is_unavailable():
+    res = CodexAdapter().classify(
+        1, b"", b"codex: failed to connect to the responses stream\n",
+        REVIEW_CONTRACT)
+    assert res.kind == "unavailable"
+    assert res.category in {"transport", "harness"}
+    assert "failed to connect" in res.detail
+
+
+def test_nonzero_empty_output_unknown_failure_stays_untrusted_but_is_bounded():
+    res = CodexAdapter().classify(
+        1, b"", b"codex internal diagnostic: " + b"x" * 5000,
+        REVIEW_CONTRACT)
+    assert res.kind == "ok"
+    assert res.detail
+    assert len(res.detail) <= 400
+
+
 def test_auth_capture_is_unavailable_auth():
     f = fx("unavailable_auth")
     res = CodexAdapter().classify(f.rc, f.stdout, f.stderr, REVIEW_CONTRACT)
