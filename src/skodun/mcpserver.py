@@ -404,11 +404,18 @@ def _float_arg(params: dict, name: str, tool: str) -> tuple[float | None, str]:
     if name not in params or params[name] is None:
         return None, ""
     value = params[name]
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None, (f"skodun {tool}: {name} must be a finite number; got "
                       f"{value!r}")
-    return float(value), ""
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError):
+        return None, (f"skodun {tool}: {name} must be a finite number; got "
+                      f"{value!r}")
+    if not math.isfinite(converted):
+        return None, (f"skodun {tool}: {name} must be a finite number; got "
+                      f"{value!r}")
+    return converted, ""
 
 
 def _bool_arg(params: dict, name: str, tool: str,

@@ -335,11 +335,37 @@ def _annotate_recovery_attempt(store, text: str, orchestration_id: str,
     return store.get_review(review_id), review_id
 
 
+def _recovery_record_identity(rec: dict) -> tuple[str, ...] | None:
+    """Read the v9 identity fields needed to accept a recovery attempt."""
+    fields = ("repo_id", "worktree_root", "branch", "head", "base_sha",
+              "diff_hash")
+    values = tuple(rec.get(field) for field in fields)
+    if any(not isinstance(value, str) or not value for value in values):
+        return None
+    return values
+
+
+def _recovery_attempt_provider(rec: dict) -> str | None:
+    """Return the provider id from the terminal chain attempt, not its adapter."""
+    attempts = rec.get("attempts")
+    if not isinstance(attempts, list):
+        return None
+    for attempt in reversed(attempts):
+        if not isinstance(attempt, dict) or "skipped" in attempt:
+            continue
+        provider = attempt.get("provider")
+        if isinstance(provider, str) and provider:
+            return provider
+    return None
+
+
 def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         reviewer=None, client_family=None, recover=False,
                         max_attempts=None, max_wall_seconds=None) -> tuple[int, str, dict]:
     """Shared review surface plus recovery metadata for MCP structured output."""
     import math
+    import threading
+    import time
 
     if not recover:
         status, text = _svc_review_once(
@@ -357,22 +383,67 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         return 2, banner_failure(reason), {"recovery": {"terminal_reason": reason}}
     if max_wall_seconds is None:
         max_wall_seconds = _RECOVERY_DEFAULT_WALL_SECONDS
-    if (isinstance(max_wall_seconds, bool)
-            or not isinstance(max_wall_seconds, (int, float))
-            or not math.isfinite(float(max_wall_seconds))
-            or max_wall_seconds <= 0 or max_wall_seconds > 86400):
+    wall_seconds = None
+    if (not isinstance(max_wall_seconds, bool)
+            and isinstance(max_wall_seconds, (int, float))):
+        try:
+            wall_seconds = float(max_wall_seconds)
+        except (OverflowError, ValueError):
+            wall_seconds = None
+    if (wall_seconds is None or not math.isfinite(wall_seconds)
+            or wall_seconds <= 0 or wall_seconds > 86400):
         reason = ("max_wall_seconds must be a positive number no greater than "
                   f"86400, got {max_wall_seconds!r}")
         from .trust import banner_failure
         return 2, banner_failure(reason), {"recovery": {"terminal_reason": reason}}
 
-    import time
     from . import ids
     from .store import RUNNING
     from .trust import banner_failure
 
     orchestration_id = ids.new_review_id("sk_orch_")
-    deadline = time.monotonic() + float(max_wall_seconds)
+    deadline = time.monotonic() + wall_seconds
+
+    class _RecoveryCancel:
+        """One cancellation token that also wakes at the recovery deadline."""
+
+        def __init__(self):
+            self._event = threading.Event()
+            self.deadline_expired = False
+
+        def _refresh(self):
+            if cancel is not None and cancel.is_set():
+                self._event.set()
+            elif time.monotonic() >= deadline:
+                self.deadline_expired = True
+                self._event.set()
+
+        def is_set(self):
+            self._refresh()
+            return self._event.is_set()
+
+        def set(self):
+            self._event.set()
+
+        def wait(self, seconds):
+            self._refresh()
+            if self._event.is_set():
+                return True
+            remaining = max(0.0, deadline - time.monotonic())
+            timeout = remaining if seconds is None else min(seconds, remaining)
+            result = self._event.wait(timeout)
+            self._refresh()
+            return result or self._event.is_set()
+
+    request_cancel = _RecoveryCancel()
+
+    def cancellation_reason():
+        if request_cancel.deadline_expired:
+            return "recovery wall budget exhausted"
+        if cancel is not None and cancel.is_set():
+            return REVIEW_CANCELLED_REASON
+        return None
+
     initial_identity = None
     try:
         initial_identity = _recovery_identity(repo)
@@ -390,9 +461,12 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
     last_rec: dict | None = None
     terminal_reason = ""
     for ordinal in range(max_attempts):
-        if cancel is not None and cancel.is_set():
+        reason = cancellation_reason()
+        if reason is not None:
             last_status, last_text = 4, banner_failure(REVIEW_CANCELLED_REASON)
-            terminal_reason = REVIEW_CANCELLED_REASON
+            if reason == "recovery wall budget exhausted":
+                last_text = banner_failure(reason)
+            terminal_reason = reason
             break
         if ordinal and initial_identity is not None:
             try:
@@ -410,7 +484,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
 
         attempt_count += 1
         last_status, last_text = _svc_review_once(
-            store, repo, progress_sink=progress_sink, cancel=cancel,
+            store, repo, progress_sink=progress_sink, cancel=request_cancel,
             reviewer=reviewer, client_family=client_family,
             avoid_providers=(set(terminal_providers)
                              if reviewer is None else set()))
@@ -426,11 +500,37 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             review_ids.append(review_id)
         if last_rec is None:
             terminal_reason = (
-                REVIEW_CANCELLED_REASON if "cancel" in last_text.lower()
+                cancellation_reason() or
+                (REVIEW_CANCELLED_REASON if "cancel" in last_text.lower()
                 else "preflight or persistence refusal; recovery stopped")
+            )
+            if review_ids:
+                last_status = 4
             break
         if last_rec.get("status") == RUNNING:
             terminal_reason = "review remained running; recovery stopped"
+            break
+        reason = cancellation_reason()
+        if reason is not None:
+            last_status = 4
+            terminal_reason = reason
+            break
+        if initial_identity is None:
+            last_status = 4
+            terminal_reason = ("could not establish recovery identity; "
+                               "recovery stopped")
+            break
+        try:
+            if (_recovery_record_identity(last_rec) != initial_identity
+                    or _recovery_identity(repo) != initial_identity):
+                last_status = 4
+                terminal_reason = "repository identity or diff moved after recovery attempt"
+                break
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:
+            last_status = 4
+            terminal_reason = f"could not recheck identity after recovery: {e!r}"
             break
         if last_rec.get("trustworthy") is True:
             terminal_reason = "trustworthy review reached"
@@ -441,22 +541,13 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         if last_status in (2, 3) or "cancel" in failure.lower():
             terminal_reason = failure or "terminal refusal; recovery stopped"
             break
-        if initial_identity is None:
-            terminal_reason = ("could not establish recovery identity; "
-                               "recovery stopped")
-            break
-        if last_rec.get("adapter") and reviewer is None:
-            terminal_providers.add(str(last_rec["adapter"]))
-        try:
-            if initial_identity is not None and _recovery_identity(repo) != initial_identity:
-                terminal_reason = "repository identity or diff moved after recovery attempt"
-                break
-        except KeyboardInterrupt:
-            raise
-        except BaseException as e:
-            terminal_reason = f"could not recheck identity after recovery: {e!r}"
-            break
-        terminal_reason = "recovery attempt was untrustworthy"
+        provider = _recovery_attempt_provider(last_rec)
+        if provider and reviewer is None:
+            terminal_providers.add(provider)
+        if ordinal + 1 < max_attempts:
+            terminal_reason = "recovery attempt was untrustworthy"
+        else:
+            terminal_reason = ""
 
     if not terminal_reason:
         terminal_reason = "recovery attempt budget exhausted"

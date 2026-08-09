@@ -142,12 +142,17 @@ def test_bounded_recovery_records_each_attempt_and_avoids_terminal_provider(
     """Recovery retries fresh records and keeps the request-level audit link."""
     from skodun.trust import banner
 
+    identity_fields = dict(repo_id="repo", worktree_root="worktree",
+                           branch="feat", head="h" * 20,
+                           base_sha="s" * 40, diff_hash="d" * 40)
     first = _artifact([], review_id="first", degraded=True,
-                      trustworthy=False, status="degraded")
-    second = _artifact([], review_id="second")
+                      trustworthy=False, status="degraded",
+                      attempts=[{"provider": "xai"}], **identity_fields)
+    second = _artifact([], review_id="second", attempts=[{"provider": "openai"}],
+                       **identity_fields)
     attempts = [first, second]
     calls = []
-    identity = ("repo", "feat", "h" * 20, "s" * 40, "d" * 40)
+    identity = ("repo", "worktree", "feat", "h" * 20, "s" * 40, "d" * 40)
     monkeypatch.setattr(services, "_recovery_identity", lambda repo: identity)
 
     def fake_once(store, repo, **kwargs):
@@ -169,7 +174,7 @@ def test_bounded_recovery_records_each_attempt_and_avoids_terminal_provider(
     assert metadata["recovery"]["review_ids"] == ["first", "second"]
     assert "trustworthy review reached" in text
     assert calls[0]["avoid_providers"] == set()
-    assert calls[1]["avoid_providers"] == {"grok"}
+    assert calls[1]["avoid_providers"] == {"xai"}
     assert rows[0]["orchestration_id"] == rows[1]["orchestration_id"]
     assert rows[0]["attempt_ordinal"] == 0
     assert rows[1]["attempt_ordinal"] == 1
@@ -179,10 +184,13 @@ def test_bounded_recovery_stops_when_identity_moves(tmp_path, monkeypatch):
     from skodun.trust import banner
 
     rec = _artifact([], review_id="only", degraded=True,
-                    trustworthy=False, status="degraded")
+                    trustworthy=False, status="degraded",
+                    repo_id="repo", worktree_root="worktree",
+                    branch="feat", head="h" * 20, base_sha="s" * 40,
+                    diff_hash="d" * 40, attempts=[{"provider": "xai"}])
     identities = iter([
-        ("repo", "feat", "h" * 20, "s" * 40, "d" * 40),
-        ("repo", "feat", "h" * 20, "s" * 40, "changed" * 8),
+        ("repo", "worktree", "feat", "h" * 20, "s" * 40, "d" * 40),
+        ("repo", "worktree", "feat", "h" * 20, "s" * 40, "changed" * 8),
     ])
     calls = []
     monkeypatch.setattr(services, "_recovery_identity",
@@ -216,12 +224,18 @@ def test_bounded_recovery_rejects_bool_limits_and_preserves_explicit_pin(
     assert metadata["recovery"]["terminal_reason"]
 
     first = _artifact([], review_id="p1", degraded=True,
-                      trustworthy=False, status="degraded")
-    second = _artifact([], review_id="p2")
+                      trustworthy=False, status="degraded",
+                      repo_id="repo", worktree_root="worktree",
+                      branch="feat", head="h", base_sha="s", diff_hash="d",
+                      attempts=[{"provider": "xai"}])
+    second = _artifact([], review_id="p2", repo_id="repo",
+                       worktree_root="worktree", branch="feat", head="h",
+                       base_sha="s", diff_hash="d",
+                       attempts=[{"provider": "openai"}])
     attempts = [first, second]
     calls = []
     monkeypatch.setattr(services, "_recovery_identity",
-                        lambda repo: ("repo", "feat", "h", "s", "d"))
+                        lambda repo: ("repo", "worktree", "feat", "h", "s", "d"))
 
     def fake_once(store, repo, **kwargs):
         calls.append(kwargs)
@@ -235,6 +249,91 @@ def test_bounded_recovery_rejects_bool_limits_and_preserves_explicit_pin(
             store, tmp_path, recover=True, reviewer="deliberate")
     assert status == 0
     assert all(call["avoid_providers"] == set() for call in calls)
+
+
+def test_bounded_recovery_rejects_float_overflow(tmp_path):
+    status, text, _metadata = services.svc_review_detailed(
+        object(), tmp_path, recover=True, max_wall_seconds=10 ** 1000)
+    assert status == 2
+    assert "max_wall_seconds" in text
+
+
+def test_bounded_recovery_deadline_cancels_the_shipped_attempt(
+        tmp_path, monkeypatch):
+    from skodun.trust import banner_failure
+
+    monkeypatch.setattr(services, "_recovery_identity",
+                        lambda repo: ("repo", "worktree", "feat", "h", "s", "d"))
+
+    def fake_once(store, repo, **kwargs):
+        assert kwargs["cancel"].wait(1) is True
+        return 4, banner_failure("review cancelled")
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "deadline.db") as store:
+        status, text, metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True, max_wall_seconds=0.001)
+    assert status == 4
+    assert metadata["recovery"]["terminal_reason"] == (
+        "recovery wall budget exhausted")
+    assert "recovery wall budget exhausted" in text
+
+
+def test_bounded_recovery_does_not_accept_a_result_after_identity_moves(
+        tmp_path, monkeypatch):
+    from skodun.trust import banner
+
+    rec = _artifact([], review_id="moved", repo_id="repo",
+                    worktree_root="worktree", branch="feat", head="h",
+                    base_sha="s", diff_hash="d",
+                    attempts=[{"provider": "xai"}])
+    identities = iter([
+        ("repo", "worktree", "feat", "h", "s", "d"),
+        ("repo", "worktree", "feat", "h", "s", "changed"),
+    ])
+    monkeypatch.setattr(services, "_recovery_identity",
+                        lambda repo: next(identities))
+
+    def fake_once(store, repo, **kwargs):
+        store.save_review(rec)
+        return 0, banner(rec)
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "moved-trust.db") as store:
+        status, _text, metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True)
+    assert status == 4
+    assert metadata["recovery"]["recovered"] is False
+    assert "moved" in metadata["recovery"]["terminal_reason"]
+
+
+def test_bounded_recovery_keeps_status_four_after_later_preflight_refusal(
+        tmp_path, monkeypatch):
+    from skodun.trust import banner, banner_failure
+
+    rec = _artifact([], review_id="prior", degraded=True,
+                    trustworthy=False, status="degraded", repo_id="repo",
+                    worktree_root="worktree", branch="feat", head="h",
+                    base_sha="s", diff_hash="d",
+                    attempts=[{"provider": "xai"}])
+    calls = []
+    monkeypatch.setattr(services, "_recovery_identity",
+                        lambda repo: ("repo", "worktree", "feat", "h", "s", "d"))
+
+    def fake_once(store, repo, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            store.save_review(rec)
+            return 4, banner(rec)
+        return 2, banner_failure("no alternative reviewer")
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "later-refusal.db") as store:
+        status, _text, metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True, max_attempts=2)
+    assert status == 4
+    assert metadata["recovery"]["review_ids"] == ["prior"]
+    assert "preflight" in metadata["recovery"]["terminal_reason"]
 
 
 # ==========================================================================
