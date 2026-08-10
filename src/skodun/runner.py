@@ -310,7 +310,8 @@ def run_with_watchdog(
                         # remains in the same process group. Reap that group before
                         # returning, otherwise a successful-looking wrapper can
                         # leave a native provider child writing to our descriptors.
-                        if _group_alive(pg):
+                        if (_group_alive(pg) and
+                                _group_has_live_descendants(pg, proc.pid)):
                             _terminate_group(proc, pg)
                             descendants_killed = True
                         rc = status
@@ -488,6 +489,40 @@ def _group_alive(pg: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _group_has_live_descendants(pg: int, leader_pid: int) -> bool:
+    """Whether ``pg`` contains a non-zombie process besides its leader.
+
+    ``killpg(..., 0)`` also sees zombie-only groups on hosts whose PID 1 does
+    not reap promptly. ``ps`` is available on the macOS/Linux hosts supported
+    by the CLI and lets normal wrapper completion preserve its output when the
+    only remaining group members are already dead. If inspection itself is
+    unavailable or unparseable, return true so the fail-closed cleanup path
+    still discards potentially contaminated output.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,pgid=,state="],
+            capture_output=True, text=True, timeout=1, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if result.returncode != 0:
+        return True
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        try:
+            pid, group = int(fields[0]), int(fields[1])
+        except ValueError:
+            continue
+        if group != pg or pid == leader_pid:
+            continue
+        if fields[2][0] not in {"Z", "X"}:
+            return True
+    return False
 
 
 def _size(path: Path) -> int:
