@@ -186,24 +186,28 @@ def test_zombie_only_group_does_not_invalidate_output(tmp_path, monkeypatch):
 def test_group_descendant_inspection_is_fail_closed(monkeypatch):
     """Controlled ps snapshots cover live, zombie-only, and inconclusive groups."""
     snapshots = iter((
-        " 10 42 S\n",       # live descendant
-        " 10 42 Z\n",       # zombie-only descendant
+        " 10 42 S\n",      # live descendant in the owned session
+        " 10 42 Z\n",      # zombie-only descendant
         "",                 # successful but inconclusive listing
         "not a ps row\n",   # malformed listing
-        " 1 42 S\n",        # reused leader PID, not a descendant
+        " 1 42 S\n",        # reused leader PID in another session
         " 2 99 S\n",        # valid snapshot after target group vanished
+        " 10 42 S\n",       # recycled PGID in another session
     ))
 
     def fake_run(*args, **kwargs):
         return SimpleNamespace(returncode=0, stdout=next(snapshots))
 
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    sessions = iter((42, 42, 99, 99))
+    monkeypatch.setattr(runner.os, "getsid", lambda pid: next(sessions))
     assert runner._group_descendant_state(42, 1) == "live"
     assert runner._group_descendant_state(42, 1) == "none"
     assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "none"
+    assert runner._group_descendant_state(42, 1) == "inconclusive"
 
 
 def test_group_descendant_inspection_treats_hidden_group_as_inconclusive(

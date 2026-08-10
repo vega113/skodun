@@ -533,8 +533,25 @@ def _group_descendant_state(pg: int, leader_pid: int) -> str:
         if group != pg:
             continue
         saw_matching_group = True
-        if pid == leader_pid:
+        try:
+            observed_session = os.getsid(pid)
+        except (OSError, ProcessLookupError):
+            # The row can disappear between ps and getsid. Treat that race as
+            # ambiguous rather than signal a numeric PGID that may already be
+            # owned by another session.
             return "inconclusive"
+        if observed_session != pg:
+            # start_new_session makes the owned session id equal to pg. A
+            # different session means this numeric PGID was recycled or is
+            # otherwise unrelated; never signal it.
+            return "inconclusive"
+        if pid == leader_pid:
+            # The reaped leader may still appear briefly as a zombie. A live
+            # row with the same PID is safe to clean only when it is still in
+            # the owned session; a different session indicates PID reuse.
+            if state[0] in {"Z", "X"}:
+                continue
+            return "live"
         if state[0] not in {"Z", "X"}:
             return "live"
     # A valid snapshot with no row for this group proves it vanished between
