@@ -577,8 +577,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                     result = runner.run_with_watchdog(
                         cmd, d.timeout_sec, cwd, out_path, err_path,
                         stdin_path=stdin_path, cancel=cancel)
-                except OSError as e:
-                    if isinstance(e, FileNotFoundError):
+                except runner.SpawnError as e:
+                    if isinstance(e.cause, FileNotFoundError):
                         # The binary existed when we looked and does not now, or
                         # the adapter's argv names something else that is
                         # missing. Same verdict as the pre-spawn check: nothing
@@ -592,10 +592,21 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                         # happen before the child can create stderr. They are
                         # invocation-local unavailability, not fatal chain
                         # errors and not provider quota state.
-                        verdict = _spawn_failure(e)
+                        verdict = _spawn_failure(e.cause)
                         skipped = verdict.detail
                     attempts.append(_attempt(
                         n, entry, skipped=skipped,
+                        classification=_classification(verdict)))
+                    exhausted.append(
+                        f"{entry.name}/{entry.provider}: {verdict.detail}")
+                    break
+                except FileNotFoundError:
+                    # Compatibility for callers/tests that replace the runner
+                    # with a function that raises the raw legacy exception.
+                    verdict = adapter.classify(
+                        UNAVAILABLE_RC, b"", b"", contract)
+                    attempts.append(_attempt(
+                        n, entry, skipped=f"binary not found: {cmd[0]}",
                         classification=_classification(verdict)))
                     exhausted.append(
                         f"{entry.name}/{entry.provider}: {verdict.detail}")

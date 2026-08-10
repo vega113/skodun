@@ -120,4 +120,22 @@ Non-`FileNotFoundError` spawn errors become bounded attempt-local `unavailable/i
 
 - [x] **Step 3: Re-run affected and complete suites**
 
-The affected suites pass with `215 passed`; the complete suite passes with `3453 passed, 160 skipped`.
+The affected suites pass with `215 passed`; the complete suite passes with `3453 passed, 160 skipped` before this follow-up test.
+
+### Task 5: Restrict spawn-error translation to `Popen`
+
+**Files:**
+- Modify: `src/skodun/runner.py`, `src/skodun/chain.py`
+- Test: `tests/test_chain.py`, `tests/test_fallback.py`, `tests/test_runner.py`
+
+- [x] **Step 1: Add a distinct spawn boundary**
+
+`runner.run_with_watchdog` wraps only its `subprocess.Popen` call in `SpawnError`; file opening, timeout cleanup, and other watchdog `OSError`s remain ordinary exceptions.
+
+- [x] **Step 2: Preserve fallback and non-fallback behavior**
+
+The real non-executable Codex test still advances to Grok, while the chain regression confirms a non-spawn `OSError` propagates without hopping.
+
+- [x] **Step 3: Verify**
+
+Focused spawn/chain/runner tests pass; the complete suite passes with `3454 passed, 160 skipped` after the boundary fix.

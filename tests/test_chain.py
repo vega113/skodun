@@ -99,6 +99,28 @@ def test_run_chain_without_a_token_is_the_shipped_call(tmp_path, monkeypatch):
     assert seen == [None]
 
 
+def test_run_chain_does_not_hop_on_non_spawn_oserror(tmp_path, monkeypatch):
+    """Watchdog I/O errors are not evidence that a provider was unavailable."""
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.store import Store
+
+    monkeypatch.setenv("SKODUN_GROK_BIN", "/bin/sh")
+    head = Reviewer(name="f", provider="xai", model="m", role="finder",
+                    fallbacks=("backup",))
+    backup = Reviewer(name="backup", provider="google", model="m2",
+                      role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(head, backup))
+    store = Store.open(tmp_path / "s.db")
+
+    def fake(*args, **kwargs):
+        raise OSError("stdout close failed")
+
+    monkeypatch.setattr(chain.runner, "run_with_watchdog", fake)
+    with store, pytest.raises(OSError, match="stdout close failed"):
+        chain.run_chain(head, cfg, cfg.defaults, b"p", tmp_path, store,
+                        tmp_path, "t")
+
+
 def test_a_token_set_between_chain_entries_stops_the_chain(tmp_path, monkeypatch):
     """Checked at the ENTRY boundary too, not only inside the watchdog.
 

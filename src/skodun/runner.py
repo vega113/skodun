@@ -73,6 +73,14 @@ class ReviewCancelled(BaseException):
         self.partial = partial
 
 
+class SpawnError(Exception):
+    """A process-start ``OSError`` separated from watchdog I/O failures."""
+
+    def __init__(self, cause: OSError) -> None:
+        self.cause = cause
+        super().__init__(str(cause))
+
+
 def _is_path_shaped(binary: str) -> bool:
     """Whether `binary` should be resolved as a path rather than walked
     through `PATH`: it contains `/`, or the platform's own separator on a
@@ -217,12 +225,12 @@ def run_with_watchdog(
         the provider is gone rather than racing the worker's exit.
 
     Note: if `cmd[0]` does not exist, `subprocess.Popen` raises
-    `FileNotFoundError` before the watchdog loop starts. That exception
-    propagates uncaught out of this function -- `stdout_path`/`stderr_path`
-    are left behind, created (by the `open()` calls above) but empty. Handling
-    a missing binary is out of scope for this module; whatever builds a retry
-    loop around this function needs to decide deliberately whether that case
-    is retryable.
+    `FileNotFoundError` before the watchdog loop starts. This function wraps
+    that and other process-start `OSError`s in `SpawnError`, while leaving
+    `stdout_path`/`stderr_path` behind, created (by the `open()` calls above)
+    but empty. Handling a missing binary is out of scope for this module;
+    whatever builds a retry loop around this function needs to decide
+    deliberately whether that case is retryable.
     """
     if _cancelled(cancel):
         # Before ANY file is opened or process started: this call is not going
@@ -239,14 +247,17 @@ def run_with_watchdog(
     stdin_file = open(stdin_path, "rb") if stdin_path is not None else None
     try:
         with open(stdout_path, "wb") as out, open(stderr_path, "wb") as err:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=cwd,
-                stdout=out,
-                stderr=err,
-                stdin=subprocess.DEVNULL if stdin_file is None else stdin_file,
-                start_new_session=True,
-            )
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=cwd,
+                    stdout=out,
+                    stderr=err,
+                    stdin=subprocess.DEVNULL if stdin_file is None else stdin_file,
+                    start_new_session=True,
+                )
+            except OSError as e:
+                raise SpawnError(e) from e
             # start_new_session=True makes the child a session+group leader, so its
             # PGID equals its pid. Capture it NOW: os.getpgid(proc.pid) races with
             # the child exiting and would raise once it is reaped.
