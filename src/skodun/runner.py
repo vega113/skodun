@@ -511,29 +511,32 @@ def _group_has_live_descendants(pg: int, leader_pid: int) -> bool:
     if result.returncode != 0:
         return True
     saw_matching_group = False
+    saw_valid_row = False
     for line in result.stdout.splitlines():
         fields = line.split()
+        if not line.strip():
+            continue
         if len(fields) < 3:
-            continue
+            return True
         try:
-            group = int(fields[1])
-        except ValueError:
-            continue
-        if group != pg:
-            continue
-        saw_matching_group = True
-        try:
-            pid = int(fields[0])
+            pid, group = int(fields[0]), int(fields[1])
         except ValueError:
             return True
         state = fields[2]
         if not state:
             return True
-        if pid == leader_pid and state[0] in {"Z", "X"}:
+        saw_valid_row = True
+        if group != pg:
+            continue
+        saw_matching_group = True
+        if pid == leader_pid:
             continue
         if state[0] not in {"Z", "X"}:
             return True
-    return not saw_matching_group
+    # A valid snapshot with no row for this group proves it vanished between
+    # liveness and inspection; an empty snapshot is inconclusive and remains
+    # fail closed.
+    return not saw_matching_group and not saw_valid_row
 
 
 def _size(path: Path) -> int:
