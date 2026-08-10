@@ -651,13 +651,14 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                     break
 
                 if result.descendants_killed:
+                    detail = ("wrapper exited with live descendants; "
+                              "attempt discarded")
                     attempts.append(_attempt(
                         n, entry, rc=result.rc, timed_out=False,
                         duration_sec=round(result.duration_sec, 3),
                         first_output_sec=_round(result.first_output_sec),
-                        classification=None,
-                        skipped="wrapper exited with live descendants; "
-                                "attempt discarded"))
+                        classification=_classification(
+                            ClassifyResult("degraded", "", detail))))
                     return _Outcome(
                         None, attempts,
                         f"reviewer {entry.name!r} left live descendants; "

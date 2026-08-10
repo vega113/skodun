@@ -33,13 +33,17 @@ def _kill_ok(pid: int) -> bool:
 
 
 def _process_is_running(pid: int) -> bool:
-    """Treat an unreaped zombie as stopped on procfs hosts."""
+    """Treat an unreaped zombie as stopped when procfs exposes its state."""
     proc_stat = Path(f"/proc/{pid}/stat")
     try:
-        fields = proc_stat.read_text(encoding="utf-8").split()
+        raw = proc_stat.read_text(encoding="utf-8")
     except OSError:
         return _kill_ok(pid)
-    return len(fields) < 3 or fields[2] != "Z"
+    closing = raw.rfind(")")
+    if closing < 0:
+        return _kill_ok(pid)
+    fields = raw[closing + 1:].split()
+    return not fields or fields[0] != "Z"
 
 
 def _group_exists(pgid: int) -> bool:
@@ -145,6 +149,8 @@ def test_early_leader_exit_reaps_wrapper_descendants(tmp_path):
         f"p=pathlib.Path({str(pidfile)!r})\n"
         "while not p.exists():\n"
         "    time.sleep(0.01)\n"
+        "sys.stdout.write('wrapper stdout\\n'); sys.stdout.flush()\n"
+        "sys.stderr.write('wrapper stderr\\n'); sys.stderr.flush()\n"
     )
     result = run_with_watchdog(
         [sys.executable, "-c", code], 10, tmp_path,
@@ -158,6 +164,8 @@ def test_early_leader_exit_reaps_wrapper_descendants(tmp_path):
         time.sleep(0.05)
     assert not _process_is_running(gc_pid), \
         f"descendant {gc_pid} survived early wrapper exit"
+    assert (tmp_path / "out").read_bytes() == b""
+    assert (tmp_path / "err").read_bytes() == b""
 
 
 def test_timeout_leaves_no_stray_process_group(tmp_path):

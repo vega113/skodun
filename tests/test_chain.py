@@ -123,8 +123,9 @@ def test_run_chain_discards_output_when_wrapper_leaves_descendants(
                                   store, tmp_path, "t")
     assert outcome.parsed is None
     assert "live descendants" in outcome.failure_reason
-    assert outcome.attempts[0]["classification"] is None
-    assert "discarded" in outcome.attempts[0]["skipped"]
+    assert outcome.attempts[0]["classification"]["kind"] == "degraded"
+    assert "discarded" in outcome.attempts[0]["classification"]["detail"]
+    assert "skipped" not in outcome.attempts[0]
 
 
 def test_run_chain_does_not_hop_on_non_spawn_oserror(tmp_path, monkeypatch):
