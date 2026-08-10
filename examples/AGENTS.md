@@ -59,6 +59,11 @@ trustworthy review must cover it.
   missing ids and already-terminal rows.
 - `skodun doctor` — install/MCP readiness (config, store schema, adapters,
   binaries). Read-only; does not move the gate. **CLI-only** (not an MCP tool).
+- `skodun providers` — read-only provider, binary, and quota-pool state. In
+  auto mode, only enabled finder entries named in `[routing].pool` are
+  candidates; a configured reviewer that is omitted from that pool remains
+  pin-only. AGY's `google:gemini` and `google:claude-gpt` pools are independent
+  when the loaded reviewer configuration resolves them separately.
 - `skodun retain [--dry-run]` — prune worker logs per `[retention]`. Never
   deletes gate artifacts. **CLI-only.**
 - `skodun schedule install` — write launchd plists from `[[schedule.jobs]]`.
@@ -165,8 +170,9 @@ converge on its own. Escalate rather than iterate when:
 ### Providers, R2/R3 presentation, ops
 
 - Registered providers include `xai` (grok), `openai` (codex), `google` (agy),
-  and **`junie`** (macOS-only, confined empty capsule + Seatbelt). Off macOS a
-  junie reviewer is `unavailable` and the chain advances.
+  optional metered `openai-api`, and **`junie`** (macOS-only, confined empty
+  capsule + Seatbelt). Off macOS a junie reviewer is `unavailable` and the
+  chain advances; it never gets an unconfined fallback.
 - Multiple providers are a **fallback chain**, not parallel review slots. Prefer
   **one** finder chain → gate. Do not also run legacy grok-review scripts and
   every cloud bot for ordinary changes unless policy says so.
@@ -177,6 +183,11 @@ converge on its own. Escalate rather than iterate when:
 - If install looks broken, run `skodun doctor` before inventing a second review
   system. For disk growth of worker logs, use `skodun retain` (or a launchd job
   from `skodun schedule install`).
+- If a provider returns no usable payload, do not immediately retry it or infer
+  quota exhaustion. First inspect `skodun doctor`, `skodun providers`, and the
+  review status/log for the bounded diagnostic. Recognized unavailable/config
+  failures may advance the configured chain; unknown failures remain
+  untrustworthy and must stay fail-closed.
 
 ### Concurrency (today)
 
