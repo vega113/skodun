@@ -178,6 +178,7 @@ class RunResult:
     first_output_sec: float | None
     output_limit_exceeded: bool = False
     descendants_killed: bool = False
+    descendant_state: str = "none"
 
 
 def run_with_watchdog(
@@ -251,6 +252,7 @@ def run_with_watchdog(
     timed_out = False
     output_limit_exceeded = False
     descendants_killed = False
+    descendant_state = "none"
     rc: int
 
     # Opened before the output files and closed in the `finally` below, so
@@ -310,10 +312,11 @@ def run_with_watchdog(
                         # remains in the same process group. Reap that group before
                         # returning, otherwise a successful-looking wrapper can
                         # leave a native provider child writing to our descriptors.
-                        if (_group_alive(pg) and
-                                _group_has_live_descendants(pg, proc.pid)):
-                            _terminate_group(proc, pg)
-                            descendants_killed = True
+                        if _group_alive(pg):
+                            descendant_state = _group_descendant_state(pg, proc.pid)
+                            if descendant_state == "live":
+                                _terminate_group(proc, pg)
+                                descendants_killed = True
                         rc = status
                         break
                     if time.monotonic() >= deadline:
@@ -341,7 +344,7 @@ def run_with_watchdog(
         elif output_limit_exceeded:
             _truncate(stdout_path, max_output_bytes)
             _truncate(stderr_path, max_output_bytes)
-        elif descendants_killed:
+        elif descendant_state != "none":
             # A wrapper that left a live child did not produce a trustworthy
             # completed attempt, even if its own stdout looked complete.
             stdout_path.write_bytes(b"")
@@ -354,6 +357,7 @@ def run_with_watchdog(
             first_output_sec=first_out,
             output_limit_exceeded=output_limit_exceeded,
             descendants_killed=descendants_killed,
+            descendant_state=descendant_state,
         )
     finally:
         if stdin_file is not None:
@@ -491,15 +495,15 @@ def _group_alive(pg: int) -> bool:
     return True
 
 
-def _group_has_live_descendants(pg: int, leader_pid: int) -> bool:
-    """Whether ``pg`` contains a non-zombie process besides its leader.
+def _group_descendant_state(pg: int, leader_pid: int) -> str:
+    """Classify ``pg`` as ``live``, ``none``, or ``inconclusive``.
 
     ``killpg(..., 0)`` also sees zombie-only groups on hosts whose PID 1 does
     not reap promptly. ``ps`` is available on the macOS/Linux hosts supported
     by the CLI and lets normal wrapper completion preserve its output when the
     only remaining group members are already dead. If inspection itself is
-    unavailable or unparseable, return true so the fail-closed cleanup path
-    still discards potentially contaminated output.
+    unavailable or unparseable, return ``inconclusive`` so the fail-closed
+    caller discards output without signaling an unrelated process group.
     """
     try:
         result = subprocess.run(
@@ -507,9 +511,9 @@ def _group_has_live_descendants(pg: int, leader_pid: int) -> bool:
             capture_output=True, text=True, timeout=1, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return True
+        return "inconclusive"
     if result.returncode != 0:
-        return True
+        return "inconclusive"
     saw_matching_group = False
     saw_valid_row = False
     for line in result.stdout.splitlines():
@@ -517,26 +521,38 @@ def _group_has_live_descendants(pg: int, leader_pid: int) -> bool:
         if not line.strip():
             continue
         if len(fields) < 3:
-            return True
+            return "inconclusive"
         try:
             pid, group = int(fields[0]), int(fields[1])
         except ValueError:
-            return True
+            return "inconclusive"
         state = fields[2]
         if not state:
-            return True
+            return "inconclusive"
         saw_valid_row = True
         if group != pg:
             continue
         saw_matching_group = True
         if pid == leader_pid:
-            continue
+            return "inconclusive"
         if state[0] not in {"Z", "X"}:
-            return True
+            return "live"
     # A valid snapshot with no row for this group proves it vanished between
     # liveness and inspection; an empty snapshot is inconclusive and remains
     # fail closed.
-    return not saw_matching_group and not saw_valid_row
+    if saw_matching_group:
+        return "none"
+    if not saw_valid_row:
+        return "inconclusive"
+    # A valid snapshot with no row for this group is conclusive only if the
+    # group vanished during the race. Visibility restrictions can hide a live
+    # member while killpg still reports the group as alive.
+    return "none" if not _group_alive(pg) else "inconclusive"
+
+
+def _group_has_live_descendants(pg: int, leader_pid: int) -> bool:
+    """Compatibility boolean for callers that only need the live state."""
+    return _group_descendant_state(pg, leader_pid) == "live"
 
 
 def _size(path: Path) -> int:

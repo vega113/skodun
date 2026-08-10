@@ -172,13 +172,14 @@ def test_early_leader_exit_reaps_wrapper_descendants(tmp_path):
 def test_zombie_only_group_does_not_invalidate_output(tmp_path, monkeypatch):
     """A group with no live child preserves a normal wrapper result."""
     monkeypatch.setattr(runner, "_group_alive", lambda pg: True)
-    monkeypatch.setattr(runner, "_group_has_live_descendants",
-                        lambda pg, leader_pid: False)
+    monkeypatch.setattr(runner, "_group_descendant_state",
+                        lambda pg, leader_pid: "none")
     result = run_with_watchdog(
         [sys.executable, "-c", "print('complete')"], 10, tmp_path,
         tmp_path / "out", tmp_path / "err",
     )
     assert result.rc == 0 and not result.descendants_killed
+    assert result.descendant_state == "none"
     assert (tmp_path / "out").read_text(encoding="utf-8").strip() == "complete"
 
 
@@ -197,12 +198,23 @@ def test_group_descendant_inspection_is_fail_closed(monkeypatch):
         return SimpleNamespace(returncode=0, stdout=next(snapshots))
 
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
-    assert runner._group_has_live_descendants(42, 1)
-    assert not runner._group_has_live_descendants(42, 1)
-    assert runner._group_has_live_descendants(42, 1)
-    assert runner._group_has_live_descendants(42, 1)
-    assert not runner._group_has_live_descendants(42, 1)
-    assert not runner._group_has_live_descendants(42, 1)
+    assert runner._group_descendant_state(42, 1) == "live"
+    assert runner._group_descendant_state(42, 1) == "none"
+    assert runner._group_descendant_state(42, 1) == "inconclusive"
+    assert runner._group_descendant_state(42, 1) == "inconclusive"
+    assert runner._group_descendant_state(42, 1) == "inconclusive"
+    assert runner._group_descendant_state(42, 1) == "none"
+
+
+def test_group_descendant_inspection_treats_hidden_group_as_inconclusive(
+        monkeypatch):
+    """A live-but-unlisted group remains fail closed."""
+    monkeypatch.setattr(
+        runner.subprocess, "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0,
+                                                 stdout=" 2 99 S\\n"))
+    monkeypatch.setattr(runner, "_group_alive", lambda pg: True)
+    assert runner._group_descendant_state(42, 1) == "inconclusive"
 
 
 def test_timeout_leaves_no_stray_process_group(tmp_path):

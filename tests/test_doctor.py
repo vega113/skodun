@@ -83,10 +83,10 @@ def test_codex_version_probe_rejects_descendant_cleanup(monkeypatch):
         err.write_bytes(b"")
         return runner.RunResult(
             rc=0, timed_out=False, duration_sec=0.1, first_output_sec=0.01,
-            descendants_killed=True)
+            descendants_killed=True, descendant_state="live")
 
     monkeypatch.setattr(runner, "run_with_watchdog", fake)
-    with pytest.raises(RuntimeError, match="live descendants"):
+    with pytest.raises(RuntimeError, match="state live"):
         CodexAdapter().version_probe()
 
 
