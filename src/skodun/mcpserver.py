@@ -240,6 +240,16 @@ class HandlerResult:
     metadata: dict = field(default_factory=dict)
 
 
+def _review_result(status: int, text: str,
+                   metadata: dict | None = None) -> HandlerResult:
+    """Build a review response that identifies the code that produced it."""
+    return HandlerResult(
+        status=status,
+        text=text,
+        metadata={"skodun_version": __version__, **(metadata or {})},
+    )
+
+
 @dataclass(frozen=True)
 class PromptSpec:
     """A static MCP prompt -- the `/mcp__skodun__<name>` slash command surface."""
@@ -579,33 +589,34 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
     down instead would let the guess outrank the operator's env.
     """
     from . import routing, services
+
     repo, refusal = _repo_arg(call.params, "review")
     if refusal:
-        return HandlerResult(status=2, text=refusal)
+        return _review_result(2, refusal)
     reviewer, refusal = _opt_string_arg(call.params, "reviewer", "review")
     if refusal:
-        return HandlerResult(status=2, text=refusal)
+        return _review_result(2, refusal)
     family, refusal = _opt_string_arg(call.params, "client_family", "review")
     if refusal:
-        return HandlerResult(status=2, text=refusal)
+        return _review_result(2, refusal)
     family = routing.resolve_client_family(family, client_name=call.client_name)
     recover, refusal = _bool_arg(call.params, "recover", "review")
     if refusal:
-        return HandlerResult(status=2, text=refusal)
+        return _review_result(2, refusal)
     max_attempts, refusal = _int_arg(call.params, "max_attempts", "review")
     if refusal:
-        return HandlerResult(status=2, text=refusal)
+        return _review_result(2, refusal)
     max_wall_seconds, refusal = _float_arg(
         call.params, "max_wall_seconds", "review")
     if refusal:
-        return HandlerResult(status=2, text=refusal)
+        return _review_result(2, refusal)
     reuse_trusted, refusal = _bool_arg(
         call.params, "reuse_trusted", "review")
     if refusal:
-        return HandlerResult(status=2, text=refusal)
+        return _review_result(2, refusal)
     fresh, refusal = _bool_arg(call.params, "fresh", "review")
     if refusal:
-        return HandlerResult(status=2, text=refusal)
+        return _review_result(2, refusal)
     with call.store_factory() as store:
         if recover:
             status, text, metadata = services.svc_review_detailed(
@@ -634,7 +645,7 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
                     family if call.params.get("client_family") is not None
                     else None))
             metadata = {}
-    return HandlerResult(status=status, text=text, metadata=metadata)
+    return _review_result(status, text, metadata)
 
 
 def _handle_log(call: "HandlerCall") -> "HandlerResult":
@@ -1888,8 +1899,11 @@ class McpServer:
                                             f"{name}")
         if spec.long_running:
             if not self._start_long_running(spec, arguments, id_):
-                self._respond_tool(id_, HandlerResult(
-                    status=BUSY_STATUS, text=BUSY_TEXT, pending_acks=[]))
+                busy = (_review_result(BUSY_STATUS, BUSY_TEXT)
+                        if spec.name == "review" else
+                        HandlerResult(status=BUSY_STATUS, text=BUSY_TEXT,
+                                      pending_acks=[]))
+                self._respond_tool(id_, busy)
             return _DEFERRED
         self._respond_tool(id_, self._run_handler(spec, arguments,
                                                  threading.Event()))
@@ -1927,19 +1941,24 @@ class McpServer:
             # status 2, `isError` true, the exception named for the log. Not a
             # crashed server, and not a protocol error either.
             self._note(f"the {spec.name} tool raised: {e!r}")
+            if spec.name == "review":
+                return _review_result(
+                    HANDLER_FAILURE_STATUS, _handler_failure_text(spec.name, e))
             return HandlerResult(
                 status=HANDLER_FAILURE_STATUS,
-                text=_handler_failure_text(spec.name, e),
-                pending_acks=[])
+                text=_handler_failure_text(spec.name, e), pending_acks=[])
         problem = _validate_result(res)
         if problem is not None:
             self._note(f"the {spec.name} tool returned something unusable "
                        f"({problem})")
-            return HandlerResult(
-                status=HANDLER_FAILURE_STATUS,
-                text=f"skodun {spec.name}: the tool returned something "
-                     f"unusable ({problem})",
-                pending_acks=[])
+            text = (f"skodun {spec.name}: the tool returned something "
+                    f"unusable ({problem})")
+            if spec.name == "review":
+                return _review_result(HANDLER_FAILURE_STATUS, text)
+            return HandlerResult(status=HANDLER_FAILURE_STATUS, text=text,
+                                 pending_acks=[])
+        if spec.name == "review":
+            return _review_result(res.status, res.text, res.metadata)
         return res
 
     def _start_long_running(self, spec: HandlerSpec, arguments: dict,
