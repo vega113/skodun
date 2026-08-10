@@ -39,11 +39,12 @@ def test_doctor_codex_version_probe_launches_binary(tmp_path, monkeypatch):
 def test_doctor_reports_codex_version_probe_failure(tmp_path, monkeypatch):
     report = _doctor_for_codex(
         tmp_path, monkeypatch,
-        'printf "spawn codex ENOENT\\n" >&2\nexit 1\n',
+        'printf "Bearer secret-token\\n" >&2\nexit 1\n',
     )
     check = next(c for c in report.checks if c.name == "adapter:openai:version")
     assert not check.ok
-    assert "ENOENT" in check.detail
+    assert "<redacted>" in check.detail
+    assert "secret-token" not in check.detail
 
 
 def test_run_doctor_reports_store_and_adapters(tmp_path, monkeypatch):

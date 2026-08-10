@@ -102,3 +102,22 @@ Run `python3 -m pytest` from the repository root. Expected: exit code 0 with no 
 - [x] **Step 3: Run the shipped CLI smoke commands**
 
 Run `PYTHONPATH=src python3 -m skodun --version`, `PYTHONPATH=src python3 -m skodun doctor --repo .`, and `PYTHONPATH=src python3 -m skodun providers --repo .`. Record the actual local Codex binary state; a broken installed Codex should make its doctor version check fail rather than be mistaken for a healthy install.
+
+### Task 4: Address hosted review findings
+
+**Files:**
+- Modify: `src/skodun/chain.py`
+- Modify: `src/skodun/adapters/codex.py`
+- Test: `tests/test_fallback.py`, `tests/test_doctor.py`
+
+- [x] **Step 1: Cover direct spawn `OSError` fallback behavior**
+
+The real fallback test uses an existing non-executable Codex file so `chain._binary_is_absent` permits the attempt and `subprocess.Popen` raises `PermissionError` before stderr exists.
+
+- [x] **Step 2: Translate native spawn errors and redact probe output**
+
+Non-`FileNotFoundError` spawn errors become bounded attempt-local `unavailable/invocation` records; Codex version-probe lines pass through control-character normalization and `_SECRET_RE` redaction before doctor reports them.
+
+- [x] **Step 3: Re-run affected and complete suites**
+
+The affected suites pass with `215 passed`; the complete suite passes with `3453 passed, 160 skipped`.

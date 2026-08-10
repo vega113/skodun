@@ -121,6 +121,15 @@ def _classification(verdict) -> dict:
             "detail": verdict.detail}
 
 
+def _spawn_failure(error: OSError) -> ClassifyResult:
+    """Represent a process-start failure as an attempt-local hop."""
+    detail = " ".join(str(error).split()) or type(error).__name__
+    return ClassifyResult(
+        "unavailable", "invocation",
+        f"spawn failed before process start: {detail}"[:400],
+    )
+
+
 def _binary_is_absent(binary: str) -> bool:
     """Whether `binary` names nothing this machine can execute.
 
@@ -568,15 +577,25 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                     result = runner.run_with_watchdog(
                         cmd, d.timeout_sec, cwd, out_path, err_path,
                         stdin_path=stdin_path, cancel=cancel)
-                except FileNotFoundError:
-                    # The binary existed when we looked and does not now, or the
-                    # adapter's argv names something else that is missing. Same
-                    # verdict as the pre-spawn check: nothing ran, so the
-                    # execution fields stay null, and the chain advances.
-                    verdict = adapter.classify(
-                        UNAVAILABLE_RC, b"", b"", contract)
+                except OSError as e:
+                    if isinstance(e, FileNotFoundError):
+                        # The binary existed when we looked and does not now, or
+                        # the adapter's argv names something else that is
+                        # missing. Same verdict as the pre-spawn check: nothing
+                        # ran, so the execution fields stay null, and the chain
+                        # advances.
+                        verdict = adapter.classify(
+                            UNAVAILABLE_RC, b"", b"", contract)
+                        skipped = f"binary not found: {cmd[0]}"
+                    else:
+                        # Permission, format, and other native spawn failures
+                        # happen before the child can create stderr. They are
+                        # invocation-local unavailability, not fatal chain
+                        # errors and not provider quota state.
+                        verdict = _spawn_failure(e)
+                        skipped = verdict.detail
                     attempts.append(_attempt(
-                        n, entry, skipped=f"binary not found: {cmd[0]}",
+                        n, entry, skipped=skipped,
                         classification=_classification(verdict)))
                     exhausted.append(
                         f"{entry.name}/{entry.provider}: {verdict.detail}")

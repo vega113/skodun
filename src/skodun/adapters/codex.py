@@ -168,7 +168,8 @@ _QUOTA_SIGNALS: tuple[bytes, ...] = (
 _INVOCATION_SIGNALS: tuple[bytes, ...] = (
     b"failed to spawn", b"spawn failed", b"permission denied",
     b"no such file", b"executable", b"cannot execute",
-    b"enoent", b"eacces", b"eperm", b"exec format error",
+    b"enoent", b"eacces", b"eperm", b"operation not permitted",
+    b"exec format error",
 )
 _TRANSPORT_SIGNALS: tuple[bytes, ...] = (
     b"failed to connect", b"connection refused", b"connection reset",
@@ -197,6 +198,8 @@ def _sanitized_diagnostic(raw: bytes, *, rc: int) -> str:
 def _first_output_line(raw: bytes) -> str:
     """Return one bounded, whitespace-normalized diagnostic line."""
     for line in raw.decode("utf-8", "replace").splitlines():
+        line = _CONTROL_RE.sub(" ", line)
+        line = _SECRET_RE.sub(r"\1<redacted>", line)
         line = " ".join(line.split())
         if line:
             return line[:_DIAGNOSTIC_LIMIT]

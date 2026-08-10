@@ -349,6 +349,29 @@ def test_fallback_chain_recovers(tmp_path, monkeypatch, capsys):
     assert _calls(tmp_path) == ["grok"]      # the dead head never spawned
 
 
+def test_spawn_permission_error_advances_to_fallback(tmp_path, monkeypatch,
+                                                     capsys):
+    """A real Popen permission error is an invocation-unavailable hop."""
+    codex = tmp_path / "bin" / "codex"
+    codex.parent.mkdir()
+    codex.write_text("#!/bin/sh\nprintf never-runs\n", encoding="utf-8")
+    # Leave the file non-executable: chain sees it exists, then the real
+    # watchdog's Popen raises PermissionError before any stderr is captured.
+    _fake_cli(tmp_path, "grok", _emit(CLEAN))
+    repo = _repo(tmp_path, CFG_OPENAI_THEN_XAI)
+
+    rec = _run(repo, _store(tmp_path))
+
+    assert rec["trustworthy"] is True
+    first, second = rec["attempts"]
+    assert first["provider"] == "openai"
+    assert first["classification"]["kind"] == "unavailable"
+    assert first["classification"]["category"] == "invocation"
+    assert "permission" in first["classification"]["detail"].lower()
+    assert second["provider"] == "xai"
+    assert second["classification"] == {"kind": "ok", "category": "", "detail": ""}
+
+
 def test_exhausted_chain_fails_closed_and_gate_semantics(tmp_path, monkeypatch,
                                                          capsys):
     monkeypatch.setenv("SKODUN_CODEX_BIN", "/nonexistent/a")
