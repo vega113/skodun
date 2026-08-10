@@ -54,6 +54,7 @@ import json
 import os
 import re
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Callable
 
 from ..config import Defaults, Reviewer
@@ -167,6 +168,8 @@ _QUOTA_SIGNALS: tuple[bytes, ...] = (
 _INVOCATION_SIGNALS: tuple[bytes, ...] = (
     b"failed to spawn", b"spawn failed", b"permission denied",
     b"no such file", b"executable", b"cannot execute",
+    b"enoent", b"eacces", b"eperm", b"operation not permitted",
+    b"exec format error",
 )
 _TRANSPORT_SIGNALS: tuple[bytes, ...] = (
     b"failed to connect", b"connection refused", b"connection reset",
@@ -174,6 +177,7 @@ _TRANSPORT_SIGNALS: tuple[bytes, ...] = (
     b"timed out", b"timeout", b"transport error",
 )
 _DIAGNOSTIC_LIMIT = 400
+_VERSION_PROBE_TIMEOUT_SEC = 10
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\x80-\x9f]+")
 _SECRET_RE = re.compile(
     r"(?i)(bearer\s+|api[_ -]?key\s*[:=]\s*|token\s*[:=]\s*)[^\s,;]+")
@@ -189,6 +193,17 @@ def _sanitized_diagnostic(raw: bytes, *, rc: int) -> str:
     detail = " ".join(detail.split())
     prefix = f"codex exited rc={rc} without a usable review payload: "
     return (prefix + detail)[:_DIAGNOSTIC_LIMIT]
+
+
+def _first_output_line(raw: bytes) -> str:
+    """Return one bounded, whitespace-normalized diagnostic line."""
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = _CONTROL_RE.sub(" ", line)
+        line = _SECRET_RE.sub(r"\1<redacted>", line)
+        line = " ".join(line.split())
+        if line:
+            return line[:_DIAGNOSTIC_LIMIT]
+    return ""
 
 # Canonical effort (`config.EFFORTS`) -> the CLI's `model_reasoning_effort`.
 #
@@ -319,6 +334,46 @@ class CodexAdapter:
     def resolve_binary(self) -> str:
         """The protocol's spelling of `resolve_codex_bin`."""
         return resolve_codex_bin()
+
+    def version_probe(self) -> str:
+        """Launch the resolved CLI and return its reported version.
+
+        A wrapper can be executable while its bundled native binary is absent,
+        so checking PATH/executable bits alone is not enough for doctor. This
+        deliberately performs the smallest real invocation and preserves
+        native spawn errors for the caller to report.
+        """
+        from ..runner import run_with_watchdog
+
+        with TemporaryDirectory(prefix="skodun-codex-version-") as raw_dir:
+            scratch = Path(raw_dir)
+            stdout_path = scratch / "stdout"
+            stderr_path = scratch / "stderr"
+            result = run_with_watchdog(
+                [self.resolve_binary(), "--version"],
+                _VERSION_PROBE_TIMEOUT_SEC,
+                Path.cwd(),
+                stdout_path,
+                stderr_path,
+                max_output_bytes=_DIAGNOSTIC_LIMIT,
+            )
+            stdout = _first_output_line(stdout_path.read_bytes())
+            stderr = _first_output_line(stderr_path.read_bytes())
+        if result.output_limit_exceeded:
+            raise RuntimeError(
+                f"codex --version exceeded the {_DIAGNOSTIC_LIMIT}-byte "
+                "output limit")
+        if result.timed_out:
+            raise RuntimeError(
+                f"codex --version timed out after {_VERSION_PROBE_TIMEOUT_SEC}s")
+        if result.rc != 0:
+            detail = stderr or stdout or "no output"
+            raise RuntimeError(
+                f"codex --version exited rc={result.rc}: {detail}")
+        if not stdout:
+            detail = stderr or "no stdout"
+            raise RuntimeError(f"codex --version returned no version: {detail}")
+        return stdout
 
     def effort_map(self) -> dict[str, str]:
         """Canonical effort -> `model_reasoning_effort`. A copy, so that a

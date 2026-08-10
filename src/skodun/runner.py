@@ -73,6 +73,16 @@ class ReviewCancelled(BaseException):
         self.partial = partial
 
 
+class SpawnError(Exception):
+    """A process-start ``OSError`` separated from watchdog I/O failures."""
+
+    def __init__(self, cause: OSError, *, cmd=None, cwd: Path | None = None) -> None:
+        self.cause = cause
+        self.cmd = tuple(cmd) if cmd is not None else None
+        self.cwd = cwd
+        super().__init__(str(cause))
+
+
 def _is_path_shaped(binary: str) -> bool:
     """Whether `binary` should be resolved as a path rather than walked
     through `PATH`: it contains `/`, or the platform's own separator on a
@@ -166,6 +176,7 @@ class RunResult:
     timed_out: bool
     duration_sec: float
     first_output_sec: float | None
+    output_limit_exceeded: bool = False
 
 
 def run_with_watchdog(
@@ -176,6 +187,7 @@ def run_with_watchdog(
     stderr_path: Path,
     stdin_path: Path | None = None,
     cancel: "threading.Event | None" = None,
+    max_output_bytes: int | None = None,
 ) -> RunResult:
     """Run `cmd` with a hard wall-clock timeout, streaming output to files.
 
@@ -199,6 +211,11 @@ def run_with_watchdog(
     caller cannot accumulate open prompt files. `DEVNULL` is deliberately NOT
     routed through the same open: `subprocess` manages that descriptor itself.
 
+    `max_output_bytes`, when given, bounds the file-backed stdout and stderr
+    capture. The process group is terminated and the files are truncated to
+    that limit before returning, so a diagnostic probe can safely use the same
+    no-pipes runner without allowing a broken wrapper to fill its disk.
+
     `cancel`, when given, is a `threading.Event` the caller's SIGTERM handler
     sets. It is checked BEFORE the spawn and on every tick, and a set token
     takes the process group down exactly as a timeout does and then raises
@@ -217,12 +234,12 @@ def run_with_watchdog(
         the provider is gone rather than racing the worker's exit.
 
     Note: if `cmd[0]` does not exist, `subprocess.Popen` raises
-    `FileNotFoundError` before the watchdog loop starts. That exception
-    propagates uncaught out of this function -- `stdout_path`/`stderr_path`
-    are left behind, created (by the `open()` calls above) but empty. Handling
-    a missing binary is out of scope for this module; whatever builds a retry
-    loop around this function needs to decide deliberately whether that case
-    is retryable.
+    `FileNotFoundError` before the watchdog loop starts. This function wraps
+    that and other process-start `OSError`s in `SpawnError`, while leaving
+    `stdout_path`/`stderr_path` behind, created (by the `open()` calls above)
+    but empty. Handling a missing binary is out of scope for this module;
+    whatever builds a retry loop around this function needs to decide
+    deliberately whether that case is retryable.
     """
     if _cancelled(cancel):
         # Before ANY file is opened or process started: this call is not going
@@ -231,6 +248,7 @@ def run_with_watchdog(
     t0 = time.monotonic()
     first_out: float | None = None
     timed_out = False
+    output_limit_exceeded = False
     rc: int
 
     # Opened before the output files and closed in the `finally` below, so
@@ -239,14 +257,17 @@ def run_with_watchdog(
     stdin_file = open(stdin_path, "rb") if stdin_path is not None else None
     try:
         with open(stdout_path, "wb") as out, open(stderr_path, "wb") as err:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=cwd,
-                stdout=out,
-                stderr=err,
-                stdin=subprocess.DEVNULL if stdin_file is None else stdin_file,
-                start_new_session=True,
-            )
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=cwd,
+                    stdout=out,
+                    stderr=err,
+                    stdin=subprocess.DEVNULL if stdin_file is None else stdin_file,
+                    start_new_session=True,
+                )
+            except OSError as e:
+                raise SpawnError(e, cmd=cmd, cwd=cwd) from e
             # start_new_session=True makes the child a session+group leader, so its
             # PGID equals its pid. Capture it NOW: os.getpgid(proc.pid) races with
             # the child exiting and would raise once it is reaped.
@@ -272,6 +293,12 @@ def run_with_watchdog(
                         # failed" are indistinguishable in the `None` this function
                         # returns. See `_size`.
                         first_out = time.monotonic() - t0
+                    if (max_output_bytes is not None and
+                            (_size(stdout_path) > max_output_bytes or
+                             _size(stderr_path) > max_output_bytes)):
+                        output_limit_exceeded = True
+                        rc = _terminate_group(proc, pg)
+                        break
                     if status is not None:
                         # Checked *before* the deadline, so a run that finishes in the
                         # final tick keeps its valid output instead of being recorded as
@@ -301,12 +328,16 @@ def run_with_watchdog(
             # Truncate only after the group is dead, so nothing can re-extend the
             # file behind our back through an inherited descriptor.
             stdout_path.write_bytes(b"")
+        elif output_limit_exceeded:
+            _truncate(stdout_path, max_output_bytes)
+            _truncate(stderr_path, max_output_bytes)
 
         return RunResult(
             rc=rc,
             timed_out=timed_out,
             duration_sec=max(0.0, time.monotonic() - t0),
             first_output_sec=first_out,
+            output_limit_exceeded=output_limit_exceeded,
         )
     finally:
         if stdin_file is not None:
@@ -449,3 +480,13 @@ def _size(path: Path) -> int:
         return path.stat().st_size
     except OSError:
         return 0
+
+
+def _truncate(path: Path, limit: int | None) -> None:
+    if limit is None:
+        return
+    try:
+        with path.open("r+b") as handle:
+            handle.truncate(limit)
+    except OSError:
+        pass

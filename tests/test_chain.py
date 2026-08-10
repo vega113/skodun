@@ -99,6 +99,84 @@ def test_run_chain_without_a_token_is_the_shipped_call(tmp_path, monkeypatch):
     assert seen == [None]
 
 
+def test_run_chain_does_not_hop_on_non_spawn_oserror(tmp_path, monkeypatch):
+    """Watchdog I/O errors are not evidence that a provider was unavailable."""
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.store import Store
+
+    monkeypatch.setenv("SKODUN_GROK_BIN", "/bin/sh")
+    head = Reviewer(name="f", provider="xai", model="m", role="finder",
+                    fallbacks=("backup",))
+    backup = Reviewer(name="backup", provider="google", model="m2",
+                      role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(head, backup))
+    store = Store.open(tmp_path / "s.db")
+
+    def fake(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise OSError("stdout close failed")
+
+    calls = []
+    monkeypatch.setattr(chain.runner, "run_with_watchdog", fake)
+    with store, pytest.raises(OSError, match="stdout close failed"):
+        chain.run_chain(head, cfg, cfg.defaults, b"p", tmp_path, store,
+                        tmp_path, "t")
+    assert len(calls) == 1
+
+
+def test_run_chain_does_not_hop_on_missing_working_directory(tmp_path,
+                                                              monkeypatch):
+    """A Popen ENOENT naming cwd is local setup failure, not binary absence."""
+    import errno
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.runner import SpawnError
+    from skodun.store import Store
+
+    monkeypatch.setenv("SKODUN_GROK_BIN", "/bin/sh")
+    head = Reviewer(name="f", provider="xai", model="m", role="finder",
+                    fallbacks=("backup",))
+    backup = Reviewer(name="backup", provider="google", model="m2",
+                      role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(head, backup))
+    store = Store.open(tmp_path / "s.db")
+    missing_cwd = tmp_path / "missing-cwd"
+
+    def fake(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        raise SpawnError(
+            OSError(errno.ENOENT, "No such file or directory", str(cwd)),
+            cmd=cmd, cwd=cwd)
+
+    monkeypatch.setattr(chain.runner, "run_with_watchdog", fake)
+    with store, pytest.raises(SpawnError, match="No such file"):
+        chain.run_chain(head, cfg, cfg.defaults, b"p", missing_cwd, store,
+                        tmp_path, "t")
+
+
+def test_run_chain_does_not_hop_on_host_resource_spawn_error(tmp_path,
+                                                              monkeypatch):
+    """EMFILE/ENOMEM-style spawn failures remain fatal local errors."""
+    import errno
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.runner import SpawnError
+    from skodun.store import Store
+
+    monkeypatch.setenv("SKODUN_GROK_BIN", "/bin/sh")
+    head = Reviewer(name="f", provider="xai", model="m", role="finder",
+                    fallbacks=("backup",))
+    backup = Reviewer(name="backup", provider="google", model="m2",
+                      role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(head, backup))
+    store = Store.open(tmp_path / "s.db")
+
+    def fake(*args, **kwargs):
+        raise SpawnError(OSError(errno.EMFILE, "Too many open files"))
+
+    monkeypatch.setattr(chain.runner, "run_with_watchdog", fake)
+    with store, pytest.raises(SpawnError, match="Too many open files"):
+        chain.run_chain(head, cfg, cfg.defaults, b"p", tmp_path, store,
+                        tmp_path, "t")
+
+
 def test_a_token_set_between_chain_entries_stops_the_chain(tmp_path, monkeypatch):
     """Checked at the ENTRY boundary too, not only inside the watchdog.
 

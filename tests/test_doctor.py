@@ -10,6 +10,67 @@ from skodun.doctor import run_doctor
 from skodun.store import SCHEMA_VERSION, Store
 
 
+def _codex_script(path: Path, body: str) -> None:
+    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _doctor_for_codex(tmp_path: Path, monkeypatch, capsys, body: str):
+    binary = tmp_path / "codex"
+    _codex_script(binary, body)
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(binary))
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "missing.toml"))
+    code = main(["doctor", "--repo", str(tmp_path)])
+    return code, capsys.readouterr().out
+
+
+def test_doctor_codex_version_probe_launches_binary(tmp_path, monkeypatch, capsys):
+    code, output = _doctor_for_codex(
+        tmp_path, monkeypatch,
+        capsys,
+        'test "$1" = "--version" || exit 19\nprintf "codex-cli 0.147.0\\n"\n',
+    )
+    assert code == 0
+    assert "[ok] adapter:openai:version: codex-cli 0.147.0" in output
+
+
+def test_doctor_reports_codex_version_probe_failure(tmp_path, monkeypatch, capsys):
+    code, output = _doctor_for_codex(
+        tmp_path, monkeypatch,
+        capsys,
+        'printf "Bearer secret-token\\n" >&2\nexit 1\n',
+    )
+    assert code == 1
+    assert "[FAIL] adapter:openai:version:" in output
+    assert "<redacted>" in output
+    assert "secret-token" not in output
+
+
+def test_doctor_codex_version_probe_times_out_bounded(tmp_path, monkeypatch, capsys):
+    from skodun.adapters import codex
+
+    monkeypatch.setattr(codex, "_VERSION_PROBE_TIMEOUT_SEC", 0.1)
+    code, output = _doctor_for_codex(
+        tmp_path, monkeypatch,
+        capsys,
+        'sleep 60\n',
+    )
+    assert code == 1
+    assert "[FAIL] adapter:openai:version:" in output
+    assert "timed out" in output
+
+
+def test_doctor_codex_version_probe_bounds_output(tmp_path, monkeypatch, capsys):
+    code, output = _doctor_for_codex(
+        tmp_path, monkeypatch, capsys,
+        'yes codex-noise\n',
+    )
+    assert code == 1
+    assert "[FAIL] adapter:openai:version:" in output
+    assert "output limit" in output
+
+
 def test_run_doctor_reports_store_and_adapters(tmp_path, monkeypatch):
     db = tmp_path / "s.db"
     monkeypatch.setenv("SKODUN_DB", str(db))

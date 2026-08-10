@@ -529,6 +529,20 @@ def test_missing_binary():
     assert res.kind == "unavailable" and res.category == "binary"
 
 
+@pytest.mark.parametrize("signal", [
+    b"ENOENT",
+    b"EACCES",
+    b"EPERM",
+    b"exec format error",
+])
+def test_every_native_spawn_signal_is_unavailable_invocation(signal):
+    res = CodexAdapter().classify(
+        1, b"", b"codex native error: " + signal + b"\n", REVIEW_CONTRACT)
+    assert res.kind == "unavailable"
+    assert res.category == "invocation"
+    assert signal.decode().lower() in res.detail.lower()
+
+
 def test_nonzero_empty_output_with_invocation_diagnostic_is_unavailable():
     res = CodexAdapter().classify(
         1, b"", b"codex: failed to connect to the responses stream\n",

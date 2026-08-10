@@ -24,6 +24,8 @@ scope here) rather than in `pipeline`.
 
 from __future__ import annotations
 
+import errno
+import os
 import shutil
 import threading
 import time
@@ -43,6 +45,9 @@ from .store import Store, _TS_FORMAT
 #: uses the same env with this floor when no override is set so hermetic
 #: tests and short local runs stay bounded.
 _DEFAULT_PROVIDER_WAIT_SEC = 30.0
+_SPAWN_UNAVAILABLE_ERRNOS = frozenset({
+    errno.ENOENT, errno.EACCES, errno.EPERM, errno.ENOEXEC,
+})
 
 
 @dataclass
@@ -119,6 +124,44 @@ def _classification(verdict) -> dict:
     """A `ClassifyResult` as it is persisted. Three keys, always all three."""
     return {"kind": verdict.kind, "category": verdict.category,
             "detail": verdict.detail}
+
+
+def _spawn_failure(error: OSError) -> ClassifyResult:
+    """Represent a process-start failure as an attempt-local hop."""
+    detail = " ".join(str(error).split()) or type(error).__name__
+    return ClassifyResult(
+        "unavailable", "invocation",
+        f"spawn failed before process start: {detail}"[:400],
+    )
+
+
+def _is_executable_spawn_failure(error: runner.SpawnError) -> bool:
+    """Whether the process-start error names ``cmd[0]``, not ``cwd``.
+
+    ``Popen`` reports a missing/inaccessible working directory with the same
+    errno family as a missing or non-executable command. Only the latter is a
+    provider-local invocation failure that the fallback chain may bypass.
+    Missing metadata is treated as a local error rather than guessed into a
+    fallback, which keeps this boundary fail closed for test doubles and
+    future runner changes.
+    """
+    if error.cmd is None or error.cwd is None:
+        return False
+    filename = getattr(error.cause, "filename", None)
+    if filename is None:
+        return False
+
+    def same_path(left, right) -> bool:
+        left_s, right_s = os.fspath(left), os.fspath(right)
+        if left_s == right_s:
+            return True
+        try:
+            return os.path.normcase(os.path.abspath(left_s)) == os.path.normcase(
+                os.path.abspath(right_s))
+        except (TypeError, ValueError):
+            return False
+
+    return same_path(filename, error.cmd[0])
 
 
 def _binary_is_absent(binary: str) -> bool:
@@ -568,11 +611,36 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                     result = runner.run_with_watchdog(
                         cmd, d.timeout_sec, cwd, out_path, err_path,
                         stdin_path=stdin_path, cancel=cancel)
+                except runner.SpawnError as e:
+                    if not _is_executable_spawn_failure(e):
+                        raise
+                    if isinstance(e.cause, FileNotFoundError):
+                        # The binary existed when we looked and does not now, or
+                        # the adapter's argv names something else that is
+                        # missing. Same verdict as the pre-spawn check: nothing
+                        # ran, so the execution fields stay null, and the chain
+                        # advances.
+                        verdict = adapter.classify(
+                            UNAVAILABLE_RC, b"", b"", contract)
+                        skipped = f"binary not found: {cmd[0]}"
+                    elif e.cause.errno in _SPAWN_UNAVAILABLE_ERRNOS:
+                        # Permission, format, and other native spawn failures
+                        # happen before the child can create stderr. They are
+                        # invocation-local unavailability, not fatal chain
+                        # errors and not provider quota state.
+                        verdict = _spawn_failure(e.cause)
+                        skipped = verdict.detail
+                    else:
+                        raise
+                    attempts.append(_attempt(
+                        n, entry, skipped=skipped,
+                        classification=_classification(verdict)))
+                    exhausted.append(
+                        f"{entry.name}/{entry.provider}: {verdict.detail}")
+                    break
                 except FileNotFoundError:
-                    # The binary existed when we looked and does not now, or the
-                    # adapter's argv names something else that is missing. Same
-                    # verdict as the pre-spawn check: nothing ran, so the
-                    # execution fields stay null, and the chain advances.
+                    # Compatibility for callers/tests that replace the runner
+                    # with a function that raises the raw legacy exception.
                     verdict = adapter.classify(
                         UNAVAILABLE_RC, b"", b"", contract)
                     attempts.append(_attempt(
