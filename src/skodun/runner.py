@@ -304,6 +304,12 @@ def run_with_watchdog(
                         # final tick keeps its valid output instead of being recorded as
                         # a timeout (the oracle re-checks liveness after its last tick
                         # for exactly this reason).
+                        # The leader may have exited while a wrapper-owned helper
+                        # remains in the same process group. Reap that group before
+                        # returning, otherwise a successful-looking wrapper can
+                        # leave a native provider child writing to our descriptors.
+                        if _group_alive(pg):
+                            _terminate_group(proc, pg)
                         rc = status
                         break
                     if time.monotonic() >= deadline:

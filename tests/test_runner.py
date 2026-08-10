@@ -120,6 +120,33 @@ def test_kills_whole_group_even_if_leader_dies_and_grandchild_ignores_term(tmp_p
     assert not _kill_ok(gc_pid), f"grandchild {gc_pid} survived the watchdog"
 
 
+def test_early_leader_exit_reaps_wrapper_descendants(tmp_path):
+    """A clean wrapper exit must not leave its native child running."""
+    pidfile = tmp_path / "gc.pid"
+    gc = (
+        "import os,time;"
+        f"open({str(pidfile)!r},'w').write(str(os.getpid()));"
+        "time.sleep(60)"
+    )
+    code = (
+        "import pathlib,subprocess,sys,time\n"
+        f"subprocess.Popen([sys.executable,'-c',{gc!r}])\n"
+        f"p=pathlib.Path({str(pidfile)!r})\n"
+        "while not p.exists():\n"
+        "    time.sleep(0.01)\n"
+    )
+    result = run_with_watchdog(
+        [sys.executable, "-c", code], 10, tmp_path,
+        tmp_path / "out", tmp_path / "err",
+    )
+    assert result.rc == 0 and not result.timed_out
+    gc_pid = int(pidfile.read_text(encoding="utf-8").strip())
+    deadline = time.monotonic() + 2.0
+    while _kill_ok(gc_pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _kill_ok(gc_pid), f"descendant {gc_pid} survived early wrapper exit"
+
+
 def test_timeout_leaves_no_stray_process_group(tmp_path):
     # The child is its own process-group leader, so its pid IS the pgid.
     #
