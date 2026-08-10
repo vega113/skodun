@@ -177,6 +177,7 @@ class RunResult:
     duration_sec: float
     first_output_sec: float | None
     output_limit_exceeded: bool = False
+    descendants_killed: bool = False
 
 
 def run_with_watchdog(
@@ -249,6 +250,7 @@ def run_with_watchdog(
     first_out: float | None = None
     timed_out = False
     output_limit_exceeded = False
+    descendants_killed = False
     rc: int
 
     # Opened before the output files and closed in the `finally` below, so
@@ -310,6 +312,7 @@ def run_with_watchdog(
                         # leave a native provider child writing to our descriptors.
                         if _group_alive(pg):
                             _terminate_group(proc, pg)
+                            descendants_killed = True
                         rc = status
                         break
                     if time.monotonic() >= deadline:
@@ -337,6 +340,11 @@ def run_with_watchdog(
         elif output_limit_exceeded:
             _truncate(stdout_path, max_output_bytes)
             _truncate(stderr_path, max_output_bytes)
+        elif descendants_killed:
+            # A wrapper that left a live child did not produce a trustworthy
+            # completed attempt, even if its own stdout looked complete.
+            stdout_path.write_bytes(b"")
+            stderr_path.write_bytes(b"")
 
         return RunResult(
             rc=rc,
@@ -344,6 +352,7 @@ def run_with_watchdog(
             duration_sec=max(0.0, time.monotonic() - t0),
             first_output_sec=first_out,
             output_limit_exceeded=output_limit_exceeded,
+            descendants_killed=descendants_killed,
         )
     finally:
         if stdin_file is not None:

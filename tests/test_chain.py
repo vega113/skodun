@@ -99,6 +99,35 @@ def test_run_chain_without_a_token_is_the_shipped_call(tmp_path, monkeypatch):
     assert seen == [None]
 
 
+def test_run_chain_discards_output_when_wrapper_leaves_descendants(
+        tmp_path, monkeypatch):
+    """A killed helper invalidates the attempt even if stdout looked complete."""
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.runner import RunResult
+    from skodun.store import Store
+
+    monkeypatch.setenv("SKODUN_GROK_BIN", "/bin/sh")
+    reviewer = Reviewer(name="f", provider="xai", model="m", role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(reviewer,))
+    store = Store.open(tmp_path / "s.db")
+
+    def fake(*args, **kwargs):
+        args[3].write_bytes(
+            b'{"structuredOutput":{"summary":"clean","findings":[]}}')
+        return RunResult(rc=0, timed_out=False, duration_sec=0.1,
+                         first_output_sec=0.01, descendants_killed=True)
+
+    monkeypatch.setattr(chain.runner, "run_with_watchdog", fake)
+    with store:
+        outcome = chain.run_chain(reviewer, cfg, cfg.defaults, b"p", tmp_path,
+                                  store, tmp_path, "t")
+    assert outcome.parsed is None
+    assert "live descendants" in outcome.failure_reason
+    assert outcome.attempts[0]["classification"]["kind"] == "degraded"
+    assert "discarded" in outcome.attempts[0]["classification"]["detail"]
+    assert "skipped" not in outcome.attempts[0]
+
+
 def test_run_chain_does_not_hop_on_non_spawn_oserror(tmp_path, monkeypatch):
     """Watchdog I/O errors are not evidence that a provider was unavailable."""
     from skodun.config import Config, Defaults, Reviewer

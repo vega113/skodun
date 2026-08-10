@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from skodun.cli import main
 from skodun.doctor import run_doctor
 from skodun.store import SCHEMA_VERSION, Store
@@ -69,6 +71,23 @@ def test_doctor_codex_version_probe_bounds_output(tmp_path, monkeypatch, capsys)
     assert code == 1
     assert "[FAIL] adapter:openai:version:" in output
     assert "output limit" in output
+
+
+def test_codex_version_probe_rejects_descendant_cleanup(monkeypatch):
+    from skodun.adapters.codex import CodexAdapter
+    from skodun import runner
+
+    def fake(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None,
+             max_output_bytes=None):
+        out.write_bytes(b"codex-cli 0.147.0\\n")
+        err.write_bytes(b"")
+        return runner.RunResult(
+            rc=0, timed_out=False, duration_sec=0.1, first_output_sec=0.01,
+            descendants_killed=True)
+
+    monkeypatch.setattr(runner, "run_with_watchdog", fake)
+    with pytest.raises(RuntimeError, match="live descendants"):
+        CodexAdapter().version_probe()
 
 
 def test_run_doctor_reports_store_and_adapters(tmp_path, monkeypatch):

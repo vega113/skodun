@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +30,20 @@ def _kill_ok(pid: int) -> bool:
     except PermissionError:  # exists, owned by someone else
         return True
     return True
+
+
+def _process_is_running(pid: int) -> bool:
+    """Treat an unreaped zombie as stopped when procfs exposes its state."""
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        raw = proc_stat.read_text(encoding="utf-8")
+    except OSError:
+        return _kill_ok(pid)
+    closing = raw.rfind(")")
+    if closing < 0:
+        return _kill_ok(pid)
+    fields = raw[closing + 1:].split()
+    return not fields or fields[0] != "Z"
 
 
 def _group_exists(pgid: int) -> bool:
@@ -134,17 +149,23 @@ def test_early_leader_exit_reaps_wrapper_descendants(tmp_path):
         f"p=pathlib.Path({str(pidfile)!r})\n"
         "while not p.exists():\n"
         "    time.sleep(0.01)\n"
+        "sys.stdout.write('wrapper stdout\\n'); sys.stdout.flush()\n"
+        "sys.stderr.write('wrapper stderr\\n'); sys.stderr.flush()\n"
     )
     result = run_with_watchdog(
         [sys.executable, "-c", code], 10, tmp_path,
         tmp_path / "out", tmp_path / "err",
     )
     assert result.rc == 0 and not result.timed_out
+    assert result.descendants_killed
     gc_pid = int(pidfile.read_text(encoding="utf-8").strip())
     deadline = time.monotonic() + 2.0
-    while _kill_ok(gc_pid) and time.monotonic() < deadline:
+    while _process_is_running(gc_pid) and time.monotonic() < deadline:
         time.sleep(0.05)
-    assert not _kill_ok(gc_pid), f"descendant {gc_pid} survived early wrapper exit"
+    assert not _process_is_running(gc_pid), \
+        f"descendant {gc_pid} survived early wrapper exit"
+    assert (tmp_path / "out").read_bytes() == b""
+    assert (tmp_path / "err").read_bytes() == b""
 
 
 def test_timeout_leaves_no_stray_process_group(tmp_path):
