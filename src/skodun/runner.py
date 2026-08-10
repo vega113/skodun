@@ -516,8 +516,6 @@ def _group_descendant_state(pg: int, leader_pid: int) -> str:
         return "inconclusive"
     saw_matching_group = False
     saw_valid_row = False
-    ambiguous_leader = False
-    saw_live_descendant = False
     for line in result.stdout.splitlines():
         fields = line.split()
         if not line.strip():
@@ -555,18 +553,17 @@ def _group_descendant_state(pg: int, leader_pid: int) -> str:
             # that row as permission to signal the group.
             if state[0] in {"Z", "X"}:
                 continue
-            ambiguous_leader = True
-            continue
+            return "inconclusive"
         if state[0] not in {"Z", "X"}:
-            saw_live_descendant = True
+            # One distinct live member in the owned session is enough to
+            # justify cleaning the group. Stop here so a later PID vanishing
+            # between ps and getsid cannot turn a proven live group into an
+            # inconclusive result and leave the child running.
+            return "live"
     # A valid snapshot with no row for this group proves it vanished between
     # liveness and inspection; an empty snapshot is inconclusive and remains
     # fail closed.
     if saw_matching_group:
-        if ambiguous_leader:
-            return "inconclusive"
-        if saw_live_descendant:
-            return "live"
         return "none"
     if not saw_valid_row:
         return "inconclusive"
