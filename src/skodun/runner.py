@@ -76,8 +76,10 @@ class ReviewCancelled(BaseException):
 class SpawnError(Exception):
     """A process-start ``OSError`` separated from watchdog I/O failures."""
 
-    def __init__(self, cause: OSError) -> None:
+    def __init__(self, cause: OSError, *, cmd=None, cwd: Path | None = None) -> None:
         self.cause = cause
+        self.cmd = tuple(cmd) if cmd is not None else None
+        self.cwd = cwd
         super().__init__(str(cause))
 
 
@@ -257,7 +259,7 @@ def run_with_watchdog(
                     start_new_session=True,
                 )
             except OSError as e:
-                raise SpawnError(e) from e
+                raise SpawnError(e, cmd=cmd, cwd=cwd) from e
             # start_new_session=True makes the child a session+group leader, so its
             # PGID equals its pid. Capture it NOW: os.getpgid(proc.pid) races with
             # the child exiting and would raise once it is reaped.

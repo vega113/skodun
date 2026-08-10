@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: Pin native-spawn diagnostics in the Codex classifier
+## Task 1: Pin native-spawn diagnostics in the Codex classifier
 
 **Files:**
 - Modify: `src/skodun/adapters/codex.py`
@@ -18,7 +18,7 @@
 
 - [x] **Step 1: Write the failing regression test**
 
-Add a parametrized test beside the existing Codex classification tests. For each native-spawn marker (`ENOENT`, `EACCES`, `EPERM`, and `exec format error`), call `CodexAdapter().classify(1, b"", b"codex: spawn ... <marker>\n", REVIEW_CONTRACT)` and assert `kind == "unavailable"`, `category == "invocation"`, and the marker is retained in the bounded detail.
+Add a parameterized test beside the existing Codex classification tests. For each native-spawn marker (`ENOENT`, `EACCES`, `EPERM`, and `exec format error`), call `CodexAdapter().classify(1, b"", b"codex: spawn ... <marker>\n", REVIEW_CONTRACT)` and assert `kind == "unavailable"`, `category == "invocation"`, and the marker is retained in the bounded detail.
 
 - [x] **Step 2: Run the focused test and verify it fails for the missing signal**
 

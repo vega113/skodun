@@ -25,6 +25,7 @@ scope here) rather than in `pipeline`.
 from __future__ import annotations
 
 import errno
+import os
 import shutil
 import threading
 import time
@@ -132,6 +133,35 @@ def _spawn_failure(error: OSError) -> ClassifyResult:
         "unavailable", "invocation",
         f"spawn failed before process start: {detail}"[:400],
     )
+
+
+def _is_executable_spawn_failure(error: runner.SpawnError) -> bool:
+    """Whether the process-start error names ``cmd[0]``, not ``cwd``.
+
+    ``Popen`` reports a missing/inaccessible working directory with the same
+    errno family as a missing or non-executable command. Only the latter is a
+    provider-local invocation failure that the fallback chain may bypass.
+    Missing metadata is treated as a local error rather than guessed into a
+    fallback, which keeps this boundary fail closed for test doubles and
+    future runner changes.
+    """
+    if error.cmd is None or error.cwd is None:
+        return False
+    filename = getattr(error.cause, "filename", None)
+    if filename is None:
+        return False
+
+    def same_path(left, right) -> bool:
+        left_s, right_s = os.fspath(left), os.fspath(right)
+        if left_s == right_s:
+            return True
+        try:
+            return os.path.normcase(os.path.abspath(left_s)) == os.path.normcase(
+                os.path.abspath(right_s))
+        except (TypeError, ValueError):
+            return False
+
+    return same_path(filename, error.cmd[0])
 
 
 def _binary_is_absent(binary: str) -> bool:
@@ -582,6 +612,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                         cmd, d.timeout_sec, cwd, out_path, err_path,
                         stdin_path=stdin_path, cancel=cancel)
                 except runner.SpawnError as e:
+                    if not _is_executable_spawn_failure(e):
+                        raise
                     if isinstance(e.cause, FileNotFoundError):
                         # The binary existed when we looked and does not now, or
                         # the adapter's argv names something else that is
