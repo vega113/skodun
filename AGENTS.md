@@ -9,9 +9,10 @@ Human docs: [`README.md`](README.md). Explicit user chat overrides this file.
 
 ## Project overview
 
-**skodun** is a local, fail-closed code-review pipeline that drives AI **CLI
-tools you already subscribe to** (grok / codex / agy / junie), not metered HTTP
-API keys.
+**skodun** is a local, fail-closed code-review pipeline that primarily drives AI
+**CLI tools you already subscribe to** (grok / codex / agy / junie). It also
+ships an explicit, optional metered `openai-api` BYOK adapter with a daily spend
+cap; that path is never introduced implicitly by a CLI failure.
 
 | Concern | Contract |
 |---|---|
@@ -21,8 +22,9 @@ API keys.
 | Triage | Audited reasons (≥20 chars, no placeholders); `dismiss` / `defer` (filed ref required) / `reopen` |
 | Surfaces | CLI and MCP share the same `services` layer for the review loop |
 
-There is **no** `anthropic` / headless Claude adapter by design (metered billing
-vs subscription-CLI premise).
+There is **no** `anthropic` / headless Claude adapter by design. The optional
+`openai-api` path is a separate, explicitly configured product surface, not a
+hidden substitute for a subscription CLI.
 
 Stack: Python ≥ 3.12, **stdlib-only** runtime, **pytest**. Code under
 `src/skodun/`.
@@ -51,6 +53,26 @@ Store: SQLite (tests use tmp paths).
 
 ---
 
+## Working agreements
+
+- Start new implementation from a clean, isolated worktree based on current
+  `origin/main`; preserve an existing checkout and its user changes. A typical
+  setup is `git fetch origin main` followed by
+  `git worktree add -b codex/<topic> <path> origin/main`. When fixing feedback
+  on an active PR, first verify and check out that PR's current head instead of
+  starting from `main`, so the fix reproduces the reviewed diff.
+- Before planning, inspect the live GitHub issue/PR state and the current
+  branch/commit. Memory, pasted status, and old rollout summaries are useful
+  context but are not current evidence. If the issue or PR is already closed or
+  merged, create a focused follow-up instead of patching stale work in place.
+- For non-trivial work, write and self-review a concrete plan under
+  `docs/superpowers/plans/` before editing. Keep the implementation slice
+  narrow and independently testable; do not turn this file into a ship log or
+  issue index.
+- Review a frozen diff. Do not edit the tree while a review is running, and do
+  not spend repeated agent turns polling a long-running command; use the
+  repository's status/gate/read-model commands instead.
+
 ## Repository map
 
 Load-bearing paths agents cannot safely guess:
@@ -64,8 +86,9 @@ Load-bearing paths agents cannot safely guess:
 | `src/skodun/services.py` | Shared CLI + MCP service path |
 | `src/skodun/mcpserver.py` | stdio MCP; one long-running `review` per process |
 | `src/skodun/capacity.py` | FIFO `review-fg` admission + queue telemetry |
-| `src/skodun/adapters/` | Providers: `xai`, `openai`, `google`, `junie` |
+| `src/skodun/adapters/` | Providers: `xai`, `openai`, `openai-api`, `google`, `junie` |
 | `src/skodun/chain.py` | Fallback chain advances only on `unavailable` |
+| `src/skodun/runner.py` | Bounded process groups, descendant cleanup, and capture files |
 | `tests/` | Hermetic suite; drive **shipped** entry points |
 | `docs/superpowers/specs/` | Designs for non-trivial work |
 | `docs/epics/` | Product epic seeds (not a substitute for GitHub) |
@@ -81,7 +104,8 @@ Load-bearing paths agents cannot safely guess:
 2. **`gate.py` / `trust.py`:** do not edit without explicit owner approval. Prefer read-model status (e.g. cancelled over durable `failed` + reason) over new store enums that risk trust drift.
 3. **CLI ↔ MCP parity.** Review-loop verbs go through `services.py` — same wording and status mapping on both surfaces.
 4. **Store migrations.** Additive only; bump `SCHEMA_VERSION` via `_MIGRATIONS`. Never extend frozen Phase-1 `_SCHEMA` for new tables. Use transactional deltas for non-idempotent SQL.
-5. **No `anthropic` adapter** unless the owner reopens that product premise.
+5. **No `anthropic` adapter** unless the owner reopens that product premise;
+   `openai-api` remains explicit and metered rather than an implicit fallback.
 6. **Tests prove the shipped path.** No hard-coded expected values that skip the unit under test; no re-implementation of production logic in tests; do not start past the code under test.
 7. **Legacy FG lock** path/name and three-line `owner` format are interop-critical. Do not rename without a dual-hold bridge.
 8. **Routing is OUTSIDE the fail-closed perimeter, deliberately.** `routing.py`
@@ -109,7 +133,14 @@ Load-bearing paths agents cannot safely guess:
 
 ## Testing instructions
 
-- Full suite: `python3 -m pytest` from repo root.
+- Start with focused shipped-path tests for the changed surface, then run the
+  full suite before merge:
+  `python3 -m pytest tests/<changed_module>.py -q --tb=short`, followed by
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q --tb=short`.
+- Run the heavy store ResourceWarning sweep separately when store/process
+  lifecycle code is involved. A sweep that stalls or is interrupted is
+  incomplete, not green: report the exact passed/skipped/deselected counts and
+  the blocker, and do not claim the full suite passed.
 - The root `tests/conftest.py` deletes every `SKODUN_*` variable from the
   environment before each test (allowlist: `SKODUN_ORACLE_DIR`). Tests set what
   they need themselves; nothing is inherited from the shell that ran pytest.
@@ -131,6 +162,10 @@ Load-bearing paths agents cannot safely guess:
 - Junie: macOS Seatbelt only; off-macOS → `unavailable`, never unconfined fallback.
 - Context packing: reject unsafe paths (symlinks, FIFOs, etc.) — fail/omit, don’t hang.
 - Do not log provider secrets or API keys.
+- Process cleanup may signal only a proven owned process group. PID/PGID/session
+  reuse, contradictory `ps` evidence, or an inconclusive snapshot fails closed;
+  do not broaden a kill to make cleanup appear successful. Output is not
+  trustworthy after live-descendant cleanup.
 
 ---
 
@@ -154,6 +189,14 @@ Land path: `implement → tests → commit → push → PR → review → merge 
 - Commits: complete sentences; *why*; `refs #N` when applicable.  
 - PRs: Summary + Test plan.  
 - Never force-push `main`. Feature branches: `--force-with-lease` only after rebase when needed.
+- Re-check the live PR head before merging. A bot summary is not a substitute
+  for inspecting actionable review comments and confirming zero unresolved
+  review threads, green required checks, and a mergeable/current branch.
+- Keep review fixes narrow: batch findings for the same root cause into one
+  follow-up commit; use a new issue/PR for a post-merge regression or an
+  unrelated concern rather than reopening or patching merged work.
+- After merge, fetch `origin/main`, verify the merge commit is present, and run
+  the focused shipped-path smoke checks from the merged checkout.
 
 ---
 
