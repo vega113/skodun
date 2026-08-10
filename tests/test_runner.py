@@ -189,6 +189,8 @@ def test_group_descendant_inspection_is_fail_closed(monkeypatch):
         " 10 42 Z\n",       # zombie-only descendant
         "",                 # successful but inconclusive listing
         "not a ps row\n",   # malformed listing
+        " 1 42 S\n",        # reused leader PID, not a descendant
+        " 2 99 S\n",        # valid snapshot after target group vanished
     ))
 
     def fake_run(*args, **kwargs):
@@ -199,6 +201,8 @@ def test_group_descendant_inspection_is_fail_closed(monkeypatch):
     assert not runner._group_has_live_descendants(42, 1)
     assert runner._group_has_live_descendants(42, 1)
     assert runner._group_has_live_descendants(42, 1)
+    assert not runner._group_has_live_descendants(42, 1)
+    assert not runner._group_has_live_descendants(42, 1)
 
 
 def test_timeout_leaves_no_stray_process_group(tmp_path):
