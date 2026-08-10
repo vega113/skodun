@@ -193,13 +193,14 @@ def test_group_descendant_inspection_is_fail_closed(monkeypatch):
         " 1 42 S\n",        # reused leader PID in another session
         " 2 99 S\n",        # valid snapshot after target group vanished
         " 10 42 S\n",       # recycled PGID in another session
+        " 1 42 S\n 10 42 S\n",  # reused leader and live child, same session
     ))
 
     def fake_run(*args, **kwargs):
         return SimpleNamespace(returncode=0, stdout=next(snapshots))
 
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
-    sessions = iter((42, 42, 99, 99))
+    sessions = iter((42, 42, 99, 99, 42, 42))
     monkeypatch.setattr(runner.os, "getsid", lambda pid: next(sessions))
     assert runner._group_descendant_state(42, 1) == "live"
     assert runner._group_descendant_state(42, 1) == "none"
@@ -207,6 +208,7 @@ def test_group_descendant_inspection_is_fail_closed(monkeypatch):
     assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "none"
+    assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "inconclusive"
 
 
@@ -219,6 +221,25 @@ def test_group_descendant_inspection_treats_hidden_group_as_inconclusive(
                                                  stdout=" 2 99 S\\n"))
     monkeypatch.setattr(runner, "_group_alive", lambda pg: True)
     assert runner._group_descendant_state(42, 1) == "inconclusive"
+
+
+def test_group_descendant_inspection_stops_after_live_descendant(monkeypatch):
+    """A later getsid race cannot discard cleanup evidence already proved."""
+    monkeypatch.setattr(
+        runner.subprocess, "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout=" 10 42 S\\n 11 42 S\\n"))
+    calls = []
+
+    def fake_getsid(pid):
+        calls.append(pid)
+        if len(calls) == 1:
+            return 42
+        raise AssertionError("inspection should stop after live descendant")
+
+    monkeypatch.setattr(runner.os, "getsid", fake_getsid)
+    assert runner._group_descendant_state(42, 1) == "live"
+    assert calls == [10]
 
 
 def test_timeout_leaves_no_stray_process_group(tmp_path):
