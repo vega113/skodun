@@ -195,8 +195,12 @@ def run_doctor(
                     try:
                         probe = adapter.version_probe()  # type: ignore[attr-defined]
                         report.add(f"adapter:{provider}:version", True, str(probe))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        report.add(
+                            f"adapter:{provider}:version",
+                            False,
+                            f"probe failed: {e!r}",
+                        )
             except Exception as e:
                 report.add(f"adapter:{provider}", False, f"{e!r}")
     except Exception as e:

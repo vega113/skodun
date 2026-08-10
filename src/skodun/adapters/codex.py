@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -167,6 +168,7 @@ _QUOTA_SIGNALS: tuple[bytes, ...] = (
 _INVOCATION_SIGNALS: tuple[bytes, ...] = (
     b"failed to spawn", b"spawn failed", b"permission denied",
     b"no such file", b"executable", b"cannot execute",
+    b"enoent", b"eacces", b"eperm", b"exec format error",
 )
 _TRANSPORT_SIGNALS: tuple[bytes, ...] = (
     b"failed to connect", b"connection refused", b"connection reset",
@@ -174,6 +176,7 @@ _TRANSPORT_SIGNALS: tuple[bytes, ...] = (
     b"timed out", b"timeout", b"transport error",
 )
 _DIAGNOSTIC_LIMIT = 400
+_VERSION_PROBE_TIMEOUT_SEC = 10
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\x80-\x9f]+")
 _SECRET_RE = re.compile(
     r"(?i)(bearer\s+|api[_ -]?key\s*[:=]\s*|token\s*[:=]\s*)[^\s,;]+")
@@ -189,6 +192,15 @@ def _sanitized_diagnostic(raw: bytes, *, rc: int) -> str:
     detail = " ".join(detail.split())
     prefix = f"codex exited rc={rc} without a usable review payload: "
     return (prefix + detail)[:_DIAGNOSTIC_LIMIT]
+
+
+def _first_output_line(raw: bytes) -> str:
+    """Return one bounded, whitespace-normalized diagnostic line."""
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = " ".join(line.split())
+        if line:
+            return line[:_DIAGNOSTIC_LIMIT]
+    return ""
 
 # Canonical effort (`config.EFFORTS`) -> the CLI's `model_reasoning_effort`.
 #
@@ -319,6 +331,31 @@ class CodexAdapter:
     def resolve_binary(self) -> str:
         """The protocol's spelling of `resolve_codex_bin`."""
         return resolve_codex_bin()
+
+    def version_probe(self) -> str:
+        """Launch the resolved CLI and return its reported version.
+
+        A wrapper can be executable while its bundled native binary is absent,
+        so checking PATH/executable bits alone is not enough for doctor. This
+        deliberately performs the smallest real invocation and preserves
+        native spawn errors for the caller to report.
+        """
+        completed = subprocess.run(
+            [self.resolve_binary(), "--version"],
+            capture_output=True,
+            timeout=_VERSION_PROBE_TIMEOUT_SEC,
+            check=False,
+        )
+        stdout = _first_output_line(completed.stdout)
+        stderr = _first_output_line(completed.stderr)
+        if completed.returncode != 0:
+            detail = stderr or stdout or "no output"
+            raise RuntimeError(
+                f"codex --version exited rc={completed.returncode}: {detail}")
+        if not stdout:
+            detail = stderr or "no stdout"
+            raise RuntimeError(f"codex --version returned no version: {detail}")
+        return stdout
 
     def effort_map(self) -> dict[str, str]:
         """Canonical effort -> `model_reasoning_effort`. A copy, so that a

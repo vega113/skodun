@@ -10,6 +10,42 @@ from skodun.doctor import run_doctor
 from skodun.store import SCHEMA_VERSION, Store
 
 
+def _codex_script(path: Path, body: str) -> None:
+    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _doctor_for_codex(tmp_path: Path, monkeypatch, body: str):
+    binary = tmp_path / "codex"
+    _codex_script(binary, body)
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(binary))
+    return run_doctor(
+        repo=tmp_path,
+        store_path=tmp_path / "s.db",
+        config_path=tmp_path / "missing.toml",
+    )
+
+
+def test_doctor_codex_version_probe_launches_binary(tmp_path, monkeypatch):
+    report = _doctor_for_codex(
+        tmp_path, monkeypatch,
+        'test "$1" = "--version" || exit 19\nprintf "codex-cli 0.147.0\\n"\n',
+    )
+    check = next(c for c in report.checks if c.name == "adapter:openai:version")
+    assert check.ok
+    assert check.detail == "codex-cli 0.147.0"
+
+
+def test_doctor_reports_codex_version_probe_failure(tmp_path, monkeypatch):
+    report = _doctor_for_codex(
+        tmp_path, monkeypatch,
+        'printf "spawn codex ENOENT\\n" >&2\nexit 1\n',
+    )
+    check = next(c for c in report.checks if c.name == "adapter:openai:version")
+    assert not check.ok
+    assert "ENOENT" in check.detail
+
+
 def test_run_doctor_reports_store_and_adapters(tmp_path, monkeypatch):
     db = tmp_path / "s.db"
     monkeypatch.setenv("SKODUN_DB", str(db))
