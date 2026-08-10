@@ -60,10 +60,12 @@ trustworthy review must cover it.
 - `skodun doctor` — install/MCP readiness (config, store schema, adapters,
   binaries). Read-only; does not move the gate. **CLI-only** (not an MCP tool).
 - `skodun providers` — read-only provider, binary, and quota-pool state. In
-  auto mode, only enabled finder entries named in `[routing].pool` are
-  candidates; a configured reviewer that is omitted from that pool remains
-  pin-only. AGY's `google:gemini` and `google:claude-gpt` pools are independent
-  when the loaded reviewer configuration resolves them separately.
+  auto mode, an explicit non-empty `[routing].pool` limits automatic head
+  selection to its enabled finder entries; when the pool is omitted or empty,
+  all enabled finders are eligible. This does not make other configured
+  reviewers pin-only: a head's `fallbacks` can still reach them. AGY's
+  `google:gemini` and `google:claude-gpt` pools are independent when the loaded
+  reviewer configuration resolves them separately.
 - `skodun retain [--dry-run]` — prune worker logs per `[retention]`. Never
   deletes gate artifacts. **CLI-only.**
 - `skodun schedule install` — write launchd plists from `[[schedule.jobs]]`.
