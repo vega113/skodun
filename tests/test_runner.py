@@ -168,6 +168,19 @@ def test_early_leader_exit_reaps_wrapper_descendants(tmp_path):
     assert (tmp_path / "err").read_bytes() == b""
 
 
+def test_zombie_only_group_does_not_invalidate_output(tmp_path, monkeypatch):
+    """A group with no live child preserves a normal wrapper result."""
+    monkeypatch.setattr(runner, "_group_alive", lambda pg: True)
+    monkeypatch.setattr(runner, "_group_has_live_descendants",
+                        lambda pg, leader_pid: False)
+    result = run_with_watchdog(
+        [sys.executable, "-c", "print('complete')"], 10, tmp_path,
+        tmp_path / "out", tmp_path / "err",
+    )
+    assert result.rc == 0 and not result.descendants_killed
+    assert (tmp_path / "out").read_text(encoding="utf-8").strip() == "complete"
+
+
 def test_timeout_leaves_no_stray_process_group(tmp_path):
     # The child is its own process-group leader, so its pid IS the pgid.
     #
