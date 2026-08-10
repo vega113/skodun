@@ -187,9 +187,9 @@ converge on its own. Escalate rather than iterate when:
   from `skodun schedule install`).
 - If a provider returns no usable payload, do not immediately retry it or infer
   quota exhaustion. First inspect `skodun doctor`, `skodun providers`, and the
-  review status/log for the bounded diagnostic. Recognized unavailable/config
-  failures may advance the configured chain; unknown failures remain
-  untrustworthy and must stay fail-closed.
+  review status/log for the bounded diagnostic. Only an outcome classified as
+  `unavailable` advances the configured chain; configuration, unknown, and
+  other non-unavailable failures remain untrustworthy and stop the chain.
 
 ### Concurrency (today)
 
