@@ -53,8 +53,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Callable
 
 from ..config import Defaults, Reviewer
@@ -343,18 +343,28 @@ class CodexAdapter:
         deliberately performs the smallest real invocation and preserves
         native spawn errors for the caller to report.
         """
-        completed = subprocess.run(
-            [self.resolve_binary(), "--version"],
-            capture_output=True,
-            timeout=_VERSION_PROBE_TIMEOUT_SEC,
-            check=False,
-        )
-        stdout = _first_output_line(completed.stdout)
-        stderr = _first_output_line(completed.stderr)
-        if completed.returncode != 0:
+        from ..runner import run_with_watchdog
+
+        with TemporaryDirectory(prefix="skodun-codex-version-") as raw_dir:
+            scratch = Path(raw_dir)
+            stdout_path = scratch / "stdout"
+            stderr_path = scratch / "stderr"
+            result = run_with_watchdog(
+                [self.resolve_binary(), "--version"],
+                _VERSION_PROBE_TIMEOUT_SEC,
+                Path.cwd(),
+                stdout_path,
+                stderr_path,
+            )
+            stdout = _first_output_line(stdout_path.read_bytes())
+            stderr = _first_output_line(stderr_path.read_bytes())
+        if result.timed_out:
+            raise RuntimeError(
+                f"codex --version timed out after {_VERSION_PROBE_TIMEOUT_SEC}s")
+        if result.rc != 0:
             detail = stderr or stdout or "no output"
             raise RuntimeError(
-                f"codex --version exited rc={completed.returncode}: {detail}")
+                f"codex --version exited rc={result.rc}: {detail}")
         if not stdout:
             detail = stderr or "no stdout"
             raise RuntimeError(f"codex --version returned no version: {detail}")

@@ -139,3 +139,21 @@ The real non-executable Codex test still advances to Grok, while the chain regre
 - [x] **Step 3: Verify**
 
 Focused spawn/chain/runner tests pass; the complete suite passes with `3454 passed, 160 skipped` after the boundary fix.
+
+### Task 6: Tighten spawn errno and probe timeout handling
+
+**Files:**
+- Modify: `src/skodun/chain.py`, `src/skodun/runner.py`, `src/skodun/adapters/codex.py`
+- Test: `tests/test_chain.py`, `tests/test_doctor.py`
+
+- [x] **Step 1: Restrict fallback to executable-path errno values**
+
+Only `ENOENT`, `EACCES`, `EPERM`, and `ENOEXEC` become invocation-unavailable hops; host resource errors such as `EMFILE` propagate.
+
+- [x] **Step 2: Use the watchdog for `codex --version`**
+
+The doctor probe writes only temporary output files and runs through the process-group watchdog, so a timed-out wrapper and its descendants are terminated and reaped.
+
+- [x] **Step 3: Verify the final behavior**
+
+Focused errno, fallback, timeout, and runner tests pass; the complete suite passes with `3456 passed, 160 skipped` before the final PR update.

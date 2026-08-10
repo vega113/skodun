@@ -47,6 +47,19 @@ def test_doctor_reports_codex_version_probe_failure(tmp_path, monkeypatch):
     assert "secret-token" not in check.detail
 
 
+def test_doctor_codex_version_probe_times_out_bounded(tmp_path, monkeypatch):
+    from skodun.adapters import codex
+
+    monkeypatch.setattr(codex, "_VERSION_PROBE_TIMEOUT_SEC", 0.1)
+    report = _doctor_for_codex(
+        tmp_path, monkeypatch,
+        'sleep 60\n',
+    )
+    check = next(c for c in report.checks if c.name == "adapter:openai:version")
+    assert not check.ok
+    assert "timed out" in check.detail
+
+
 def test_run_doctor_reports_store_and_adapters(tmp_path, monkeypatch):
     db = tmp_path / "s.db"
     monkeypatch.setenv("SKODUN_DB", str(db))

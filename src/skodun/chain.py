@@ -24,6 +24,7 @@ scope here) rather than in `pipeline`.
 
 from __future__ import annotations
 
+import errno
 import shutil
 import threading
 import time
@@ -43,6 +44,9 @@ from .store import Store, _TS_FORMAT
 #: uses the same env with this floor when no override is set so hermetic
 #: tests and short local runs stay bounded.
 _DEFAULT_PROVIDER_WAIT_SEC = 30.0
+_SPAWN_UNAVAILABLE_ERRNOS = frozenset({
+    errno.ENOENT, errno.EACCES, errno.EPERM, errno.ENOEXEC,
+})
 
 
 @dataclass
@@ -587,13 +591,15 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                         verdict = adapter.classify(
                             UNAVAILABLE_RC, b"", b"", contract)
                         skipped = f"binary not found: {cmd[0]}"
-                    else:
+                    elif e.cause.errno in _SPAWN_UNAVAILABLE_ERRNOS:
                         # Permission, format, and other native spawn failures
                         # happen before the child can create stderr. They are
                         # invocation-local unavailability, not fatal chain
                         # errors and not provider quota state.
                         verdict = _spawn_failure(e.cause)
                         skipped = verdict.detail
+                    else:
+                        raise
                     attempts.append(_attempt(
                         n, entry, skipped=skipped,
                         classification=_classification(verdict)))
