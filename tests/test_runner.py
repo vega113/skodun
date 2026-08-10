@@ -194,6 +194,7 @@ def test_group_descendant_inspection_is_fail_closed(monkeypatch):
         " 2 99 S\n",        # valid snapshot after target group vanished
         " 10 42 S\n",       # recycled PGID in another session
         " 1 42 S\n 10 42 S\n",  # reused leader and live child, same session
+        " 10 42 S\n 1 42 S\n",  # leader row appears after descendant
     ))
 
     def fake_run(*args, **kwargs):
@@ -208,6 +209,7 @@ def test_group_descendant_inspection_is_fail_closed(monkeypatch):
     assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "none"
+    assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "inconclusive"
 
