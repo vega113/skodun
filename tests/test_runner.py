@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -179,6 +180,25 @@ def test_zombie_only_group_does_not_invalidate_output(tmp_path, monkeypatch):
     )
     assert result.rc == 0 and not result.descendants_killed
     assert (tmp_path / "out").read_text(encoding="utf-8").strip() == "complete"
+
+
+def test_group_descendant_inspection_is_fail_closed(monkeypatch):
+    """Controlled ps snapshots cover live, zombie-only, and inconclusive groups."""
+    snapshots = iter((
+        " 10 42 S\n",       # live descendant
+        " 10 42 Z\n",       # zombie-only descendant
+        "",                 # successful but inconclusive listing
+        "not a ps row\n",   # malformed listing
+    ))
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=next(snapshots))
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    assert runner._group_has_live_descendants(42, 1)
+    assert not runner._group_has_live_descendants(42, 1)
+    assert runner._group_has_live_descendants(42, 1)
+    assert runner._group_has_live_descendants(42, 1)
 
 
 def test_timeout_leaves_no_stray_process_group(tmp_path):

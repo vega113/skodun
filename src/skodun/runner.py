@@ -510,19 +510,30 @@ def _group_has_live_descendants(pg: int, leader_pid: int) -> bool:
         return True
     if result.returncode != 0:
         return True
+    saw_matching_group = False
     for line in result.stdout.splitlines():
         fields = line.split()
         if len(fields) < 3:
             continue
         try:
-            pid, group = int(fields[0]), int(fields[1])
+            group = int(fields[1])
         except ValueError:
             continue
-        if group != pg or pid == leader_pid:
+        if group != pg:
             continue
-        if fields[2][0] not in {"Z", "X"}:
+        saw_matching_group = True
+        try:
+            pid = int(fields[0])
+        except ValueError:
             return True
-    return False
+        state = fields[2]
+        if not state:
+            return True
+        if pid == leader_pid and state[0] in {"Z", "X"}:
+            continue
+        if state[0] not in {"Z", "X"}:
+            return True
+    return not saw_matching_group
 
 
 def _size(path: Path) -> int:
