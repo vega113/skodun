@@ -516,6 +516,7 @@ def _group_descendant_state(pg: int, leader_pid: int) -> str:
         return "inconclusive"
     saw_matching_group = False
     saw_valid_row = False
+    matching_rows = []
     for line in result.stdout.splitlines():
         fields = line.split()
         if not line.strip():
@@ -533,6 +534,14 @@ def _group_descendant_state(pg: int, leader_pid: int) -> str:
         if group != pg:
             continue
         saw_matching_group = True
+        matching_rows.append((pid, state[0]))
+
+    # ps output is not an identity-ordered snapshot. Check every leader row
+    # before accepting a descendant: a recycled leader can appear after a
+    # distinct live member and must still make the result inconclusive.
+    for pid, state in matching_rows:
+        if pid != leader_pid:
+            continue
         try:
             observed_session = os.getsid(pid)
         except (OSError, ProcessLookupError):
@@ -545,16 +554,23 @@ def _group_descendant_state(pg: int, leader_pid: int) -> str:
             # different session means this numeric PGID was recycled or is
             # otherwise unrelated; never signal it.
             return "inconclusive"
-        if pid == leader_pid:
-            # The reaped leader may still appear briefly as a zombie. A live
-            # row with the same PID is ambiguous even when its session also
-            # equals pg: a new start_new_session child can recreate the same
-            # numeric PID/PGID/SID after the original leader exits. Never use
-            # that row as permission to signal the group.
-            if state[0] in {"Z", "X"}:
-                continue
+        # The reaped leader may still appear briefly as a zombie. A live row
+        # with the same PID is ambiguous even when its session also equals pg:
+        # a new start_new_session child can recreate the same numeric
+        # PID/PGID/SID after the original leader exits. Never use that row as
+        # permission to signal the group.
+        if state not in {"Z", "X"}:
             return "inconclusive"
-        if state[0] not in {"Z", "X"}:
+    for pid, state in matching_rows:
+        if pid == leader_pid:
+            continue
+        try:
+            observed_session = os.getsid(pid)
+        except (OSError, ProcessLookupError):
+            return "inconclusive"
+        if observed_session != pg:
+            return "inconclusive"
+        if state not in {"Z", "X"}:
             # One distinct live member in the owned session is enough to
             # justify cleaning the group. Stop here so a later PID vanishing
             # between ps and getsid cannot turn a proven live group into an
