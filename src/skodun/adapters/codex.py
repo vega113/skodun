@@ -359,6 +359,9 @@ class CodexAdapter:
             )
             stdout = _first_output_line(stdout_path.read_bytes())
             stderr = _first_output_line(stderr_path.read_bytes())
+        if result.descendants_killed:
+            raise RuntimeError(
+                "codex --version wrapper exited with live descendants")
         if result.output_limit_exceeded:
             raise RuntimeError(
                 f"codex --version exceeded the {_DIAGNOSTIC_LIMIT}-byte "

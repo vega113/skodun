@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +30,16 @@ def _kill_ok(pid: int) -> bool:
     except PermissionError:  # exists, owned by someone else
         return True
     return True
+
+
+def _process_is_running(pid: int) -> bool:
+    """Treat an unreaped zombie as stopped on procfs hosts."""
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        fields = proc_stat.read_text(encoding="utf-8").split()
+    except OSError:
+        return _kill_ok(pid)
+    return len(fields) < 3 or fields[2] != "Z"
 
 
 def _group_exists(pgid: int) -> bool:
@@ -140,11 +151,13 @@ def test_early_leader_exit_reaps_wrapper_descendants(tmp_path):
         tmp_path / "out", tmp_path / "err",
     )
     assert result.rc == 0 and not result.timed_out
+    assert result.descendants_killed
     gc_pid = int(pidfile.read_text(encoding="utf-8").strip())
     deadline = time.monotonic() + 2.0
-    while _kill_ok(gc_pid) and time.monotonic() < deadline:
+    while _process_is_running(gc_pid) and time.monotonic() < deadline:
         time.sleep(0.05)
-    assert not _kill_ok(gc_pid), f"descendant {gc_pid} survived early wrapper exit"
+    assert not _process_is_running(gc_pid), \
+        f"descendant {gc_pid} survived early wrapper exit"
 
 
 def test_timeout_leaves_no_stray_process_group(tmp_path):
