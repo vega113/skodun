@@ -193,13 +193,14 @@ def test_group_descendant_inspection_is_fail_closed(monkeypatch):
         " 1 42 S\n",        # reused leader PID in another session
         " 2 99 S\n",        # valid snapshot after target group vanished
         " 10 42 S\n",       # recycled PGID in another session
+        " 1 42 S\n 10 42 S\n",  # reused leader and live child, same session
     ))
 
     def fake_run(*args, **kwargs):
         return SimpleNamespace(returncode=0, stdout=next(snapshots))
 
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
-    sessions = iter((42, 42, 99, 99))
+    sessions = iter((42, 42, 99, 99, 42, 42))
     monkeypatch.setattr(runner.os, "getsid", lambda pid: next(sessions))
     assert runner._group_descendant_state(42, 1) == "live"
     assert runner._group_descendant_state(42, 1) == "none"
@@ -207,6 +208,7 @@ def test_group_descendant_inspection_is_fail_closed(monkeypatch):
     assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "none"
+    assert runner._group_descendant_state(42, 1) == "inconclusive"
     assert runner._group_descendant_state(42, 1) == "inconclusive"
 
 

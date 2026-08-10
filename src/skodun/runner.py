@@ -516,6 +516,8 @@ def _group_descendant_state(pg: int, leader_pid: int) -> str:
         return "inconclusive"
     saw_matching_group = False
     saw_valid_row = False
+    ambiguous_leader = False
+    saw_live_descendant = False
     for line in result.stdout.splitlines():
         fields = line.split()
         if not line.strip():
@@ -547,17 +549,24 @@ def _group_descendant_state(pg: int, leader_pid: int) -> str:
             return "inconclusive"
         if pid == leader_pid:
             # The reaped leader may still appear briefly as a zombie. A live
-            # row with the same PID is safe to clean only when it is still in
-            # the owned session; a different session indicates PID reuse.
+            # row with the same PID is ambiguous even when its session also
+            # equals pg: a new start_new_session child can recreate the same
+            # numeric PID/PGID/SID after the original leader exits. Never use
+            # that row as permission to signal the group.
             if state[0] in {"Z", "X"}:
                 continue
-            return "live"
+            ambiguous_leader = True
+            continue
         if state[0] not in {"Z", "X"}:
-            return "live"
+            saw_live_descendant = True
     # A valid snapshot with no row for this group proves it vanished between
     # liveness and inspection; an empty snapshot is inconclusive and remains
     # fail closed.
     if saw_matching_group:
+        if ambiguous_leader:
+            return "inconclusive"
+        if saw_live_descendant:
+            return "live"
         return "none"
     if not saw_valid_row:
         return "inconclusive"
