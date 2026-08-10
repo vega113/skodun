@@ -650,9 +650,9 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                         f"{entry.name}/{entry.provider}: {verdict.detail}")
                     break
 
-                if result.descendants_killed:
-                    detail = ("wrapper exited with live descendants; "
-                              "attempt discarded")
+                if result.descendant_state != "none":
+                    detail = (f"wrapper descendant state "
+                              f"{result.descendant_state}; attempt discarded")
                     attempts.append(_attempt(
                         n, entry, rc=result.rc, timed_out=False,
                         duration_sec=round(result.duration_sec, 3),
@@ -661,8 +661,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                             ClassifyResult("degraded", "", detail))))
                     return _Outcome(
                         None, attempts,
-                        f"reviewer {entry.name!r} left live descendants; "
-                        "attempt discarded")
+                        f"reviewer {entry.name!r} left descendant state "
+                        f"{result.descendant_state}; attempt discarded")
 
                 if result.timed_out:
                     attempts.append(_attempt(

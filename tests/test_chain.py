@@ -115,14 +115,15 @@ def test_run_chain_discards_output_when_wrapper_leaves_descendants(
         args[3].write_bytes(
             b'{"structuredOutput":{"summary":"clean","findings":[]}}')
         return RunResult(rc=0, timed_out=False, duration_sec=0.1,
-                         first_output_sec=0.01, descendants_killed=True)
+                         first_output_sec=0.01, descendants_killed=True,
+                         descendant_state="live")
 
     monkeypatch.setattr(chain.runner, "run_with_watchdog", fake)
     with store:
         outcome = chain.run_chain(reviewer, cfg, cfg.defaults, b"p", tmp_path,
                                   store, tmp_path, "t")
     assert outcome.parsed is None
-    assert "live descendants" in outcome.failure_reason
+    assert "descendant state live" in outcome.failure_reason
     assert outcome.attempts[0]["classification"]["kind"] == "degraded"
     assert "discarded" in outcome.attempts[0]["classification"]["detail"]
     assert "skipped" not in outcome.attempts[0]
