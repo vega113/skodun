@@ -61,6 +61,16 @@ def test_doctor_codex_version_probe_times_out_bounded(tmp_path, monkeypatch, cap
     assert "timed out" in output
 
 
+def test_doctor_codex_version_probe_bounds_output(tmp_path, monkeypatch, capsys):
+    code, output = _doctor_for_codex(
+        tmp_path, monkeypatch, capsys,
+        'yes codex-noise\n',
+    )
+    assert code == 1
+    assert "[FAIL] adapter:openai:version:" in output
+    assert "output limit" in output
+
+
 def test_run_doctor_reports_store_and_adapters(tmp_path, monkeypatch):
     db = tmp_path / "s.db"
     monkeypatch.setenv("SKODUN_DB", str(db))

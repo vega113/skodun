@@ -176,6 +176,7 @@ class RunResult:
     timed_out: bool
     duration_sec: float
     first_output_sec: float | None
+    output_limit_exceeded: bool = False
 
 
 def run_with_watchdog(
@@ -186,6 +187,7 @@ def run_with_watchdog(
     stderr_path: Path,
     stdin_path: Path | None = None,
     cancel: "threading.Event | None" = None,
+    max_output_bytes: int | None = None,
 ) -> RunResult:
     """Run `cmd` with a hard wall-clock timeout, streaming output to files.
 
@@ -208,6 +210,11 @@ def run_with_watchdog(
     exception, including a `Popen` that never started -- so a long-lived
     caller cannot accumulate open prompt files. `DEVNULL` is deliberately NOT
     routed through the same open: `subprocess` manages that descriptor itself.
+
+    `max_output_bytes`, when given, bounds the file-backed stdout and stderr
+    capture. The process group is terminated and the files are truncated to
+    that limit before returning, so a diagnostic probe can safely use the same
+    no-pipes runner without allowing a broken wrapper to fill its disk.
 
     `cancel`, when given, is a `threading.Event` the caller's SIGTERM handler
     sets. It is checked BEFORE the spawn and on every tick, and a set token
@@ -241,6 +248,7 @@ def run_with_watchdog(
     t0 = time.monotonic()
     first_out: float | None = None
     timed_out = False
+    output_limit_exceeded = False
     rc: int
 
     # Opened before the output files and closed in the `finally` below, so
@@ -285,6 +293,12 @@ def run_with_watchdog(
                         # failed" are indistinguishable in the `None` this function
                         # returns. See `_size`.
                         first_out = time.monotonic() - t0
+                    if (max_output_bytes is not None and
+                            (_size(stdout_path) > max_output_bytes or
+                             _size(stderr_path) > max_output_bytes)):
+                        output_limit_exceeded = True
+                        rc = _terminate_group(proc, pg)
+                        break
                     if status is not None:
                         # Checked *before* the deadline, so a run that finishes in the
                         # final tick keeps its valid output instead of being recorded as
@@ -314,12 +328,16 @@ def run_with_watchdog(
             # Truncate only after the group is dead, so nothing can re-extend the
             # file behind our back through an inherited descriptor.
             stdout_path.write_bytes(b"")
+        elif output_limit_exceeded:
+            _truncate(stdout_path, max_output_bytes)
+            _truncate(stderr_path, max_output_bytes)
 
         return RunResult(
             rc=rc,
             timed_out=timed_out,
             duration_sec=max(0.0, time.monotonic() - t0),
             first_output_sec=first_out,
+            output_limit_exceeded=output_limit_exceeded,
         )
     finally:
         if stdin_file is not None:
@@ -462,3 +480,13 @@ def _size(path: Path) -> int:
         return path.stat().st_size
     except OSError:
         return 0
+
+
+def _truncate(path: Path, limit: int | None) -> None:
+    if limit is None:
+        return
+    try:
+        with path.open("r+b") as handle:
+            handle.truncate(limit)
+    except OSError:
+        pass

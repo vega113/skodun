@@ -355,9 +355,14 @@ class CodexAdapter:
                 Path.cwd(),
                 stdout_path,
                 stderr_path,
+                max_output_bytes=_DIAGNOSTIC_LIMIT,
             )
             stdout = _first_output_line(stdout_path.read_bytes())
             stderr = _first_output_line(stderr_path.read_bytes())
+        if result.output_limit_exceeded:
+            raise RuntimeError(
+                f"codex --version exceeded the {_DIAGNOSTIC_LIMIT}-byte "
+                "output limit")
         if result.timed_out:
             raise RuntimeError(
                 f"codex --version timed out after {_VERSION_PROBE_TIMEOUT_SEC}s")
