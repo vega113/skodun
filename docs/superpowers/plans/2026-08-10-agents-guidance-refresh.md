@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: Capture the current repository contract in root guidance
+## Task 1: Capture the current repository contract in root guidance
 
 **Files:**
 - Modify: `AGENTS.md`
@@ -35,14 +35,14 @@ Clarify that the current PR head is the review unit, unresolved review threads m
 
 Record the recent runner hardening contract: cleanup may signal only a proven owned process group; PID/PGID/session races or inconclusive `ps` evidence fail closed, and output must not be trusted after descendant cleanup. Do not weaken this to make a provider appear healthy.
 
-### Task 2: Refresh the client-facing agent template
+## Task 2: Refresh the client-facing agent template
 
 **Files:**
 - Modify: `examples/AGENTS.md`
 
 - [ ] **Step 1: Explain automatic-pool scope and quota diagnostics**
 
-State that auto routing selects only configured enabled finder entries in `[routing].pool`, that `skodun providers` reports provider and quota-pool state, and that AGY Gemini and Claude/GPT pools are independent when configured with their resolved pool identities.
+State that an explicit non-empty `[routing].pool` limits automatic head selection, while an omitted or empty pool considers all enabled finders; explain that fallbacks may still reach configured reviewers outside the automatic head pool. Also state that `skodun providers` reports provider and quota-pool state, and that AGY Gemini and Claude/GPT pools are independent when configured with their resolved pool identities.
 
 - [ ] **Step 2: Add install/schema freshness recovery**
 
@@ -52,7 +52,7 @@ Make `doctor`, `providers`, and MCP restart the first response to schema-behind,
 
 Require checking the actual provider state and bounded diagnostics before retrying, preserve fail-closed behavior for unknown failures, and keep the existing rule that only `gate` certifies the current frozen diff.
 
-### Task 3: Self-review and verify the documentation change
+## Task 3: Self-review and verify the documentation change
 
 **Files:**
 - Test: `tests/` via existing shipped entry points; no production code changes expected.
@@ -76,7 +76,7 @@ Expected: focused tests pass and `git diff --check` is clean. The PR will rely o
 
 Confirm that only `AGENTS.md`, `examples/AGENTS.md`, and this plan changed; `src/skodun/gate.py` and `src/skodun/trust.py` remain byte-identical; no issue index or historical ship log was added.
 
-### Task 4: Deliver and merge
+## Task 4: Deliver and merge
 
 - [ ] **Step 1: Commit the focused documentation update**
 

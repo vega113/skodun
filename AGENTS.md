@@ -55,10 +55,12 @@ Store: SQLite (tests use tmp paths).
 
 ## Working agreements
 
-- Start implementation from a clean, isolated worktree based on current
+- Start new implementation from a clean, isolated worktree based on current
   `origin/main`; preserve an existing checkout and its user changes. A typical
   setup is `git fetch origin main` followed by
-  `git worktree add -b codex/<topic> <path> origin/main`.
+  `git worktree add -b codex/<topic> <path> origin/main`. When fixing feedback
+  on an active PR, first verify and check out that PR's current head instead of
+  starting from `main`, so the fix reproduces the reviewed diff.
 - Before planning, inspect the live GitHub issue/PR state and the current
   branch/commit. Memory, pasted status, and old rollout summaries are useful
   context but are not current evidence. If the issue or PR is already closed or
