@@ -781,6 +781,7 @@ def test_a_second_review_is_refused_while_one_is_in_flight_and_the_loop_stays_li
         assert busy["isError"] is True
         assert busy["content"][0]["text"] == mcpserver.BUSY_TEXT
         assert busy["structuredContent"]["status"] != 0
+        assert busy["structuredContent"]["skodun_version"] == skodun.__version__
         assert got[3]["result"]["content"][0]["text"] == "alive"
         assert 1 not in got, "the review answered before it was released"
         # Exactly ONE review ever started.
@@ -788,6 +789,8 @@ def test_a_second_review_is_refused_while_one_is_in_flight_and_the_loop_stays_li
         fakes.release.set()
         _wait_until(lambda: 1 in _by_id(out), what="the review's own response")
         assert _by_id(out)[1]["result"]["content"][0]["text"] == "reviewed"
+        assert (_by_id(out)[1]["result"]["structuredContent"]
+                ["skodun_version"]) == skodun.__version__
     finally:
         pipe.close()
         t.join(timeout=10)

@@ -878,7 +878,10 @@ def test_mcp_reuse_hit_preserves_structured_metadata_without_recovery(
         params={"repo": str(tmp_path), "reuse_trusted": True},
         store_factory=lambda: Store.open(tmp_path / "s.db"),
         cancel=threading.Event()))
-    assert result.metadata == {"reuse": {"hit": True, "review_id": "r1"}}
+    assert result.metadata == {
+        "reuse": {"hit": True, "review_id": "r1"},
+        "skodun_version": skodun.__version__,
+    }
 
 
 def test_a_client_name_nothing_recognises_leaves_the_family_undeclared(
@@ -1731,6 +1734,9 @@ def test_the_review_tool_returns_the_verdict_banner_the_cli_prints(tmp_path,
     res = _tool("review", db, repo=str(repo))
     assert res.status == 0, res.text
     assert res.text.startswith("SKODUN VERDICT: trustworthy=true findings=0")
+    assert res.metadata["skodun_version"] == skodun.__version__
+    assert (mcpserver.tool_result(res)["structuredContent"]
+            ["skodun_version"]) == skodun.__version__
 
     # ...and the CLI, on its own store, prints exactly that shape as its last
     # stdout line.
