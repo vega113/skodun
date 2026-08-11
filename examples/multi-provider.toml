@@ -154,6 +154,13 @@ provider = "openai"
 model    = "gpt-5.4-mini"     # the codex CLI has no `list models` subcommand -- see README
 effort   = "medium"
 role     = "finder"
+fallbacks = ["finder-gemini"]
+
+[[reviewers]]
+name     = "finder-gemini"
+provider = "google"
+model    = "gemini-3.1-pro-high"
+role     = "finder"
 
 # --- the refuter: a DIFFERENT provider re-examines the finder's findings ---
 #
@@ -179,17 +186,6 @@ role     = "finder"
 #                 `merge_failed_extra_pass`, which demotes. The refuter's
 #                 outage cannot cause this demotion.
 #
-# Observed 2026-08-03: this entry on a metered provider whose key the MCP
-# server process could not see turned clean grok reviews into untrustworthy
-# ones, gate 2, until it was given somewhere to hop to.
-#
-#     fallbacks = ["finder"]
-#
-# That is same-family as the finder on the runs where it fires, which is the
-# thing this pass exists to avoid -- but only on the runs where the alternative
-# was losing the finder's verdict. `fallbacks` hop on `unavailable` (quota,
-# auth, missing binary, unknown model), which is exactly the outage this
-# covers.
 [[reviewers]]
 name      = "refuter"
 provider  = "openai"

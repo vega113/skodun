@@ -883,7 +883,7 @@ def test_mcp_reuse_hit_preserves_structured_metadata_without_recovery(
     assert result.metadata["reuse"] == {"hit": True, "review_id": "r1"}
     assert result.metadata["skodun_version"] == skodun.__version__
     assert result.metadata["skodun_commit"] == (
-        provenance.cached_provenance().get("skodun_commit"))
+        (provenance.cached_provenance() or {}).get("skodun_commit"))
 
 
 def test_a_client_name_nothing_recognises_leaves_the_family_undeclared(

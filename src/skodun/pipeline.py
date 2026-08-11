@@ -996,13 +996,12 @@ def _pass_reviewer(cfg: Config, pass_name: str, finder: Reviewer) -> Reviewer:
     its configured fallbacks, is the reviewer for both the primary and clean
     adversarial check unless the pass is the separate annotation-only refuter.
 
-    UNCHANGED by `run_review`'s `reviewer=` request, and deliberately: that
-    request selects the FINDER head for one run, while the passes select by
-    ROLE, and letting one override the other would re-point a pass the operator
-    configured on purpose. The request reaches a pass only through the shipped
-    `else the finder's` fallback — i.e. only where the config named no reviewer
-    for that role at all, and the pass was already going to run on whatever
-    headed the chain.
+    The skeptic is the exception to role-specific selection: it follows the
+    finder chosen by `run_review`'s `reviewer=` request or auto-routing, so its
+    own fallback chain is the same chain that protects the primary review.
+    Other extra passes remain role-selected and are not redirected by
+    `reviewer=` except through the existing `else the finder's` fallback when
+    no reviewer for that role is configured.
     """
     if pass_name == "skeptic":
         return finder
