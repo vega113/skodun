@@ -1128,8 +1128,10 @@ def test_run_review_is_the_only_production_caller_of_head_resolution():
                  "resolve_review_head")}
 
     assert sites == {"pipeline.py::<module>::def",
-                     "pipeline.py::_run_review::ref"}, (
+                     "pipeline.py::_run_review::ref",
+                     "readiness.py::check::ref"}, (
         "`resolve_review_head` is written somewhere new. That is not "
         "automatically wrong -- it IS a decision about which surfaces "
-        "auto-route, and Phase A scoped it to the foreground review loop. "
+        "auto-route. The read-only review-readiness surface intentionally "
+        "uses the same foreground selection rules. "
         "Widen this set deliberately, and say so in the function's scope note.")

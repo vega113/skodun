@@ -140,6 +140,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--fresh", action="store_true", dest="fresh",
         help="always run a real review, even when trusted reuse is enabled")
 
+    readiness = sub.add_parser(
+        "review-readiness",
+        help="check whether a trustworthy review path is locally available")
+    readiness.add_argument("--repo", type=Path, default=Path("."),
+                           help="repository to inspect (default: current directory)")
+    readiness.add_argument("--reviewer", default=None, dest="reviewer",
+                           metavar="NAME",
+                           help="configured reviewer entry to inspect")
+    readiness.add_argument("--client-family", default=None, dest="client_family",
+                           metavar="FAMILY",
+                           help="calling client family for auto-routing")
+    readiness.add_argument("--json", action="store_true", dest="json_output",
+                           help="render machine-readable JSON")
+
     stats = sub.add_parser(
         "stats", help="show operational review and capacity telemetry")
     stats.add_argument(
@@ -767,6 +781,23 @@ def _cmd_stats(args) -> int:
         code, text = svc_stats(
             store, getattr(args, "since_days", 7),
             "json" if getattr(args, "json_output", False) else "text")
+    return _emit(text, code)
+
+
+def _cmd_review_readiness(args) -> int:
+    """Run the cheap read-only review topology check."""
+    from .services import svc_review_readiness
+    from .store import Store
+
+    try:
+        store = Store.open(_store_path())
+    except BaseException as e:
+        return _emit(f"skodun review-readiness: could not open the store: {e!r}", 2)
+    with store:
+        code, text, _metadata = svc_review_readiness(
+            store, Path(args.repo), reviewer=getattr(args, "reviewer", None),
+            client_family=getattr(args, "client_family", None),
+            output="json" if getattr(args, "json_output", False) else "text")
     return _emit(text, code)
 
 
@@ -2051,6 +2082,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 130
         if args.command == "stats":
             return _cmd_stats(args)
+        if args.command == "review-readiness":
+            return _cmd_review_readiness(args)
         if args.command == "providers":
             return _cmd_providers(args)
         if args.command == "import-legacy":

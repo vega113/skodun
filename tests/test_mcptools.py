@@ -57,7 +57,7 @@ _SRC = str(Path(skodun.__file__).resolve().parents[1])
 #: `triage_defer` is APPENDED rather than slotted beside `triage_dismiss`: the
 #: order is the order tools were added, a client's tool picker renders it, and
 #: reordering the shipped eight would move every one of them for no reason.
-EXPECTED_TOOLS = ["gate", "review", "log", "surface", "triage_list",
+EXPECTED_TOOLS = ["gate", "review_readiness", "review", "log", "surface", "triage_list",
                   "triage_dismiss", "adopt_refuter", "triage_reopen",
                   "triage_defer", "review_status", "review_cancel",
                   "feedback_add", "feedback_list"]
@@ -758,9 +758,9 @@ def test_an_absent_reviewer_is_not_a_request_on_either_surface(tmp_path,
     """The asymmetry `_repo_arg` already has, for the same reason: an argument
     nobody sent is the caller declining to choose, and it must not be refused.
 
-    Both surfaces get as far as the CONFIG's own finder and fail on the pinned-
-    away provider binary -- which is a review that ran badly (4), never the
-    preflight refusal (2) a bad name produces.
+    Both surfaces get as far as the CONFIG's own finder and report the pinned-
+    away provider binary as a static preflight refusal (2), never silently
+    spending review capacity on a provider that cannot run.
     """
     repo = _reviewer_repo(tmp_path, monkeypatch)
     db = tmp_path / "absent.db"
@@ -769,7 +769,7 @@ def test_an_absent_reviewer_is_not_a_request_on_either_surface(tmp_path,
     cli, tool = _both(db, ["review", "--repo", str(repo)], "review", capsys,
                       repo=str(repo))
 
-    assert cli[0] == tool[0] == 4, (cli, tool)
+    assert cli[0] == tool[0] == 2, (cli, tool)
     assert "is not configured" not in cli[1] and "is not configured" not in tool[1]
 
 

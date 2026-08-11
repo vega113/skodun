@@ -65,6 +65,7 @@ Background:
 | Command | What it does | Exit codes |
 | --- | --- | --- |
 | `skodun review [--repo DIR] [--reviewer NAME] [--client-family FAMILY] [--recover] [--max-attempts N] [--max-wall-seconds S] [--reuse-trusted] [--fresh]` | Run a foreground review and record it. `--reviewer` heads this run's chain with a named `[[reviewers]]` entry; opt-in `--recover` makes bounded fresh attempts after an untrustworthy result, while opt-in `--reuse-trusted` reuses only an exact trustworthy foreground artifact. `--fresh` bypasses reuse for a deliberate second opinion; explicit reviewer and client-family intent also force a real review. | `0` trustworthy and clean · `1` trustworthy, findings open · `2` preflight refusal (nothing ran) · `3` gave up waiting for the lock · `4` no trustworthy review was recorded · `130` interrupted with Ctrl-C (stdout is left empty on purpose — an operator's own interruption, not a refusal). |
+| `skodun review-readiness [--repo DIR] [--reviewer NAME] [--client-family FAMILY] [--json]` | Read-only, pre-capacity diagnosis of the configured trustworthy review topology: known-impossible paths report a stable reason code; unknown live provider health remains eligible. It never probes a model, changes gate/trust, or certifies a push. | `0` potentially available · `2` known-impossible, config, repository, or store-read failure. |
 | `skodun gate [--repo DIR]` | Fail closed unless a trustworthy review already covers this exact diff; every decision is written to the audit log. Wire it into pre-push or CI. | `0` clean or every finding triaged · `1` findings open · `2` no trustworthy review covers this diff. Every unexpected exception maps to `2`, never `1`. |
 | `skodun providers [--repo DIR]` | List every registered provider adapter, whether its CLI binary is resolvable and executable right now, and its cached availability state. Read-only; never gates anything. | `0` always, even with missing binaries — that is exactly what this command exists to report · `1` a reviewer in the loaded config (enabled or not) names a `provider` with no registered adapter · `2` `--repo`/config/store could not be read at all. |
 | `skodun stats [--since-days N] [--json]` | Report explicit review-stage and capacity telemetry: canonical repository coverage, queue-only wait, model runtime, total admission time, trust/findings counts, and legacy coverage. `--json` is the machine-readable projection of the same read model. CLI-only; it never gates or mutates the store. | `0` report produced · `2` invalid window/format or the store could not be read. |
@@ -92,6 +93,15 @@ behaves identically to the installed `skodun` console script.
 
 Run `skodun <command> --help` for the exact flags; the table above is a summary, not
 a substitute.
+
+`review-readiness` is a static admission diagnosis, not a provider health probe:
+it refuses only when the configured trustworthy topology is already known to be
+impossible and otherwise leaves the normal review path eligible. A normal review
+may still return exit `4` after a provider starts and times out, emits unusable
+output, or exhausts its fallback chain; `--recover` is the bounded outer recovery
+loop for that runtime failure. Provider-chain fallback remains the inner rule and
+advances only on an `unavailable` attempt. Exact trustworthy reuse is opt-in with
+`--reuse-trusted`; `--fresh` forces a new review.
 
 ## Configuration
 

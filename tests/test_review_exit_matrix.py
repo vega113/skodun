@@ -128,7 +128,8 @@ def _skeptic_demotion(tmp_path, monkeypatch):
 def _no_reviewer_could_run(tmp_path, monkeypatch):
     """The shape that was already pinned, kept in the table so the matrix is
     the whole matrix rather than the part nobody had covered yet."""
-    monkeypatch.setenv("SKODUN_GROK_BIN", str(tmp_path / "no-such-grok"))
+    from tests.test_fallback import _fake_cli
+    _fake_cli(tmp_path, "grok", "exit 127")
     return _repo(tmp_path)
 
 
@@ -161,12 +162,13 @@ _MATRIX = (
     ("extra-pass demotion", _skeptic_demotion, _UNTRUSTWORTHY_EXIT,
      lambda r: (r.get("status") == "failed" and r.get("findings_total") == 0
                 and _at(r, "extra_passes", "skeptic", "failed") is True)),
-    # `rc is None`, NOT falsy: `rc == 0` is a process that ran and exited
-    # cleanly, and this row exists to pin the case where NOTHING executed.
+    # A provider process can start and still return an unusable invocation
+    # result. That is a runtime failure (exit 4), distinct from the new static
+    # missing-binary preflight refusal (exit 2).
     ("no reviewer could run", _no_reviewer_could_run, _UNTRUSTWORTHY_EXIT,
      lambda r: (r.get("status") == "failed"
-                and _first_attempt(r).get("rc", 0) is None
-                and "unavailable" in r.get("failure_reason", ""))),
+                and _first_attempt(r).get("rc") == 127
+                and "all providers unavailable" in r.get("failure_reason", ""))),
 )
 
 _ROWS = [(name, build, code) for name, build, code, _ in _MATRIX]

@@ -33,6 +33,15 @@ def test_version(capsys):
     assert capsys.readouterr().out.strip().startswith("skodun ")
 
 
+def test_review_readiness_parser_exposes_json_and_reviewer_flags():
+    from skodun.cli import build_parser
+    args = build_parser().parse_args(
+        ["review-readiness", "--reviewer", "finder", "--json"])
+    assert args.command == "review-readiness"
+    assert args.reviewer == "finder"
+    assert args.json_output is True
+
+
 def test_no_subcommand_is_not_a_silent_success(capsys):
     """`skodun` with nothing after it ran nothing, so it must not report 0.
 

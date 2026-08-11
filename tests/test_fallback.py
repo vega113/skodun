@@ -374,8 +374,8 @@ def test_spawn_permission_error_advances_to_fallback(tmp_path, monkeypatch,
 
 def test_exhausted_chain_fails_closed_and_gate_semantics(tmp_path, monkeypatch,
                                                          capsys):
-    monkeypatch.setenv("SKODUN_CODEX_BIN", "/nonexistent/a")
-    monkeypatch.setenv("SKODUN_GROK_BIN", "/nonexistent/b")
+    _fake_cli(tmp_path, "codex", "exit 127")
+    _fake_cli(tmp_path, "grok", "exit 127")
     repo = _repo(tmp_path, CFG_OPENAI_THEN_XAI)
     st = _store(tmp_path)
 
@@ -592,8 +592,8 @@ def test_an_exhausted_chain_is_exit_4_through_the_cli(tmp_path, monkeypatch,
                                                       capsys):
     """4, not 2: the config was fine and the review was really attempted --
     what is missing is a trustworthy result, which is exactly what 4 says."""
-    monkeypatch.setenv("SKODUN_CODEX_BIN", "/nonexistent/a")
-    monkeypatch.setenv("SKODUN_GROK_BIN", "/nonexistent/b")
+    _fake_cli(tmp_path, "codex", "exit 127")
+    _fake_cli(tmp_path, "grok", "exit 127")
     repo = _repo(tmp_path, CFG_OPENAI_THEN_XAI)
 
     code = main(["review", "--repo", str(repo)])
@@ -757,11 +757,13 @@ def test_mid_chain_cache_expiry_is_honoured_without_sleep(tmp_path, monkeypatch,
     (`_finder_chain_unavailable`) also walks the chain first, so a spy sees
     those earlier reads too.
 
-    Spy policy (call order):
+    Readiness adds one read-only topology pass before execution. Spy policy
+    (call order):
       1. preflight entry0 → LIVE (unavailable)
       2. preflight entry1 → EXPIRED so preflight does not refuse the whole run
-      3. chain entry0 → LIVE → skipped
-      4+. chain entry1 (and any later reads) → EXPIRED → entry runs
+      3–4. readiness snapshot → EXPIRED, so the topology remains eligible
+      5. chain entry0 → LIVE → skipped
+      6+. chain entry1 (and any later reads) → EXPIRED → entry runs
 
     No `sleep`, no flakiness.
     """
@@ -775,8 +777,8 @@ def test_mid_chain_cache_expiry_is_honoured_without_sleep(tmp_path, monkeypatch,
 
     def spy(self, provider, now_iso, env=os.environ):
         calls.append(now_iso)
-        # Live only on 1st and 3rd consult (preflight e0 + chain e0).
-        if len(calls) not in (1, 3):
+        # Live only on 1st and 5th consult (preflight e0 + chain e0).
+        if len(calls) not in (1, 5):
             now_iso = _iso(3600)
         return real(self, provider, now_iso, env)
 
@@ -907,15 +909,9 @@ def test_a_fallback_entry_that_is_itself_unavailable_exhausts_the_chain(
     st = _store(tmp_path)
     st.mark_provider_unavailable("openai", "rate limited", "quota", _iso(3600))
 
-    rec = _run(repo, st)
-
+    with pytest.raises(PreflightRefused, match="binary_unavailable"):
+        _run(repo, st)
     assert _calls(tmp_path) == []
-    kinds = [a["classification"]["kind"] for a in rec["attempts"]]
-    assert kinds == ["unavailable", "unavailable"]
-    assert [a["classification"]["category"] for a in rec["attempts"]] == \
-        ["quota", "binary"]
-    assert rec["failure_reason"].startswith("all providers unavailable")
-    assert rec["trustworthy"] is False
 
 
 def test_each_entry_gets_its_own_degraded_budget(tmp_path, monkeypatch, capsys):
@@ -1334,14 +1330,8 @@ role = "security"
     monkeypatch.setenv("SKODUN_CODEX_BIN", "/nonexistent/skodun-dead")
     repo = _risky(_repo(tmp_path, cfg))
 
-    rec = _run(repo, _store(tmp_path))
-
-    meta = rec["extra_passes"]["security"]
-    assert meta["failed"] is True
-    assert meta["provider"] is None and meta["model"] is None
-    assert meta["effort"] is None
-    assert isinstance(meta["note"], str) and meta["note"]
-    assert rec["trustworthy"] is False       # a failed pass still demotes
+    with pytest.raises(PreflightRefused, match="required_pass_unavailable"):
+        _run(repo, _store(tmp_path))
 
 
 def test_a_broken_extra_pass_prompt_records_null_provenance_and_a_note(

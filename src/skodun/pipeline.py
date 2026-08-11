@@ -1344,6 +1344,22 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     if unavailable is not None:
         raise PreflightRefused(unavailable)
 
+    _checkpoint(cancel, None, "before review readiness")
+
+    # Static readiness is deliberately before stale recovery, the foreground
+    # lock, and review-fg admission. It is a snapshot only: the authoritative
+    # diff and pass plan are still captured under the lock below, and chain
+    # execution re-checks provider state at every entry boundary. The check
+    # never probes a model or acquires capacity, so a known missing binary,
+    # static API-key prerequisite, or scheduled hard pass cannot spend the
+    # operator's queue budget merely to report an impossible topology.
+    from . import readiness
+    ready = readiness.check(
+        store, repo, cfg, requested=requested, client_family=client_family)
+    if not ready.ready:
+        raise PreflightRefused(
+            f"review readiness {ready.reason_code}: {ready.reason}; no review ran")
+
     # --- 2. sweep the wreckage of any SIGKILLed predecessor ---------------
     recover_stale(store, cfg)
 
