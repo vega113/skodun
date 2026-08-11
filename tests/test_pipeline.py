@@ -35,7 +35,7 @@ import pytest
 from skodun import capacity, pipeline, runner
 from skodun.adapters import REVIEW_CONTRACT
 from skodun.cli import main
-from skodun.config import load_config
+from skodun.config import Config, Defaults, Reviewer, load_config
 from skodun.gitio import capture_diff, diff_identity, git_common_dir, resolve_base
 from skodun.pipeline import LockTimeout, PersistenceFailed, PreflightRefused, run_review
 from skodun.store import Store
@@ -164,6 +164,20 @@ def _store(tmp_path: Path) -> Store:
 
 def _run(repo: Path, store: Store, **kw) -> dict:
     return run_review(repo, load_config(repo), store, **kw)
+
+
+def test_skeptic_reuses_selected_finder_chain_not_refuter_role():
+    default_finder = Reviewer(name="finder", provider="xai", model="grok",
+                              role="finder")
+    selected_finder = Reviewer(name="finder-codex", provider="openai",
+                               model="gpt-5.4", role="finder")
+    refuter = Reviewer(name="refuter", provider="google", model="claude",
+                       role="refuter")
+    cfg = Config(defaults=Defaults(),
+                 reviewers=(default_finder, selected_finder, refuter))
+
+    assert pipeline._pass_reviewer(cfg, "skeptic", selected_finder) is selected_finder
+    assert pipeline._pass_reviewer(cfg, "refuter", selected_finder) is refuter
 
 
 def _verdict(rec: dict, capsys) -> str:

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import threading
 from pathlib import Path
 
@@ -58,18 +59,18 @@ _UNTRUSTWORTHY_EXIT = 4
 DEGRADED = json.dumps({"structuredOutput": {"summary": "s", "findings": []},
                        "stopReason": "ERROR"})
 
-#: A finder chain with a `role = "refuter"` entry on a provider whose binary is
-#: not there. A clean finder schedules the SKEPTIC pass, `_pass_reviewer`
-#: prefers the refuter-role entry for it, the pass produces nothing, and
+#: The selected finder is Codex, and its hermetic binary answers the primary
+#: review once before refusing the skeptic call. The skeptic deliberately uses
+#: that same selected finder entry, so the second call produces nothing and
 #: `passes.merge_failed_extra_pass` demotes the whole record -- #79's third
 #: shape, reported as "finder clean + skeptic fail ... status=failed,
 #: findings=0, good summary".
-CFG_WITH_DEAD_SKEPTIC = CFG + """
+CFG_WITH_DEAD_SKEPTIC = """
 [[reviewers]]
-name     = "refuter"
+name     = "finder-codex"
 provider = "openai"
 model    = "gpt-test-0309"
-role     = "refuter"
+role     = "finder"
 """
 
 
@@ -118,10 +119,36 @@ def _degraded(tmp_path, monkeypatch):
 def _skeptic_demotion(tmp_path, monkeypatch):
     """#79 row 3: the finder was clean and an extra pass could not run."""
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
-    monkeypatch.setenv("SKODUN_CODEX_BIN", str(tmp_path / "no-such-codex"))
-    _fake_grok(tmp_path, _emit(CLEAN))
+    stream = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "t"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message",
+            "text": json.dumps({"summary": "clean", "findings": []})}}),
+        json.dumps({"type": "turn.completed"}),
+        "",
+    ])
+    stream_path = tmp_path / "codex-stream.jsonl"
+    stream_path.write_text(stream, encoding="utf-8")
+    count_path = tmp_path / "codex-calls"
+    codex = tmp_path / "bin" / "codex"
+    codex.parent.mkdir(exist_ok=True)
+    codex.write_text(
+        "#!/bin/sh\n"
+        f"count={shlex.quote(str(count_path))}\n"
+        f"stream={shlex.quote(str(stream_path))}\n"
+        "n=0\n"
+        "[ -f \"$count\" ] && n=$(cat \"$count\")\n"
+        "n=$((n + 1))\n"
+        "printf '%s' \"$n\" > \"$count\"\n"
+        "[ \"$n\" -eq 1 ] || exit 127\n"
+        "cat \"$stream\"\n",
+        encoding="utf-8")
+    codex.chmod(codex.stat().st_mode | 0o111)
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(codex))
     repo = _repo(tmp_path)
-    (repo / ".skodun.toml").write_text(CFG_WITH_DEAD_SKEPTIC, encoding="utf-8")
+    (repo / ".skodun.toml").write_text(
+        CFG_WITH_DEAD_SKEPTIC, encoding="utf-8")
     return repo
 
 

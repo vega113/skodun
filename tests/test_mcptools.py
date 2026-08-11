@@ -868,6 +868,8 @@ def test_reuse_does_not_treat_handshake_family_as_explicit_intent(
 
 def test_mcp_reuse_hit_preserves_structured_metadata_without_recovery(
         tmp_path, monkeypatch):
+    from skodun import provenance
+
     def fake_detailed(store, repo, **kw):
         assert kw["reuse_trusted"] is True
         return 0, "SKODUN REUSE: review_id=r1", {
@@ -878,10 +880,10 @@ def test_mcp_reuse_hit_preserves_structured_metadata_without_recovery(
         params={"repo": str(tmp_path), "reuse_trusted": True},
         store_factory=lambda: Store.open(tmp_path / "s.db"),
         cancel=threading.Event()))
-    assert result.metadata == {
-        "reuse": {"hit": True, "review_id": "r1"},
-        "skodun_version": skodun.__version__,
-    }
+    assert result.metadata["reuse"] == {"hit": True, "review_id": "r1"}
+    assert result.metadata["skodun_version"] == skodun.__version__
+    assert result.metadata["skodun_commit"] == (
+        provenance.cached_provenance().get("skodun_commit"))
 
 
 def test_a_client_name_nothing_recognises_leaves_the_family_undeclared(

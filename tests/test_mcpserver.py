@@ -471,6 +471,23 @@ def test_the_serverinfo_names_skodun_and_its_own_version():
     assert result["capabilities"] == {"tools": {}, "prompts": {}}
 
 
+def test_review_result_reports_cached_build_identity(monkeypatch):
+    from skodun import provenance
+
+    monkeypatch.setattr(
+        provenance, "cached_provenance",
+        lambda: {"skodun_version": skodun.__version__,
+                 "skodun_commit": "a" * 40},
+    )
+
+    result = mcpserver._review_result(0, "ok")
+    structured = mcpserver.tool_result(result)["structuredContent"]
+
+    assert result.metadata["skodun_version"] == skodun.__version__
+    assert result.metadata["skodun_commit"] == "a" * 40
+    assert structured["skodun_commit"] == "a" * 40
+
+
 def test_the_handshake_never_waits_on_git(monkeypatch):
     """`serverInfo.commit` is best effort, and this is the reason it is.
 

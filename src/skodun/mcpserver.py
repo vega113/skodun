@@ -243,10 +243,19 @@ class HandlerResult:
 def _review_result(status: int, text: str,
                    metadata: dict | None = None) -> HandlerResult:
     """Build a review response that identifies the code that produced it."""
+    # The package version tells a client which release family answered. The
+    # cached commit tells it which editable-checkout build answered when one is
+    # available; a wheel has no honest commit, so None is still reported rather
+    # than inferred from the current checkout on disk.
+    from .provenance import cached_provenance
+
+    build = cached_provenance() or {}
     return HandlerResult(
         status=status,
         text=text,
-        metadata={"skodun_version": __version__, **(metadata or {})},
+        metadata={"skodun_version": __version__,
+                  "skodun_commit": build.get("skodun_commit"),
+                  **(metadata or {})},
     )
 
 

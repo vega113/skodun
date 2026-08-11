@@ -10,7 +10,7 @@ Long-form: [`../../docs/integrate-external-project.md`](../../docs/integrate-ext
 | Symptom | Likely cause | What to do |
 |---|---|---|
 | Review ends in **&lt;1s**, `trustworthy=false`, “no parseable review”, junie | Outer process used `PYTHONPATH=src` only; junie runner is `python -I` and could not import `skodun` | **Install** skodun into that Python (`pip install -e .` / pipx). Prefer the `skodun` console script. See § Junie. |
-| Finder looks clean, then whole review **untrustworthy**, `extra_passes.skeptic` / refuter failed | Clean finder schedules **skeptic** (uses `role=refuter` provider). That provider **quota**/auth failed and **demoted** the review | Fix that provider, or temporarily `SKODUN_SKEPTIC_PASS=0` and/or `SKODUN_REFUTER_PASS=0` |
+| Finder looks clean, then whole review **untrustworthy**, `extra_passes.skeptic` failed | Clean finder schedules **skeptic** on the selected finder chain. Its quota/auth failure **demoted** the review | Fix the selected finder chain, or temporarily `SKODUN_SKEPTIC_PASS=0`; a `role=refuter` outage is annotation-only |
 | `provider_state` / “marking provider … unavailable until …” | Quota/rate-limit cached in the store | Wait for TTL, use another provider/reviewer, or (debug only) `SKODUN_IGNORE_PROVIDER_STATE` |
 | `openai-api` “missing API key” / auth failure | Key not in **this** process env (CLI shell or MCP server `env`) | `export OPENAI_API_KEY=…` or set MCP `env`; never TOML. Alias: `SKODUN_OPENAI_API_KEY`. Restart MCP after changing env. See [`openai-api.md`](openai-api.md). |
 | `api daily spend limit reached … this UTC day` | Per-provider **daily** cap hit (default $10/UTC day) | Wait until UTC midnight, or raise `SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY` for that day only — not a lifetime total |
@@ -57,7 +57,7 @@ If junie fails instantly with “No module named skodun” (older builds) or emp
 
 ## Skeptic / refuter demotion
 
-On a **trustworthy clean** finder (`findings_total == 0`, mode `now`), skodun may run a **skeptic** pass. That pass prefers a configured `role = "refuter"` reviewer (often openai/codex). If that chain is **unavailable** (quota), the extra pass **fails closed** and demotes the primary — even when the finder was clean.
+On a **trustworthy clean** finder (`findings_total == 0`, mode `now`), skodun may run a **skeptic** pass using the selected finder entry and its fallback chain. If that chain is **unavailable** (quota), the extra pass **fails closed** and demotes the primary — even when the finder was clean. A configured `role = "refuter"` is separate: it annotates findings and its outage does not demote the review.
 
 | Env | Effect |
 |---|---|
