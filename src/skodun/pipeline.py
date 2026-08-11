@@ -978,15 +978,12 @@ def _reviewer_for(cfg: Config, role: str) -> Reviewer | None:
 #: provider must be refused before the lock and before any model call, not
 #: discovered by the luck of a diff that happened to need splitting.
 #:
-#: `skeptic` and `refuter` collide on the role name `refuter` — pre-existing
-#: (the skeptic already preferred that role before this pass existed) and
-#: still safe now that `refuter` is a real, separately-scheduled pass: the two
-#: are mutually exclusive by `should_run_skeptic`/`refuter_decision`'s own
-#: eligibility (the skeptic only runs on a trustworthy CLEAN finder, the
-#: refuter only on a trustworthy finder WITH findings), so at most one of them
-#: ever reads this table in a given run. If that mutual exclusion ever
-#: changes, this shared name needs a second look.
-_EXTRA_PASS_ROLES = {"security": "security", "skeptic": "refuter",
+#: The skeptic deliberately reuses the selected finder entry and its own
+#: fallback chain. It is a clean-result adversarial check, not the
+#: cross-provider finding annotation pass; coupling it to the `refuter` role
+#: would let an unrelated refuter quota outage demote an otherwise clean
+#: finder. Only the refuter pass reads the `refuter` role.
+_EXTRA_PASS_ROLES = {"security": "security", "skeptic": "finder",
                      "refuter": "refuter",
                      passes.INTEGRATION_PASS: passes.INTEGRATION_ROLE}
 
@@ -994,16 +991,20 @@ _EXTRA_PASS_ROLES = {"security": "security", "skeptic": "refuter",
 def _pass_reviewer(cfg: Config, pass_name: str, finder: Reviewer) -> Reviewer:
     """The reviewer an extra pass will use: its role's, else the finder's.
 
-    See `_extra_pass` for why the role-specific preference exists at all.
+    See `_extra_pass` for why the role-specific preference exists at all. The
+    skeptic's `finder` mapping is intentional: the selected head, including
+    its configured fallbacks, is the reviewer for both the primary and clean
+    adversarial check unless the pass is the separate annotation-only refuter.
 
-    UNCHANGED by `run_review`'s `reviewer=` request, and deliberately: that
-    request selects the FINDER head for one run, while the passes select by
-    ROLE, and letting one override the other would re-point a pass the operator
-    configured on purpose. The request reaches a pass only through the shipped
-    `else the finder's` fallback — i.e. only where the config named no reviewer
-    for that role at all, and the pass was already going to run on whatever
-    headed the chain.
+    The skeptic is the exception to role-specific selection: it follows the
+    finder chosen by `run_review`'s `reviewer=` request or auto-routing, so its
+    own fallback chain is the same chain that protects the primary review.
+    Other extra passes remain role-selected and are not redirected by
+    `reviewer=` except through the existing `else the finder's` fallback when
+    no reviewer for that role is configured.
     """
+    if pass_name == "skeptic":
+        return finder
     reviewer = _reviewer_for(cfg, _EXTRA_PASS_ROLES[pass_name])
     return reviewer if reviewer is not None else finder
 
@@ -3262,15 +3263,11 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
                 cancel: "threading.Event | None" = None) -> dict:
     """Run one extra pass and merge it into `rec`, returning the new record.
 
-    `reviewer` is the caller's choice, and the caller makes a DELIBERATE one:
-    a configured, enabled reviewer whose role matches the pass (`security` for
-    the security pass, `refuter` for the skeptic pass) is preferred, and the
-    finder is the fallback. That is slightly more than Phase 1 promised — the
-    brief says the extra passes reuse the finder's adapter — but a config that
-    names a cheaper or differently-specialised model for a lens has said what it
-    wants, and silently ignoring it would be the surprise. The cost of the wider
-    behaviour is one more thing that can be misconfigured, which is why
-    `run_review`'s preflight now resolves those reviewers' adapters too, before
+    `reviewer` is the caller's deliberate choice. Security can use its
+    configured `security` role; the skeptic receives the selected finder from
+    `_pass_reviewer` and therefore follows that finder's chain. The separate
+    refuter annotation pass uses its configured `refuter` role in
+    `_refuter_pass`. The role-specific choices are resolved in preflight before
     the lock and before any model call.
 
     Merge semantics are Task 14's, and the choice between them is made here:

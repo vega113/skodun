@@ -347,6 +347,12 @@ there are none, plus `+20` when the provider's family differs from the caller's
 is excluded; a pooled entry whose provider has no adapter is a config error and
 is refused outright, naming the entry, rather than quietly routed around.
 
+If the calling client should use its own subscription when it is routable, set
+`cross_model = false`. For example, with `client_family = "openai"` this makes
+the Codex CLI entry win the same free-capacity tie instead of rewarding a
+different provider family. An explicit `--reviewer finder-codex` remains the
+strongest one-run pin.
+
 Ties go to the entry you listed first — `[routing] pool` as written, else the
 reviewer table's own order. Two entries on one provider always score
 identically, so an alphabetical tie-break would let a rename decide which model
@@ -451,6 +457,19 @@ fallback they differ — that gap is the fallback rate. `unrouted` is a review
 with no routing audit: a background pre-push review, or a record written before
 routing existed. Reviews imported by `import-legacy` are excluded; they never
 took a skodun provider slot.
+
+### The skeptic
+
+On a trustworthy clean finder (`findings_total == 0`, mode `now`), skodun may
+run a skeptic pass to attack the clean result. The skeptic uses the selected
+finder entry and its configured fallback chain, so a Codex-routed review uses
+the Codex subscription for both calls. It is a fail-closed coverage pass: an
+unavailable or unparseable skeptic demotes the review.
+
+This is separate from `role = "refuter"`. The refuter is scheduled when the
+finder has findings and is an annotation-only, cross-provider re-examination;
+its quota outage does not demote the finder. Keeping the two paths separate
+means a Google refuter blackout cannot block a clean Codex review's skeptic.
 
 ### The refuter
 
@@ -897,6 +916,10 @@ because the gate is trusted **across time**: a review recorded last week is
 honoured today while the diff identity matches, so a change in how skodun
 classifies or scores would otherwise be invisible in the records it left
 behind.
+
+MCP `review` and `review_readiness` responses expose the same identity in
+`structuredContent.skodun_version` and `structuredContent.skodun_commit`, so a
+client does not need to parse human text or issue a separate shell command.
 
 `skodun_commit` is `null` for an install that is not a checkout — a wheel has
 no commit, and the version still identifies the code. On a checkout it carries

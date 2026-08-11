@@ -47,9 +47,9 @@
 #   * IT CHANGES NOTHING WHILE NOTHING IS BUSY. Ties go to the entry you listed
 #     first, so with every provider idle `auto` heads the same entry `off`
 #     would have. It deviates only once load actually differs.
-#   * EXTRA PASSES ARE NOT ROUTED. The security, skeptic, refuter and
-#     integration passes still pick by ROLE, so a refuter you deliberately put
-#     on another provider stays there.
+#   * EXTRA PASSES ARE NOT ROUTED. The skeptic reuses the selected finder and
+#     its fallback chain; security, refuter and integration still pick by ROLE,
+#     so a refuter you deliberately put on another provider stays there.
 #
 # Every review records `routed_reviewer` and `route_reason` (`pinned`,
 # `config-finder`, `auto:free`, `auto:free+cross`, `auto:wait`, …) on its
@@ -154,6 +154,13 @@ provider = "openai"
 model    = "gpt-5.4-mini"     # the codex CLI has no `list models` subcommand -- see README
 effort   = "medium"
 role     = "finder"
+fallbacks = ["finder-gemini"]
+
+[[reviewers]]
+name     = "finder-gemini"
+provider = "google"
+model    = "gemini-3.1-pro-high"
+role     = "finder"
 
 # --- the refuter: a DIFFERENT provider re-examines the finder's findings ---
 #
@@ -166,30 +173,19 @@ role     = "finder"
 # model re-examining its own work tends to agree with itself, and
 # `triage --adopt-refuter` prints a WARNING when it detects this.
 #
-# GIVE IT A FALLBACK -- because of the SKEPTIC, not because of the refuter.
-# This entry serves two passes, and they treat a dead provider differently:
+# GIVE THE FINDER A FALLBACK -- the skeptic reuses that selected chain. The
+# refuter has its own chain and treats a dead provider differently:
 #
 #   refuter pass  annotation-only. `merge_refuter_pass` cannot make a review
 #                 untrustworthy, so a refuter whose provider is unavailable
 #                 leaves the review exactly as the finder left it. Nothing to
 #                 protect against here.
-#   skeptic pass  runs on a trustworthy CLEAN finder, and a pass that produces
-#                 NOTHING at all -- quota, auth, a missing binary -- goes
-#                 through `merge_failed_extra_pass`, which demotes. So an
-#                 outage on this entry costs you the clean verdict the finder
-#                 already earned.
+#   skeptic pass  runs on a trustworthy CLEAN finder through the selected
+#                 finder's chain, and a pass that produces NOTHING at all --
+#                 quota, auth, a missing binary -- goes through
+#                 `merge_failed_extra_pass`, which demotes. The refuter's
+#                 outage cannot cause this demotion.
 #
-# Observed 2026-08-03: this entry on a metered provider whose key the MCP
-# server process could not see turned clean grok reviews into untrustworthy
-# ones, gate 2, until it was given somewhere to hop to.
-#
-#     fallbacks = ["finder"]
-#
-# That is same-family as the finder on the runs where it fires, which is the
-# thing this pass exists to avoid -- but only on the runs where the alternative
-# was losing the finder's verdict. `fallbacks` hop on `unavailable` (quota,
-# auth, missing binary, unknown model), which is exactly the outage this
-# covers.
 [[reviewers]]
 name      = "refuter"
 provider  = "openai"
