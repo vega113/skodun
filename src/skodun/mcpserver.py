@@ -512,6 +512,28 @@ def _handle_gate(call: "HandlerCall") -> "HandlerResult":
     return HandlerResult(status=status, text=text)
 
 
+def _handle_review_readiness(call: "HandlerCall") -> "HandlerResult":
+    """Answer the shared read-only readiness check without starting a review."""
+    from . import routing, services
+
+    repo, refusal = _repo_arg(call.params, "review_readiness")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    reviewer, refusal = _opt_string_arg(
+        call.params, "reviewer", "review_readiness")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    family, refusal = _opt_string_arg(
+        call.params, "client_family", "review_readiness")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    family = routing.resolve_client_family(family, client_name=call.client_name)
+    with call.store_factory() as store:
+        status, text, metadata = services.svc_review_readiness(
+            store, repo, reviewer=reviewer, client_family=family)
+    return _review_result(status, text, metadata)
+
+
 def disconnect_policy() -> str:
     """``drain`` (default) or ``cancel`` for in-flight review on session end."""
     raw = (os.environ.get(DISCONNECT_POLICY_ENV) or DEFAULT_DISCONNECT_POLICY)
@@ -942,6 +964,25 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                         "open, 2 = no trustworthy review covers this content. "
                         "The same decision `skodun gate` makes, from the same "
                         "store."),
+        HandlerSpec(
+            name="review_readiness", long_running=False,
+            input_schema=_schema({
+                **_REPO_PROPERTY,
+                "reviewer": {
+                    "type": "string",
+                    "description": "configured reviewer entry to inspect; "
+                                   "omitted uses normal finder/routing "
+                                   "selection"},
+                "client_family": {
+                    "type": "string",
+                    "description": "calling client family for auto-routing"},
+            }),
+            handler=_handle_review_readiness,
+            description="Read-only review readiness. Reports whether the "
+                        "configured topology has a locally plausible path to "
+                        "trustworthy coverage before review capacity or a "
+                        "provider process is used. It never health-probes a "
+                        "model and never certifies gate/trust."),
         HandlerSpec(
             name="review", long_running=True,
             input_schema=_schema({

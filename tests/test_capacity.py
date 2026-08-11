@@ -310,6 +310,29 @@ def test_preflight_does_not_fire_when_one_provider_is_free(tmp_path):
     st.close()
 
 
+def test_missing_finder_binary_is_refused_before_review_fg_admission(
+        tmp_path, monkeypatch):
+    repo = _linked_worktree(tmp_path)
+    cfg = config.Config(
+        defaults=config.Defaults(timeout_sec=1, max_turns=1),
+        reviewers=(config.Reviewer(name="finder", provider="xai",
+                                   model="test-model"),),
+    )
+    st = Store.open(tmp_path / "s.db")
+    monkeypatch.setenv("SKODUN_GROK_BIN", str(tmp_path / "missing-grok"))
+    called = {"n": 0}
+
+    def no_admission(*args, **kwargs):
+        called["n"] += 1
+        raise AssertionError("review-fg admission must not be acquired")
+
+    monkeypatch.setattr(pipeline.capacity, "acquire_for_fg", no_admission)
+    with pytest.raises(PreflightRefused, match="binary_unavailable"):
+        pipeline.run_review(repo, cfg, st, lock_wait=30.0)
+    assert called["n"] == 0
+    st.close()
+
+
 def test_run_review_surfaces_queue_progress_under_contention(tmp_path):
     """CLI path: progress callback from acquire_for_fg includes position/budget.
 

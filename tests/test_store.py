@@ -2402,6 +2402,7 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_provenance.py",
     "tests/test_stats.py",
     "tests/test_reuse.py",
+    "tests/test_readiness.py",
 )
 
 #: Store-touching modules deliberately kept OUT of the subprocess sweep, with

@@ -665,15 +665,10 @@ role = "integrator"
     _diff, plan = _plan(repo, cfg)
     st = _store(tmp_path)
 
-    rec = _run(repo, st)
-
-    assert _calls(tmp_path) == len(plan)      # the integrator never spawned
-    assert rec["parse_ok"] is False and rec["trustworthy"] is False
-    assert rec["status"] == "failed"
-    assert rec["integration"]["status"] == "failed"
-    assert rec["integration"]["provider"] is None
-    assert rec["usable_output"] is True
-    assert run_gate(st, repo, cfg).code == 2
+    with pytest.raises(pipeline.PreflightRefused,
+                       match="required_pass_unavailable"):
+        _run(repo, st)
+    assert _calls(tmp_path) == 0      # readiness refuses before any batch
 
 
 def test_a_failed_batch_demotes_the_aggregate(tmp_path, capsys):
@@ -743,17 +738,9 @@ def test_zero_batches_is_a_terminal_failure_never_a_clean_verdict(
     monkeypatch.setattr(batching, "split", lambda *a, **kw: [])
     st = _store(tmp_path)
 
-    rec = _run(repo, st)
-
+    with pytest.raises(pipeline.PreflightRefused, match="prompt_unfit"):
+        _run(repo, st)
     assert _calls(tmp_path) == 0             # no model call is spent
-    assert rec["parse_ok"] is False and rec["trustworthy"] is False
-    assert rec["status"] == "failed"
-    assert rec["batched"] is True and rec["batch_count"] == 0
-    assert rec["batches"] == [] and "integration" not in rec
-    assert "no batches" in rec["failure_reason"]
-    assert rec["usable_output"] is False
-    assert load_valid_artifact(rec) is rec
-    assert run_gate(st, repo, load_config(repo)).code == 2
 
 
 # --------------------------------------------------------------------------

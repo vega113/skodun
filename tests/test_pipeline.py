@@ -767,17 +767,14 @@ def test_timeout_retries_exhausted_fails_closed(tmp_path, capsys):
     assert [a["timed_out"] for a in rec["attempts"]] == [True, True]
 
 
-def test_a_missing_reviewer_binary_is_recorded_and_never_retried(tmp_path,
-                                                                 capsys,
-                                                                 monkeypatch):
+def test_a_missing_reviewer_binary_is_refused_before_any_review_record(
+        tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("SKODUN_GROK_BIN", str(tmp_path / "nope" / "grok"))
     repo = _repo(tmp_path, "\n[defaults]\ntimeout_retries = 2\n"
                            "degraded_retries = 2\n")
-    rec = _run(repo, _store(tmp_path))
-    assert rec["parse_ok"] is False and rec["status"] == "failed"
-    assert len(rec["attempts"]) == 1        # retrying cannot conjure a binary
-    assert "not found" in rec["failure_reason"]
-    assert _verdict(rec, capsys).startswith("SKODUN VERDICT: trustworthy=false")
+    with pytest.raises(PreflightRefused, match="binary_unavailable"):
+        _run(repo, _store(tmp_path))
+    assert _calls(tmp_path) == 0
 
 
 # --------------------------------------------------------------------------
@@ -1529,7 +1526,10 @@ def test_an_auto_run_heads_a_different_provider_than_mode_off_would(
     made against `openai` at all is the proof the head really moved.
     """
     _fake_grok(tmp_path, _emit(CLEAN))
-    monkeypatch.setenv("SKODUN_CODEX_BIN", str(tmp_path / "no-such-codex"))
+    codex = tmp_path / "bin" / "codex"
+    codex.write_text("#!/bin/sh\nexit 127\n", encoding="utf-8")
+    codex.chmod(codex.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(codex))
     repo = _repo(tmp_path, '\n[routing]\nmode = "auto"\n' + _SECOND_FINDER)
     st = _store(tmp_path)
     _hold_xai(st)

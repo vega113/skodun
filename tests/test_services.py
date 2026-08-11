@@ -43,7 +43,8 @@ from tests.test_gitio import _git, _mkrepo
 STORE_BACKED = ["svc_gate", "svc_review", "svc_log", "svc_surface",
                 "svc_triage_list", "svc_triage_dismiss", "svc_adopt_refuter",
                 "svc_triage_reopen", "svc_triage_defer", "svc_deferrals",
-                "svc_review_status", "svc_review_cancel", "svc_review_detailed"]
+                "svc_review_status", "svc_review_cancel", "svc_review_detailed",
+                "svc_review_readiness"]
 
 #: A deferral needs a filed reference and a reason that clears the same audit
 #: floor a dismissal's does -- both, or the service refuses.
@@ -201,6 +202,31 @@ def test_no_module_redirects_stdout_anywhere():
         for pattern in banned:
             hit = re.search(pattern, src, re.MULTILINE)
             assert hit is None, f"{path.name}: {hit.group(0)!r}"
+
+
+def test_review_readiness_is_read_only_and_returns_structured_metadata(
+        tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    import subprocess
+    for args in (("init", "-b", "main"),
+                 ("config", "user.email", "test@example.invalid"),
+                 ("config", "user.name", "Readiness Test")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True,
+                       capture_output=True, text=True)
+    (repo / "a.py").write_text("print(1)\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "a.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"],
+                   check=True, capture_output=True, text=True)
+    (repo / ".skodun.toml").write_text(
+        '[[reviewers]]\nname = "finder"\nprovider = "xai"\nmodel = "grok"\n',
+        encoding="utf-8")
+    monkeypatch.setenv("SKODUN_GROK_BIN", "/bin/sh")
+    with Store.open(tmp_path / "readiness.db") as store:
+        status, text, metadata = services.svc_review_readiness(store, repo)
+    assert status == 0
+    assert "potentially_available" in text
+    assert metadata["readiness"]["reason_code"] == "health_unknown"
 
 
 def test_the_services_module_is_importable_without_sqlite_or_git():

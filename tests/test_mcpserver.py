@@ -573,6 +573,39 @@ def test_the_default_registry_is_the_curated_review_loop():
     _server(registry=registry, prompts=prompts)
 
 
+def test_default_registry_exposes_readiness_as_non_long_running_tool():
+    spec = next(s for s in mcpserver.default_registry()
+                if s.name == "review_readiness")
+    assert spec.long_running is False
+    assert spec.input_schema["properties"]["reviewer"]["type"] == "string"
+
+
+def test_readiness_handler_calls_shared_service(monkeypatch):
+    from contextlib import contextmanager
+
+    seen = {}
+
+    def fake_service(store, repo, *, reviewer=None, client_family=None):
+        seen["repo"] = repo
+        seen["reviewer"] = reviewer
+        return 0, "ready", {"readiness": {"state": "potentially_available"}}
+
+    @contextmanager
+    def factory():
+        yield object()
+
+    monkeypatch.setattr("skodun.services.svc_review_readiness", fake_service)
+    spec = next(s for s in mcpserver.default_registry()
+                if s.name == "review_readiness")
+    result = spec.handler(HandlerCall(
+        params={"repo": ".", "reviewer": "finder"},
+        store_factory=factory, cancel=threading.Event()))
+    assert result.status == 0
+    assert result.text == "ready"
+    assert result.metadata["readiness"]["state"] == "potentially_available"
+    assert seen["reviewer"] == "finder"
+
+
 def test_a_handler_that_returns_nonsense_is_a_tool_error_not_a_crash():
     def liar(call):
         return {"status": 0, "text": "a dict is not a HandlerResult"}

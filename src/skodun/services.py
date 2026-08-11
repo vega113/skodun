@@ -142,6 +142,34 @@ def svc_gate(store, repo) -> tuple[int, str]:
     return result.code, result.message
 
 
+def svc_review_readiness(store, repo, *, reviewer=None, client_family=None,
+                         output="text") -> tuple[int, str, dict]:
+    """Read-only readiness for a review, without acquiring review capacity."""
+    from .cli import _repo_root
+    from .config import load_config
+    from . import readiness
+
+    try:
+        root = _repo_root(Path(repo))
+        cfg = load_config(root)
+        report = readiness.check(
+            store, root, cfg, requested=reviewer,
+            client_family=client_family)
+        text = readiness.render(report, output=output)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as exc:
+        report = readiness.ReadinessReport(
+            ready=False, state="known_impossible",
+            reason_code="readiness_error",
+            reason=f"could not run readiness check: {exc!r}",
+            finder=None, topology=(), passes=(), diff_bytes=0,
+            prompt_budget_bytes=None, batch_count=0, estimated_attempts=0,
+            estimated_worst_runtime_sec=0, estimated_lock_budget_sec=0)
+        text = readiness.render(report, output=output)
+    return (0 if report.ready else 2), text, {"readiness": report.to_dict()}
+
+
 # --- review -----------------------------------------------------------------
 
 
