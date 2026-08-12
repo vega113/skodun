@@ -321,11 +321,15 @@ def test_recovery_reuses_one_parsed_stack_request_but_passes_it_to_each_run(
     with Store.open(tmp_path / "stack-recovery.db") as store:
         status, text, metadata = services.svc_review_detailed(
             store, tmp_path, stack_manifest=manifest_path, recover=True,
-            max_attempts=3, max_wall_seconds=30)
+            max_attempts=3, max_wall_seconds=30, reuse_trusted=True)
 
     assert status == 0
     assert loads == [manifest_path]
     assert seen == [request, request]
+    assert text.splitlines()[0].startswith("SKODUN REUSE: bypass")
+    assert text.splitlines()[1] == (
+        "SKODUN STACK: status=ignored reason=malformed_json")
+    assert text.splitlines()[2].startswith("SKODUN RECOVERY:")
     assert text.count("SKODUN STACK:") == 1
     assert metadata["stack"] == {
         "status": "ignored", "reason_code": "malformed_json"}

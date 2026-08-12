@@ -584,6 +584,15 @@ def _portable_remote_identity(remote: str) -> str | None:
             or any("\\" in part or "@" in part or ":" in part
                    for part in parts)):
         return None
+    normalized_host = bare_host.lower()
+    if ":" in host:
+        try:
+            port = int(host.rsplit(":", 1)[1])
+        except ValueError:
+            return None
+        if ((remote.startswith("https://") and port == 443)
+                or (remote.startswith("ssh://") and port == 22)):
+            host = normalized_host
     return f"{host.lower()}/{'/'.join(parts)}"
 
 

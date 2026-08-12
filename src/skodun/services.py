@@ -806,11 +806,12 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         "recovered": bool(last_rec and last_rec.get("trustworthy") is True
                            and len(review_ids) > 1),
     }}
-    if reuse_note:
-        prefix = f"{reuse_note}\n{prefix}"
+    prefix_lines = [reuse_note] if reuse_note else []
     if "stack" in result_metadata:
         from .stack import render_projection
-        prefix = f"{render_projection(result_metadata['stack'])}\n{prefix}"
+        prefix_lines.append(render_projection(result_metadata["stack"]))
+    prefix_lines.append(prefix)
+    prefix = "\n".join(prefix_lines)
     return last_status, f"{prefix}\n{last_text}", {
         **reuse_metadata, **metadata, **result_metadata}
 

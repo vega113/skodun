@@ -256,6 +256,16 @@ def test_manifest_unknown_nested_fields_are_refused(tmp_path):
     assert "must-not-survive" not in request.problem.detail
 
 
+def test_tracking_refs_must_match_manifest_repository(tmp_path):
+    document = _manifest()
+    document["current_slice"]["tracking_ref"] = "github.com/other/project#14"
+
+    request = stack.load_request(
+        _write(tmp_path / "other-tracking.json", document))
+
+    assert request.problem.reason_code == "tracking_repository_mismatch"
+
+
 def test_manifest_symlink_is_refused(tmp_path):
     target = _write(tmp_path / "target.json")
     link = tmp_path / "link.json"
@@ -678,6 +688,14 @@ def test_prefix_scope_classifies_only_actual_current_slice_paths(tmp_path):
 
     assert current["scope_attribution"]["scope"] == "current_slice"
     assert inherited["scope_attribution"]["scope"] == "unknown"
+
+
+def test_classifier_preserves_non_dict_raw_findings():
+    result = stack.StackValidation(
+        status="ignored", reason_code="malformed_json", manifest=None)
+    raw = ["provider emitted an invalid finding"]
+
+    assert stack.classify_findings(raw, result) == raw
 
 
 def test_multiple_nonexclusive_scopes_from_one_slice_are_not_integration(

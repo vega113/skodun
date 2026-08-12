@@ -435,6 +435,16 @@ def _parse_manifest(document: object) -> StackManifest:
     commits.append(manifest.current_slice.commit)
     if len(set(commits)) != len(commits):
         raise _ManifestError("duplicate_commit", "slice commits must be unique")
+    tracking_refs = [
+        *(item.tracking_ref for item in manifest.dependencies),
+        manifest.current_slice.tracking_ref,
+        *(item.tracking_ref for item in manifest.downstream_owners),
+    ]
+    if any(ref.rpartition("#")[0] != manifest.repository_id
+           for ref in tracking_refs):
+        raise _ManifestError(
+            "tracking_repository_mismatch",
+            "tracking references must use the manifest repository")
     expected_parent = (
         manifest.dependencies[-1].slice_id if manifest.dependencies else None)
     if manifest.direct_parent != expected_parent:
@@ -794,11 +804,14 @@ def _attribution(
 def classify_findings(
     findings: list,
     result: StackValidation,
-) -> list[dict]:
+) -> list[Any]:
     """Return additive, conservative scope annotations for raw findings."""
-    out: list[dict] = []
+    out: list[Any] = []
     for raw in findings if isinstance(findings, list) else []:
-        finding = dict(raw) if isinstance(raw, dict) else {}
+        if not isinstance(raw, dict):
+            out.append(raw)
+            continue
+        finding = dict(raw)
         path = _finding_path(finding.get("file"))
         if result.status != "valid":
             attribution = _attribution("unknown", result.reason_code)

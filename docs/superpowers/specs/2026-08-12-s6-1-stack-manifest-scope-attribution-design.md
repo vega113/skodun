@@ -53,7 +53,7 @@ additive finding annotations in `artifact_json`.
 
 This approach keeps stack semantics cohesive, needs no database migration, and
 leaves all certification and triage joins untouched. It also gives #145 and
-#147 a precise identity vocabulary without coupling their storage models.
+`#147` a precise identity vocabulary without coupling their storage models.
 
 ### B. Add stack tables to the SQLite store — rejected for S6.1
 
@@ -360,7 +360,7 @@ The initial closed reason vocabulary is:
   `duplicate_key`, `unknown_field`, `unsupported_schema`, `invalid_field`,
   `limit_exceeded`, `digest_mismatch`
 - identity: `repository_unresolved`, `repository_mismatch`, `stale_base`,
-  `stale_head`
+  `stale_head`, `tracking_repository_mismatch`
 - graph/Git: `missing_commit`, `not_commit`, `duplicate_slice`,
   `duplicate_commit`, `stack_cycle`, `direct_parent_mismatch`,
   `dependency_reordered`, `dependency_unreachable`, `ownership_unreachable`,
