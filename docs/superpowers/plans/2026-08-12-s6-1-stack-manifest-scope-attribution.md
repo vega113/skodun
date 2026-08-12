@@ -406,7 +406,7 @@
 - Modify: `README.md`
 - Modify: `docs/superpowers/plans/2026-08-12-s6-1-stack-manifest-scope-attribution.md`
 
-- [ ] **Step 1: Document the shipped flag and boundaries.**
+- [x] **Step 1: Document the shipped flag and boundaries.**
 
   Update the CLI table and MCP review description with `stack_manifest`, the
   strict v1 identity, ordinary full-diff continuation on invalid attribution,
