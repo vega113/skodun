@@ -481,6 +481,13 @@
   Rebase and rerun verification if another shared-seam PR lands first. Merge
   only after the exact current head is green and reviewed.
 
+  Review follow-up before merge: preserve bounded downstream
+  `known_finding_refs` in the persisted attribution, classify Go `_test.go`
+  paths as fixtures/tests, and canonicalize only URI-unreserved repository
+  path escapes while rejecting encoded separators and traversal. Added
+  failing fixtures in `tests/test_stack.py` and `tests/test_gitio.py`; the
+  impacted shipped-path suites pass (`763 passed, 9 skipped`).
+
 - [ ] **Step 5: Verify merged main and close #144.**
 
   Fetch `origin/main`, verify the merge commit is present, run the focused

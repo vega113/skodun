@@ -423,6 +423,7 @@ def test_tubescribes_shaped_stack_validates_and_classifies_exact_owners(tmp_path
         {"file": "src/core.py", "line": 1, "title": "parent"},
         {"file": "src/current.py", "line": 1, "title": "current"},
         {"file": "tests/test_current.py", "line": 1, "title": "fixture"},
+        {"file": "pkg/cache_test.go", "line": 1, "title": "go fixture"},
         {"file": "src/shared.py", "line": 1, "title": "cross-slice"},
         {"file": "src/downstream.py", "line": 1, "title": "downstream"},
         {"file": "src/unknown.py", "line": 1, "title": "unknown"},
@@ -431,12 +432,13 @@ def test_tubescribes_shaped_stack_validates_and_classifies_exact_owners(tmp_path
     attributions = [finding["scope_attribution"] for finding in findings]
     assert [item["scope"] for item in attributions] == [
         "inherited_dependency", "current_slice", "fixture_or_test",
-        "integration", "downstream_owned", "unknown",
+        "fixture_or_test", "integration", "downstream_owned", "unknown",
     ]
     assert attributions[0]["owner_slice_id"] == "pr-10"
     assert attributions[0]["owner_ref"] == f"{REPOSITORY}#10"
     assert attributions[1]["owner_slice_id"] == "pr-14"
-    assert attributions[4]["owner_ref"] == f"{REPOSITORY}#16"
+    assert attributions[5]["owner_ref"] == f"{REPOSITORY}#16"
+    assert attributions[5]["known_finding_refs"] == ["legacy-key-16"]
     assert findings[0]["title"] == "parent"
 
 

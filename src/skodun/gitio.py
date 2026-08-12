@@ -532,6 +532,32 @@ _REMOTE_HOST = re.compile(r"[A-Za-z0-9.-]+")
 _SCP_REMOTE = re.compile(
     r"(?:(?P<user>[^@/:]+)@)?(?P<host>[^/:]+):(?P<path>.+)")
 _FULL_COMMIT_OID = re.compile(r"[0-9a-f]{40}")
+_HEX = frozenset("0123456789abcdefABCDEF")
+_UNRESERVED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
+
+
+def _decode_unreserved_path(value: str) -> str | None:
+    """Decode only URI unreserved escapes; reject reserved/invalid escapes."""
+    chars: list[str] = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char != "%":
+            chars.append(char)
+            index += 1
+            continue
+        if (index + 2 >= len(value)
+                or value[index + 1] not in _HEX
+                or value[index + 2] not in _HEX):
+            return None
+        decoded = chr(int(value[index + 1:index + 3], 16))
+        if decoded not in _UNRESERVED:
+            return None
+        chars.append(decoded)
+        index += 3
+    return "".join(chars)
 
 
 def _portable_remote_identity(remote: str) -> str | None:
@@ -576,6 +602,9 @@ def _portable_remote_identity(remote: str) -> str | None:
     if (_REMOTE_HOST.fullmatch(bare_host) is None
             or bare_host.startswith(".") or bare_host.endswith(".")
             or ".." in bare_host):
+        return None
+    path = _decode_unreserved_path(path)
+    if path is None:
         return None
     if path.endswith(".git"):
         path = path[:-4]

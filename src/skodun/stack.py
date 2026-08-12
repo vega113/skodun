@@ -759,7 +759,10 @@ def _fixture_or_test(path: str) -> bool:
         any(part in {"test", "tests", "fixtures", "__tests__"}
             for part in parts[:-1])
         or name.startswith("test_")
-        or name.endswith(("_test.py", ".test.js", ".test.ts", ".spec.js", ".spec.ts"))
+        or name.endswith((
+            "_test.py", "_test.go", ".test.js", ".test.ts",
+            ".spec.js", ".spec.ts",
+        ))
     )
 
 
@@ -790,13 +793,17 @@ def _attribution(
     *,
     owner_slice_id: str | None = None,
     owner_ref: str | None = None,
+    known_finding_refs: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    return {
+    attribution = {
         "scope": scope,
         "reason_code": reason_code,
         "owner_slice_id": owner_slice_id,
         "owner_ref": owner_ref,
     }
+    if known_finding_refs:
+        attribution["known_finding_refs"] = list(known_finding_refs)
+    return attribution
 
 
 def classify_findings(
@@ -875,6 +882,7 @@ def classify_findings(
                 attribution = _attribution(
                     "downstream_owned", "exact_downstream_scope",
                     owner_ref=downstream_matches[0].tracking_ref,
+                    known_finding_refs=downstream_matches[0].known_finding_refs,
                 )
             elif owner_matches or downstream_matches:
                 attribution = _attribution("unknown", "ambiguous_owner")
