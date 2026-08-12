@@ -1940,20 +1940,30 @@ class Store:
             merged["superseded_by"] = row["superseded_by"]
             merged = _normalize_record(merged, label="finalize_review")
             batch_orchestration_id = merged.get("batch_orchestration_id")
-            incomplete_failure = (
-                batch_orchestration_id is not None
-                and merged.get("status") == "failed"
-                and merged.get("degraded") is True)
             complete_checkpoint = batch_orchestration_id is None
             if batch_orchestration_id is not None:
                 batch_orchestration_id = _require_text(
                     "batch_orchestration_id", batch_orchestration_id)
                 batch_identity_digest = _require_text(
                     "batch_identity_digest", merged.get("batch_identity_digest"))
-                if not incomplete_failure:
+                try:
                     self._require_complete_orchestration(
                         batch_orchestration_id, batch_identity_digest)
                     complete_checkpoint = True
+                except ValueError as exc:
+                    # A pre-push worker may persist an untrustworthy degraded
+                    # record while its batch set is incomplete, preserving the
+                    # partial evidence for diagnosis.  A fully completed set,
+                    # including a degraded/failed provider result, is a real
+                    # terminal orchestration and must be consumed so retries
+                    # do not replay paid calls forever.  Do not hide identity,
+                    # state, or missing-orchestration errors behind this
+                    # background-failure exception.
+                    if not (merged.get("status") == "failed"
+                            and merged.get("degraded") is True
+                            and str(exc) ==
+                            "batch orchestration has incomplete checkpoints"):
+                        raise
             cur = self._c.execute(
                 _FINALIZE_REVIEW, _review_values(merged) + (record_id,))
             applied = cur.rowcount == 1

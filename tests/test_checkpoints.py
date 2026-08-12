@@ -147,6 +147,14 @@ def test_checkpoint_payload_refuses_unknown_or_sensitive_fields():
             provenance={"PATH": "/usr/bin:/secret"}))
 
 
+@pytest.mark.parametrize("field", ["path", "command"])
+def test_checkpoint_payload_allows_valid_finding_metadata(field):
+    finding = {**_payload()["findings"][0], field: "/src/app.py"}
+    payload = checkpoints.CheckpointPayload.from_mapping(
+        _payload(findings=[finding]))
+    assert payload.as_dict()["findings"][0][field] == "/src/app.py"
+
+
 def test_checkpoint_payload_reuses_strict_finding_and_attempt_shapes():
     with pytest.raises(ValueError, match="findings"):
         checkpoints.CheckpointPayload.from_mapping(_payload(
@@ -424,6 +432,25 @@ def test_incomplete_degraded_prepush_finalization_is_untrustworthy(
         assert store.finalize_review(reservation.record_id, rec) is True
         saved = store.get_review(reservation.record_id)
     assert saved["trustworthy"] is False
+
+
+def test_complete_degraded_prepush_finalization_consumes_checkpoints(tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store)
+        _complete_all(store)
+        reservation = store.reserve_prepush(
+            "feature", "h" * 40, "origin/main", "b" * 40, "d" * 40,
+            100, {}, repo="repo-1", now=NOW)
+        rec = store.get_review(reservation.record_id)
+        rec.update(status="failed", degraded=True,
+                   degraded_reason="provider returned degraded output",
+                   failure_reason="provider returned degraded output",
+                   batch_orchestration_id="orch-1",
+                   batch_identity_digest=_identity().digest())
+        assert store.finalize_review(reservation.record_id, rec) is True
+        orchestration = store.get_orchestration("orch-1")
+    assert orchestration["state"] == "consumed"
+    assert orchestration["final_review_id"] == reservation.record_id
 
 
 def test_final_review_and_checkpoint_consumption_commit_together(tmp_path):

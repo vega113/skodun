@@ -37,6 +37,10 @@ _FORBIDDEN_FIELDS = frozenset({
     "path", "path_value", "path_values", "executable_path", "argv", "command",
     "binary",
 })
+_FINDING_FIELD_EXCEPTIONS = frozenset({
+    "path", "path_value", "path_values", "executable_path", "argv",
+    "command", "binary",
+})
 
 
 def canonical_digest(value: Any) -> str:
@@ -183,19 +187,22 @@ def first_mismatch(left: OrchestrationIdentity,
     return None
 
 
-def _scan_json(value: Any, *, label: str) -> None:
+def _scan_json(value: Any, *, label: str,
+               forbidden_fields: frozenset[str] = _FORBIDDEN_FIELDS) -> None:
     """Refuse secret/transcript-shaped fields and non-JSON/unbounded strings."""
     if isinstance(value, Mapping):
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError(f"{label} contains a non-string object key")
-            if key.casefold() in _FORBIDDEN_FIELDS:
+            if key.casefold() in forbidden_fields:
                 raise ValueError(f"{label} contains forbidden field {key!r}")
-            _scan_json(item, label=f"{label}.{key}")
+            _scan_json(item, label=f"{label}.{key}",
+                       forbidden_fields=forbidden_fields)
         return
     if isinstance(value, list):
         for index, item in enumerate(value):
-            _scan_json(item, label=f"{label}[{index}]")
+            _scan_json(item, label=f"{label}[{index}]",
+                       forbidden_fields=forbidden_fields)
         return
     if isinstance(value, str):
         if len(value) > MAX_TEXT_CHARS:
@@ -312,7 +319,17 @@ class CheckpointPayload:
             raise ValueError("checkpoint payload provenance must be an object")
         if raw["accepted"] is not None and not isinstance(raw["accepted"], Mapping):
             raise ValueError("checkpoint payload accepted must be an object or null")
-        _scan_json(raw, label="checkpoint payload")
+        # Finding records are provider-defined review metadata.  Their
+        # established ``path``/``command`` fields are valid and already part
+        # of the final review artifact; keep the sensitive-field door strict
+        # for provenance, attempts, and every other checkpoint field.
+        finding_forbidden = frozenset(
+            _FORBIDDEN_FIELDS - _FINDING_FIELD_EXCEPTIONS)
+        for name, value in raw.items():
+            _scan_json(
+                value, label=f"checkpoint payload.{name}",
+                forbidden_fields=(finding_forbidden
+                                  if name == "findings" else _FORBIDDEN_FIELDS))
         try:
             text = json.dumps(raw, ensure_ascii=False, sort_keys=True,
                               separators=(",", ":"), allow_nan=False)
