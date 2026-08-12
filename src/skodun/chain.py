@@ -29,6 +29,7 @@ import os
 import shutil
 import threading
 import time
+import contextvars
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -48,6 +49,32 @@ _DEFAULT_PROVIDER_WAIT_SEC = 30.0
 _SPAWN_UNAVAILABLE_ERRNOS = frozenset({
     errno.ENOENT, errno.EACCES, errno.EPERM, errno.ENOEXEC,
 })
+_CURRENT_EXECUTION = contextvars.ContextVar(
+    "skodun_attempt_execution", default=None)
+
+
+def _execution_provenance(adapter, provider: str, binary: str) -> dict:
+    """Resolve bounded executable identity without recording environment."""
+    resolved = None
+    if runner._is_path_shaped(binary):
+        if os.path.isabs(binary):
+            resolved = os.path.realpath(binary)
+    else:
+        resolved = shutil.which(binary)
+    version = None
+    # Provider version probes can themselves invoke the CLI and consume a
+    # model-wrapper process. Review telemetry therefore records the resolved
+    # executable without adding an unrequested provider call; doctor/providers
+    # remain the explicit version/build-probe surface.
+    override = {
+        "xai": "SKODUN_GROK_BIN", "openai": "SKODUN_CODEX_BIN",
+        "google": "SKODUN_AGY_BIN", "junie": "SKODUN_JUNIE_BIN",
+    }.get(provider)
+    source = (f"env:{override}" if override and override in os.environ
+              else "provider-default")
+    return {"adapter": getattr(adapter, "name", None),
+            "resolved": resolved, "version": version,
+            "override_source": source}
 
 
 @dataclass
@@ -117,6 +144,11 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
         row["skipped"] = skipped
     if usage is not None:
         row["usage"] = usage
+    execution = _CURRENT_EXECUTION.get()
+    # A skipped row means no process was started, so executable identity would
+    # be misleading even if the adapter was resolved before the skip.
+    if execution is not None and skipped is None:
+        row["execution_provenance"] = dict(execution)
     return row
 
 
@@ -456,6 +488,7 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
     still get one wall-clock bound that is **not** reset per hop.
     """
     from .pipeline import _chain_for, _note
+    _CURRENT_EXECUTION.set(None)
     chain = _chain_for(cfg, head)
     attempts: list[dict] = []
     exhausted: list[str] = []
@@ -470,6 +503,9 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
             + capacity.admission_wait_from_env(_DEFAULT_PROVIDER_WAIT_SEC))
 
     for i, entry in enumerate(chain):
+        # Do not let a skipped fallback inherit the prior entry's executable
+        # identity. A cache/admission refusal started no process.
+        _CURRENT_EXECUTION.set(None)
         if runner._cancelled(cancel):
             # The ENTRY boundary. Nothing has spawned for this entry yet, so
             # there is no group to take down -- `run_with_watchdog` owns that
@@ -491,6 +527,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
             continue
 
         binary = adapter.resolve_binary()
+        _CURRENT_EXECUTION.set(
+            _execution_provenance(adapter, entry.provider, binary))
         if _binary_is_absent(binary):
             n += 1
             verdict = adapter.classify(UNAVAILABLE_RC, b"", b"", contract)

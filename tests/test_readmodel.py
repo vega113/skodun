@@ -59,3 +59,21 @@ def test_no_output_failure_is_none_not_clean():
     p = project_review(_record(status="failed", trustworthy=False))
     assert p.coverage_state == "none"
     assert p.gate_eligible is False
+
+
+def test_malformed_prompt_bytes_are_ignored_and_plan_digest_wins():
+    rec = _record(
+        status="clean", trustworthy=True, usable_output=True,
+        batch_plan={"planner_version": "plan-v1", "boundary_digest": "plan"},
+        batches=[
+            {"parse_ok": True, "telemetry": {"bytes": {"prompt": 12},
+                                                 "boundary_digest": "slice"}},
+            {"parse_ok": True, "telemetry": {"bytes": {"prompt": "bad"}}},
+            {"parse_ok": True, "telemetry": {"bytes": {"prompt": True}}},
+            {"parse_ok": True, "telemetry": {"bytes": {"prompt": -1}}},
+            {"parse_ok": True, "telemetry": {"bytes": "bad"}},
+        ])
+    p = project_review(rec)
+    assert p.prompt_bytes == 12
+    assert p.planner_version == "plan-v1"
+    assert p.boundary_digest == "plan"

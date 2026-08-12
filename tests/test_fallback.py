@@ -615,7 +615,13 @@ _ATTEMPT_KEYS = {"n", "provider", "model", "effort", "rc", "timed_out",
 
 def _assert_attempt_schema(row: dict) -> None:
     assert _ATTEMPT_KEYS <= set(row), sorted(_ATTEMPT_KEYS - set(row))
-    assert set(row) <= _ATTEMPT_KEYS | {"skipped"}, sorted(set(row) - _ATTEMPT_KEYS)
+    assert set(row) <= (_ATTEMPT_KEYS | {"skipped", "execution_provenance"}), \
+        sorted(set(row) - _ATTEMPT_KEYS)
+    if "execution_provenance" in row:
+        assert isinstance(row["execution_provenance"], dict)
+        assert set(row["execution_provenance"]) <= {
+            "adapter", "resolved", "version", "override_source",
+        }
 
 
 def test_every_attempt_row_carries_the_complete_schema(tmp_path, monkeypatch,

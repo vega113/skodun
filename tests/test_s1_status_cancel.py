@@ -141,6 +141,35 @@ def test_svc_review_status_by_id_and_current_for_repo(tmp_path):
         assert "state=findings" in text
 
 
+def test_svc_review_status_json_exposes_batched_telemetry_projection(tmp_path):
+    rec = _artifact([], id="sk_batch", status="clean", trustworthy=True,
+                    usable_output=True, findings_total=0,
+                    batches=[
+                        {"parse_ok": True, "telemetry":
+                         {"bytes": {"prompt": 7}}},
+                        {"parse_ok": True, "telemetry":
+                         {"bytes": {"prompt": 9}}}],
+                    batch_plan={"planner_version": "plan-v1",
+                                "boundary_digest": "d" * 8},
+                    batch_count=2)
+    db = _db_with(tmp_path, rec)
+    with Store.open(db) as st:
+        code, payload = services.svc_review_status(
+            st, review_id="sk_batch", output="json")
+        code_text, text = services.svc_review_status(st, review_id="sk_batch")
+    assert code == 0
+    import json
+    coverage = json.loads(payload)["coverage"]
+    assert coverage["batch_count"] == 2
+    assert coverage["prompt_bytes"] == 16
+    assert coverage["planner_version"] == "plan-v1"
+    assert coverage["boundary_digest"] == "d" * 8
+    assert code_text == 0
+    assert "batch_count=2" in text
+    assert "failed_passes=0" in text
+    assert "boundary_digest=" + ("d" * 8) in text
+
+
 def test_svc_review_status_missing_id_refuses(tmp_path):
     db = _db_with(tmp_path)
     with Store.open(db) as st:

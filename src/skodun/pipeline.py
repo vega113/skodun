@@ -167,7 +167,7 @@ from pathlib import Path
 
 from . import (batching, budget, capacity, chain, checklist, checkpoints,
                contextpack, gitio, ids, passes, promptbuild, provenance, reuse,
-               routing, runner)
+               routing, runner, telemetry)
 from .adapters import NORMAL_STOP_REASONS, REFUTER_CONTRACT, get_adapter
 from .config import Config, Defaults, Reviewer, quota_pool_for
 from .store import Store, _TS_FORMAT
@@ -2675,6 +2675,16 @@ def _batch_budget(d: Defaults, reviewer: Reviewer | None = None) -> int:
     return max(1, envelope)
 
 
+def _effective_batch_budget(d: Defaults,
+                            reviewer: Reviewer | None = None) -> int:
+    """Return the provider ceiling narrowed by an optional batch hint."""
+    budget = _batch_budget(d, reviewer)
+    target = d.batch_target_bytes
+    if target > 0:
+        return min(budget, target)
+    return budget
+
+
 def batch_plan(diff: bytes, d: Defaults,
                reviewer: Reviewer | None = None) -> list[batching.Batch] | None:
     """The batch plan for `diff`, or None when it fits one prompt.
@@ -2691,9 +2701,12 @@ def batch_plan(diff: bytes, d: Defaults,
     no batches only for empty input, and an empty batch would send an empty
     prompt and risk minting a clean verdict for a diff nothing looked at.
     """
-    if len(diff) <= budget.prompt_budget(d, reviewer):
+    threshold = budget.prompt_budget(d, reviewer)
+    if d.batch_target_bytes > 0:
+        threshold = min(threshold, d.batch_target_bytes)
+    if len(diff) <= threshold:
         return None
-    return batching.split(diff, _batch_budget(d, reviewer))
+    return batching.split(diff, _effective_batch_budget(d, reviewer))
 
 
 def _estimate_batch_count(repo: Path, d: Defaults,
@@ -2924,8 +2937,18 @@ def _checkpointed_sub(
             f"{label} is already in flight under another exact resumer; "
             "no duplicate provider call was launched")
     try:
+        started = time.monotonic()
         sub = _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
                        label, cancel=cancel)
+        sub = replace(sub, provenance={
+            **sub.provenance,
+            # Empty synthetic sub-results have no process or admission work;
+            # preserve unknown rather than manufacturing a timing value that
+            # would make checkpoint reuse differ from a fresh deterministic run.
+            "wall_duration_sec": (
+                round(max(0.0, time.monotonic() - started), 3)
+                if sub.attempts else None),
+        })
         payload = checkpoints.payload_from_sub(sub)
         applied = store.complete_checkpoint(
             checkpoint_run.orchestration_id, pass_identity.kind,
@@ -3201,7 +3224,7 @@ def _orchestration_identity(
         config_hash=config_hash,
         policy_hash=reuse.security_policy_identity(cfg),
         planner_version=checkpoints.PLANNER_VERSION,
-        batch_budget=_batch_budget(d, finder),
+        batch_budget=_effective_batch_budget(d, finder),
         batch_count=len(prepared.batches),
         boundary_digest=prepared.boundary_digest,
         integration_plan_digest=prepared.integration_plan_digest,
@@ -3361,13 +3384,19 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             _note(f"batch {index}/{count} is {len(batch.data)} bytes "
                   f"(> {mdb}); its prompt is truncated and this "
                   f"review cannot be trustworthy")
+        effective_d = _escalated(d, prompt.prompt_bytes, large_prompt)
         sub = _checkpointed_sub(
             checkpoint_run, prepared.identity, reviewer=finder, cfg=cfg,
-            d=_escalated(d, prompt.prompt_bytes, large_prompt), prompt=prompt,
+            d=effective_d, prompt=prompt,
             root=root, store=store, scratch=scratch, tag=f"{tag}.b{index}",
             label=f"batch {index}", cancel=cancel)
+        run_duration_sec = round(sum(
+            float(a.get("duration_sec") or 0.0)
+            for a in sub.attempts if isinstance(a, dict)
+            and isinstance(a.get("duration_sec"), (int, float))), 3)
         subs.append(sub)
         findings.extend(sub.findings)
+        checklist_meta = passes.checklist_meta(mode, selection)
         metas.append({
             # Provenance FIRST so the explicit fields below always win: which
             # provider answered is `_provenance`'s vocabulary to widen, and a new
@@ -3389,8 +3418,20 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             "findings_total": len(sub.findings),
             "failure_reason": sub.failure_reason,
             "prompt_bytes": prompt.prompt_bytes,
-            "checklist": passes.checklist_meta(mode, selection),
+            "checklist": checklist_meta,
             "attempts": sub.attempts,
+            "telemetry": telemetry.batch_telemetry(
+                planner_version=checkpoints.PLANNER_VERSION,
+                batch_budget=_effective_batch_budget(d, finder),
+                boundary_digest=prepared.identity.boundary_hash,
+                batch_index=index, batch_count=count,
+                diff_bytes=len(batch.data),
+                context_bytes=(pack.bytes_total if pack is not None else 0),
+                checklist_bytes=int(checklist_meta.get("bytes_total") or 0),
+                prompt_bytes=prompt.prompt_bytes,
+                attempts=sub.attempts, timeout_sec=effective_d.timeout_sec,
+                run_duration_sec=run_duration_sec,
+                wall_duration_sec=sub.provenance.get("wall_duration_sec")),
         })
 
     # --- the cross-file pass over the seams the split just cut --------------
@@ -3430,6 +3471,14 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 "failed", ran=False, checklist=meta_checklist, note=reason,
                 stop_reason=integration_sub.stop_reason,
                 provenance=integration_sub.provenance)
+            integration["telemetry"] = telemetry.batch_telemetry(
+                planner_version=checkpoints.PLANNER_VERSION,
+                batch_budget=_effective_batch_budget(d, finder),
+                boundary_digest=prepared_plan.integration_plan_digest,
+                batch_index=0, batch_count=count,
+                diff_bytes=len(diff.data), context_bytes=0,
+                checklist_bytes=int(meta_checklist.get("bytes_total") or 0),
+                prompt_bytes=0, attempts=(), timeout_sec=d.timeout_sec)
         else:
             prompt_bytes += prompt.prompt_bytes
             if prompt.diff_truncated:
@@ -3444,13 +3493,17 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 }),
                 diff_hash=gitio.diff_identity(diff.data),
                 boundary_hash=prepared_plan.integration_plan_digest)
+            effective_d = _escalated(d, prompt.prompt_bytes, large_prompt)
             integration_sub = _checkpointed_sub(
                 checkpoint_run, integration_identity, reviewer=reviewer,
-                cfg=cfg, d=_escalated(
-                    d, prompt.prompt_bytes, large_prompt), prompt=prompt,
+                cfg=cfg, d=effective_d, prompt=prompt,
                 root=root, store=store, scratch=scratch,
                 tag=passes.INTEGRATION_PASS, label="the integration pass",
                 cancel=cancel)
+            run_duration_sec = round(sum(
+                float(a.get("duration_sec") or 0.0)
+                for a in integration_sub.attempts if isinstance(a, dict)
+                and isinstance(a.get("duration_sec"), (int, float))), 3)
             # Tagged BEFORE they are merged: nothing downstream can tell a
             # cross-file finding from a within-batch one afterwards.
             tagged = passes.tag_integration_findings(integration_sub.findings)
@@ -3467,6 +3520,19 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 provenance=integration_sub.provenance,
                 checklist=meta_checklist,
                 note=integration_sub.failure_reason)
+            integration["telemetry"] = telemetry.batch_telemetry(
+                planner_version=checkpoints.PLANNER_VERSION,
+                batch_budget=_effective_batch_budget(d, finder),
+                boundary_digest=prepared_plan.integration_plan_digest,
+                batch_index=0, batch_count=count,
+                diff_bytes=len(diff.data), context_bytes=0,
+                checklist_bytes=int(meta_checklist.get("bytes_total") or 0),
+                prompt_bytes=prompt.prompt_bytes,
+                attempts=integration_sub.attempts,
+                timeout_sec=effective_d.timeout_sec,
+                run_duration_sec=run_duration_sec,
+                wall_duration_sec=integration_sub.provenance.get(
+                    "wall_duration_sec"))
 
     # --- aggregate ---------------------------------------------------------
     # ORACLE (`grok-prepush-review.sh:3703-3820`): parse_ok is ALL, degraded and
@@ -3503,6 +3569,13 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
     out.update(
         batched=True,
         batch_count=count,
+        batch_plan={
+            "planner_version": checkpoints.PLANNER_VERSION,
+            "batch_budget": _effective_batch_budget(d, finder),
+            "batch_count": count,
+            "boundary_digest": prepared_plan.boundary_digest,
+            "integration_plan_digest": prepared_plan.integration_plan_digest,
+        },
         batches=metas,
         parse_ok=parse_ok,
         degraded=degraded,

@@ -117,6 +117,13 @@ def _context_hash(root: Path, diff, cfg, reviewer):
     return value if isinstance(value, str) and value.strip() else ""
 
 
+def _batch_threshold(defaults, reviewer) -> int:
+    """Mirror the pipeline's target-aware threshold for trusted reuse."""
+    envelope = budget.prompt_budget(defaults, reviewer)
+    target = defaults.batch_target_bytes
+    return min(envelope, target) if target > 0 else envelope
+
+
 def _identity_for(repo: Path, cfg, base, diff, *, branch: str,
                   reviewer_name: str | None, candidate: dict | None = None):
     root = gitio._worktree_root(repo)
@@ -127,7 +134,7 @@ def _identity_for(repo: Path, cfg, base, diff, *, branch: str,
     routed = (candidate or {}).get("routed_reviewer")
     reviewer = _reviewer_by_name(cfg, routed) or _reviewer_by_name(
         cfg, reviewer_name)
-    if reviewer is not None and len(diff.data) > budget.prompt_budget(
+    if reviewer is not None and len(diff.data) > _batch_threshold(
             cfg.defaults, reviewer):
         context_hash, checklist_hash = _batched_identities(
             root, diff, cfg, reviewer)
@@ -153,6 +160,8 @@ def _batched_identities(root: Path, diff, cfg, reviewer):
     defaults = cfg.defaults
     envelope = budget.prompt_budget(defaults, reviewer)
     batch_budget = envelope // 2 if defaults.context_pack else envelope
+    if defaults.batch_target_bytes > 0:
+        batch_budget = min(batch_budget, defaults.batch_target_bytes)
     batches = batching.split(diff.data, max(1, batch_budget))
     mode = passes.batch_checklist_mode(len(batches))
     sole = len(batches) == 1

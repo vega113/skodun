@@ -1,3 +1,10 @@
+"""Configuration loading and validation for the fail-closed review pipeline.
+
+The frozen defaults model is part of review identity: invalid values are
+rejected at the configuration door and positive batch targets may only narrow
+the provider-derived planner budget.
+"""
+
 from __future__ import annotations
 import math, os, tomllib
 from dataclasses import dataclass, fields
@@ -70,6 +77,9 @@ class Defaults:
     checklist_dir: str = "docs/review/checklists"
     rules_json: str = "docs/review/code-rules.json"
     untracked_max: int = 100
+    # Optional per-review diff target. Zero preserves the provider-derived
+    # planner; a positive value can only split a complete diff more finely.
+    batch_target_bytes: int = 0
 
     # --- Repo-layout tables (configuration, never code literals) ------------
     # skodun ships generic defaults so committed code carries no project's
@@ -202,6 +212,7 @@ _DEFAULTS_MINIMUMS = {
     "timeout_retries": 0,
     "degraded_retries": 0,
     "untracked_max": 0,
+    "batch_target_bytes": 0,
 }
 
 # key -> normalizer. Values arrive from TOML as lists; Defaults is frozen and

@@ -703,7 +703,7 @@ def test_the_review_tool_takes_a_reviewer_by_name_in_its_schema():
     props = spec.input_schema["properties"]
     assert set(props) == {"repo", "reviewer", "client_family", "recover",
                           "max_attempts", "max_wall_seconds",
-                          "reuse_trusted", "fresh"}
+                          "reuse_trusted", "fresh", "batch_target_bytes"}
     assert props["reviewer"]["type"] == "string"
     assert props["reviewer"]["description"]
     assert spec.input_schema["required"] == []
