@@ -32,7 +32,9 @@ import json
 import hashlib
 import os
 import re
+import shutil
 import sqlite3
+import tempfile
 import time
 from urllib.parse import quote
 from collections.abc import Mapping
@@ -128,13 +130,18 @@ def inspect_schema(path: Path) -> SchemaInfo:
     if not path.is_file():
         return SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
                           reason_code="not_a_file")
+    snapshot = None
+    db_path = path
     wal = Path(str(path) + "-wal")
     shm = Path(str(path) + "-shm")
-    if wal.exists() and not shm.exists():
-        return SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
-                          reason_code="wal_sidecar_incomplete",
-                          detail="WAL exists without its shared-memory sidecar")
-    uri = f"file:{quote(str(path.resolve()))}?mode=ro"
+    if wal.exists():
+        snapshot = tempfile.TemporaryDirectory(prefix="skodun-inspect-")
+        db_path = Path(snapshot.name) / path.name
+        shutil.copyfile(path, db_path)
+        shutil.copyfile(wal, Path(str(db_path) + "-wal"))
+        if shm.exists():
+            shutil.copyfile(shm, Path(str(db_path) + "-shm"))
+    uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
     conn = None
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=0)
@@ -148,6 +155,8 @@ def inspect_schema(path: Path) -> SchemaInfo:
     finally:
         if conn is not None:
             conn.close()
+        if snapshot is not None:
+            snapshot.cleanup()
 
 
 def _pid_alive(pid: int) -> bool:
@@ -207,7 +216,18 @@ def migration_blockers(path: Path) -> tuple[str, ...]:
     info = inspect_schema(path)
     if info.state not in ("older", "current"):
         return ()
-    uri = f"file:{quote(str(Path(path).resolve()))}?mode=ro"
+    snapshot = None
+    db_path = Path(path)
+    wal = Path(str(db_path) + "-wal")
+    if wal.exists():
+        snapshot = tempfile.TemporaryDirectory(prefix="skodun-blockers-")
+        db_path = Path(snapshot.name) / db_path.name
+        shutil.copyfile(path, db_path)
+        shutil.copyfile(wal, Path(str(db_path) + "-wal"))
+        shm = Path(str(path) + "-shm")
+        if shm.exists():
+            shutil.copyfile(shm, Path(str(db_path) + "-shm"))
+    uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=0)
     try:
         tables = {row[0] for row in conn.execute(
@@ -234,6 +254,8 @@ def migration_blockers(path: Path) -> tuple[str, ...]:
         return tuple(blockers)
     finally:
         conn.close()
+        if snapshot is not None:
+            snapshot.cleanup()
 
 #: Set to anything other than "0", unset, or blank to ignore `provider_state`
 #: entirely.
