@@ -802,7 +802,8 @@ def _fixture_or_test(path: str) -> bool:
         or name.startswith("test_")
         or name.endswith((
             "_test.py", "_test.go", ".test.js", ".test.ts",
-            ".spec.js", ".spec.ts",
+            ".test.jsx", ".test.tsx", ".spec.js", ".spec.ts",
+            ".spec.jsx", ".spec.tsx",
         ))
     )
 
