@@ -547,7 +547,8 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         status, text = _svc_review_once(
             store, repo, progress_sink=progress_sink, cancel=cancel,
             reviewer=reviewer, client_family=client_family,
-            resume_checkpoints=not fresh)
+            resume_checkpoints=(not fresh and reviewer is None
+                                and client_family is None))
         if reuse_note:
             text = f"{reuse_note}\n{text}"
         return status, text, reuse_metadata

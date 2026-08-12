@@ -166,6 +166,23 @@ def test_fresh_controls_incomplete_checkpoint_resume_at_shared_service(
     assert seen == [expected_resume]
 
 
+@pytest.mark.parametrize("intent", ["reviewer", "client_family"])
+def test_explicit_review_intent_bypasses_incomplete_checkpoint_resume(
+        tmp_path, monkeypatch, intent):
+    monkeypatch.setattr(
+        services, "_try_reuse",
+        lambda *args, **kwargs: (None, None, {}))
+    seen = []
+    monkeypatch.setattr(
+        services, "_svc_review_once",
+        lambda *args, **kwargs: seen.append(kwargs["resume_checkpoints"])
+        or (0, "clean"))
+    kwargs = {intent: "named"}
+    with Store.open(tmp_path / f"intent-{intent}.db") as store:
+        services.svc_review_detailed(store, tmp_path, **kwargs)
+    assert seen == [False]
+
+
 def test_opt_in_reuse_honors_cancellation_before_and_during_a_probe(
         tmp_path, monkeypatch):
     cancel = threading.Event()
