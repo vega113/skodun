@@ -486,6 +486,25 @@ class StackValidation:
     dependencies: tuple[SliceEvidence, ...] = ()
     current_slice: SliceEvidence | None = None
 
+    def to_dict(self) -> dict[str, Any]:
+        """Bounded artifact/service projection; never the raw manifest."""
+        manifest = self.manifest
+        return {
+            "schema_version": None if manifest is None else manifest.schema_version,
+            "status": self.status,
+            "reason_code": self.reason_code,
+            "repository_id": None if manifest is None else manifest.repository_id,
+            "manifest_digest": (
+                None if manifest is None else manifest.manifest_digest),
+            "current_slice_id": (
+                None if manifest is None else manifest.current_slice.slice_id),
+            "direct_parent": None if manifest is None else manifest.direct_parent,
+            "dependency_count": (
+                0 if manifest is None else len(manifest.dependencies)),
+            "downstream_owner_count": (
+                0 if manifest is None else len(manifest.downstream_owners)),
+        }
+
 
 def _ignored(request: StackRequest, reason_code: str) -> StackValidation:
     return StackValidation(
@@ -627,8 +646,12 @@ def validate(
             return _ignored(request, "missing_commit")
         if object_type != "commit":
             return _ignored(request, "not_commit")
-    for older, newer in zip(chain, chain[1:]):
-        if older == newer or not gitio.is_ancestor(Path(repo), older, newer):
+    for edge, (older, newer) in enumerate(zip(chain, chain[1:])):
+        dirty_only_identity = (
+            not manifest.dependencies and edge == 0 and older == newer)
+        if (not dirty_only_identity
+                and (older == newer
+                     or not gitio.is_ancestor(Path(repo), older, newer))):
             return _ignored(request, "dependency_reordered")
 
     try:

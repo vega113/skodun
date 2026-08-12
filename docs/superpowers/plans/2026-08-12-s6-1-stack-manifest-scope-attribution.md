@@ -257,7 +257,7 @@
 - Modify: `src/skodun/pipeline.py`
 - Modify: `tests/test_pipeline.py`
 
-- [ ] **Step 1: Write failing full-pipeline tests.**
+- [x] **Step 1: Write failing full-pipeline tests.**
 
   Extend the shipped foreground fixture to call:
 
@@ -276,7 +276,7 @@
   ordinary full record with `stack.status == "ignored"` and unknown
   attribution.
 
-- [ ] **Step 2: Run the focused test and confirm RED.**
+- [x] **Step 2: Run the focused test and confirm RED.**
 
   ```bash
   python3 -m pytest tests/test_pipeline.py -q --tb=short
@@ -285,7 +285,7 @@
   Expected failure: `run_review` does not accept `stack_request` and records
   carry no stack projection.
 
-- [ ] **Step 3: Thread stack validation through the authoritative capture.**
+- [x] **Step 3: Thread stack validation through the authoritative capture.**
 
   Add the keyword-only parameter:
 
@@ -299,7 +299,7 @@
   trust/status persistence, call `stack.classify_findings`. Do not change
   prompt bytes, model calls, trust computation, or empty-diff behavior.
 
-- [ ] **Step 4: Pin protected seams.**
+- [x] **Step 4: Pin protected seams.**
 
   Keep the existing SHA-256 expectations in `tests/test_seams.py` unchanged.
   Add pipeline assertions that no stack field participates in trust-axis
@@ -309,7 +309,7 @@
   python3 -m pytest tests/test_pipeline.py tests/test_seams.py tests/test_gate.py tests/test_trust.py -q --tb=short
   ```
 
-- [ ] **Step 5: Commit the pipeline integration.**
+- [x] **Step 5: Commit the pipeline integration.**
 
   ```bash
   git diff --check

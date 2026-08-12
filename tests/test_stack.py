@@ -494,6 +494,31 @@ def test_current_dirty_content_is_validated_from_the_frozen_worktree(tmp_path):
     assert finding["scope_attribution"]["scope"] == "current_slice"
 
 
+def test_dirty_only_stack_allows_certification_base_to_equal_head(tmp_path):
+    repo = tmp_path / "dirty-only"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "stack@example.com")
+    _git(repo, "config", "user.name", "Stack Test")
+    _git(repo, "remote", "add", "origin", "https://github.com/acme/project.git")
+    head = _commit(repo, "a.txt", "one\n", "base")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    state = {"repo": repo, "base": head, "head": head}
+    document = _manifest()
+    document["certification_base"] = head
+    document["current_head"] = head
+    document["current_slice"]["commit"] = head
+    document["current_slice"]["ownership"] = [_scope("a.txt")]
+
+    _state, _request, _full_diff, result = _validation(
+        tmp_path, state=state, document=document)
+
+    assert result.status == "valid"
+    finding = stack.classify_findings(
+        [{"file": "a.txt", "line": 1}], result)[0]
+    assert finding["scope_attribution"]["scope"] == "current_slice"
+
+
 def test_tree_movement_during_stack_capture_disables_attribution(
         tmp_path, monkeypatch):
     state = _stack_repo(tmp_path)
