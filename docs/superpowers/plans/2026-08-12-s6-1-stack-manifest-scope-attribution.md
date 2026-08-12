@@ -39,7 +39,7 @@
 - Create: `tests/test_stack.py`
 - Modify: `tests/test_gitio.py`
 
-- [ ] **Step 1: Write failing canonical-origin tests.**
+- [x] **Step 1: Write failing canonical-origin tests.**
 
   Add tests that create a repository with each accepted `origin` URL and assert:
 
@@ -59,7 +59,7 @@
   Cover missing origin, local paths, URL passwords/query/fragment, control
   characters, and `..` path segments returning `None`, never a guessed name.
 
-- [ ] **Step 2: Run the tests and confirm RED.**
+- [x] **Step 2: Run the tests and confirm RED.**
 
   Run:
 
@@ -70,7 +70,7 @@
   Expected failure: `AttributeError` for the missing
   `canonical_repository_identity` helper.
 
-- [ ] **Step 3: Add narrow Git helpers.**
+- [x] **Step 3: Add narrow Git helpers.**
 
   Add public `canonical_repository_identity(repo: Path) -> str | None`,
   `exact_commit_exists(repo: Path, oid: str) -> bool`, and
@@ -81,7 +81,7 @@
   `cat-file -e <oid>^{commit}`, and `merge-base --is-ancestor`; manifest text is
   never accepted as arbitrary revspec syntax.
 
-- [ ] **Step 4: Write failing parser/digest/file-safety tests.**
+- [x] **Step 4: Write failing parser/digest/file-safety tests.**
 
   Define a `_manifest()` fixture that includes every v1 field and a helper that
   recomputes `manifest_digest`. Test successful parsing plus duplicate keys,
@@ -103,7 +103,7 @@
   Invalid input returns a frozen `StackRequest` with a stable `StackProblem`;
   it does not raise raw JSON/OSError text to the caller.
 
-- [ ] **Step 5: Run the parser tests and confirm RED.**
+- [x] **Step 5: Run the parser tests and confirm RED.**
 
   Run:
 
@@ -113,7 +113,7 @@
 
   Expected failure: import error for the absent `skodun.stack` module.
 
-- [ ] **Step 6: Implement minimal strict dataclasses and parser.**
+- [x] **Step 6: Implement minimal strict dataclasses and parser.**
 
   Use frozen dataclasses with explicit fields:
 
@@ -146,7 +146,7 @@
   `fstat`, single-link regular-file checks, size cap, and a post-read metadata
   check.
 
-- [ ] **Step 7: Run focused tests and commit.**
+- [x] **Step 7: Run focused tests and commit.**
 
   Run:
 

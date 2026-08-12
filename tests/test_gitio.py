@@ -22,13 +22,16 @@ from skodun.gitio import (
     blob_bytes,
     blob_sha1,
     blob_size,
+    canonical_repository_identity,
     capture_diff,
     capture_ref_diff,
     current_branch,
     diff_identity,
+    exact_commit_exists,
     git_common_dir,
     head_sha,
     is_primary_checkout,
+    is_ancestor,
     tree_fingerprint,
     resolve_base,
     resolve_ref_base,
@@ -919,6 +922,71 @@ def test_git_common_dir_shared_between_worktrees(tmp_path):
     _git(repo, "worktree", "add", str(wt), "-b", "w1")
     assert git_common_dir(repo) == git_common_dir(wt)
     assert git_common_dir(repo) == (repo / ".git").resolve()
+
+
+@pytest.mark.parametrize(("url", "expected"), [
+    ("https://github.com/Acme/Project.git", "github.com/Acme/Project"),
+    ("git@github.com:Acme/Project.git", "github.com/Acme/Project"),
+    ("ssh://git@github.com/Acme/Project.git", "github.com/Acme/Project"),
+])
+def test_canonical_repository_identity_normalizes_supported_remotes(
+        tmp_path, url, expected):
+    repo = _mkrepo(tmp_path)
+    _git(repo, "remote", "add", "origin", url)
+
+    assert canonical_repository_identity(repo) == expected
+
+
+@pytest.mark.parametrize("url", [
+    "/tmp/project.git",
+    "file:///tmp/project.git",
+    "https://user:secret@example.com/acme/project.git",
+    "https://example.com/acme/../project.git",
+    "https://example.com/acme/project.git?token=secret",
+    "https://example.com/acme/project.git#fragment",
+    "https://example.com/acme/control\x01project.git",
+])
+def test_canonical_repository_identity_refuses_unportable_or_unsafe_remotes(
+        tmp_path, url):
+    repo = _mkrepo(tmp_path)
+    _git(repo, "remote", "add", "origin", url)
+
+    assert canonical_repository_identity(repo) is None
+
+
+def test_canonical_repository_identity_never_guesses_without_origin(tmp_path):
+    repo = _mkrepo(tmp_path)
+
+    assert canonical_repository_identity(repo) is None
+
+
+def test_exact_commit_exists_accepts_only_full_commit_object_ids(tmp_path):
+    repo = _mkrepo(tmp_path)
+    commit = head_sha(repo)
+    blob = subprocess.run(
+        ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+        input=b"blob\n", capture_output=True, check=True,
+    ).stdout.decode().strip()
+
+    assert exact_commit_exists(repo, commit) is True
+    assert exact_commit_exists(repo, blob) is False
+    assert exact_commit_exists(repo, commit[:12]) is False
+    assert exact_commit_exists(repo, "f" * 40) is False
+    assert exact_commit_exists(repo, "--help") is False
+
+
+def test_is_ancestor_accepts_only_ordered_full_commit_object_ids(tmp_path):
+    repo = _mkrepo(tmp_path)
+    older = head_sha(repo)
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "c1")
+    newer = head_sha(repo)
+
+    assert is_ancestor(repo, older, newer) is True
+    assert is_ancestor(repo, newer, older) is False
+    assert is_ancestor(repo, older[:12], newer) is False
+    assert is_ancestor(repo, "f" * 40, newer) is False
 
 
 def test_current_branch_and_head_sha(tmp_path):

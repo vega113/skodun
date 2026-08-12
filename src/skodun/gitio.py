@@ -38,10 +38,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import stat
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Mandatory on every diff: keeps no external-diff or textconv driver able to
 # alter the hashed bytes. Does NOT make the hashed bytes config-independent in
@@ -524,6 +526,91 @@ def git_common_dir(repo: Path) -> Path:
 def repository_identity(repo: Path) -> str:
     """Stable local identity for a repository and all linked worktrees."""
     return str(git_common_dir(Path(repo)))
+
+
+_REMOTE_HOST = re.compile(r"[A-Za-z0-9.-]+")
+_SCP_REMOTE = re.compile(
+    r"(?:(?P<user>[^@/:]+)@)?(?P<host>[^/:]+):(?P<path>.+)")
+_FULL_COMMIT_OID = re.compile(r"[0-9a-f]{40}")
+
+
+def _portable_remote_identity(remote: str) -> str | None:
+    """Normalize a clone-portable HTTPS/SSH remote, or refuse it.
+
+    The local git-common-dir identity above deliberately stays machine-local.
+    Stack manifests and evidence receipts need a separate identity that is
+    stable across clones, without accepting local paths or URL credentials.
+    """
+    if (not remote or any(ord(char) < 32 or ord(char) == 127
+                          for char in remote)):
+        return None
+    host = ""
+    path = ""
+    if "://" in remote:
+        try:
+            parsed = urlsplit(remote)
+            port = parsed.port
+        except ValueError:
+            return None
+        if parsed.scheme not in {"https", "ssh"}:
+            return None
+        if parsed.query or parsed.fragment or parsed.password is not None:
+            return None
+        if parsed.scheme == "https" and parsed.username is not None:
+            return None
+        host = parsed.hostname or ""
+        if port is not None:
+            host = f"{host}:{port}"
+        path = parsed.path.removeprefix("/")
+    else:
+        match = _SCP_REMOTE.fullmatch(remote)
+        if match is None:
+            return None
+        host = match.group("host")
+        path = match.group("path")
+    bare_host = host.split(":", 1)[0]
+    if (_REMOTE_HOST.fullmatch(bare_host) is None
+            or bare_host.startswith(".") or bare_host.endswith(".")
+            or ".." in bare_host):
+        return None
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if (not parts or any(not part or part in {".", ".."} for part in parts)
+            or any("\\" in part for part in parts)):
+        return None
+    return f"{host.lower()}/{'/'.join(parts)}"
+
+
+def canonical_repository_identity(repo: Path) -> str | None:
+    """Return ``host/path`` for the repository's portable ``origin`` URL."""
+    result = _run(Path(repo), "config", "--get", "remote.origin.url",
+                  ok_codes=(0, 1))
+    if result.returncode != 0:
+        return None
+    remote = result.stdout.decode("utf-8", "strict").rstrip("\r\n")
+    return _portable_remote_identity(remote)
+
+
+def exact_commit_exists(repo: Path, oid: str) -> bool:
+    """Whether ``oid`` is one exact full SHA-1 naming a commit object."""
+    if not isinstance(oid, str) or _FULL_COMMIT_OID.fullmatch(oid) is None:
+        return False
+    return _run(
+        Path(repo), "cat-file", "-e", f"{oid}^{{commit}}",
+        ok_codes=(0, 1, 128),
+    ).returncode == 0
+
+
+def is_ancestor(repo: Path, older_oid: str, newer_oid: str) -> bool:
+    """Whether two exact commit IDs have the claimed strict order."""
+    if (not exact_commit_exists(repo, older_oid)
+            or not exact_commit_exists(repo, newer_oid)):
+        return False
+    return _run(
+        Path(repo), "merge-base", "--is-ancestor", older_oid, newer_oid,
+        ok_codes=(0, 1, 128),
+    ).returncode == 0
 
 
 def observed_worktree_root(repo: Path) -> str:
