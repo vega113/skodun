@@ -597,6 +597,10 @@ def _changed_line_map(
     return dict(evidence.changed_lines)
 
 
+def _status_for_path(evidence: SliceEvidence, path: str) -> str | None:
+    return dict(evidence.statuses).get(path)
+
+
 def _dependency_coordinates_stable(
     path: str,
     evidence_index: int,
@@ -964,14 +968,27 @@ def classify_findings(
                     path, evidence_positions[id(evidence)], evidence_set)
                 for kind, evidence, scope in stack_matches
             )
-            uncertain_path = any(
+            current_exact_match = any(
+                kind == "current_slice"
+                and (_status_for_path(evidence, path) not in {"R", "C", "D"})
+                and (((scope.line_start is None and scope.symbol is None)
+                      and bool(_changed_line_map(evidence).get(path)))
+                     or (scope.line_start is not None
+                         and type(finding_line) is int
+                         and any(start <= finding_line <= end
+                                 for start, end in _changed_line_map(evidence)
+                                 .get(path, ()))))
+                for kind, evidence, scope in stack_matches
+            )
+            uncertain_path = False if current_exact_match else any(
                 path in evidence.uncertain_files
                 and (type(finding_line) is not int
                      or not any(start <= finding_line <= end
                                 for start, end in _changed_line_map(evidence)
                                 .get(path, ())))
                 for evidence in evidence_set)
-            uncertain_path = uncertain_path or dependency_coordinates_uncertain
+            if not current_exact_match:
+                uncertain_path = uncertain_path or dependency_coordinates_uncertain
 
             if uncertain_path:
                 attribution = _attribution("unknown", "uncertain_git_mapping")
