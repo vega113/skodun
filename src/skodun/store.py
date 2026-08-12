@@ -1068,7 +1068,7 @@ class Store:
     def save_review(self, rec: dict) -> None:
         self._write_review(_normalize_record(rec, label="save_review"))
 
-    def save_checkpointed_review(self, rec: dict) -> None:
+    def save_checkpointed_review(self, rec: dict) -> dict:
         """Atomically publish a final review and consume its checkpoints.
 
         No review row can become coverage-bearing while its orchestration is
@@ -1086,9 +1086,14 @@ class Store:
             self._require_complete_orchestration(
                 orchestration_id, identity_digest)
             self._write_review(normalized)
+            persisted = self.get_review(normalized["id"])
+            if persisted is None:
+                raise ValueError(
+                    "checkpointed review was not readable before finalization")
             self._consume_orchestration_in_transaction(
                 orchestration_id, normalized["id"], _iso_now())
             self._c.execute("COMMIT")
+            return persisted
         except BaseException:
             try:
                 self._c.execute("ROLLBACK")

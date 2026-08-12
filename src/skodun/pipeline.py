@@ -2046,8 +2046,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     f"repository or checkpoint identity moved before "
                     f"finalization ({mismatch}); no aggregate was published")
             try:
-                store.save_checkpointed_review(rec)
-                stored = store.get_review(rec["id"])
+                stored = store.save_checkpointed_review(rec)
             except Exception as exc:
                 raise PersistenceFailed(
                     f"could not atomically finalize batch checkpoints: "
