@@ -632,11 +632,18 @@ def _slice_evidence(item: StackSlice, diff: object) -> SliceEvidence:
         path = batching.file_of(section)
         added_lines: list[int] = []
         new_line: int | None = None
+        hunk_path_has_change = False
+        hunk_path_has_addition = False
         for line in section:
             match = _HUNK_RANGE.match(line)
             if match is not None:
+                if (hunk_path_has_change and not hunk_path_has_addition
+                        and path):
+                    uncertain.add(path)
                 start = int(match.group("start"))
                 new_line = start
+                hunk_path_has_change = False
+                hunk_path_has_addition = False
                 continue
             if new_line is None or line.startswith(b"\\"):
                 continue
@@ -644,7 +651,10 @@ def _slice_evidence(item: StackSlice, diff: object) -> SliceEvidence:
             if prefix == b"+":
                 added_lines.append(new_line)
                 new_line += 1
+                hunk_path_has_change = True
+                hunk_path_has_addition = True
             elif prefix == b"-":
+                hunk_path_has_change = True
                 continue
             elif prefix == b" ":
                 new_line += 1
@@ -655,6 +665,8 @@ def _slice_evidence(item: StackSlice, diff: object) -> SliceEvidence:
             else:
                 ranges.append((line_number, line_number))
         if path and not ranges:
+            uncertain.add(path)
+        if (path and hunk_path_has_change and not hunk_path_has_addition):
             uncertain.add(path)
         if path and ranges:
             changed_lines.setdefault(path, []).extend(ranges)
