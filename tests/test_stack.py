@@ -755,6 +755,26 @@ def test_line_evidence_contains_only_added_new_side_lines():
     assert evidence.changed_lines == (("src/a.py", ((2, 2), (4, 4))),)
 
 
+def test_mixed_deletion_only_hunk_remains_uncertain():
+    item = stack.StackSlice(
+        slice_id="pr-14", commit=HEAD, tracking_ref=f"{REPOSITORY}#14",
+        ownership=(),
+    )
+    diff = SimpleNamespace(
+        files=("src/a.py",), statuses={"src/a.py": "M"},
+        data=(
+            b"diff --git a/src/a.py b/src/a.py\n"
+            b"@@ -1,2 +1,1 @@\n-old\n keep\n"
+            b"@@ -10,1 +10,2 @@\n context\n+new\n"
+        ),
+    )
+
+    evidence = stack._slice_evidence(item, diff)
+
+    assert "src/a.py" in evidence.uncertain_files
+    assert evidence.changed_lines == (("src/a.py", ((11, 11),)),)
+
+
 def test_distinct_symbol_scopes_do_not_overlap():
     left = stack.OwnershipScope(
         kind="file", path="src/a.py", exclusive=True,
