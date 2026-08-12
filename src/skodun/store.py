@@ -190,6 +190,18 @@ def _wait_for_init_lock(lock: Path, path: Path) -> None:
         time.sleep(0.01)
 
 
+def _discard_dead_lock(lock: Path) -> bool:
+    """Reclaim a sidecar only when its recorded owner is provably dead."""
+    owner = _lock_owner(lock)
+    if owner is None or _pid_alive(owner):
+        return False
+    try:
+        lock.unlink()
+    except FileNotFoundError:
+        pass
+    return True
+
+
 def migration_blockers(path: Path) -> tuple[str, ...]:
     """Return active review/claim/capacity blockers using a read-only connection."""
     info = inspect_schema(path)
@@ -1183,6 +1195,8 @@ class Store:
                 continue
         migration_lock = Path(str(path) + ".migration.lock")
         if migration_lock.exists():
+            _discard_dead_lock(migration_lock)
+        if migration_lock.exists():
             raise SchemaLifecycleError(
                 "migration_busy", f"migration lock is held: {migration_lock}",
                 version=None)
@@ -1279,9 +1293,12 @@ class Store:
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError as exc:
-            raise SchemaLifecycleError(
-                "migration_busy", f"migration lock is held: {lock}",
-                version=int(info.version)) from exc
+            if _discard_dead_lock(lock):
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            else:
+                raise SchemaLifecycleError(
+                    "migration_busy", f"migration lock is held: {lock}",
+                    version=int(info.version)) from exc
         os.write(fd, str(os.getpid()).encode("ascii"))
         os.close(fd)
         # Refresh the schema and blockers after taking the exclusive
