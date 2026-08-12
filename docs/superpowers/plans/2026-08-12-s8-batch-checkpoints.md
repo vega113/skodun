@@ -55,7 +55,7 @@ Expected: failures for missing v13 tables/APIs and `SCHEMA_VERSION == 12`.
 
 - [x] **Step 3: Implement additive schema and store APIs**
 
-Bump `SCHEMA_VERSION` to 13 through `_MIGRATIONS` only. Add `create_orchestration`, `find_resume_candidate`, `record_orchestration_mismatch`, `claim_checkpoint`, `complete_checkpoint`, `release_checkpoint`, `list_checkpoints`, `consume_orchestration`, and bounded expiry/prune APIs. Use `BEGIN IMMEDIATE` for every non-idempotent state transition and conditional token/fence predicates for completion.
+Bump `SCHEMA_VERSION` to 13 through `_MIGRATIONS` only. Add `create_orchestration`, `find_resume_candidate`, `record_orchestration_mismatch`, `claim_checkpoint`, `complete_checkpoint`, `release_checkpoint`, `list_checkpoints`, and bounded expiry/prune APIs. Keep consumption private to the atomic review-finalization transaction so no caller can consume checkpoints without publishing their review. Use `BEGIN IMMEDIATE` for every multi-statement non-idempotent state transition and conditional token/fence predicates for completion.
 
 - [x] **Step 4: Run the focused tests and verify GREEN**
 
@@ -135,21 +135,21 @@ Expected: all resume, fencing, cancellation, and aggregate-equivalence tests pas
 - Modify: `tests/test_mcpserver.py`
 - Modify: `README.md`
 
-- [ ] **Step 1: Write failing parity tests**
+- [x] **Step 1: Write failing parity tests**
 
 Assert `fresh=True` reaches the pipeline as `resume=False` through `services.py`, CLI `--fresh`, and MCP `fresh`; default behavior resumes an exact incomplete orchestration. Assert human and MCP progress name reused batches and first mismatch consistently, without exposing checkpoint payloads or prompts.
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run: `python3 -m pytest tests/test_services.py tests/test_cli.py tests/test_mcpserver.py -q --tb=short -k 'fresh or resume or checkpoint'`
 
 Expected: the existing flag affects trusted-review reuse only and does not yet control checkpoint resume.
 
-- [ ] **Step 3: Thread the shared resume intent**
+- [x] **Step 3: Thread the shared resume intent**
 
 Extend the existing `svc_review_detailed` path so `fresh` disables both trusted artifact reuse and checkpoint resume. Keep CLI/MCP argument schemas unchanged, preserve one MCP review in flight, and document exact resume, mismatch, in-flight, expiry, and fresh behavior.
 
-- [ ] **Step 4: Run the focused tests and verify GREEN**
+- [x] **Step 4: Run the focused tests and verify GREEN**
 
 Run: `python3 -m pytest tests/test_services.py tests/test_cli.py tests/test_mcpserver.py -q --tb=short -k 'fresh or resume or checkpoint'`
 

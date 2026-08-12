@@ -1058,9 +1058,14 @@ def test_resume_mismatch_restarts_fresh_and_explains_the_first_field(
     with pytest.raises(pipeline.ReviewCancelled):
         pipeline.run_review(repo, cfg, store, cancel=cancel)
 
+    # Even a setting outside the currently executing foreground path belongs
+    # to the exact CONFIG identity. Resume is deliberately conservative: a
+    # later release may make this value plan-affecting, and old checkpoints
+    # must not then acquire approximate compatibility by accident.
     changed = dc_replace(
-        cfg, defaults=dc_replace(
-            cfg.defaults, max_turns=cfg.defaults.max_turns + 1))
+        cfg, dispatch=dc_replace(
+            cfg.dispatch,
+            large_prompt_bytes=cfg.dispatch.large_prompt_bytes + 1))
     calls = []
     progress = []
 

@@ -1048,8 +1048,9 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                                    "review (default false)"},
                 "fresh": {
                     "type": "boolean",
-                    "description": "always run a fresh review, bypassing "
-                                   "trusted reuse; useful for a second opinion"},
+                    "description": "run wholly fresh, bypassing trusted reuse "
+                                   "and incomplete batch checkpoints; useful "
+                                   "for a second opinion"},
             }),
             handler=_handle_review,
             description="Review the outgoing change NOW, in the foreground, and "

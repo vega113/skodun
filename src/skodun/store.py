@@ -1406,20 +1406,29 @@ class Store:
         fence = _plain_nonnegative_int("fence", fence)
         reason = _checkpoint_text("reason", reason)
         at = _require_ts("at", at)
-        cur = self._c.execute(
-            """UPDATE review_checkpoints
-                  SET state='pending', claim_token=NULL, claim_owner=NULL,
-                      claimed_at=NULL, lease_expires_at=NULL, failure_reason=?
-                WHERE orchestration_id=? AND pass_kind=? AND pass_index=?
-                  AND state='running' AND claim_owner=?
-                  AND claim_token=? AND fence=?""",
-            (reason, orchestration_id, pass_kind, pass_index, owner,
-             claim_token, fence))
-        if cur.rowcount == 1:
-            self._c.execute(
-                "UPDATE review_orchestrations SET updated_at=? WHERE id=?",
-                (at, orchestration_id))
-        return cur.rowcount == 1
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._c.execute(
+                """UPDATE review_checkpoints
+                      SET state='pending', claim_token=NULL, claim_owner=NULL,
+                          claimed_at=NULL, lease_expires_at=NULL, failure_reason=?
+                    WHERE orchestration_id=? AND pass_kind=? AND pass_index=?
+                      AND state='running' AND claim_owner=?
+                      AND claim_token=? AND fence=?""",
+                (reason, orchestration_id, pass_kind, pass_index, owner,
+                 claim_token, fence))
+            if cur.rowcount == 1:
+                self._c.execute(
+                    "UPDATE review_orchestrations SET updated_at=? WHERE id=?",
+                    (at, orchestration_id))
+            self._c.execute("COMMIT")
+            return cur.rowcount == 1
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except BaseException:
+                pass
+            raise
 
     def expire_orchestrations(self, *, now: str) -> int:
         """Mark incomplete expired orchestration state; never touch reviews."""
@@ -1431,38 +1440,6 @@ class Store:
                 WHERE state IN ('active','cancelled','failed','complete')
                   AND expires_at <= ?""", (now, now))
         return cur.rowcount
-
-    def consume_orchestration(self, orchestration_id: str, *,
-                              final_review_id: str, at: str) -> bool:
-        """Mark an orchestration consumed iff every planned pass is complete."""
-        orchestration_id = _require_text("orchestration_id", orchestration_id)
-        final_review_id = _require_text("final_review_id", final_review_id)
-        at = _require_ts("at", at)
-        self._c.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._c.execute(
-                """SELECT COUNT(*) AS total,
-                          SUM(CASE WHEN state='complete' THEN 1 ELSE 0 END) AS done
-                     FROM review_checkpoints WHERE orchestration_id=?""",
-                (orchestration_id,)).fetchone()
-            if row is None or int(row["total"] or 0) == 0 \
-                    or int(row["done"] or 0) != int(row["total"]):
-                self._c.execute("COMMIT")
-                return False
-            cur = self._c.execute(
-                """UPDATE review_orchestrations
-                      SET state='consumed', final_review_id=?, updated_at=?
-                    WHERE id=? AND state IN
-                      ('active','cancelled','failed','complete')""",
-                (final_review_id, at, orchestration_id))
-            self._c.execute("COMMIT")
-            return cur.rowcount == 1
-        except BaseException:
-            try:
-                self._c.execute("ROLLBACK")
-            except BaseException:
-                pass
-            raise
 
     def reuse_candidates(self, repo_id: str, base_sha: str,
                          diff_hash: str) -> list[dict]:

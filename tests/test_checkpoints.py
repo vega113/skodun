@@ -270,29 +270,6 @@ def test_incomplete_orchestration_expiry_never_creates_review_coverage(tmp_path)
             "repo-1", "b" * 40, "d" * 40) == []
 
 
-def test_orchestration_is_consumed_only_after_every_pass_is_complete(tmp_path):
-    payload = checkpoints.CheckpointPayload.from_mapping(_payload())
-    with Store.open(tmp_path / "s.db") as store:
-        _created(store)
-        for identity in _identity().pass_identities:
-            # Integration prompt identity is frozen when its recovered prompt
-            # first exists; use a concrete exact hash at claim time.
-            if identity.prompt_hash is None:
-                identity = replace(identity, prompt_hash="z" * 64)
-            claim = store.claim_checkpoint(
-                "orch-1", identity, owner="worker", now=NOW,
-                lease_expires_at=LATER)
-            assert store.complete_checkpoint(
-                "orch-1", identity.kind, identity.index, owner="worker",
-                claim_token=claim["claim_token"], fence=claim["fence"],
-                payload=payload, completed_at=NOW)
-        assert store.consume_orchestration(
-            "orch-1", final_review_id="sk-final", at=NOW) is True
-        row = store.get_orchestration("orch-1")
-    assert row["state"] == "consumed"
-    assert row["final_review_id"] == "sk-final"
-
-
 def _review(review_id="sk-final"):
     return {
         "id": review_id, "reviewed_at": NOW, "branch": "feature",

@@ -141,6 +141,31 @@ def test_opt_in_reuse_returns_existing_review_without_running_pipeline(
     assert events[0]["outcome"] == "hit"
 
 
+@pytest.mark.parametrize(("fresh", "expected_resume"), [
+    (False, True),
+    (True, False),
+])
+def test_fresh_controls_incomplete_checkpoint_resume_at_shared_service(
+        tmp_path, monkeypatch, fresh, expected_resume):
+    """CLI and MCP both reach this seam, so `fresh` must have one meaning."""
+    monkeypatch.setattr(
+        services, "_try_reuse",
+        lambda *args, **kwargs: (None, None, {}))
+    seen = []
+
+    def fake_review_once(*args, **kwargs):
+        seen.append(kwargs.get("resume_checkpoints"))
+        return 0, "clean"
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_review_once)
+    with Store.open(tmp_path / f"fresh-{fresh}.db") as store:
+        status, text, _metadata = services.svc_review_detailed(
+            store, tmp_path, fresh=fresh)
+
+    assert (status, text) == (0, "clean")
+    assert seen == [expected_resume]
+
+
 def test_opt_in_reuse_honors_cancellation_before_and_during_a_probe(
         tmp_path, monkeypatch):
     cancel = threading.Event()

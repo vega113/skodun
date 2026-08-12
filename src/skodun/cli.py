@@ -138,7 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="reuse an exact trustworthy foreground review when available")
     review.add_argument(
         "--fresh", action="store_true", dest="fresh",
-        help="always run a real review, even when trusted reuse is enabled")
+        help="run wholly fresh, bypassing trusted reuse and incomplete batch "
+             "checkpoints")
 
     readiness = sub.add_parser(
         "review-readiness",

@@ -3164,7 +3164,12 @@ def _orchestration_identity(
     })
     config_hash = checkpoints.canonical_digest({
         "mode": rec.get("mode"),
-        "defaults": asdict(d),
+        # Hash the complete loaded policy plus the mode-specific effective
+        # defaults. A currently non-executing field is still configuration
+        # identity: a later planner may begin consuming it, and old durable
+        # checkpoints must not silently become approximately compatible.
+        "config": asdict(cfg),
+        "effective_defaults": asdict(d),
     })
     pass_identities = list(item.identity for item in prepared.batches)
     if prepared.integration_selection is not None:
