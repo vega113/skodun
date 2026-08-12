@@ -852,7 +852,9 @@ def test_dependency_line_is_uncertain_after_later_same_path_change():
 def test_exact_current_line_ignores_unrelated_dependency_uncertainty():
     dependency_item = stack.StackSlice(
         slice_id="dep", commit=HEAD, tracking_ref=f"{REPOSITORY}#13",
-        ownership=(),
+        ownership=(stack.OwnershipScope(
+            kind="file", path="src/a.py", exclusive=False,
+            line_start=9, line_end=9, symbol=None),),
     )
     current_item = stack.StackSlice(
         slice_id="current", commit=HEAD, tracking_ref=f"{REPOSITORY}#14",
@@ -864,7 +866,8 @@ def test_exact_current_line_ignores_unrelated_dependency_uncertainty():
         status="valid", reason_code="ok", manifest=None,
         dependencies=(stack.SliceEvidence(
             slice=dependency_item, files=frozenset({"src/a.py"}), statuses=(),
-            uncertain_files=frozenset({"src/a.py"}), changed_lines=(),
+            uncertain_files=frozenset({"src/a.py"}),
+            changed_lines=(("src/a.py", ((1, 1),)),),
         ),),
         current_slice=stack.SliceEvidence(
             slice=current_item, files=frozenset({"src/a.py"}), statuses=(),
