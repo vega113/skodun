@@ -623,6 +623,29 @@ def test_readiness_handler_calls_shared_service(monkeypatch):
     assert seen["reviewer"] == "finder"
 
 
+def test_review_fresh_reaches_the_shared_service(monkeypatch):
+    from contextlib import contextmanager
+
+    seen = {}
+
+    def fake_service(store, repo, **kwargs):
+        seen.update(kwargs)
+        return 0, "clean", {}
+
+    @contextmanager
+    def factory():
+        yield object()
+
+    monkeypatch.setattr("skodun.services.svc_review_detailed", fake_service)
+    spec = next(s for s in mcpserver.default_registry() if s.name == "review")
+    result = spec.handler(HandlerCall(
+        params={"repo": ".", "fresh": True},
+        store_factory=factory, cancel=threading.Event()))
+
+    assert result.status == 0
+    assert seen["fresh"] is True
+
+
 def test_a_handler_that_returns_nonsense_is_a_tool_error_not_a_crash():
     def liar(call):
         return {"status": 0, "text": "a dict is not a HandlerResult"}

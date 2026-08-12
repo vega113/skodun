@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 
 from skodun import (batching, budget, chain, checklist, contextpack, gitio,
-                    passes, pipeline, promptbuild, runner, trust)
+                    passes, pipeline, promptbuild, runner, services, trust)
 from skodun.adapters import ParseResult
 from skodun.cli import main
 from skodun.config import Defaults, load_config
@@ -813,6 +813,322 @@ def test_the_sole_batch_prompt_is_byte_identical_to_the_unbatched_prompt(
     sent = (tmp_path / "bin" / "prompt_1.txt").read_bytes()
     assert sent == expected.text
     assert out["prompt_bytes"] == expected.prompt_bytes
+
+
+def test_checkpoint_preparation_is_deterministic_and_invokes_no_provider(
+        tmp_path, monkeypatch):
+    """Identity is frozen from the exact prompts before resumable work runs."""
+    repo = _oversized(tmp_path)
+    cfg = load_config(repo)
+    d = cfg.defaults
+    root = gitio._worktree_root(repo)
+    base = resolve_base(repo)
+    diff = capture_diff(repo, base.sha, d.untracked_max)
+    finder = pipeline._reviewer_for(cfg, "finder")
+    batches = pipeline.batch_plan(diff.data, d, finder)
+    branch = gitio.current_branch(repo)
+    head = gitio.head_sha(repo)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("preparing checkpoint identity invoked a provider")
+
+    monkeypatch.setattr(pipeline, "_run_chain", forbidden)
+    one = pipeline._prepare_batch_plan(
+        diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, base_ref=base.ref, base_sha=base.sha,
+        head_label=f"{head} (working tree)")
+    two = pipeline._prepare_batch_plan(
+        diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, base_ref=base.ref, base_sha=base.sha,
+        head_label=f"{head} (working tree)")
+
+    assert [item.prompt.text for item in one.batches] == \
+        [item.prompt.text for item in two.batches]
+    assert one.context_hash == two.context_hash
+    assert one.checklist_hash == two.checklist_hash
+    assert one.boundary_digest == two.boundary_digest
+    assert one.integration_plan_digest == two.integration_plan_digest
+    assert [item.identity for item in one.batches] == \
+        [item.identity for item in two.batches]
+
+
+def test_prepared_prompts_are_the_prompts_the_orchestrator_sends(tmp_path):
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _oversized(tmp_path)
+    cfg = load_config(repo)
+    d = cfg.defaults
+    root = gitio._worktree_root(repo)
+    base = resolve_base(repo)
+    diff = capture_diff(repo, base.sha, d.untracked_max)
+    finder = pipeline._reviewer_for(cfg, "finder")
+    batches = pipeline.batch_plan(diff.data, d, finder)
+    branch = gitio.current_branch(repo)
+    head = gitio.head_sha(repo)
+    prepared = pipeline._prepare_batch_plan(
+        diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, base_ref=base.ref, base_sha=base.sha,
+        head_label=f"{head} (working tree)")
+
+    with tempfile.TemporaryDirectory() as scratch:
+        pipeline._orchestrate(
+            {"id": "sk_prepared", "mode": "now", "model": finder.model,
+             "adapter": "grok", "summary": "", "findings": []}, diff,
+            batches=batches, cfg=cfg, d=d, root=root, store=_store(tmp_path),
+            scratch=Path(scratch), finder=finder, branch=branch,
+            base_ref=base.ref, base_sha=base.sha,
+            head_label=f"{head} (working tree)", prepared_plan=prepared)
+
+    for index, item in enumerate(prepared.batches, 1):
+        assert (tmp_path / "bin" / f"prompt_{index}.txt").read_bytes() == \
+            item.prompt.text
+
+
+def test_prepared_plan_builds_the_complete_checkpoint_identity(tmp_path):
+    repo = _oversized(tmp_path)
+    cfg = load_config(repo)
+    d = cfg.defaults
+    root = gitio._worktree_root(repo)
+    base = resolve_base(repo)
+    diff = capture_diff(repo, base.sha, d.untracked_max)
+    finder = pipeline._reviewer_for(cfg, "finder")
+    batches = pipeline.batch_plan(diff.data, d, finder)
+    branch = gitio.current_branch(repo)
+    head = gitio.head_sha(repo)
+    prepared = pipeline._prepare_batch_plan(
+        diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, base_ref=base.ref, base_sha=base.sha,
+        head_label=f"{head} (working tree)")
+    rec = {"mode": "now", "requested_reviewer": None,
+           "client_family": None, "routed_reviewer": finder.name}
+
+    identity = pipeline._orchestration_identity(
+        rec, diff, prepared, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, head=head, base_ref=base.ref, base_sha=base.sha,
+        tree_fingerprint=gitio.tree_fingerprint(repo, paths=diff.files))
+
+    assert identity.batch_count == len(batches)
+    assert identity.batch_budget == pipeline._batch_budget(d, finder)
+    assert identity.context_hash == prepared.context_hash
+    assert identity.checklist_hash == prepared.checklist_hash
+    assert identity.pass_identities[:-1] == tuple(
+        item.identity for item in prepared.batches)
+    assert identity.pass_identities[-1].kind == "integration"
+    assert identity.pass_identities[-1].prompt_hash is None
+
+
+def _clean_checkpoint_sub(label: str) -> pipeline._Sub:
+    return pipeline._Sub(
+        parse_ok=True, degraded=False, degraded_reason="",
+        stop_reason="EndTurn", diff_truncated=False,
+        summary=f"clean {label}", findings=[], failure_reason="", attempts=[],
+        provenance={"provider": "xai", "model": "grok", "effort": None},
+        accepted={"adapter_name": "grok", "model": "grok",
+                  "provider": "xai", "effort": None})
+
+
+def _without_run_identity(rec: dict) -> dict:
+    """Comparable aggregate fields across two independently minted reviews."""
+    ignored = {
+        "id", "reviewed_at", "review_started_at", "review_completed_at",
+        "batch_orchestration_id", "tree_fingerprint",
+    }
+    out = {key: value for key, value in rec.items() if key not in ignored}
+    out["batches"] = [
+        {key: value for key, value in batch.items() if key != "id"}
+        for batch in out.get("batches", [])]
+    return out
+
+
+def test_cancel_after_three_batches_resumes_only_the_missing_work(
+        tmp_path, monkeypatch):
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _oversized(tmp_path, files=4)
+    cfg = load_config(repo)
+    store = _store(tmp_path)
+    cancel = threading.Event()
+    first_calls = []
+
+    def first(*_args, **kwargs):
+        label = _args[8] if len(_args) > 8 else kwargs["label"]
+        first_calls.append(label)
+        if label == "batch 3":
+            cancel.set()
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", first)
+    with pytest.raises(pipeline.ReviewCancelled):
+        pipeline.run_review(repo, cfg, store, cancel=cancel)
+
+    orchestration = store._c.execute(
+        "SELECT id FROM review_orchestrations").fetchone()
+    checkpoints = store.list_checkpoints(orchestration["id"])
+    assert first_calls == ["batch 1", "batch 2", "batch 3"]
+    assert [row["state"] for row in checkpoints] == [
+        "complete", "complete", "complete", "pending", "pending"]
+
+    resumed_calls = []
+
+    def resumed(*_args, **kwargs):
+        label = _args[8] if len(_args) > 8 else kwargs["label"]
+        resumed_calls.append(label)
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", resumed)
+    resumed_rec = pipeline.run_review(
+        repo, cfg, store, cancel=threading.Event())
+
+    assert resumed_calls == ["batch 4", "the integration pass"]
+    assert resumed_rec["trustworthy"] is True
+    consumed = store.get_orchestration(
+        resumed_rec["batch_orchestration_id"])
+    assert consumed["state"] == "consumed"
+    assert consumed["final_review_id"] == resumed_rec["id"]
+
+    fresh_calls = []
+
+    def fresh(*_args, **kwargs):
+        label = _args[8] if len(_args) > 8 else kwargs["label"]
+        fresh_calls.append(label)
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", fresh)
+    fresh_rec = pipeline.run_review(
+        repo, cfg, store, cancel=threading.Event(),
+        resume_checkpoints=False)
+    assert fresh_calls == [
+        "batch 1", "batch 2", "batch 3", "batch 4",
+        "the integration pass"]
+    assert _without_run_identity(resumed_rec) == _without_run_identity(fresh_rec)
+
+
+def test_global_wall_timeout_preserves_three_batches_for_resume(
+        tmp_path, monkeypatch):
+    """The service deadline uses the same cancellation token as process cleanup."""
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _oversized(tmp_path, files=4)
+    cfg = load_config(repo)
+    store = _store(tmp_path)
+    first_calls = []
+
+    def times_out_on_fourth(*args, **kwargs):
+        label = args[8] if len(args) > 8 else kwargs["label"]
+        first_calls.append(label)
+        if label == "batch 4":
+            cancel = kwargs["cancel"]
+            assert cancel.wait(5), "recovery deadline did not cancel the pass"
+            raise pipeline.ReviewCancelled("review cancelled")
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", times_out_on_fourth)
+    status, text, _metadata = services.svc_review_detailed(
+        store, repo, recover=True, max_attempts=1, max_wall_seconds=3)
+    assert status == 4
+    assert "wall budget exhausted" in text
+    assert first_calls == ["batch 1", "batch 2", "batch 3", "batch 4"]
+
+    candidate = store.find_resume_candidate(
+        gitio.repository_identity(repo),
+        gitio.observed_worktree_root(repo), gitio.current_branch(repo))
+    assert [row["state"] for row in store.list_checkpoints(candidate["id"])] == [
+        "complete", "complete", "complete", "pending", "pending"]
+
+    resumed_calls = []
+
+    def clean(*args, **kwargs):
+        label = args[8] if len(args) > 8 else kwargs["label"]
+        resumed_calls.append(label)
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", clean)
+    resumed = pipeline.run_review(repo, cfg, store, cancel=threading.Event())
+    assert resumed["trustworthy"] is True
+    assert resumed_calls == ["batch 4", "the integration pass"]
+
+
+def test_live_racing_resumer_invokes_no_provider(tmp_path, monkeypatch):
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _oversized(tmp_path, files=4)
+    cfg = load_config(repo)
+    store = _store(tmp_path)
+    cancel = threading.Event()
+
+    def stop_after_three(*_args, **kwargs):
+        label = _args[8] if len(_args) > 8 else kwargs["label"]
+        if label == "batch 3":
+            cancel.set()
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", stop_after_three)
+    with pytest.raises(pipeline.ReviewCancelled):
+        pipeline.run_review(repo, cfg, store, cancel=cancel)
+    orchestration = store.find_resume_candidate(
+        gitio.repository_identity(repo),
+        gitio.observed_worktree_root(repo), gitio.current_branch(repo))
+    rows = store.list_checkpoints(orchestration["id"])
+    fourth = rows[3]
+    from skodun.checkpoints import PassIdentity
+    store.claim_checkpoint(
+        orchestration["id"], PassIdentity(
+            kind="batch", index=4, prompt_hash=fourth["prompt_hash"],
+            diff_hash=fourth["diff_hash"],
+            boundary_hash=fourth["boundary_hash"]),
+        owner="other-resumer", now="2026-08-12T10:00:00Z",
+        lease_expires_at="2099-08-12T10:00:00Z")
+
+    monkeypatch.setattr(
+        pipeline, "_run_sub",
+        lambda *_args, **_kwargs: pytest.fail("racing resumer invoked provider"))
+    with pytest.raises(pipeline.CheckpointInFlight, match="batch 4"):
+        pipeline.run_review(repo, cfg, store, cancel=threading.Event())
+
+
+def test_resume_mismatch_restarts_fresh_and_explains_the_first_field(
+        tmp_path, monkeypatch):
+    from dataclasses import replace as dc_replace
+
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _oversized(tmp_path, files=4)
+    cfg = load_config(repo)
+    store = _store(tmp_path)
+    cancel = threading.Event()
+
+    def stop_after_one(*_args, **kwargs):
+        label = _args[8] if len(_args) > 8 else kwargs["label"]
+        if label == "batch 1":
+            cancel.set()
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", stop_after_one)
+    with pytest.raises(pipeline.ReviewCancelled):
+        pipeline.run_review(repo, cfg, store, cancel=cancel)
+
+    # Even a setting outside the currently executing foreground path belongs
+    # to the exact CONFIG identity. Resume is deliberately conservative: a
+    # later release may make this value plan-affecting, and old checkpoints
+    # must not then acquire approximate compatibility by accident.
+    changed = dc_replace(
+        cfg, dispatch=dc_replace(
+            cfg.dispatch,
+            large_prompt_bytes=cfg.dispatch.large_prompt_bytes + 1))
+    calls = []
+    progress = []
+
+    def clean(*_args, **kwargs):
+        label = _args[8] if len(_args) > 8 else kwargs["label"]
+        calls.append(label)
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", clean)
+    pipeline.run_review(
+        repo, changed, store, cancel=threading.Event(),
+        progress_sink=progress.append)
+
+    assert calls == [
+        "batch 1", "batch 2", "batch 3", "batch 4",
+        "the integration pass"]
+    assert any(
+        "checkpoint resume refused: config_hash changed" in line
+        for line in progress)
 
 
 # --------------------------------------------------------------------------

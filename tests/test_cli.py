@@ -3292,6 +3292,7 @@ def test_review_help_documents_the_flag_and_its_env_fallback(capsys):
     out = capsys.readouterr().out
     assert "--client-family" in out
     assert "SKODUN_CLIENT_FAMILY" in out
+    assert "incomplete batch checkpoints" in out
 
 
 def test_review_parser_exposes_opt_in_reuse_and_fresh_flags():

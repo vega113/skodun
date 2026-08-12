@@ -42,7 +42,7 @@ def test_v9_migration_adds_nullable_telemetry_columns(tmp_path):
     raw.close()
 
     st = Store.open(db)
-    assert SCHEMA_VERSION == 12
+    assert SCHEMA_VERSION == 13
     cols = {r[1] for r in st._c.execute("PRAGMA table_info(reviews)")}
     assert {"review_started_at", "review_completed_at", "repo_id",
             "worktree_root", "orchestration_id", "attempt_ordinal",

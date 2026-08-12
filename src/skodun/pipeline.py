@@ -162,11 +162,12 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from . import (batching, budget, capacity, chain, checklist, contextpack, gitio,
-               ids, passes, promptbuild, provenance, reuse, routing, runner)
+from . import (batching, budget, capacity, chain, checklist, checkpoints,
+               contextpack, gitio, ids, passes, promptbuild, provenance, reuse,
+               routing, runner)
 from .adapters import NORMAL_STOP_REASONS, REFUTER_CONTRACT, get_adapter
 from .config import Config, Defaults, Reviewer, quota_pool_for
 from .store import Store, _TS_FORMAT
@@ -229,6 +230,17 @@ class PersistenceFailed(PipelineError):
     The review is worthless if it cannot be read back: the gate reads the
     store, not this process's memory.
     """
+
+
+class CheckpointInFlight(PipelineError):
+    """An exact pass is already claimed by a live competing resumer."""
+
+
+class CheckpointClaimLost(PipelineError):
+    """A caller lost its fenced pass claim before it could complete it."""
+
+
+CHECKPOINT_RETENTION_SEC = 7 * 24 * 3600
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +359,10 @@ def _iso_at(epoch: float) -> str:
 
 def _iso_now() -> str:
     return time.strftime(_TS_FORMAT, time.gmtime())
+
+
+def _iso_after(seconds: float) -> str:
+    return time.strftime(_TS_FORMAT, time.gmtime(time.time() + max(0, seconds)))
 
 
 #: `sk_<utcstamp>_<pid>_<uuid8>`, now `ids.new_review_id`. An IMPORT, not a
@@ -1195,7 +1211,8 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                cancel: "threading.Event | None" = None,
                reviewer: str | None = None,
                client_family: str | None = None,
-               avoid_providers: set[str] | None = None) -> dict:
+               avoid_providers: set[str] | None = None,
+               resume_checkpoints: bool = True) -> dict:
     """Run one foreground review and return the record that was persisted.
 
     WRITES NOTHING TO STDOUT. Progress goes to stderr (or to `progress_sink`);
@@ -1271,7 +1288,8 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
     try:
         return _run_review(repo, cfg, store, mode, lock_wait, lock_poll,
                            id_prefix, lock_stale, cancel, d, reviewer,
-                           client_family, avoid_providers)
+                           client_family, avoid_providers,
+                           resume_checkpoints)
     finally:
         if progress_sink is not None:
             _PROGRESS.sink = None
@@ -1283,7 +1301,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 cancel: "threading.Event | None", d: Defaults,
                 requested: str | None = None,
                 client_family: str | None = None,
-                avoid_providers: set[str] | None = None) -> dict:
+                avoid_providers: set[str] | None = None,
+                resume_checkpoints: bool = True) -> dict:
     """`run_review`'s body. Split off ONLY so the progress sink can be installed
     and removed around it without wrapping 400 lines in another indent level."""
 
@@ -1517,6 +1536,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     previous_sigterm = _install_fg_sigterm(cancel)
     persisted = False
     finalized = False
+    checkpoint_run: _CheckpointRun | None = None
+    prepared_plan: _PreparedPlan | None = None
     try:
         # The first boundary INSIDE the lock. Everything above it left nothing
         # behind; from here the `finally` is what cleans up, so the check moves
@@ -1718,6 +1739,21 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     extra_passes={}, failure_reason="", batched=True,
                     batch_count=len(plan), batches=[], usable_output=False,
                 )
+                prepared_plan = _prepare_batch_plan(
+                    diff, batches=plan, cfg=cfg, d=d, root=root,
+                    finder=finder, branch=branch, base_ref=base.ref,
+                    base_sha=base.sha, head_label=f"{head} (working tree)")
+                checkpoint_identity = _orchestration_identity(
+                    rec, diff, prepared_plan, cfg=cfg, d=d, root=root,
+                    finder=finder, branch=branch, head=head,
+                    base_ref=base.ref, base_sha=base.sha,
+                    tree_fingerprint=tree_fingerprint)
+                checkpoint_run = _begin_checkpoint_run(
+                    store, checkpoint_identity, rec,
+                    resume=resume_checkpoints)
+                rec["batch_orchestration_id"] = \
+                    checkpoint_run.orchestration_id
+                rec["batch_identity_digest"] = checkpoint_identity.digest()
                 # Persisted `running` BEFORE the first model call and already
                 # carrying its BATCHED `worst_runtime_sec`: that is the only
                 # moment at which `recover_stale` can learn not to sweep this row
@@ -1730,7 +1766,9 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     rec, diff, batches=plan, cfg=cfg, d=d, root=root,
                     store=store, scratch=scratch, finder=finder, branch=branch,
                     base_ref=base.ref, base_sha=base.sha,
-                    head_label=f"{head} (working tree)", cancel=cancel)
+                    head_label=f"{head} (working tree)", cancel=cancel,
+                    prepared_plan=prepared_plan,
+                    checkpoint_run=checkpoint_run)
                 answering_provider = _answering_provider(rec, finder)
             else:
                 # --- 6b. UNBATCHED: checklist -> context pack -> prompt ----
@@ -1993,7 +2031,32 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         # was killed halfway through looking at. `persisted and not finalized`
         # sends it to the `finally`, which demotes the row it saved.
         _checkpoint(cancel, rec, "after the review, before it was recorded")
-        stored = _persist(store, rec)
+        if checkpoint_run is not None:
+            mismatch = _revalidate_foreground_orchestration(
+                checkpoint_run.identity, rec, repo=repo, cfg=cfg, d=d,
+                finder=finder)
+            if mismatch is not None:
+                try:
+                    store.record_orchestration_mismatch(
+                        checkpoint_run.orchestration_id, mismatch,
+                        at=_iso_now())
+                except Exception:
+                    pass
+                raise CheckpointClaimLost(
+                    f"repository or checkpoint identity moved before "
+                    f"finalization ({mismatch}); no aggregate was published")
+            try:
+                stored = store.save_checkpointed_review(rec)
+            except Exception as exc:
+                raise PersistenceFailed(
+                    f"could not atomically finalize batch checkpoints: "
+                    f"{exc!r}") from exc
+            if stored is None:
+                raise PersistenceFailed(
+                    f"review {rec['id']} was not readable after checkpoint "
+                    "finalization")
+        else:
+            stored = _persist(store, rec)
         finalized = True
         if runner._cancelled(cancel):
             # STEP 8's foreground twin: THE POST-COMMIT LINEARIZATION CHECK. The
@@ -2312,6 +2375,21 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                     files_changed=list(diff.files), diff_bytes=len(diff.data),
                     batched=True, batch_count=planned, batches=[],
                     usable_output=False)
+                prepared_plan = _prepare_batch_plan(
+                    diff, batches=plan, cfg=cfg, d=d, root=root,
+                    finder=finder, branch=branch, base_ref=base.ref,
+                    base_sha=base.sha, head_label=local_oid,
+                    context_source="oid", context_oid=local_oid)
+                checkpoint_identity = _orchestration_identity(
+                    rec, diff, prepared_plan, cfg=cfg, d=d, root=root,
+                    finder=finder, branch=branch, head=local_oid,
+                    base_ref=base.ref, base_sha=base.sha,
+                    tree_fingerprint=local_oid)
+                checkpoint_run = _begin_checkpoint_run(
+                    store, checkpoint_identity, rec, resume=True)
+                rec["batch_orchestration_id"] = \
+                    checkpoint_run.orchestration_id
+                rec["batch_identity_digest"] = checkpoint_identity.digest()
                 _note(f"reviewing {len(diff.files)} file(s) vs {base.ref} as "
                       f"{record_id} in {planned} batch(es) ...")
                 rec = _orchestrate(
@@ -2319,7 +2397,9 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                     store=store, scratch=scratch, finder=finder, branch=branch,
                     base_ref=base.ref, base_sha=base.sha, head_label=local_oid,
                     context_source="oid", context_oid=local_oid,
-                    large_prompt=large_prompt, cancel=cancel)
+                    large_prompt=large_prompt, cancel=cancel,
+                    prepared_plan=prepared_plan,
+                    checkpoint_run=checkpoint_run)
             else:
                 rec = _single_shot(
                     common, diff, cfg=cfg, d=d, root=root, store=store,
@@ -2722,6 +2802,153 @@ class _Sub:
     accepted: dict | None
 
 
+@dataclass(frozen=True)
+class _PreparedBatch:
+    """One deterministic batch prompt and every input that produced it."""
+
+    batch: batching.Batch
+    selection: object
+    pack: object | None
+    prompt: object
+    identity: checkpoints.PassIdentity
+
+
+@dataclass(frozen=True)
+class _PreparedPlan:
+    """The complete deterministic plan frozen before provider invocation."""
+
+    batches: tuple[_PreparedBatch, ...]
+    integration_selection: object | None
+    context_hash: str | None
+    checklist_hash: str | None
+    boundary_digest: str
+    integration_plan_digest: str
+
+
+@dataclass(frozen=True)
+class _CheckpointRun:
+    orchestration_id: str
+    owner: str
+    identity: checkpoints.OrchestrationIdentity
+
+
+def _begin_checkpoint_run(store: Store, identity: checkpoints.OrchestrationIdentity,
+                          rec: dict, *, resume: bool) -> _CheckpointRun:
+    """Resume one exact candidate or create a fresh orchestration."""
+    now = _iso_now()
+    try:
+        store.expire_orchestrations(now=now)
+    except Exception as exc:
+        raise PersistenceFailed(
+            f"could not expire batch checkpoints: {exc!r}") from exc
+    candidate = None
+    if resume:
+        candidate = store.find_resume_candidate(
+            identity.repo_id, identity.worktree_root, identity.branch)
+    if candidate is not None:
+        try:
+            stored = checkpoints.OrchestrationIdentity.from_json(
+                candidate["identity_json"])
+            mismatch = checkpoints.first_mismatch(stored, identity)
+        except Exception:
+            mismatch = "identity_json"
+        if mismatch is None:
+            orchestration_id = candidate["id"]
+            _note(f"resuming exact batch orchestration {orchestration_id}")
+            return _CheckpointRun(
+                orchestration_id, ids.new_review_id("sk_owner_"), identity)
+        try:
+            store.record_orchestration_mismatch(
+                candidate["id"], mismatch, at=now)
+        except Exception as exc:
+            raise PersistenceFailed(
+                f"could not record checkpoint mismatch: {exc!r}") from exc
+        _note(f"checkpoint resume refused: {mismatch} changed; starting fresh")
+    orchestration_id = ids.new_review_id("sk_batch_")
+    try:
+        created = store.create_orchestration(
+            orchestration_id, identity,
+            requested_mode=str(rec.get("mode") or "now"),
+            created_at=now, expires_at=_iso_after(CHECKPOINT_RETENTION_SEC),
+            reuse_existing=resume)
+    except Exception as exc:
+        raise PersistenceFailed(
+            f"could not create batch checkpoints: {exc!r}") from exc
+    if created["id"] != orchestration_id:
+        _note(f"another resumer created exact batch orchestration {created['id']}")
+        return _CheckpointRun(
+            created["id"], ids.new_review_id("sk_owner_"), identity)
+    _note(f"started batch orchestration {orchestration_id}")
+    return _CheckpointRun(
+        orchestration_id, ids.new_review_id("sk_owner_"), identity)
+
+
+def _checkpointed_sub(
+        checkpoint_run: _CheckpointRun | None,
+        pass_identity: checkpoints.PassIdentity, *, reviewer: Reviewer,
+        cfg: Config, d: Defaults, prompt, root: Path, store: Store,
+        scratch: Path, tag: str, label: str,
+        cancel: "threading.Event | None") -> _Sub:
+    """Reuse or exclusively run one exact pass under a fenced store claim."""
+    if checkpoint_run is None:
+        return _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
+                        label, cancel=cancel)
+    now = _iso_now()
+    width = max(1, len(_chain_for(cfg, reviewer)))
+    # The caller passes `_escalated(d, prompt.prompt_bytes, large_prompt)`
+    # here, so this lease uses the same raised timeout as the provider attempt
+    # for large prompts. Keeping the calculation at the claim boundary makes
+    # the lease cover retries plus grace, rather than a stale pre-escalation
+    # default.
+    lease_seconds = budget.worst_runtime(d, width, 0)
+    try:
+        claim = store.claim_checkpoint(
+            checkpoint_run.orchestration_id, pass_identity,
+            owner=checkpoint_run.owner, now=now,
+            lease_expires_at=_iso_after(lease_seconds))
+    except Exception as exc:
+        raise PersistenceFailed(
+            f"could not claim checkpoint for {label}: {exc!r}") from exc
+    if claim["decision"] == "complete":
+        try:
+            payload = checkpoints.CheckpointPayload(claim["payload_json"])
+            fields = checkpoints.sub_fields_from_payload(payload)
+            sub = _Sub(**fields)
+        except Exception as exc:
+            raise PersistenceFailed(
+                f"stored checkpoint for {label} is invalid: {exc!r}") from exc
+        _note(f"{label}: reused completed checkpoint")
+        return sub
+    if claim["decision"] == "in_flight":
+        raise CheckpointInFlight(
+            f"{label} is already in flight under another exact resumer; "
+            "no duplicate provider call was launched")
+    try:
+        sub = _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
+                       label, cancel=cancel)
+        payload = checkpoints.payload_from_sub(sub)
+        applied = store.complete_checkpoint(
+            checkpoint_run.orchestration_id, pass_identity.kind,
+            pass_identity.index, owner=checkpoint_run.owner,
+            claim_token=claim["claim_token"], fence=claim["fence"],
+            payload=payload, completed_at=_iso_now())
+        if not applied:
+            raise CheckpointClaimLost(
+                f"lost fenced checkpoint claim for {label}; refusing to "
+                "publish this provider result")
+        return sub
+    except BaseException:
+        try:
+            store.release_checkpoint(
+                checkpoint_run.orchestration_id, pass_identity.kind,
+                pass_identity.index, owner=checkpoint_run.owner,
+                claim_token=claim["claim_token"], fence=claim["fence"],
+                reason=f"{label} did not complete", at=_iso_now())
+        except Exception:
+            pass
+        raise
+
+
 def _escalated(d: Defaults, prompt_bytes: int,
                large_prompt: tuple[int, int] | None) -> Defaults:
     """`d`, with the timeout raised for a prompt that is over the threshold.
@@ -2828,13 +3055,191 @@ def _batch_labels(branch: str, head_label: str, index: int, count: int,
             f"files: {', '.join(files)}")
 
 
+def _prepare_batch_plan(
+        diff, *, batches: list, cfg: Config, d: Defaults, root: Path,
+        finder: Reviewer, branch: str, base_ref: str, base_sha: str,
+        head_label: str, context_source: str = "wt",
+        context_oid: str | None = None) -> _PreparedPlan:
+    """Freeze deterministic pass inputs before any resumable provider call.
+
+    Exact resume cannot learn context/checklist/prompt identity lazily after a
+    provider has already answered.  This helper performs the same pure/file
+    preparation `_orchestrate` historically performed immediately before each
+    call, for every batch up front, while the caller still holds its existing
+    repository identity/foreground serialization boundary.
+    """
+    count = len(batches)
+    if count < 1:
+        raise ValueError("a checkpoint plan needs at least one batch")
+    mode = passes.batch_checklist_mode(count)
+    sole = count == 1
+    envelope = budget.prompt_budget(d, finder)
+    prepared: list[_PreparedBatch] = []
+    selections = []
+    context_hashes: list[str | None] = []
+    boundaries = []
+
+    for index, batch in enumerate(batches, 1):
+        selection = checklist.select(
+            batch.files, mode, _under(root, d.checklist_dir),
+            _under(root, d.rules_json), d.checklist_map,
+            d.test_path_patterns)
+        selections.append(selection)
+        pack = None
+        if d.context_pack:
+            headroom = promptbuild.context_headroom(
+                envelope, len(batch.data), packing=True)
+            pack = contextpack.pack(
+                root, list(batch.files),
+                {name: diff.statuses[name] for name in batch.files
+                 if name in diff.statuses},
+                headroom, source=context_source, oid=context_oid,
+                pack_large_added=not sole)
+            context_hashes.append(
+                pack.sha256 if isinstance(pack.sha256, str) else None)
+        b_branch, b_head = _batch_labels(
+            branch, head_label, index, count, list(batch.files))
+        prompt = promptbuild.build(
+            b_branch, base_ref, base_sha, b_head, batch.data, envelope,
+            selection, pack.body if pack is not None else None)
+        boundary = {
+            "index": index,
+            "diff_hash": gitio.diff_identity(batch.data),
+            "files": list(batch.files),
+            "splitter_truncated": batch.truncated is True,
+        }
+        boundary_hash = checkpoints.canonical_digest(boundary)
+        boundaries.append(boundary)
+        prepared.append(_PreparedBatch(
+            batch=batch, selection=selection, pack=pack, prompt=prompt,
+            identity=checkpoints.PassIdentity(
+                kind="batch", index=index,
+                prompt_hash=checkpoints.canonical_digest({
+                    "prompt_sha256": gitio.diff_identity(prompt.text),
+                    "prompt_bytes": prompt.prompt_bytes,
+                    "diff_truncated": prompt.diff_truncated is True,
+                }),
+                diff_hash=gitio.diff_identity(batch.data),
+                boundary_hash=boundary_hash)))
+
+    boundary_digest = checkpoints.canonical_digest(boundaries)
+    integration_selection = None
+    integration_selection_hash = None
+    if passes.should_run_integration(count):
+        integration_selection = checklist.select(
+            diff.files, passes.INTEGRATION_CHECKLIST_MODE,
+            _under(root, d.checklist_dir), _under(root, d.rules_json),
+            d.checklist_map, d.test_path_patterns)
+        selections.append(integration_selection)
+        integration_selection_hash = reuse.checklist_identity(
+            integration_selection)
+    integration_plan_digest = checkpoints.canonical_digest({
+        "scheduled": integration_selection is not None,
+        "batch_count": count,
+        "boundary_digest": boundary_digest,
+        "selection_hash": integration_selection_hash,
+    })
+    return _PreparedPlan(
+        batches=tuple(prepared),
+        integration_selection=integration_selection,
+        context_hash=reuse.aggregate_context_identity(
+            context_hashes, enabled=d.context_pack),
+        checklist_hash=reuse.aggregate_checklist_identity(
+            selections,
+            batch_boundaries=[gitio.diff_identity(batch.data)
+                              for batch in batches]),
+        boundary_digest=boundary_digest,
+        integration_plan_digest=integration_plan_digest)
+
+
+def _orchestration_identity(
+        rec: dict, diff, prepared: _PreparedPlan, *, cfg: Config, d: Defaults,
+        root: Path, finder: Reviewer, branch: str, head: str, base_ref: str,
+        base_sha: str, tree_fingerprint: str
+        ) -> checkpoints.OrchestrationIdentity:
+    """Build the complete checkpoint identity from one frozen prepared plan."""
+    integrator = _pass_reviewer(cfg, passes.INTEGRATION_PASS, finder)
+
+    def _graph(reviewer: Reviewer) -> list[dict]:
+        return [asdict(entry) for entry in _chain_for(cfg, reviewer)]
+
+    reviewer_hash = checkpoints.canonical_digest({
+        "requested_reviewer": rec.get("requested_reviewer"),
+        "client_family": rec.get("client_family"),
+        "routed_reviewer": rec.get("routed_reviewer"),
+        "finder": _graph(finder),
+        "integration": (_graph(integrator)
+                        if prepared.integration_selection is not None else []),
+    })
+    config_hash = checkpoints.canonical_digest({
+        "mode": rec.get("mode"),
+        # Hash the complete loaded policy plus the mode-specific effective
+        # defaults. A currently non-executing field is still configuration
+        # identity: a later planner may begin consuming it, and old durable
+        # checkpoints must not silently become approximately compatible.
+        "config": asdict(cfg),
+        "effective_defaults": asdict(d),
+    })
+    pass_identities = list(item.identity for item in prepared.batches)
+    if prepared.integration_selection is not None:
+        pass_identities.append(checkpoints.PassIdentity(
+            kind="integration", index=0, prompt_hash=None,
+            diff_hash=gitio.diff_identity(diff.data),
+            boundary_hash=prepared.integration_plan_digest))
+    return checkpoints.OrchestrationIdentity(
+        repo_id=gitio.repository_identity(root),
+        worktree_root=gitio.observed_worktree_root(root),
+        branch=branch,
+        head=head,
+        base_ref=base_ref,
+        base_sha=base_sha,
+        diff_hash=gitio.diff_identity(diff.data),
+        tree_fingerprint=tree_fingerprint,
+        context_hash=prepared.context_hash,
+        checklist_hash=prepared.checklist_hash,
+        reviewer_hash=reviewer_hash,
+        config_hash=config_hash,
+        policy_hash=reuse.security_policy_identity(cfg),
+        planner_version=checkpoints.PLANNER_VERSION,
+        batch_budget=_batch_budget(d, finder),
+        batch_count=len(prepared.batches),
+        boundary_digest=prepared.boundary_digest,
+        integration_plan_digest=prepared.integration_plan_digest,
+        pass_identities=tuple(pass_identities))
+
+
+def _revalidate_foreground_orchestration(
+        expected: checkpoints.OrchestrationIdentity, rec: dict, *,
+        repo: Path, cfg: Config, d: Defaults, finder: Reviewer) -> str | None:
+    """Recompute the exact repository/plan identity before final publication."""
+    base = gitio.resolve_base(repo)
+    diff = gitio.capture_diff(repo, base.sha, d.untracked_max)
+    branch = gitio.current_branch(repo)
+    head = gitio.head_sha(repo)
+    plan = batch_plan(diff.data, d, finder)
+    if not plan:
+        return "batch_plan"
+    root = gitio._worktree_root(repo)
+    prepared = _prepare_batch_plan(
+        diff, batches=plan, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, base_ref=base.ref, base_sha=base.sha,
+        head_label=f"{head} (working tree)")
+    current = _orchestration_identity(
+        rec, diff, prepared, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, head=head, base_ref=base.ref, base_sha=base.sha,
+        tree_fingerprint=gitio.tree_fingerprint(repo, paths=diff.files))
+    return checkpoints.first_mismatch(expected, current)
+
+
 def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                  root: Path, store: Store, scratch: Path, finder: Reviewer,
                  branch: str, base_ref: str, base_sha: str, head_label: str,
                  tag: str = "primary", context_source: str = "wt",
                  context_oid: str | None = None,
                  large_prompt: tuple[int, int] | None = None,
-                 cancel: "threading.Event | None" = None) -> dict:
+                 cancel: "threading.Event | None" = None,
+                 prepared_plan: _PreparedPlan | None = None,
+                 checkpoint_run: _CheckpointRun | None = None) -> dict:
     """Review `batches` as sub-reviews plus one cross-file pass; AGGREGATE.
 
     Returns a new record: `rec` with every aggregate field filled in. `rec` is
@@ -2871,7 +3276,16 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
     """
     count = len(batches)
     mode = passes.batch_checklist_mode(count)
-    sole = count == 1
+    if prepared_plan is None:
+        prepared_plan = _prepare_batch_plan(
+            diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+            branch=branch, base_ref=base_ref, base_sha=base_sha,
+            head_label=head_label, context_source=context_source,
+            context_oid=context_oid)
+    if len(prepared_plan.batches) != count or any(
+            item.batch != batch
+            for item, batch in zip(prepared_plan.batches, batches)):
+        raise ValueError("the prepared checkpoint plan does not match the batches")
     # Every BATCH prompt is the finder's, so it is the finder's envelope — the
     # same number `batch_plan` cut these batches with, read from the same
     # helper rather than re-derived. The integration pass is a DIFFERENT
@@ -2911,7 +3325,8 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             checklist_notes.append(selection.note)
         checklist_degraded = checklist_degraded or selection.degraded is True
 
-    for index, batch in enumerate(batches, 1):
+    for index, prepared in enumerate(prepared_plan.batches, 1):
+        batch = prepared.batch
         # A BATCH BOUNDARY. The checklist selection, the context pack and the
         # prompt build below all happen outside any watchdog, so a token set
         # while the previous batch was being written up would otherwise buy a
@@ -2921,27 +3336,12 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         # the files this batch shows. A file split across two batches has its
         # context packed into both -- accepted, because the batches are reviewed
         # independently and each one has to stand on its own.
-        selection = checklist.select(
-            batch.files, mode, _under(root, d.checklist_dir),
-            _under(root, d.rules_json), d.checklist_map, d.test_path_patterns)
+        selection = prepared.selection
         checklist_selections.append(selection)
         _fold_checklist(selection)
 
-        pack = None
-        if d.context_pack:
-            headroom = promptbuild.context_headroom(
-                mdb, len(batch.data), packing=True)
-            # `pack_large_added` is True for a real split (a batch may hold only
-            # part of a large added file, so packing it whole adds what the
-            # slice cannot show) and False for the sole batch, which already
-            # carries every added file whole -- the unbatched rule, because the
-            # sole batch IS the unbatched diff.
-            pack = contextpack.pack(
-                root, list(batch.files),
-                {f: diff.statuses[f] for f in batch.files
-                 if f in diff.statuses},
-                headroom, source=context_source, oid=context_oid,
-                pack_large_added=not sole)
+        pack = prepared.pack
+        if pack is not None:
             context_hashes.append(
                 pack.sha256 if isinstance(pack.sha256, str) else None)
             ctx_bytes += pack.bytes_total
@@ -2953,11 +3353,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 if entry not in ctx_omitted:
                     ctx_omitted.append(entry)
 
-        b_branch, b_head = _batch_labels(branch, head_label, index, count,
-                                         list(batch.files))
-        prompt = promptbuild.build(b_branch, base_ref, base_sha, b_head,
-                                   batch.data, mdb, selection,
-                                   pack.body if pack is not None else None)
+        prompt = prepared.prompt
         prompt_bytes += prompt.prompt_bytes
         _note(f"batch {index}/{count} ({len(batch.files)} file(s), "
               f"{len(batch.data)} bytes) ...")
@@ -2965,10 +3361,11 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             _note(f"batch {index}/{count} is {len(batch.data)} bytes "
                   f"(> {mdb}); its prompt is truncated and this "
                   f"review cannot be trustworthy")
-        sub = _run_sub(finder, cfg,
-                       _escalated(d, prompt.prompt_bytes, large_prompt),
-                       prompt, root, store, scratch,
-                       f"{tag}.b{index}", f"batch {index}", cancel=cancel)
+        sub = _checkpointed_sub(
+            checkpoint_run, prepared.identity, reviewer=finder, cfg=cfg,
+            d=_escalated(d, prompt.prompt_bytes, large_prompt), prompt=prompt,
+            root=root, store=store, scratch=scratch, tag=f"{tag}.b{index}",
+            label=f"batch {index}", cancel=cancel)
         subs.append(sub)
         findings.extend(sub.findings)
         metas.append({
@@ -3003,10 +3400,9 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         # The last pass boundary in an orchestration: the integration prompt is
         # built from every batch's diff and findings, which is real work.
         _checkpoint(cancel, None, "before the integration pass")
-        selection = checklist.select(
-            diff.files, passes.INTEGRATION_CHECKLIST_MODE,
-            _under(root, d.checklist_dir), _under(root, d.rules_json),
-            d.checklist_map, d.test_path_patterns)
+        selection = prepared_plan.integration_selection
+        if selection is None:
+            raise ValueError("the prepared plan omitted a required integration pass")
         checklist_selections.append(selection)
         _fold_checklist(selection)
         meta_checklist = passes.checklist_meta(
@@ -3039,11 +3435,22 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             if prompt.diff_truncated:
                 _note(f"NOTE integration context capped at {integration_mdb} "
                       f"bytes; some cross-file relationships were not shown")
-            integration_sub = _run_sub(
-                reviewer, cfg,
-                _escalated(d, prompt.prompt_bytes, large_prompt),
-                prompt, root, store, scratch,
-                passes.INTEGRATION_PASS, "the integration pass", cancel=cancel)
+            integration_identity = checkpoints.PassIdentity(
+                kind="integration", index=0,
+                prompt_hash=checkpoints.canonical_digest({
+                    "prompt_sha256": gitio.diff_identity(prompt.text),
+                    "prompt_bytes": prompt.prompt_bytes,
+                    "diff_truncated": prompt.diff_truncated is True,
+                }),
+                diff_hash=gitio.diff_identity(diff.data),
+                boundary_hash=prepared_plan.integration_plan_digest)
+            integration_sub = _checkpointed_sub(
+                checkpoint_run, integration_identity, reviewer=reviewer,
+                cfg=cfg, d=_escalated(
+                    d, prompt.prompt_bytes, large_prompt), prompt=prompt,
+                root=root, store=store, scratch=scratch,
+                tag=passes.INTEGRATION_PASS, label="the integration pass",
+                cancel=cancel)
             # Tagged BEFORE they are merged: nothing downstream can tell a
             # cross-file finding from a within-batch one afterwards.
             tagged = passes.tag_integration_findings(integration_sub.findings)

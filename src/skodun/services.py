@@ -175,7 +175,8 @@ def svc_review_readiness(store, repo, *, reviewer=None, client_family=None,
 
 def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
                      reviewer=None, client_family=None,
-                     avoid_providers=None) -> tuple[int, str]:
+                     avoid_providers=None,
+                     resume_checkpoints=True) -> tuple[int, str]:
     """Run one foreground review. `(code, banner)`. Exit codes, and why:
 
       0  trustworthy and clean            3  gave up waiting for the lock
@@ -274,7 +275,8 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
         rec = run_review(root, cfg, store, progress_sink=progress_sink,
                          cancel=cancel, reviewer=reviewer,
                          client_family=client_family,
-                         avoid_providers=avoid_providers)
+                         avoid_providers=avoid_providers,
+                         resume_checkpoints=resume_checkpoints)
     except PreflightRefused as e:
         return 2, banner_failure(str(e))
     except LockTimeout as e:
@@ -542,9 +544,18 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
     if reuse_result is not None:
         return (*reuse_result, reuse_metadata)
     if not recover:
+        # MCP resolves an omitted family from the handshake, then passes the
+        # separate ``reuse_client_family`` intent marker.  A handshake guess
+        # must not turn an otherwise resumable call into a fresh run; only an
+        # explicitly declared family is a resume boundary.
+        intent_family = (client_family
+                         if reuse_client_family is _REUSE_INTENT_UNSET
+                         else reuse_client_family)
         status, text = _svc_review_once(
             store, repo, progress_sink=progress_sink, cancel=cancel,
-            reviewer=reviewer, client_family=client_family)
+            reviewer=reviewer, client_family=client_family,
+            resume_checkpoints=(not fresh and reviewer is None
+                                and intent_family is None))
         if reuse_note:
             text = f"{reuse_note}\n{text}"
         return status, text, reuse_metadata
@@ -639,7 +650,13 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             store, repo, progress_sink=progress_sink, cancel=request_cancel,
             reviewer=reviewer, client_family=client_family,
             avoid_providers=(set(terminal_providers)
-                             if reviewer is None else set()))
+                             if reviewer is None else set()),
+            # Recovery attempts are deliberately independent second looks.
+            # The caller may opt into checkpoint resume for an ordinary review,
+            # but the bounded recovery contract has always promised fresh
+            # records and provider diversity; reusing a partial batch here
+            # would silently turn a retry into the same interrupted run.
+            resume_checkpoints=False)
         try:
             last_rec, review_id = _annotate_recovery_attempt(
                 store, last_text, orchestration_id, ordinal)

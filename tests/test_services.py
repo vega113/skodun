@@ -141,6 +141,64 @@ def test_opt_in_reuse_returns_existing_review_without_running_pipeline(
     assert events[0]["outcome"] == "hit"
 
 
+@pytest.mark.parametrize(("fresh", "expected_resume"), [
+    (False, True),
+    (True, False),
+])
+def test_fresh_controls_incomplete_checkpoint_resume_at_shared_service(
+        tmp_path, monkeypatch, fresh, expected_resume):
+    """CLI and MCP both reach this seam, so `fresh` must have one meaning."""
+    monkeypatch.setattr(
+        services, "_try_reuse",
+        lambda *args, **kwargs: (None, None, {}))
+    seen = []
+
+    def fake_review_once(*args, **kwargs):
+        seen.append(kwargs.get("resume_checkpoints"))
+        return 0, "clean"
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_review_once)
+    with Store.open(tmp_path / f"fresh-{fresh}.db") as store:
+        status, text, _metadata = services.svc_review_detailed(
+            store, tmp_path, fresh=fresh)
+
+    assert (status, text) == (0, "clean")
+    assert seen == [expected_resume]
+
+
+@pytest.mark.parametrize("intent", ["reviewer", "client_family"])
+def test_explicit_review_intent_bypasses_incomplete_checkpoint_resume(
+        tmp_path, monkeypatch, intent):
+    monkeypatch.setattr(
+        services, "_try_reuse",
+        lambda *args, **kwargs: (None, None, {}))
+    seen = []
+    monkeypatch.setattr(
+        services, "_svc_review_once",
+        lambda *args, **kwargs: seen.append(kwargs["resume_checkpoints"])
+        or (0, "clean"))
+    kwargs = {intent: "named"}
+    with Store.open(tmp_path / f"intent-{intent}.db") as store:
+        services.svc_review_detailed(store, tmp_path, **kwargs)
+    assert seen == [False]
+
+
+def test_inferred_client_family_keeps_checkpoint_resume_enabled(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        services, "_try_reuse",
+        lambda *args, **kwargs: (None, None, {}))
+    seen = []
+    monkeypatch.setattr(
+        services, "_svc_review_once",
+        lambda *args, **kwargs: seen.append(kwargs["resume_checkpoints"])
+        or (0, "clean"))
+    with Store.open(tmp_path / "inferred-family.db") as store:
+        services.svc_review_detailed(
+            store, tmp_path, client_family="xai", reuse_client_family=None)
+    assert seen == [True]
+
+
 def test_opt_in_reuse_honors_cancellation_before_and_during_a_probe(
         tmp_path, monkeypatch):
     cancel = threading.Event()
@@ -277,6 +335,7 @@ def test_bounded_recovery_records_each_attempt_and_avoids_terminal_provider(
     assert "trustworthy review reached" in text
     assert calls[0]["avoid_providers"] == set()
     assert calls[1]["avoid_providers"] == {"xai"}
+    assert all(call["resume_checkpoints"] is False for call in calls)
     assert rows[0]["orchestration_id"] == rows[1]["orchestration_id"]
     assert rows[0]["attempt_ordinal"] == 0
     assert rows[1]["attempt_ordinal"] == 1
