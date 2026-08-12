@@ -918,11 +918,17 @@ def classify_findings(
                     scope.exclusive or bool(previous and previous[2]),
                 )
             owner_matches = list(stack_owners.values())
+            finding_line = finding.get("line")
+            evidence_set = (*result.dependencies,
+                            *((result.current_slice,) if
+                              result.current_slice is not None else ()))
             uncertain_path = any(
                 path in evidence.uncertain_files
-                for evidence in (*result.dependencies,
-                                 *((result.current_slice,) if
-                                   result.current_slice is not None else ())))
+                and (type(finding_line) is not int
+                     or not any(start <= finding_line <= end
+                                for start, end in _changed_line_map(evidence)
+                                .get(path, ())))
+                for evidence in evidence_set)
 
             if uncertain_path:
                 attribution = _attribution("unknown", "uncertain_git_mapping")

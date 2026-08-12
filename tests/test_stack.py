@@ -775,6 +775,28 @@ def test_mixed_deletion_only_hunk_remains_uncertain():
     assert evidence.changed_lines == (("src/a.py", ((11, 11),)),)
 
 
+def test_mixed_hunk_added_line_keeps_exact_scope_attribution():
+    item = stack.StackSlice(
+        slice_id="pr-14", commit=HEAD, tracking_ref=f"{REPOSITORY}#14",
+        ownership=(stack.OwnershipScope(
+            kind="file", path="src/a.py", exclusive=True,
+            line_start=11, line_end=11, symbol=None),),
+    )
+    result = SimpleNamespace(
+        status="valid", reason_code="ok", manifest=None,
+        current_slice=stack.SliceEvidence(
+            slice=item, files=frozenset({"src/a.py"}), statuses=(),
+            uncertain_files=frozenset({"src/a.py"}),
+            changed_lines=(("src/a.py", ((11, 11),)),)),
+        dependencies=(),
+    )
+
+    finding = stack.classify_findings(
+        [{"file": "src/a.py", "line": 11}], result)[0]
+
+    assert finding["scope_attribution"]["scope"] == "current_slice"
+
+
 def test_distinct_symbol_scopes_do_not_overlap():
     left = stack.OwnershipScope(
         kind="file", path="src/a.py", exclusive=True,
