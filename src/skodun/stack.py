@@ -509,7 +509,9 @@ class StackValidation:
         """Bounded artifact/service projection; never the raw manifest."""
         manifest = self.manifest
         return {
-            "schema_version": None if manifest is None else manifest.schema_version,
+            "schema_version": (
+                manifest.schema_version
+                if self.status == "valid" and manifest is not None else None),
             "status": self.status,
             "reason_code": self.reason_code,
             "manifest_digest": (
@@ -688,10 +690,10 @@ def validate(
         return _ignored(request, "invalid_field")
     try:
         repository_id = gitio.canonical_repository_identity(Path(repo))
-    except (gitio.GitError, OSError, UnicodeError):
-        return _ignored(request, "git_error")
-    except (OSError, UnicodeError):
+    except UnicodeError:
         repository_id = None
+    except (gitio.GitError, OSError):
+        return _ignored(request, "git_error")
     if repository_id is None:
         return _ignored(request, "repository_unresolved")
     if manifest.repository_id != repository_id:

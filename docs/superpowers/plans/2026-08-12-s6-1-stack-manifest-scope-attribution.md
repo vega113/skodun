@@ -526,6 +526,12 @@
   ambient `diff.renameLimit` from silently disabling exhaustive rename/copy
   analysis. Git/stack verification passes (`127 passed, 9 skipped`).
 
+  Final projection/identity follow-up: ignored projections omit schema version;
+  undecodable origins report `repository_unresolved`; stack rename evidence
+  retains both source and destination paths as uncertain; and URL path `@`/`:`
+  characters remain valid after authority credential checks. Focused suites
+  pass (`282 passed, 9 skipped`).
+
 - [ ] **Step 5: Verify merged main and close #144.**
 
   Fetch `origin/main`, verify the merge commit is present, run the focused

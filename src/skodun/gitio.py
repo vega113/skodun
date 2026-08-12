@@ -255,6 +255,8 @@ def _tracked_statuses(
         two_path = code in ("R", "C")
         path = toks[i + 2] if two_path else toks[i + 1]
         statuses[path] = code
+        if detect_renames and two_path:
+            statuses[toks[i + 1]] = code
         i += 3 if two_path else 2
     return statuses
 
@@ -587,6 +589,7 @@ def _portable_remote_identity(remote: str) -> str | None:
         return None
     host = ""
     path = ""
+    url_scheme: str | None = None
     if "://" in remote:
         try:
             parsed = urlsplit(remote)
@@ -598,6 +601,7 @@ def _portable_remote_identity(remote: str) -> str | None:
         if parsed.query or parsed.fragment or parsed.password is not None:
             return None
         host = parsed.hostname or ""
+        url_scheme = parsed.scheme
         if port is not None:
             host = f"{host}:{port}"
         path = parsed.path.removeprefix("/")
@@ -623,7 +627,8 @@ def _portable_remote_identity(remote: str) -> str | None:
         path = path[:-4]
     parts = path.split("/")
     if (not parts or any(not part or part in {".", ".."} for part in parts)
-            or any("\\" in part or "@" in part or ":" in part
+            or any("\\" in part or (url_scheme is None and
+                                     ("@" in part or ":" in part))
                    for part in parts)):
         return None
     normalized_host = bare_host.lower()
@@ -632,8 +637,8 @@ def _portable_remote_identity(remote: str) -> str | None:
             port = int(host.rsplit(":", 1)[1])
         except ValueError:
             return None
-        if ((parsed.scheme == "https" and port == 443)
-                or (parsed.scheme == "ssh" and port == 22)):
+        if ((url_scheme == "https" and port == 443)
+                or (url_scheme == "ssh" and port == 22)):
             host = normalized_host
     return f"{host.lower()}/{'/'.join(parts)}"
 
