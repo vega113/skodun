@@ -719,6 +719,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             # records and provider diversity; reusing a partial batch here
             # would silently turn a retry into the same interrupted run.
             resume_checkpoints=False, batch_target_bytes=batch_target_bytes,
+            stack_request=stack_request,
             result_metadata=attempt_metadata)
         try:
             last_rec, review_id = _annotate_recovery_attempt(
