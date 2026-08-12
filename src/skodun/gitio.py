@@ -561,31 +561,34 @@ _SCP_REMOTE = re.compile(
     r"(?:(?P<user>[^@/:]+)@)?(?P<host>[^/:]+):(?P<path>.+)")
 _FULL_COMMIT_OID = re.compile(r"[0-9a-f]{40}")
 _HEX = frozenset("0123456789abcdefABCDEF")
-_UNRESERVED = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-)
 
 
 def _decode_unreserved_path(value: str) -> str | None:
-    """Decode only URI unreserved escapes; reject reserved/invalid escapes."""
-    chars: list[str] = []
+    """Decode valid UTF-8 URI escapes, refusing encoded path separators."""
+    encoded: bytearray = bytearray()
     index = 0
     while index < len(value):
         char = value[index]
         if char != "%":
-            chars.append(char)
+            try:
+                encoded.extend(char.encode("utf-8"))
+            except UnicodeEncodeError:
+                return None
             index += 1
             continue
         if (index + 2 >= len(value)
                 or value[index + 1] not in _HEX
                 or value[index + 2] not in _HEX):
             return None
-        decoded = chr(int(value[index + 1:index + 3], 16))
-        if decoded not in _UNRESERVED:
+        decoded = int(value[index + 1:index + 3], 16)
+        if decoded in b"/\\?#":
             return None
-        chars.append(decoded)
+        encoded.append(decoded)
         index += 3
-    return "".join(chars)
+    try:
+        return bytes(encoded).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def _portable_remote_identity(remote: str) -> str | None:
@@ -621,8 +624,11 @@ def _portable_remote_identity(remote: str) -> str | None:
         if match is None:
             return None
         # SCP syntax has no URL parser to isolate credentials. Reject them
-        # explicitly so a userinfo-like prefix cannot become part of identity.
-        if "@" in match.group("path"):
+        # explicitly when an @ appears before the host/path separator. Once
+        # that separator is crossed, @ and : are ordinary path characters.
+        at = remote.find("@")
+        separator = remote.find(":")
+        if at >= 0 and separator >= 0 and separator < at:
             return None
         host = match.group("host")
         path = match.group("path")
@@ -639,9 +645,7 @@ def _portable_remote_identity(remote: str) -> str | None:
         path = path[:-4]
     parts = path.split("/")
     if (not parts or any(not part or part in {".", ".."} for part in parts)
-            or any("\\" in part or (url_scheme is None and
-                                     ("@" in part or ":" in part))
-                   for part in parts)):
+            or any("\\" in part for part in parts)):
         return None
     normalized_host = bare_host.lower()
     if ":" in host:

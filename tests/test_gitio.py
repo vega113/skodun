@@ -965,6 +965,9 @@ def test_git_common_dir_shared_between_worktrees(tmp_path):
     ("ssh://git@github.com:22/Acme/Project.git", "github.com/Acme/Project"),
     ("SSH://git@github.com:22/Acme/Project.git", "github.com/Acme/Project"),
     ("https://github.com/Acme/%50roject.git", "github.com/Acme/Project"),
+    ("https://github.com/Acme/caf%C3%A9.git", "github.com/Acme/café"),
+    ("git@github.com:Acme/repo@v2.git", "github.com/Acme/repo@v2"),
+    ("git@github.com:Acme/repo:v2.git", "github.com/Acme/repo:v2"),
 ])
 def test_canonical_repository_identity_normalizes_supported_remotes(
         tmp_path, url, expected):
@@ -977,7 +980,6 @@ def test_canonical_repository_identity_normalizes_supported_remotes(
 @pytest.mark.parametrize("url", [
     "/tmp/project.git",
     "file:///tmp/project.git",
-    "https://user:secret@example.com/acme/project.git",
     "user:secret@example.com:acme/project.git",
     "https://example.com/acme/../project.git",
     "https://example.com/acme/project.git?token=secret",
@@ -987,6 +989,7 @@ def test_canonical_repository_identity_normalizes_supported_remotes(
     "https://example.com/acme/control\x01project.git",
     "https://example.com/acme/%2Fproject.git",
     "https://example.com/acme/%2e%2e/project.git",
+    "https://user:secret@example.com/acme/project.git",
 ])
 def test_canonical_repository_identity_refuses_unportable_or_unsafe_remotes(
         tmp_path, url):
