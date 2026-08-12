@@ -16,6 +16,9 @@ provider executable provenance (#152), or evidence receipts (#147).
 
 1. Checkpoints are not reviews. Gate, triage, delivery, dedup, exact-diff
    reuse, and normal review listings cannot query checkpoint tables.
+   Deterministic batch preparation and orchestration creation therefore happen
+   before a coverage-bearing `reviews` row is written; a crash in preparation
+   leaves resumable orchestration state, never a misleading running review.
 2. Resume requires exact equality for repository, worktree, branch, head,
    certification base, full diff, tree, context, checklist, reviewer graph,
    effective config/policy, planner version, batch budget, ordered boundaries,
