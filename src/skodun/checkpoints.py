@@ -36,6 +36,16 @@ _FORBIDDEN_FIELDS = frozenset({
 })
 
 
+def canonical_digest(value: Any) -> str:
+    """SHA-256 of deterministic JSON identity material."""
+    try:
+        body = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"identity material is not canonical JSON: {exc}") from exc
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
 def _text(label: str, value: object, *, optional: bool = False) -> str | None:
     if optional and value is None:
         return None
@@ -237,4 +247,3 @@ class CheckpointPayload:
         if not isinstance(value, dict):  # defensive against direct construction
             raise ValueError("checkpoint payload JSON must decode to an object")
         return value
-

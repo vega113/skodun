@@ -162,11 +162,12 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from . import (batching, budget, capacity, chain, checklist, contextpack, gitio,
-               ids, passes, promptbuild, provenance, reuse, routing, runner)
+from . import (batching, budget, capacity, chain, checklist, checkpoints,
+               contextpack, gitio, ids, passes, promptbuild, provenance, reuse,
+               routing, runner)
 from .adapters import NORMAL_STOP_REASONS, REFUTER_CONTRACT, get_adapter
 from .config import Config, Defaults, Reviewer, quota_pool_for
 from .store import Store, _TS_FORMAT
@@ -2722,6 +2723,29 @@ class _Sub:
     accepted: dict | None
 
 
+@dataclass(frozen=True)
+class _PreparedBatch:
+    """One deterministic batch prompt and every input that produced it."""
+
+    batch: batching.Batch
+    selection: object
+    pack: object | None
+    prompt: object
+    identity: checkpoints.PassIdentity
+
+
+@dataclass(frozen=True)
+class _PreparedPlan:
+    """The complete deterministic plan frozen before provider invocation."""
+
+    batches: tuple[_PreparedBatch, ...]
+    integration_selection: object | None
+    context_hash: str | None
+    checklist_hash: str | None
+    boundary_digest: str
+    integration_plan_digest: str
+
+
 def _escalated(d: Defaults, prompt_bytes: int,
                large_prompt: tuple[int, int] | None) -> Defaults:
     """`d`, with the timeout raised for a prompt that is over the threshold.
@@ -2828,13 +2852,162 @@ def _batch_labels(branch: str, head_label: str, index: int, count: int,
             f"files: {', '.join(files)}")
 
 
+def _prepare_batch_plan(
+        diff, *, batches: list, cfg: Config, d: Defaults, root: Path,
+        finder: Reviewer, branch: str, base_ref: str, base_sha: str,
+        head_label: str, context_source: str = "wt",
+        context_oid: str | None = None) -> _PreparedPlan:
+    """Freeze deterministic pass inputs before any resumable provider call.
+
+    Exact resume cannot learn context/checklist/prompt identity lazily after a
+    provider has already answered.  This helper performs the same pure/file
+    preparation `_orchestrate` historically performed immediately before each
+    call, for every batch up front, while the caller still holds its existing
+    repository identity/foreground serialization boundary.
+    """
+    count = len(batches)
+    if count < 1:
+        raise ValueError("a checkpoint plan needs at least one batch")
+    mode = passes.batch_checklist_mode(count)
+    sole = count == 1
+    envelope = budget.prompt_budget(d, finder)
+    prepared: list[_PreparedBatch] = []
+    selections = []
+    context_hashes: list[str | None] = []
+    boundaries = []
+
+    for index, batch in enumerate(batches, 1):
+        selection = checklist.select(
+            batch.files, mode, _under(root, d.checklist_dir),
+            _under(root, d.rules_json), d.checklist_map,
+            d.test_path_patterns)
+        selections.append(selection)
+        pack = None
+        if d.context_pack:
+            headroom = promptbuild.context_headroom(
+                envelope, len(batch.data), packing=True)
+            pack = contextpack.pack(
+                root, list(batch.files),
+                {name: diff.statuses[name] for name in batch.files
+                 if name in diff.statuses},
+                headroom, source=context_source, oid=context_oid,
+                pack_large_added=not sole)
+            context_hashes.append(
+                pack.sha256 if isinstance(pack.sha256, str) else None)
+        b_branch, b_head = _batch_labels(
+            branch, head_label, index, count, list(batch.files))
+        prompt = promptbuild.build(
+            b_branch, base_ref, base_sha, b_head, batch.data, envelope,
+            selection, pack.body if pack is not None else None)
+        boundary = {
+            "index": index,
+            "diff_hash": gitio.diff_identity(batch.data),
+            "files": list(batch.files),
+            "splitter_truncated": batch.truncated is True,
+        }
+        boundary_hash = checkpoints.canonical_digest(boundary)
+        boundaries.append(boundary)
+        prepared.append(_PreparedBatch(
+            batch=batch, selection=selection, pack=pack, prompt=prompt,
+            identity=checkpoints.PassIdentity(
+                kind="batch", index=index,
+                prompt_hash=checkpoints.canonical_digest({
+                    "prompt_sha256": gitio.diff_identity(prompt.text),
+                    "prompt_bytes": prompt.prompt_bytes,
+                    "diff_truncated": prompt.diff_truncated is True,
+                }),
+                diff_hash=gitio.diff_identity(batch.data),
+                boundary_hash=boundary_hash)))
+
+    boundary_digest = checkpoints.canonical_digest(boundaries)
+    integration_selection = None
+    integration_selection_hash = None
+    if passes.should_run_integration(count):
+        integration_selection = checklist.select(
+            diff.files, passes.INTEGRATION_CHECKLIST_MODE,
+            _under(root, d.checklist_dir), _under(root, d.rules_json),
+            d.checklist_map, d.test_path_patterns)
+        selections.append(integration_selection)
+        integration_selection_hash = reuse.checklist_identity(
+            integration_selection)
+    integration_plan_digest = checkpoints.canonical_digest({
+        "scheduled": integration_selection is not None,
+        "batch_count": count,
+        "boundary_digest": boundary_digest,
+        "selection_hash": integration_selection_hash,
+    })
+    return _PreparedPlan(
+        batches=tuple(prepared),
+        integration_selection=integration_selection,
+        context_hash=reuse.aggregate_context_identity(
+            context_hashes, enabled=d.context_pack),
+        checklist_hash=reuse.aggregate_checklist_identity(
+            selections,
+            batch_boundaries=[gitio.diff_identity(batch.data)
+                              for batch in batches]),
+        boundary_digest=boundary_digest,
+        integration_plan_digest=integration_plan_digest)
+
+
+def _orchestration_identity(
+        rec: dict, diff, prepared: _PreparedPlan, *, cfg: Config, d: Defaults,
+        root: Path, finder: Reviewer, branch: str, head: str, base_ref: str,
+        base_sha: str, tree_fingerprint: str
+        ) -> checkpoints.OrchestrationIdentity:
+    """Build the complete checkpoint identity from one frozen prepared plan."""
+    integrator = _pass_reviewer(cfg, passes.INTEGRATION_PASS, finder)
+
+    def _graph(reviewer: Reviewer) -> list[dict]:
+        return [asdict(entry) for entry in _chain_for(cfg, reviewer)]
+
+    reviewer_hash = checkpoints.canonical_digest({
+        "requested_reviewer": rec.get("requested_reviewer"),
+        "client_family": rec.get("client_family"),
+        "routed_reviewer": rec.get("routed_reviewer"),
+        "finder": _graph(finder),
+        "integration": (_graph(integrator)
+                        if prepared.integration_selection is not None else []),
+    })
+    config_hash = checkpoints.canonical_digest({
+        "mode": rec.get("mode"),
+        "defaults": asdict(d),
+    })
+    pass_identities = list(item.identity for item in prepared.batches)
+    if prepared.integration_selection is not None:
+        pass_identities.append(checkpoints.PassIdentity(
+            kind="integration", index=0, prompt_hash=None,
+            diff_hash=gitio.diff_identity(diff.data),
+            boundary_hash=prepared.integration_plan_digest))
+    return checkpoints.OrchestrationIdentity(
+        repo_id=gitio.repository_identity(root),
+        worktree_root=gitio.observed_worktree_root(root),
+        branch=branch,
+        head=head,
+        base_ref=base_ref,
+        base_sha=base_sha,
+        diff_hash=gitio.diff_identity(diff.data),
+        tree_fingerprint=tree_fingerprint,
+        context_hash=prepared.context_hash,
+        checklist_hash=prepared.checklist_hash,
+        reviewer_hash=reviewer_hash,
+        config_hash=config_hash,
+        policy_hash=reuse.security_policy_identity(cfg),
+        planner_version=checkpoints.PLANNER_VERSION,
+        batch_budget=_batch_budget(d, finder),
+        batch_count=len(prepared.batches),
+        boundary_digest=prepared.boundary_digest,
+        integration_plan_digest=prepared.integration_plan_digest,
+        pass_identities=tuple(pass_identities))
+
+
 def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                  root: Path, store: Store, scratch: Path, finder: Reviewer,
                  branch: str, base_ref: str, base_sha: str, head_label: str,
                  tag: str = "primary", context_source: str = "wt",
                  context_oid: str | None = None,
                  large_prompt: tuple[int, int] | None = None,
-                 cancel: "threading.Event | None" = None) -> dict:
+                 cancel: "threading.Event | None" = None,
+                 prepared_plan: _PreparedPlan | None = None) -> dict:
     """Review `batches` as sub-reviews plus one cross-file pass; AGGREGATE.
 
     Returns a new record: `rec` with every aggregate field filled in. `rec` is
@@ -2871,7 +3044,16 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
     """
     count = len(batches)
     mode = passes.batch_checklist_mode(count)
-    sole = count == 1
+    if prepared_plan is None:
+        prepared_plan = _prepare_batch_plan(
+            diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+            branch=branch, base_ref=base_ref, base_sha=base_sha,
+            head_label=head_label, context_source=context_source,
+            context_oid=context_oid)
+    if len(prepared_plan.batches) != count or any(
+            item.batch != batch
+            for item, batch in zip(prepared_plan.batches, batches)):
+        raise ValueError("the prepared checkpoint plan does not match the batches")
     # Every BATCH prompt is the finder's, so it is the finder's envelope — the
     # same number `batch_plan` cut these batches with, read from the same
     # helper rather than re-derived. The integration pass is a DIFFERENT
@@ -2911,7 +3093,8 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             checklist_notes.append(selection.note)
         checklist_degraded = checklist_degraded or selection.degraded is True
 
-    for index, batch in enumerate(batches, 1):
+    for index, prepared in enumerate(prepared_plan.batches, 1):
+        batch = prepared.batch
         # A BATCH BOUNDARY. The checklist selection, the context pack and the
         # prompt build below all happen outside any watchdog, so a token set
         # while the previous batch was being written up would otherwise buy a
@@ -2921,27 +3104,12 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         # the files this batch shows. A file split across two batches has its
         # context packed into both -- accepted, because the batches are reviewed
         # independently and each one has to stand on its own.
-        selection = checklist.select(
-            batch.files, mode, _under(root, d.checklist_dir),
-            _under(root, d.rules_json), d.checklist_map, d.test_path_patterns)
+        selection = prepared.selection
         checklist_selections.append(selection)
         _fold_checklist(selection)
 
-        pack = None
-        if d.context_pack:
-            headroom = promptbuild.context_headroom(
-                mdb, len(batch.data), packing=True)
-            # `pack_large_added` is True for a real split (a batch may hold only
-            # part of a large added file, so packing it whole adds what the
-            # slice cannot show) and False for the sole batch, which already
-            # carries every added file whole -- the unbatched rule, because the
-            # sole batch IS the unbatched diff.
-            pack = contextpack.pack(
-                root, list(batch.files),
-                {f: diff.statuses[f] for f in batch.files
-                 if f in diff.statuses},
-                headroom, source=context_source, oid=context_oid,
-                pack_large_added=not sole)
+        pack = prepared.pack
+        if pack is not None:
             context_hashes.append(
                 pack.sha256 if isinstance(pack.sha256, str) else None)
             ctx_bytes += pack.bytes_total
@@ -2953,11 +3121,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 if entry not in ctx_omitted:
                     ctx_omitted.append(entry)
 
-        b_branch, b_head = _batch_labels(branch, head_label, index, count,
-                                         list(batch.files))
-        prompt = promptbuild.build(b_branch, base_ref, base_sha, b_head,
-                                   batch.data, mdb, selection,
-                                   pack.body if pack is not None else None)
+        prompt = prepared.prompt
         prompt_bytes += prompt.prompt_bytes
         _note(f"batch {index}/{count} ({len(batch.files)} file(s), "
               f"{len(batch.data)} bytes) ...")
@@ -3003,10 +3167,9 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
         # The last pass boundary in an orchestration: the integration prompt is
         # built from every batch's diff and findings, which is real work.
         _checkpoint(cancel, None, "before the integration pass")
-        selection = checklist.select(
-            diff.files, passes.INTEGRATION_CHECKLIST_MODE,
-            _under(root, d.checklist_dir), _under(root, d.rules_json),
-            d.checklist_map, d.test_path_patterns)
+        selection = prepared_plan.integration_selection
+        if selection is None:
+            raise ValueError("the prepared plan omitted a required integration pass")
         checklist_selections.append(selection)
         _fold_checklist(selection)
         meta_checklist = passes.checklist_meta(

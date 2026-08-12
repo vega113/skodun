@@ -815,6 +815,107 @@ def test_the_sole_batch_prompt_is_byte_identical_to_the_unbatched_prompt(
     assert out["prompt_bytes"] == expected.prompt_bytes
 
 
+def test_checkpoint_preparation_is_deterministic_and_invokes_no_provider(
+        tmp_path, monkeypatch):
+    """Identity is frozen from the exact prompts before resumable work runs."""
+    repo = _oversized(tmp_path)
+    cfg = load_config(repo)
+    d = cfg.defaults
+    root = gitio._worktree_root(repo)
+    base = resolve_base(repo)
+    diff = capture_diff(repo, base.sha, d.untracked_max)
+    finder = pipeline._reviewer_for(cfg, "finder")
+    batches = pipeline.batch_plan(diff.data, d, finder)
+    branch = gitio.current_branch(repo)
+    head = gitio.head_sha(repo)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("preparing checkpoint identity invoked a provider")
+
+    monkeypatch.setattr(pipeline, "_run_chain", forbidden)
+    one = pipeline._prepare_batch_plan(
+        diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, base_ref=base.ref, base_sha=base.sha,
+        head_label=f"{head} (working tree)")
+    two = pipeline._prepare_batch_plan(
+        diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, base_ref=base.ref, base_sha=base.sha,
+        head_label=f"{head} (working tree)")
+
+    assert [item.prompt.text for item in one.batches] == \
+        [item.prompt.text for item in two.batches]
+    assert one.context_hash == two.context_hash
+    assert one.checklist_hash == two.checklist_hash
+    assert one.boundary_digest == two.boundary_digest
+    assert one.integration_plan_digest == two.integration_plan_digest
+    assert [item.identity for item in one.batches] == \
+        [item.identity for item in two.batches]
+
+
+def test_prepared_prompts_are_the_prompts_the_orchestrator_sends(tmp_path):
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _oversized(tmp_path)
+    cfg = load_config(repo)
+    d = cfg.defaults
+    root = gitio._worktree_root(repo)
+    base = resolve_base(repo)
+    diff = capture_diff(repo, base.sha, d.untracked_max)
+    finder = pipeline._reviewer_for(cfg, "finder")
+    batches = pipeline.batch_plan(diff.data, d, finder)
+    branch = gitio.current_branch(repo)
+    head = gitio.head_sha(repo)
+    prepared = pipeline._prepare_batch_plan(
+        diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, base_ref=base.ref, base_sha=base.sha,
+        head_label=f"{head} (working tree)")
+
+    with tempfile.TemporaryDirectory() as scratch:
+        pipeline._orchestrate(
+            {"id": "sk_prepared", "mode": "now", "model": finder.model,
+             "adapter": "grok", "summary": "", "findings": []}, diff,
+            batches=batches, cfg=cfg, d=d, root=root, store=_store(tmp_path),
+            scratch=Path(scratch), finder=finder, branch=branch,
+            base_ref=base.ref, base_sha=base.sha,
+            head_label=f"{head} (working tree)", prepared_plan=prepared)
+
+    for index, item in enumerate(prepared.batches, 1):
+        assert (tmp_path / "bin" / f"prompt_{index}.txt").read_bytes() == \
+            item.prompt.text
+
+
+def test_prepared_plan_builds_the_complete_checkpoint_identity(tmp_path):
+    repo = _oversized(tmp_path)
+    cfg = load_config(repo)
+    d = cfg.defaults
+    root = gitio._worktree_root(repo)
+    base = resolve_base(repo)
+    diff = capture_diff(repo, base.sha, d.untracked_max)
+    finder = pipeline._reviewer_for(cfg, "finder")
+    batches = pipeline.batch_plan(diff.data, d, finder)
+    branch = gitio.current_branch(repo)
+    head = gitio.head_sha(repo)
+    prepared = pipeline._prepare_batch_plan(
+        diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, base_ref=base.ref, base_sha=base.sha,
+        head_label=f"{head} (working tree)")
+    rec = {"mode": "now", "requested_reviewer": None,
+           "client_family": None, "routed_reviewer": finder.name}
+
+    identity = pipeline._orchestration_identity(
+        rec, diff, prepared, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, head=head, base_ref=base.ref, base_sha=base.sha,
+        tree_fingerprint=gitio.tree_fingerprint(repo, paths=diff.files))
+
+    assert identity.batch_count == len(batches)
+    assert identity.batch_budget == pipeline._batch_budget(d, finder)
+    assert identity.context_hash == prepared.context_hash
+    assert identity.checklist_hash == prepared.checklist_hash
+    assert identity.pass_identities[:-1] == tuple(
+        item.identity for item in prepared.batches)
+    assert identity.pass_identities[-1].kind == "integration"
+    assert identity.pass_identities[-1].prompt_hash is None
+
+
 # --------------------------------------------------------------------------
 # what each prompt is allowed to carry
 # --------------------------------------------------------------------------

@@ -71,21 +71,21 @@ Expected: all new store/checkpoint tests pass.
 - Modify: `tests/test_batched_review.py`
 - Test: `tests/test_reuse.py`
 
-- [ ] **Step 1: Write failing planner/identity tests**
+- [x] **Step 1: Write failing planner/identity tests**
 
 Assert the pipeline can prepare every batch prompt, checklist/context identity, boundary digest, and reviewer/config/policy identity without invoking `_run_chain`; the prompt bytes match the existing `_orchestrate` path exactly. Assert foreground working-tree and pre-push OID context produce stable but distinct identities when their packed bytes differ.
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run: `python3 -m pytest tests/test_batched_review.py tests/test_reuse.py -q --tb=short -k 'checkpoint or orchestration_identity or prepared_batch'`
 
 Expected: failures for missing preparation/identity seams.
 
-- [ ] **Step 3: Extract preparation without changing aggregation**
+- [x] **Step 3: Extract preparation without changing aggregation**
 
 Introduce focused frozen prepared-pass structures and helpers that reuse `batch_plan`, checklist selection, context packing, prompt building, `aggregate_context_identity`, `aggregate_checklist_identity`, and `security_policy_identity`. Keep the existing batch bytes and integration scheduling rules unchanged; do not edit gate/trust.
 
-- [ ] **Step 4: Run the focused tests and verify GREEN**
+- [x] **Step 4: Run the focused tests and verify GREEN**
 
 Run: `python3 -m pytest tests/test_batched_review.py tests/test_reuse.py -q --tb=short -k 'checkpoint or orchestration_identity or prepared_batch'`
 
