@@ -605,6 +605,7 @@ def _dependency_coordinates_stable(
     path: str,
     evidence_index: int,
     evidence_set: tuple[SliceEvidence, ...],
+    finding_line: int,
 ) -> bool:
     """Return whether a dependency's post-image line numbers remain final.
 
@@ -621,7 +622,8 @@ def _dependency_coordinates_stable(
             continue
         if path in later.uncertain_files:
             return False
-        if _changed_line_map(later).get(path):
+        later_ranges = _changed_line_map(later).get(path, ())
+        if any(start <= finding_line for start, _end in later_ranges):
             return False
     return True
 
@@ -976,7 +978,7 @@ def classify_findings(
                 scope.line_start is not None
                 and _scope_path_matches(scope, path)
                 and not _dependency_coordinates_stable(
-                    path, index, evidence_set)
+                    path, index, evidence_set, finding_line)
                 for index, evidence in enumerate(result.dependencies)
                 for scope in evidence.slice.ownership
             )
@@ -985,7 +987,8 @@ def classify_findings(
                 and scope.line_start is not None
                 and type(finding_line) is int
                 and not _dependency_coordinates_stable(
-                    path, evidence_positions[id(evidence)], evidence_set)
+                    path, evidence_positions[id(evidence)], evidence_set,
+                    finding_line)
                 for kind, evidence, scope in stack_matches
             )
             hard_status_uncertain = any(
