@@ -413,13 +413,13 @@
   no auto-triage, and no runnable advisory mode. Include a compact manifest
   example that uses real field names from the parser.
 
-- [ ] **Step 2: Run focused acceptance tests.**
+- [x] **Step 2: Run focused acceptance tests.**
 
   ```bash
   python3 -m pytest tests/test_stack.py tests/test_gitio.py tests/test_pipeline.py tests/test_services.py tests/test_cli.py tests/test_mcpserver.py tests/test_mcptools.py tests/test_reuse.py tests/test_gate.py tests/test_trust.py tests/test_seams.py -q --tb=short
   ```
 
-- [ ] **Step 3: Run full verification.**
+- [x] **Step 3: Run full verification.**
 
   ```bash
   PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q --tb=short
@@ -428,16 +428,17 @@
   ```
 
   Record exact passed/skipped counts. A stall or interruption is incomplete.
+  Verified on the frozen head: `3550 passed, 160 skipped in 957.60s`.
   The dedicated store ResourceWarning sweep is not required because this PR
   adds no store schema or process-lifecycle code.
 
-- [ ] **Step 4: Self-review every acceptance criterion.**
+- [x] **Step 4: Self-review every acceptance criterion.**
 
   Compare the diff with issue #144 and the design. Verify no prompt bytes,
   certification bytes, trust axes, finding keys, triage records, store schema,
   gate/trust files, or advisory execution changed. Freeze scope after this pass.
 
-- [ ] **Step 5: Commit documentation and plan state.**
+- [x] **Step 5: Commit documentation and plan state.**
 
   ```bash
   git add README.md docs/superpowers/plans/2026-08-12-s6-1-stack-manifest-scope-attribution.md
@@ -450,13 +451,13 @@
 
 - No planned production changes; review fixes must be issue-narrow and test-first.
 
-- [ ] **Step 1: Refresh coordination state.**
+- [x] **Step 1: Refresh coordination state.**
 
   Fetch `origin/main`, inspect all open PRs, list shared seams touched by the
   other lane, and rebase `codex/s6-144-stack-manifest` if main advanced. Resolve
   conflicts semantically and rerun Task 5 verification after any rebase.
 
-- [ ] **Step 2: Freeze and review the exact head.**
+- [x] **Step 2: Freeze and review the exact head.**
 
   Run the repository's current trustworthy Skodun review/gate workflow for the
   exact branch head without editing the tree while review is active. Resolve
