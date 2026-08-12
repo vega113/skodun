@@ -144,23 +144,30 @@ def run_doctor(
 
     # Store
     try:
-        from .store import SCHEMA_VERSION, Store
+        from .store import SCHEMA_VERSION, Store, inspect_schema
 
-        with Store.open(store_path) as st:
-            ver = st._c.execute("PRAGMA user_version").fetchone()[0]
-            n = st._c.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
-            report.add(
-                "store",
-                ver == SCHEMA_VERSION,
-                f"open ok path={store_path} schema_v={ver} "
-                f"(build expects v{SCHEMA_VERSION}) reviews={n}",
-            )
-            log_dir = st.log_dir()
-            report.add(
-                "worker_logs",
-                log_dir.is_dir(),
-                f"dir={log_dir}",
-            )
+        info = inspect_schema(store_path)
+        if info["state"] == "missing":
+            report.add("store", True,
+                       f"missing path={store_path}; no store bytes inspected")
+            report.add("worker_logs", True,
+                       f"not created for missing store {store_path}")
+        elif info["state"] != "current":
+            detail = (f"schema state={info['state']} path={store_path} "
+                      f"version={info.get('version')} (build expects v"
+                      f"{SCHEMA_VERSION}); explicit migration required")
+            if info["state"] == "newer":
+                detail += (" — newer than this skodun; upgrade this process and "
+                           "restart every MCP client")
+            report.add("store", False, detail)
+            report.add("worker_logs", True, "not inspected by read-only doctor")
+        else:
+            with Store.open_readonly(store_path) as st:
+                n = st._c.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+            report.add("store", True,
+                       f"read-only ok path={store_path} schema_v={SCHEMA_VERSION} "
+                       f"(build expects v{SCHEMA_VERSION}) reviews={n}")
+            report.add("worker_logs", True, "not created by read-only doctor")
     except Exception as e:
         detail = f"open failed: {e!r}"
         if "newer than this skodun" in str(e):

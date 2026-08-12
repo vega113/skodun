@@ -29,10 +29,12 @@ the only thing that keeps it honest is its filed reference, which is why
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sqlite3
 import time
+from urllib.parse import quote
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +59,21 @@ _REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 SCHEMA_VERSION = 13
 
 
+class SchemaLifecycleError(ValueError):
+    """Fail-closed schema policy refusal with a stable diagnostic category."""
+
+    def __init__(self, reason_code: str, message: str, *, version: int | None):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.version = version
+
+
+def schema_migration_required_message(version: int) -> str:
+    return (f"store schema v{version} requires explicit migration to "
+            f"v{SCHEMA_VERSION}; run `skodun store migrate --plan` then "
+            "`--apply` from a clean immutable build")
+
+
 def schema_too_new_message(store_version: int) -> str:
     """Refusal text when the on-disk store was written by a newer skodun.
 
@@ -72,6 +89,56 @@ def schema_too_new_message(store_version: int) -> str:
         "then restart MCP — do not fall back to the CLI while MCP stays on the "
         "old build (CLI and MCP must share one install)."
     )
+
+
+def inspect_schema(path: Path) -> dict:
+    """Inspect a database without creating or mutating filesystem state."""
+    path = Path(path)
+    if not path.exists():
+        return {"state": "missing", "path": str(path), "version": None,
+                "target": SCHEMA_VERSION}
+    if not path.is_file():
+        return {"state": "invalid", "path": str(path), "version": None,
+                "target": SCHEMA_VERSION, "reason_code": "not_a_file"}
+    uri = f"file:{quote(str(path.resolve()))}?mode=ro"
+    conn = None
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        state = ("current" if version == SCHEMA_VERSION else
+                 "older" if version < SCHEMA_VERSION else "newer")
+        return {"state": state, "path": str(path), "version": version,
+                "target": SCHEMA_VERSION}
+    except sqlite3.DatabaseError as exc:
+        return {"state": "invalid", "path": str(path), "version": None,
+                "target": SCHEMA_VERSION, "reason_code": "invalid_sqlite",
+                "detail": repr(exc)}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def migration_blockers(path: Path) -> tuple[str, ...]:
+    """Return active review/claim blockers using a read-only connection."""
+    info = inspect_schema(path)
+    if info["state"] not in ("older", "current"):
+        return ()
+    uri = f"file:{quote(str(Path(path).resolve()))}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        blockers: list[str] = []
+        if "reviews" in tables and conn.execute(
+                "SELECT 1 FROM reviews WHERE status='running' LIMIT 1").fetchone():
+            blockers.append("active_review")
+        if "review_checkpoints" in tables and conn.execute(
+                "SELECT 1 FROM review_checkpoints WHERE state='running' LIMIT 1"
+        ).fetchone():
+            blockers.append("active_checkpoint_claim")
+        return tuple(blockers)
+    finally:
+        conn.close()
 
 #: Set to anything other than "0", unset, or blank to ignore `provider_state`
 #: entirely.
@@ -1006,15 +1073,150 @@ class Store:
     @classmethod
     def open(cls, path: Path) -> "Store":
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        existed = path.exists()
+        if not existed:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            if not existed:
+                _migrate(conn)
+            else:
+                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                if version > SCHEMA_VERSION:
+                    raise SchemaLifecycleError(
+                        "schema_too_new", schema_too_new_message(version),
+                        version=version)
+                if version < SCHEMA_VERSION:
+                    raise SchemaLifecycleError(
+                        "migration_required",
+                        schema_migration_required_message(version),
+                        version=version)
+                # Connection-local; unlike WAL/DDL this does not alter the
+                # store bytes and is safe for an already-current authority.
+                conn.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            conn.close()        # never leave a refused store open or locked
+            raise
+        return cls(conn, path)
+
+    @classmethod
+    def open_readonly(cls, path: Path) -> "Store":
+        """Open an existing current store with SQLite's `mode=ro` policy."""
+        info = inspect_schema(path)
+        if info["state"] == "missing":
+            raise SchemaLifecycleError(
+                "missing", f"store does not exist: {path}", version=None)
+        if info["state"] == "older":
+            raise SchemaLifecycleError(
+                "migration_required",
+                schema_migration_required_message(int(info["version"])),
+                version=int(info["version"]))
+        if info["state"] == "newer":
+            raise SchemaLifecycleError(
+                "schema_too_new", schema_too_new_message(int(info["version"])),
+                version=int(info["version"]))
+        if info["state"] != "current":
+            raise SchemaLifecycleError(
+                info.get("reason_code", "invalid_schema"),
+                f"store cannot be opened read-only: {path}", version=None)
+        uri = f"file:{quote(str(Path(path).resolve()))}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return cls(conn, Path(path))
+
+    @classmethod
+    def _open_for_migration_tests(cls, path: Path) -> "Store":
+        """Test seam for constructing historical fixtures; CLI owns production use."""
+        path = Path(path)
         conn = sqlite3.connect(path, isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
             _migrate(conn)
         except BaseException:
-            conn.close()        # never leave a refused store open or locked
+            conn.close()
             raise
         return cls(conn, path)
+
+    @classmethod
+    def migrate_existing(cls, path: Path, *, build_commit: str,
+                          receipt_path: Path | None = None) -> dict:
+        """Explicitly migrate one existing store and write a bounded receipt."""
+        path = Path(path)
+        info = inspect_schema(path)
+        if info["state"] != "older":
+            raise SchemaLifecycleError(
+                "not_migratable", "migration requires an older existing store",
+                version=info.get("version"))
+        if not isinstance(build_commit, str) or not re.fullmatch(
+                r"[0-9a-f]{40}(?:-(?:dirty|unknown))?", build_commit):
+            raise SchemaLifecycleError(
+                "build_identity_required",
+                "migration requires an exact clean build commit",
+                version=int(info["version"]))
+        if build_commit.endswith(("-dirty", "-unknown")):
+            raise SchemaLifecycleError(
+                "build_not_clean", "migration requires a clean build commit",
+                version=int(info["version"]))
+        blockers = migration_blockers(path)
+        if blockers:
+            raise SchemaLifecycleError(
+                "active_work", "migration blocked by: " + ", ".join(blockers),
+                version=int(info["version"]))
+        lock = Path(str(path) + ".migration.lock")
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as exc:
+            raise SchemaLifecycleError(
+                "migration_busy", f"migration lock is held: {lock}",
+                version=int(info["version"])) from exc
+        os.close(fd)
+        backup = Path(str(path) + ".backup-before-v" + str(SCHEMA_VERSION))
+        started_at = _iso_now()
+        try:
+            source = sqlite3.connect(path, isolation_level=None)
+            target = sqlite3.connect(backup, isolation_level=None)
+            try:
+                source.backup(target)
+                if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise ValueError("backup integrity check failed")
+            finally:
+                target.close()
+                source.close()
+            backup.chmod(0o600)
+            with sqlite3.connect(path, isolation_level=None) as conn:
+                _migrate(conn)
+                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                if version != SCHEMA_VERSION:
+                    raise ValueError("migration did not reach target schema")
+                integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+                if integrity != "ok":
+                    raise ValueError(f"integrity check failed: {integrity}")
+            digest = hashlib.sha256(backup.read_bytes()).hexdigest()
+            receipt = {
+                "schema_from": int(info["version"]),
+                "schema_to": SCHEMA_VERSION,
+                "build_commit": build_commit,
+                "started_at": started_at,
+                "finished_at": _iso_now(),
+                "backup_path": str(backup),
+                "backup_sha256": digest,
+                "diagnostic_category": "success",
+                "result": "success",
+            }
+            destination = (Path(receipt_path) if receipt_path is not None
+                           else Path(str(path) + ".migration-receipt.json"))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(json.dumps(receipt, sort_keys=True) + "\n",
+                                   encoding="utf-8")
+            destination.chmod(0o600)
+            return receipt
+        finally:
+            try:
+                lock.unlink()
+            except FileNotFoundError:
+                pass
 
     def close(self) -> None:
         """Close the underlying connection. Idempotent.
