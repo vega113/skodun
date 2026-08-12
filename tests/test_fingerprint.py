@@ -26,6 +26,18 @@ def test_path_component_whitespace_remains_distinct():
         {"file": "src/a b.py", "title": "same"})
 
 
+def test_case_sensitive_claims_remain_distinct():
+    assert fingerprint.finding_fingerprint(
+        {"file": "src/a.py", "title": "Foo()"}) != fingerprint.finding_fingerprint(
+        {"file": "src/a.py", "title": "foo()"})
+
+
+def test_unicode_path_codepoints_remain_distinct():
+    assert fingerprint.finding_fingerprint(
+        {"file": "src/\ufb01.py", "title": "same"}) != fingerprint.finding_fingerprint(
+        {"file": "src/fi.py", "title": "same"})
+
+
 def test_fingerprint_changes_scope_claim_and_mutation():
     base = {"file": "src/a.py", "title": "bad", "symbol": "run"}
     assert fingerprint.finding_fingerprint(base) != fingerprint.finding_fingerprint(

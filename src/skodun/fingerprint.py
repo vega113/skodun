@@ -27,8 +27,15 @@ def _norm(value: object) -> str:
     return re.sub(r"\s+", " ", text).strip().casefold()
 
 
+def _claim_norm(value: object) -> str:
+    """Normalize claim whitespace without changing identifier identity."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
 def _path(value: object) -> str:
-    text = unicodedata.normalize("NFKC", str(value or ""))
+    # Git paths are byte/Unicode identities.  Only normalize repository path
+    # syntax; compatibility or case folding could merge distinct files.
+    text = str(value or "")
     text = text.replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
@@ -63,7 +70,7 @@ def _source_and_claim(finding: Mapping[str, Any]) -> tuple[str, str]:
     claim_marker = _EXTRA_MARKER.match(raw) or _PASS_MARKER.match(raw)
     if claim_marker is not None:
         raw = raw[claim_marker.end():]
-    return explicit, _norm(raw) or UNKNOWN
+    return explicit, _claim_norm(raw) or UNKNOWN
 
 
 def _location(finding: Mapping[str, Any]) -> tuple[str, str]:
