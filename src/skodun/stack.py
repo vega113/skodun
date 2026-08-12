@@ -597,6 +597,31 @@ def _changed_line_map(
     return dict(evidence.changed_lines)
 
 
+def _dependency_coordinates_stable(
+    path: str,
+    evidence_index: int,
+    evidence_set: tuple[SliceEvidence, ...],
+) -> bool:
+    """Return whether a dependency's post-image line numbers remain final.
+
+    Dependency evidence is captured against that slice's post-image, while a
+    provider finding is anchored to the final reviewed tree.  We do not retain
+    enough raw patch data to translate arbitrary historical coordinates here,
+    so any later change to the same path keeps a line-scoped dependency
+    attribution explicitly uncertain.  Unchanged paths remain coordinate
+    stable, and this conservative boundary never turns a coincidental line
+    number into trusted lineage.
+    """
+    for later in evidence_set[evidence_index + 1:]:
+        if path not in later.files:
+            continue
+        if path in later.uncertain_files:
+            return False
+        if _changed_line_map(later).get(path):
+            return False
+    return True
+
+
 def _scope_is_reachable(scope: OwnershipScope, evidence: SliceEvidence) -> bool:
     matched_paths = [
         path for path in evidence.files if _scope_path_matches(scope, path)
@@ -632,18 +657,23 @@ def _slice_evidence(item: StackSlice, diff: object) -> SliceEvidence:
         path = batching.file_of(section)
         added_lines: list[int] = []
         new_line: int | None = None
-        hunk_path_has_change = False
-        hunk_path_has_addition = False
+        change_run_has_change = False
+        change_run_has_addition = False
+
+        def finish_change_run() -> None:
+            nonlocal change_run_has_change, change_run_has_addition
+            if (change_run_has_change and not change_run_has_addition
+                    and path):
+                uncertain.add(path)
+            change_run_has_change = False
+            change_run_has_addition = False
+
         for line in section:
             match = _HUNK_RANGE.match(line)
             if match is not None:
-                if (hunk_path_has_change and not hunk_path_has_addition
-                        and path):
-                    uncertain.add(path)
+                finish_change_run()
                 start = int(match.group("start"))
                 new_line = start
-                hunk_path_has_change = False
-                hunk_path_has_addition = False
                 continue
             if new_line is None or line.startswith(b"\\"):
                 continue
@@ -651,13 +681,15 @@ def _slice_evidence(item: StackSlice, diff: object) -> SliceEvidence:
             if prefix == b"+":
                 added_lines.append(new_line)
                 new_line += 1
-                hunk_path_has_change = True
-                hunk_path_has_addition = True
+                change_run_has_change = True
+                change_run_has_addition = True
             elif prefix == b"-":
-                hunk_path_has_change = True
+                change_run_has_change = True
                 continue
             elif prefix == b" ":
+                finish_change_run()
                 new_line += 1
+        finish_change_run()
         ranges: list[tuple[int, int]] = []
         for line_number in sorted(set(added_lines)):
             if ranges and line_number == ranges[-1][1] + 1:
@@ -665,8 +697,6 @@ def _slice_evidence(item: StackSlice, diff: object) -> SliceEvidence:
             else:
                 ranges.append((line_number, line_number))
         if path and not ranges:
-            uncertain.add(path)
-        if (path and hunk_path_has_change and not hunk_path_has_addition):
             uncertain.add(path)
         if path and ranges:
             changed_lines.setdefault(path, []).extend(ranges)
@@ -922,6 +952,18 @@ def classify_findings(
             evidence_set = (*result.dependencies,
                             *((result.current_slice,) if
                               result.current_slice is not None else ()))
+            evidence_positions = {
+                id(evidence): index
+                for index, evidence in enumerate(evidence_set)
+            }
+            dependency_coordinates_uncertain = any(
+                kind == "inherited_dependency"
+                and scope.line_start is not None
+                and type(finding_line) is int
+                and not _dependency_coordinates_stable(
+                    path, evidence_positions[id(evidence)], evidence_set)
+                for kind, evidence, scope in stack_matches
+            )
             uncertain_path = any(
                 path in evidence.uncertain_files
                 and (type(finding_line) is not int
@@ -929,6 +971,7 @@ def classify_findings(
                                 for start, end in _changed_line_map(evidence)
                                 .get(path, ())))
                 for evidence in evidence_set)
+            uncertain_path = uncertain_path or dependency_coordinates_uncertain
 
             if uncertain_path:
                 attribution = _attribution("unknown", "uncertain_git_mapping")

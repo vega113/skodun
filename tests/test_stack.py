@@ -797,6 +797,58 @@ def test_mixed_hunk_added_line_keeps_exact_scope_attribution():
     assert finding["scope_attribution"]["scope"] == "current_slice"
 
 
+def test_coalesced_deletion_run_inside_hunk_remains_uncertain():
+    item = stack.StackSlice(
+        slice_id="pr-14", commit=HEAD, tracking_ref=f"{REPOSITORY}#14",
+        ownership=(),
+    )
+    diff = SimpleNamespace(
+        files=("src/a.py",), statuses={"src/a.py": "M"},
+        data=(
+            b"diff --git a/src/a.py b/src/a.py\n"
+            b"@@ -1,4 +1,4 @@\n"
+            b"-old\n context\n+new\n context\n"
+        ),
+    )
+
+    evidence = stack._slice_evidence(item, diff)
+
+    assert "src/a.py" in evidence.uncertain_files
+    assert evidence.changed_lines == (("src/a.py", ((2, 2),)),)
+
+
+def test_dependency_line_is_uncertain_after_later_same_path_change():
+    dependency_item = stack.StackSlice(
+        slice_id="dep", commit=HEAD, tracking_ref=f"{REPOSITORY}#13",
+        ownership=(stack.OwnershipScope(
+            kind="file", path="src/a.py", exclusive=True,
+            line_start=2, line_end=2, symbol=None),),
+    )
+    current_item = stack.StackSlice(
+        slice_id="current", commit=HEAD, tracking_ref=f"{REPOSITORY}#14",
+        ownership=(),
+    )
+    result = SimpleNamespace(
+        status="valid", reason_code="ok", manifest=None,
+        dependencies=(stack.SliceEvidence(
+            slice=dependency_item, files=frozenset({"src/a.py"}), statuses=(),
+            uncertain_files=frozenset(),
+            changed_lines=(("src/a.py", ((2, 2),)),),
+        ),),
+        current_slice=stack.SliceEvidence(
+            slice=current_item, files=frozenset({"src/a.py"}), statuses=(),
+            uncertain_files=frozenset(),
+            changed_lines=(("src/a.py", ((1, 1),)),),
+        ),
+    )
+
+    finding = stack.classify_findings(
+        [{"file": "src/a.py", "line": 2}], result)[0]
+
+    assert finding["scope_attribution"]["scope"] == "unknown"
+    assert finding["scope_attribution"]["reason_code"] == "uncertain_git_mapping"
+
+
 def test_distinct_symbol_scopes_do_not_overlap():
     left = stack.OwnershipScope(
         kind="file", path="src/a.py", exclusive=True,
