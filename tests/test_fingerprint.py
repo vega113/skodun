@@ -6,7 +6,7 @@ from skodun.store import Store
 
 
 def test_fingerprint_is_versioned_and_normalizes_path_claim_whitespace():
-    left = {"file": "./src\\a.py", "title": "  SQL   injection  "}
+    left = {"file": "./src/a.py", "title": "  SQL   injection  "}
     right = {"file": "src/a.py", "title": "SQL injection"}
 
     assert fingerprint.finding_fingerprint(left) == fingerprint.finding_fingerprint(right)
@@ -36,6 +36,12 @@ def test_unicode_path_codepoints_remain_distinct():
     assert fingerprint.finding_fingerprint(
         {"file": "src/\ufb01.py", "title": "same"}) != fingerprint.finding_fingerprint(
         {"file": "src/fi.py", "title": "same"})
+
+
+def test_literal_backslash_path_remains_distinct_from_separator():
+    assert fingerprint.finding_fingerprint(
+        {"file": "src/a\\b.py", "title": "same"}) != fingerprint.finding_fingerprint(
+        {"file": "src/a/b.py", "title": "same"})
 
 
 def test_fingerprint_changes_scope_claim_and_mutation():
@@ -101,6 +107,14 @@ def test_lineage_moved_line_uses_location_outside_digest_and_claim_changes_are_n
     changed = fingerprint.annotate_findings(
         [{**old, "title": "different"}], [old])[0]
     assert changed["finding_lineage_v2"]["match_reason"] == "new"
+
+
+def test_same_file_line_change_without_anchor_is_ambiguous():
+    old = {"file": "src/a.py", "line": 10, "title": "same"}
+    moved = {**old, "line": 42}
+    result = fingerprint.annotate_findings([moved], [old])[0]
+    assert result["finding_lineage_v2"]["match_reason"] == "ambiguous"
+    assert result["finding_lineage_v2"]["predecessor_index"] is None
 
 
 def test_same_claim_in_unrelated_structure_is_not_linked():

@@ -36,7 +36,6 @@ def _path(value: object) -> str:
     # Git paths are byte/Unicode identities.  Only normalize repository path
     # syntax; compatibility or case folding could merge distinct files.
     text = str(value or "")
-    text = text.replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
     return text or UNKNOWN
@@ -152,7 +151,18 @@ def annotate_findings(
                         if candidate[1] == predecessor_review_id
                         and candidate[2] == predecessor), None)
             if old is not None and _location(old[0]) != _location(finding):
-                reason = "moved"
+                old_payload = fingerprint_payload(old[0])
+                # Without a stable anchor, a changed line may be a second
+                # independent occurrence rather than the same finding moved.
+                # Preserve the conservative ambiguity result instead of
+                # inventing a predecessor.
+                if (old_payload["anchor"] == UNKNOWN
+                        and fingerprint_payload(finding)["anchor"] == UNKNOWN):
+                    reason = "ambiguous"
+                    predecessor_review_id = None
+                    predecessor = None
+                else:
+                    reason = "moved"
             else:
                 reason = "repeated"
         elif len(matches) > 1:
