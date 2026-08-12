@@ -1104,12 +1104,12 @@ def test_v12_store_gains_only_the_v13_checkpoint_objects(tmp_path):
                 store_mod, "_MIGRATIONS",
                 tuple((target, delta) for target, delta
                       in store_mod._MIGRATIONS if target <= 12)):
-        Store.open(db).close()
+        Store._open_for_migration_tests(db).close()
     assert _user_version(db) == 12
     before = _objects(db)
     assert not (V13_OBJECTS & before)
 
-    Store.open(db).close()
+    Store._open_for_migration_tests(db).close()
 
     assert _user_version(db) == SCHEMA_VERSION == 13
     assert _objects(db) - before == V13_OBJECTS
@@ -1125,7 +1125,7 @@ def test_migration_from_true_phase1_db(tmp_path):
     raw.commit()
     raw.close()
     assert _user_version(db) == 0                     # it really starts at v0
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert st.get_review("r1")["summary"] == "ok"     # rows preserved
     assert V6_TABLE in _objects(db)
@@ -1141,7 +1141,7 @@ def test_phase1_store_upgrade_preserves_every_table_index_and_row(tmp_path):
     before = _objects(db)
     assert ("table", "provider_state") not in before
 
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
 
     after = _objects(db)
     assert before <= after, before - after            # nothing dropped
@@ -1170,7 +1170,7 @@ def test_future_schema_refused_before_any_ddl(tmp_path):
     raw.commit()
     raw.close()
     with pytest.raises(ValueError, match="newer"):
-        Store.open(db)
+        Store._open_for_migration_tests(db)
     raw = sqlite3.connect(db)                         # and it really ran no DDL:
     tables = {r[0] for r in raw.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
@@ -1255,7 +1255,7 @@ def test_a_store_one_version_above_this_build_is_refused_untouched(tmp_path):
     NEXT version, not 99. A real v3 store stamped v4 by a newer skodun must come
     back byte-identical, exactly as the v0/v2 fixtures above do."""
     db = _v2_db(tmp_path / "s.db")
-    Store.open(db).close()                          # a real, fully migrated store
+    Store._open_for_migration_tests(db).close()     # a real, fully migrated store
     assert _user_version(db) == SCHEMA_VERSION
     raw = sqlite3.connect(db)
     raw.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1:d}")
@@ -1286,7 +1286,7 @@ def test_a_v2_store_gains_every_v3_delta(tmp_path):
     assert _user_version(db) == 2
     before = _objects(db)
 
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
 
     assert _user_version(db) == SCHEMA_VERSION
     assert before <= _objects(db)                          # nothing dropped
@@ -1304,7 +1304,7 @@ def test_the_v3_reviews_columns_are_nullable_and_default_null(tmp_path):
     """T8/T10 write them later; every existing row must read as "not set"
     rather than as a number the stale-recovery sweep would act on."""
     db = _v2_db(tmp_path / "s.db")
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     row = st._c.execute("SELECT worst_runtime_sec, pid, superseded_by FROM reviews"
                         " WHERE id='r1'").fetchone()
     assert dict(row) == {"worst_runtime_sec": None, "pid": None, "superseded_by": None}
@@ -1356,7 +1356,7 @@ def test_the_v3_delta_seeds_one_dismiss_event_per_existing_triage_row(tmp_path):
                   dismissed_at="2026-07-27T11:00:00Z")
     db = _v2_db(tmp_path / "s.db", triage_rows=(LEGACY_TRIAGE, second))
 
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
 
     events = _events(st)
     assert [e["event"] for e in events] == ["dismiss", "dismiss"]
@@ -1379,7 +1379,7 @@ def test_the_v3_delta_seeds_one_dismiss_event_per_existing_triage_row(tmp_path):
 
 def test_the_v3_delta_seeds_nothing_on_a_store_with_no_dismissals(tmp_path):
     db = _v2_db(tmp_path / "s.db", triage_rows=())
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     assert _events(st) == []
     assert st.triage_for("b", "s" * 40) == {}
 
@@ -1389,12 +1389,12 @@ def test_seeding_runs_once_and_a_reopen_survives_the_next_open(tmp_path):
     store that is already v3: a second seeding would append a fresh `dismiss`
     event on top of a human's later `reopen` and silently re-dismiss it."""
     db = _v2_db(tmp_path / "s.db")
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     st.triage_reopen(dict(LEGACY_TRIAGE, at="2026-07-28T09:00:00Z",
                           reason="the crash reproduces on main, reopening it"))
     st.close()
 
-    st2 = Store.open(db)
+    st2 = Store._open_for_migration_tests(db)
     assert [e["event"] for e in _events(st2)] == ["dismiss", "reopen"]
     assert st2.triage_for("b", "s" * 40) == {}
 
@@ -1436,7 +1436,7 @@ def test_a_crash_mid_v3_delta_leaves_a_clean_v2_store_that_migrates_on_retry(
     _broken_v3_ladder(monkeypatch)
 
     with pytest.raises(sqlite3.OperationalError):
-        Store.open(db)
+        Store._open_for_migration_tests(db)
 
     # NOTHING from the delta survived: not the tables, not the columns, not the
     # stamp -- and the legacy dismissal is untouched.
@@ -1450,7 +1450,7 @@ def test_a_crash_mid_v3_delta_leaves_a_clean_v2_store_that_migrates_on_retry(
         conn.close()
 
     monkeypatch.undo()                               # the crash is over; retry
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     assert _user_version(db) == SCHEMA_VERSION
     assert V3_REVIEW_COLUMNS <= set(_columns(db, "reviews"))
     assert [e["event"] for e in _events(st)] == ["dismiss"]
@@ -1463,7 +1463,7 @@ def test_a_crashed_v3_migration_never_leaves_the_store_open(tmp_path, monkeypatc
     db = _v2_db(tmp_path / "s.db")
     _broken_v3_ladder(monkeypatch)
     with pytest.raises(sqlite3.OperationalError):
-        Store.open(db)
+        Store._open_for_migration_tests(db)
     monkeypatch.undo()
     # A second process can take the write lock immediately, which it could not
     # if the failed attempt still held an open transaction.
@@ -1488,7 +1488,7 @@ def test_the_v3_delta_is_not_replay_idempotent_which_is_why_it_is_atomic(tmp_pat
     from skodun.store import _MIGRATION_V3
 
     db = _v2_db(tmp_path / "s.db")
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     with pytest.raises(sqlite3.OperationalError, match="duplicate column"):
         for sql in _MIGRATION_V3:
             st._c.execute(sql)
@@ -1507,7 +1507,7 @@ def test_apply_atomic_is_a_no_op_when_a_peer_already_applied_the_delta(tmp_path)
     from skodun.store import _MIGRATION_V3, _apply_atomic
 
     db = _v2_db(tmp_path / "s.db")
-    st = Store.open(db)                     # migrates it all the way up
+    st = Store._open_for_migration_tests(db) # migrates it all the way up
     assert _user_version(db) == SCHEMA_VERSION
     _apply_atomic(st._c, 3, _MIGRATION_V3)  # the loser's call: a no-op
     assert _user_version(db) == SCHEMA_VERSION
@@ -1627,7 +1627,7 @@ def _v3_db(path, *, triage_rows=(LEGACY_TRIAGE,)):
     """
     _v2_db(path, triage_rows=triage_rows)
     with _pinned_at_v3():
-        Store.open(path).close()
+        Store._open_for_migration_tests(path).close()
     assert _user_version(path) == 3
     assert _columns(path, "triage_events") == V3_TRIAGE_EVENT_COLUMNS
     return path
@@ -1637,7 +1637,7 @@ def test_a_v3_store_gains_the_widened_vocabulary_and_the_reference_column(tmp_pa
     db = _v3_db(tmp_path / "s.db")
     before = _objects(db)
 
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
 
     assert _user_version(db) == SCHEMA_VERSION == 13
     # A v3 store climbs v4–v12 in one open: v5 index + capacity, feedback,
@@ -1680,7 +1680,7 @@ def test_the_rebuild_preserves_every_row_and_its_seq_value(tmp_path):
     assert [e["seq"] for e in before] == [1, 2, 3]
     assert [e["event"] for e in before] == ["dismiss", "dismiss", "reopen"]
 
-    st = Store.open(db)                                    # the v4 rebuild
+    st = Store._open_for_migration_tests(db)                # the v4 rebuild
 
     after = _events(st)
     assert after == [dict(e, tracking_ref=None) for e in before]
@@ -1714,7 +1714,7 @@ def test_a_v0_and_a_v2_store_both_climb_the_whole_ladder_to_v5(tmp_path):
     v0 = _phase1_db(tmp_path / "v0.db")
     v2 = _v2_db(tmp_path / "v2.db")
     for db in (v0, v2):
-        st = Store.open(db)
+        st = Store._open_for_migration_tests(db)
         assert _user_version(db) == SCHEMA_VERSION, db
         assert ("table", "provider_state") in _objects(db), db
         assert V3_TABLES <= {name for _, name in _objects(db)}, db
@@ -1728,9 +1728,9 @@ def test_a_v0_and_a_v2_store_both_climb_the_whole_ladder_to_v5(tmp_path):
 
 def test_a_v4_store_is_left_alone_by_a_second_open(tmp_path):
     db = _v2_db(tmp_path / "s.db")
-    Store.open(db).close()
+    Store._open_for_migration_tests(db).close()
     before = _events(db)
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     assert _user_version(db) == SCHEMA_VERSION
     assert _events(db) == before, "the rebuild ran again on an already-v4 store"
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
@@ -1769,7 +1769,7 @@ def test_a_crash_mid_v4_delta_leaves_a_clean_v3_store_that_migrates_on_retry(
     _broken_v4_ladder(monkeypatch)
 
     with pytest.raises(sqlite3.OperationalError):
-        Store.open(db)
+        Store._open_for_migration_tests(db)
 
     # NOTHING from the delta survived: the v3 table is still there, with its
     # v3 columns, its rows and its version.
@@ -1779,7 +1779,7 @@ def test_a_crash_mid_v4_delta_leaves_a_clean_v3_store_that_migrates_on_retry(
     assert ("table", "triage_events_v4") not in _objects(db)
 
     monkeypatch.undo()                                # the crash is over; retry
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     assert _user_version(db) == SCHEMA_VERSION
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     assert [e["event"] for e in _events(st)] == ["dismiss"]
@@ -1792,7 +1792,7 @@ def test_a_crashed_v4_migration_never_leaves_the_store_open(tmp_path, monkeypatc
     db = _v3_db(tmp_path / "s.db")
     _broken_v4_ladder(monkeypatch)
     with pytest.raises(sqlite3.OperationalError):
-        Store.open(db)
+        Store._open_for_migration_tests(db)
     monkeypatch.undo()
     other = sqlite3.connect(db, isolation_level=None, timeout=0.5)
     try:
@@ -1819,7 +1819,7 @@ def test_replaying_the_v4_delta_silently_drops_every_tracking_reference(tmp_path
     from skodun.store import _MIGRATION_V4
 
     db = _v3_db(tmp_path / "s.db")
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     st.triage_defer(_deferral())
     assert _events(st)[-1]["tracking_ref"] == TRACKING_REF
 
@@ -1844,7 +1844,7 @@ def test_apply_atomic_is_a_no_op_for_v4_when_a_peer_already_applied_it(tmp_path)
     from skodun.store import _MIGRATION_V4, _apply_atomic
 
     db = _v3_db(tmp_path / "s.db")
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     st.triage_defer(_deferral())
     assert _user_version(db) == SCHEMA_VERSION
 
@@ -1865,7 +1865,7 @@ def test_a_store_stamped_v6_is_still_refused_untouched(tmp_path):
     `> SCHEMA_VERSION` (see `test_a_future_version_store_is_refused`).
     """
     db = _v2_db(tmp_path / "s.db")
-    Store.open(db).close()
+    Store._open_for_migration_tests(db).close()
     assert _user_version(db) == SCHEMA_VERSION
     raw = sqlite3.connect(db)
     raw.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1:d}")
@@ -1929,7 +1929,7 @@ def _v4_db(path, *, triage_rows=(LEGACY_TRIAGE,)):
     """
     _v3_db(path, triage_rows=triage_rows)
     with _pinned_at_v4():
-        Store.open(path).close()
+        Store._open_for_migration_tests(path).close()
     assert _user_version(path) == 4
     assert "repo" not in _columns(path, "reviews")
     return path
@@ -1941,7 +1941,7 @@ def test_a_v4_store_gains_the_repo_column_and_its_index(tmp_path):
     db = _v4_db(tmp_path / "s.db")
     before = _objects(db)
 
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
 
     assert _user_version(db) == SCHEMA_VERSION == 13
     assert "repo" in _columns(db, "reviews")
@@ -1960,12 +1960,12 @@ def test_a_v5_store_gains_capacity_admissions(tmp_path):
     """v6 is additive: capacity_admissions + index; no review column change."""
     db = _v4_db(tmp_path / "v5climb.db")
     with _pinned_at_v5():
-        Store.open(db).close()
+        Store._open_for_migration_tests(db).close()
     assert _user_version(db) == 5
     before = _objects(db)
     assert V6_TABLE not in before
 
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
 
     assert _user_version(db) == SCHEMA_VERSION == 13
     assert _objects(db) - before == V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS
@@ -1981,7 +1981,7 @@ def test_a_v6_store_gains_feedback_events(tmp_path):
     # user_version 6 without feedback tables is not how the ladder works.
     # Instead: open to current, which includes v7 from empty climb of v5.
     with _pinned_at_v5():
-        Store.open(db).close()
+        Store._open_for_migration_tests(db).close()
     # Manually apply only v6 DDL and stamp 6 so feedback is missing.
     import sqlite3
     raw = sqlite3.connect(db)
@@ -1994,7 +1994,7 @@ def test_a_v6_store_gains_feedback_events(tmp_path):
     before = _objects(db)
     assert V7_TABLE not in before
 
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
 
     assert _user_version(db) == SCHEMA_VERSION == 13
     assert _objects(db) - before == V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS
@@ -2036,7 +2036,7 @@ def test_a_crash_mid_v5_delta_leaves_a_clean_v4_store_that_migrates_on_retry(
     _broken_v5_ladder(monkeypatch)
 
     with pytest.raises(sqlite3.OperationalError):
-        Store.open(db)
+        Store._open_for_migration_tests(db)
 
     # NOTHING from the delta survived: not the column, not the index, not the
     # stamp -- and the v4 store is otherwise exactly as it was.
@@ -2046,7 +2046,7 @@ def test_a_crash_mid_v5_delta_leaves_a_clean_v4_store_that_migrates_on_retry(
     assert [e["event"] for e in _events(db)] == ["dismiss"]
 
     monkeypatch.undo()                                # the crash is over; retry
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     assert _user_version(db) == SCHEMA_VERSION
     assert "repo" in _columns(db, "reviews")
     assert V5_INDEX in _objects(db)
@@ -2059,7 +2059,7 @@ def test_a_crashed_v5_migration_never_leaves_the_store_open(tmp_path, monkeypatc
     db = _v4_db(tmp_path / "s.db")
     _broken_v5_ladder(monkeypatch)
     with pytest.raises(sqlite3.OperationalError):
-        Store.open(db)
+        Store._open_for_migration_tests(db)
     monkeypatch.undo()
     other = sqlite3.connect(db, isolation_level=None, timeout=0.5)
     try:
@@ -2435,6 +2435,7 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_stats.py",
     "tests/test_reuse.py",
     "tests/test_readiness.py",
+    "tests/test_schema_lifecycle.py",
 )
 
 #: Store-touching modules deliberately kept OUT of the subprocess sweep, with

@@ -285,7 +285,7 @@ def test_the_v3_migration_preserves_an_existing_dismissals_effect_on_the_gate(tm
     db = tmp_path / "s.db"
     _v2_store_with_a_dismissal(db, repo)
 
-    st = Store.open(db)                    # v2 -> v4, seeding the event stream
+    st = Store._open_for_migration_tests(db)  # v2 -> v4, seeding the event stream
     assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
     r = run_gate(st, repo, _cfg(repo), env={})
@@ -306,7 +306,7 @@ def test_that_gate_continuity_test_is_sensitive(tmp_path):
     raw.commit()
     raw.close()
 
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     assert run_gate(st, repo, _cfg(repo), env={}).code == 1
 
 

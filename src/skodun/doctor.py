@@ -144,23 +144,40 @@ def run_doctor(
 
     # Store
     try:
-        from .store import SCHEMA_VERSION, Store
+        from .store import SCHEMA_VERSION, Store, inspect_schema
 
-        with Store.open(store_path) as st:
-            ver = st._c.execute("PRAGMA user_version").fetchone()[0]
-            n = st._c.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
-            report.add(
-                "store",
-                ver == SCHEMA_VERSION,
-                f"open ok path={store_path} schema_v={ver} "
-                f"(build expects v{SCHEMA_VERSION}) reviews={n}",
-            )
-            log_dir = st.log_dir()
-            report.add(
-                "worker_logs",
-                log_dir.is_dir(),
-                f"dir={log_dir}",
-            )
+        info = inspect_schema(store_path)
+        if info.state == "missing":
+            report.add("store", True,
+                       f"missing path={store_path}; no store bytes inspected")
+            report.add("worker_logs", True,
+                       f"not created for missing store {store_path}")
+        elif info.state == "older":
+            report.add("store", False,
+                       f"schema state=older path={store_path} version={info.version} "
+                       f"(build expects v{SCHEMA_VERSION}); explicit migration "
+                       "required")
+            report.add("worker_logs", True, "not inspected by read-only doctor")
+        elif info.state == "newer":
+            report.add("store", False,
+                       f"schema state=newer path={store_path} version={info.version} "
+                       f"(build expects v{SCHEMA_VERSION}); upgrade this process "
+                       "because the store is newer than this skodun, then restart "
+                       "every MCP client")
+            report.add("worker_logs", True, "not inspected by read-only doctor")
+        elif info.state == "invalid":
+            report.add("store", False,
+                       f"schema state=invalid path={store_path} "
+                       f"reason_code={info.reason_code or 'invalid_schema'}; "
+                       "repair or restore the store before use")
+            report.add("worker_logs", True, "not inspected by read-only doctor")
+        else:
+            with Store.open_readonly(store_path) as st:
+                n = st._c.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+            report.add("store", True,
+                       f"read-only ok path={store_path} schema_v={SCHEMA_VERSION} "
+                       f"(build expects v{SCHEMA_VERSION}) reviews={n}")
+            report.add("worker_logs", True, "not created by read-only doctor")
     except Exception as e:
         detail = f"open failed: {e!r}"
         if "newer than this skodun" in str(e):

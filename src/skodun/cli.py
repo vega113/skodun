@@ -40,6 +40,7 @@ are guarded below:
 import argparse
 import os
 import shutil
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -92,6 +93,22 @@ def build_parser() -> argparse.ArgumentParser:
         "gate", help="fail closed unless a trustworthy review covers this change")
     gate.add_argument("--repo", type=Path, default=Path("."),
                       help="repository to gate (default: the current directory)")
+
+    store = sub.add_parser(
+        "store", help="inspect or explicitly migrate the review store")
+    store_sub = store.add_subparsers(dest="store_command", required=True)
+    migrate = store_sub.add_parser(
+        "migrate", help="plan or apply an explicit schema migration")
+    migrate_mode = migrate.add_mutually_exclusive_group(required=True)
+    migrate_mode.add_argument("--plan", action="store_true",
+                              help="inspect the migration without writing")
+    migrate_mode.add_argument("--apply", action="store_true",
+                              help="apply the planned migration with backup")
+    migrate.add_argument("--db", type=Path, default=None,
+                         help="database path (default: SKODUN_DB/default store)")
+    migrate.add_argument("--build-commit", default=None,
+                         help="explicit clean immutable 40-hex build commit")
+    migrate.set_defaults(store_action=True)
 
     review = sub.add_parser(
         "review", help="review the outgoing change now, in the foreground")
@@ -697,6 +714,55 @@ def _cmd_gate(args) -> int:
     with store:
         code, message = svc_gate(store, Path(args.repo))
     return _emit(message, code)
+
+
+def _cmd_store(args) -> int:
+    """CLI-only maintenance surface; MCP has no route to this function."""
+    if getattr(args, "store_command", None) != "migrate":
+        return _emit("skodun store: unknown command", 2)
+    from . import provenance
+    from .store import (SCHEMA_VERSION, SchemaLifecycleError, inspect_schema,
+                        migration_blockers, Store)
+    path = Path(args.db) if args.db is not None else _store_path()
+    info = inspect_schema(path)
+    build = provenance.code_provenance()
+    authority_commit = build.get("skodun_commit")
+    requested_commit = args.build_commit
+    if requested_commit is not None and requested_commit != authority_commit:
+        return _emit(
+            "skodun store migrate: build_identity_mismatch; explicit commit "
+            "must match the clean installed authority", 2)
+    commit = authority_commit
+    if args.apply:
+        if not commit:
+            return _emit(
+                "skodun store migrate: build_identity_required; use a clean "
+                "immutable checkout or provide an explicit release build", 2)
+        try:
+            receipt = Store.migrate_existing(path, build_commit=commit)
+        except (SchemaLifecycleError, OSError, sqlite3.Error, ValueError) as exc:
+            reason = getattr(exc, "reason_code", "migration_failed")
+            return _emit(
+                f"skodun store migrate: refused reason_code={reason}: {exc}", 2)
+        return _emit(
+            f"skodun store migrate: applied v{receipt['schema_from']} -> "
+            f"v{SCHEMA_VERSION}; backup={receipt['backup_path']} "
+            f"sha256={receipt['backup_sha256']} receipt="
+            f"{path}.migration-receipt.json", 0)
+    if not args.plan:
+        return _emit(
+            "skodun store migrate: choose exactly one of --plan or --apply", 2)
+    if info.state == "missing":
+        return _emit(
+            f"skodun store migrate: plan path={path} state=missing "
+            f"target_schema={SCHEMA_VERSION} (ordinary open initializes it)", 0)
+    blockers = migration_blockers(path)
+    return _emit(
+        f"skodun store migrate: plan path={path} state={info.state} "
+        f"current_schema={info.version} target_schema={SCHEMA_VERSION} "
+        f"build_commit={commit or 'unknown'} backup={path}.backup-before-v"
+        f"{SCHEMA_VERSION} blockers={','.join(blockers) or 'none'} "
+        "restart_mcp=true", 0 if info.state == "older" else 2)
 
 
 def _cmd_review(args) -> int:
@@ -2064,6 +2130,8 @@ def main(argv: list[str] | None = None) -> int:
                 "usage error; no review ran"), code)
         if args.command == "gate":
             return _cmd_gate(args)
+        if args.command == "store":
+            return _cmd_store(args)
         if args.command == "review":
             try:
                 return _cmd_review(args)
