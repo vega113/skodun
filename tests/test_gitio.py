@@ -295,6 +295,24 @@ def test_untracked_only_diff_starts_with_newline(tmp_path):
     assert not d.data.endswith(b"\n")  # every section is trailing-newline-stripped
 
 
+def test_diff_captures_pin_standard_prefixes(tmp_path):
+    """Attribution headers stay parseable under ambient prefix settings."""
+    repo = _mkrepo(tmp_path)
+    _git(repo, "checkout", "-b", "feat")
+    base = resolve_base(repo)
+    _git(repo, "config", "diff.noprefix", "true")
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+
+    working = capture_diff(repo, base.sha, untracked_max=100)
+    assert b"diff --git a/a.txt b/a.txt" in working.data
+
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "change")
+    local_oid = _git(repo, "rev-parse", "HEAD")
+    committed = capture_ref_diff(repo, base.sha, local_oid)
+    assert b"diff --git a/a.txt b/a.txt" in committed.data
+
+
 def test_no_separator_appended_when_untracked_yields_no_diff(tmp_path):
     """ORACLE PARITY: the oracle skips untracked entries that are not regular
     files (`[ -f ]`) and appends the separator only when the section is

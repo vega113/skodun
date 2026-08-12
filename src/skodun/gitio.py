@@ -49,6 +49,11 @@ from urllib.parse import urlsplit
 # alter the hashed bytes. Does NOT make the hashed bytes config-independent in
 # general — see the module docstring's core.quotepath note.
 _DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
+# Stack attribution parses the unified patch headers to map changed lines back
+# to manifest scopes. Pin Git's ordinary a/ and b/ prefixes so ambient
+# diff.noprefix or custom prefix configuration cannot turn a real path into a
+# header label that the parser cannot resolve.
+_DIFF_PREFIX_FLAGS = ("--src-prefix=a/", "--dst-prefix=b/")
 
 
 class GitError(RuntimeError):
@@ -307,7 +312,8 @@ def capture_diff(
     repo = _worktree_root(repo)
     detection = ("-M", "-C", "--find-copies-harder", "-l0") if detect_renames else ()
     tracked = _run(
-        repo, "--no-pager", "diff", *_DIFF_FLAGS, *detection, base_sha).stdout
+        repo, "--no-pager", "diff", *_DIFF_FLAGS, *_DIFF_PREFIX_FLAGS,
+        *detection, base_sha).stdout
     statuses = _tracked_statuses(repo, base_sha, detect_renames=detect_renames)
     files = list(statuses)
 
@@ -323,7 +329,8 @@ def capture_diff(
         if not (repo / f).is_file():  # `[ -f ]`: follows symlinks, rejects dangling
             continue
         cp = _run(
-            repo, "--no-pager", "diff", *_DIFF_FLAGS, "--no-index", "--", "/dev/null", f,
+            repo, "--no-pager", "diff", *_DIFF_FLAGS, *_DIFF_PREFIX_FLAGS,
+            "--no-index", "--", "/dev/null", f,
             ok_codes=(0, 1),
         )
         if not cp.stdout:
@@ -364,7 +371,8 @@ def capture_ref_diff(
     """
     detection = ("-M", "-C", "--find-copies-harder", "-l0") if detect_renames else ()
     tracked = _run(
-        repo, "--no-pager", "diff", *_DIFF_FLAGS, *detection,
+        repo, "--no-pager", "diff", *_DIFF_FLAGS, *_DIFF_PREFIX_FLAGS,
+        *detection,
         base_sha, local_oid).stdout
     statuses = _tracked_statuses(
         repo, base_sha, local_oid, detect_renames=detect_renames)
