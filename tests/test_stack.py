@@ -186,9 +186,13 @@ def test_manifest_file_size_is_bounded_before_json_parsing(tmp_path):
     assert request.problem.reason_code == "too_large"
 
 
-def test_manifest_collection_sizes_are_bounded(tmp_path):
+@pytest.mark.parametrize("collection", [
+    "dependencies", "downstream_owners", "owner_scopes", "total_scopes",
+    "known_finding_refs",
+])
+def test_manifest_collection_sizes_are_bounded(tmp_path, collection):
     document = _manifest()
-    document["dependencies"] = [
+    dependencies = [
         {
             "slice_id": f"slice-{index}",
             "commit": f"{index + 3:040x}",
@@ -197,11 +201,49 @@ def test_manifest_collection_sizes_are_bounded(tmp_path):
         }
         for index in range(stack.MAX_DEPENDENCIES + 1)
     ]
-    document["direct_parent"] = document["dependencies"][-1]["slice_id"]
+    if collection == "dependencies":
+        document["dependencies"] = dependencies
+        document["direct_parent"] = dependencies[-1]["slice_id"]
+    elif collection == "downstream_owners":
+        document["downstream_owners"] = [{
+            "tracking_ref": f"{REPOSITORY}#{index + 100}",
+            "ownership": [], "known_finding_refs": [],
+        } for index in range(stack.MAX_DOWNSTREAM_OWNERS + 1)]
+    elif collection == "owner_scopes":
+        document["current_slice"]["ownership"] = [
+            _scope(f"src/{index}.py")
+            for index in range(stack.MAX_SCOPES_PER_OWNER + 1)]
+    elif collection == "total_scopes":
+        document["dependencies"] = []
+        for dep_index in range(8):
+            document["dependencies"].append({
+                "slice_id": f"slice-total-{dep_index}",
+                "commit": f"{dep_index + 3:040x}",
+                "tracking_ref": f"{REPOSITORY}#{dep_index + 20}",
+                "ownership": [
+                    _scope(f"src/{dep_index}/{index}.py")
+                    for index in range(stack.MAX_SCOPES_PER_OWNER)
+                ],
+            })
+        document["direct_parent"] = document["dependencies"][-1]["slice_id"]
+    else:
+        document["downstream_owners"] = [{
+            "tracking_ref": f"{REPOSITORY}#100",
+            "ownership": [],
+            "known_finding_refs": [
+                f"finding-{index}"
+                for index in range(stack.MAX_KNOWN_FINDING_REFS + 1)
+            ],
+        }]
 
-    request = stack.load_request(_write(tmp_path / "many.json", document))
-
-    assert request.problem.reason_code == "limit_exceeded"
+    if collection == "total_scopes":
+        document["manifest_digest"] = "sha256:" + "0" * 64
+        with pytest.raises(ValueError, match="limit_exceeded"):
+            stack._parse_manifest(document)
+    else:
+        request = stack.load_request(
+            _write(tmp_path / f"many-{collection}.json", document))
+        assert request.problem.reason_code == "limit_exceeded"
 
 
 def test_manifest_unknown_nested_fields_are_refused(tmp_path):

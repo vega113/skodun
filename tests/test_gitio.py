@@ -941,6 +941,7 @@ def test_canonical_repository_identity_normalizes_supported_remotes(
     "/tmp/project.git",
     "file:///tmp/project.git",
     "https://user:secret@example.com/acme/project.git",
+    "user:secret@example.com:acme/project.git",
     "https://example.com/acme/../project.git",
     "https://example.com/acme/project.git?token=secret",
     "https://example.com/acme/project.git#fragment",
@@ -985,6 +986,9 @@ def test_is_ancestor_accepts_only_ordered_full_commit_object_ids(tmp_path):
 
     assert is_ancestor(repo, older, newer) is True
     assert is_ancestor(repo, newer, older) is False
+    # Git treats an object as its own ancestor; callers needing a strict edge
+    # must compare the ids separately, as stack.validate does.
+    assert is_ancestor(repo, older, older) is True
     assert is_ancestor(repo, older[:12], newer) is False
     assert is_ancestor(repo, "f" * 40, newer) is False
 

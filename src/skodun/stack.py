@@ -150,10 +150,11 @@ def _read_regular_file(path: Path) -> bytes:
             after_path = os.stat(path, follow_symlinks=False)
         except OSError as exc:
             raise _ManifestError("unsafe_file", "manifest moved during read") from exc
-        identity = lambda value: (
-            value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
-            value.st_size, value.st_mtime_ns,
-        )
+        def identity(value: os.stat_result) -> tuple[int, ...]:
+            return (
+                value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+                value.st_size, value.st_mtime_ns,
+            )
         if identity(before) != identity(after_fd) or \
                 identity(after_fd) != identity(after_path):
             raise _ManifestError("unsafe_file", "manifest moved during read")
@@ -599,12 +600,12 @@ def _slice_evidence(item: StackSlice, diff: object) -> SliceEvidence:
         for path, code in dict(getattr(diff, "statuses", {})).items()
     }
     uncertain = {
-        path for path, code in statuses.items() if code in {"R", "C", "D"}
+        path for path, code in statuses.items() if code[:1] in {"R", "C", "D"}
     }
     lines = getattr(diff, "data", b"").splitlines(keepends=True)
     changed_lines: dict[str, list[tuple[int, int]]] = {}
-    for section in batching._sections(lines):
-        path = batching._file_of(section)
+    for section in batching.sections(lines):
+        path = batching.file_of(section)
         hunk_ranges: list[tuple[int, int]] = []
         for line in section:
             match = _HUNK_RANGE.match(line)

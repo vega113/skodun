@@ -566,6 +566,10 @@ def _portable_remote_identity(remote: str) -> str | None:
         match = _SCP_REMOTE.fullmatch(remote)
         if match is None:
             return None
+        # SCP syntax has no URL parser to isolate credentials. Reject them
+        # explicitly so a userinfo-like prefix cannot become part of identity.
+        if "@" in match.group("path"):
+            return None
         host = match.group("host")
         path = match.group("path")
     bare_host = host.split(":", 1)[0]
@@ -577,7 +581,8 @@ def _portable_remote_identity(remote: str) -> str | None:
         path = path[:-4]
     parts = path.split("/")
     if (not parts or any(not part or part in {".", ".."} for part in parts)
-            or any("\\" in part for part in parts)):
+            or any("\\" in part or "@" in part or ":" in part
+                   for part in parts)):
         return None
     return f"{host.lower()}/{'/'.join(parts)}"
 
