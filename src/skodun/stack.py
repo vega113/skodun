@@ -626,6 +626,16 @@ def _dependency_coordinates_stable(
     return True
 
 
+def _dependency_file_scope_stable(
+    path: str,
+    evidence_index: int,
+    evidence_set: tuple[SliceEvidence, ...],
+) -> bool:
+    """Return whether a dependency's unanchored file scope stays present."""
+    return all(path not in later.files
+               for later in evidence_set[evidence_index + 1:])
+
+
 def _scope_is_reachable(scope: OwnershipScope, evidence: SliceEvidence) -> bool:
     matched_paths = [
         path for path in evidence.files if _scope_path_matches(scope, path)
@@ -980,14 +990,26 @@ def classify_findings(
                                  .get(path, ()))))
                 for kind, evidence, scope in stack_matches
             )
-            uncertain_path = False if current_exact_match else any(
+            exact_unanchored_match = any(
+                scope.line_start is None
+                and scope.symbol is None
+                and _status_for_path(evidence, path) not in {"R", "C", "D"}
+                and bool(_changed_line_map(evidence).get(path))
+                and (kind == "current_slice"
+                     or _dependency_file_scope_stable(
+                         path, evidence_positions[id(evidence)], evidence_set))
+                for kind, evidence, scope in stack_matches
+            )
+            uncertainty_is_relevant = not (
+                current_exact_match or exact_unanchored_match)
+            uncertain_path = False if not uncertainty_is_relevant else any(
                 path in evidence.uncertain_files
                 and (type(finding_line) is not int
                      or not any(start <= finding_line <= end
                                 for start, end in _changed_line_map(evidence)
                                 .get(path, ())))
                 for evidence in evidence_set)
-            if not current_exact_match:
+            if dependency_coordinates_uncertain:
                 uncertain_path = uncertain_path or dependency_coordinates_uncertain
 
             if uncertain_path:
