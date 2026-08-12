@@ -1,6 +1,7 @@
 """Shipped-path tests for versioned fingerprint and lineage invariants."""
 
 from skodun import fingerprint
+from skodun import pipeline
 from skodun.store import Store
 
 
@@ -82,6 +83,20 @@ def test_same_claim_in_unrelated_structure_is_not_linked():
     unrelated = {"file": "src/b.py", "title": "same", "category": "rule-2"}
     result = fingerprint.annotate_findings([unrelated], [old])[0]
     assert result["finding_lineage_v2"]["match_reason"] == "new"
+
+
+def test_lineage_ignores_running_predecessor_rows():
+    finding = {"file": "src/a.py", "title": "same"}
+
+    class StoreStub:
+        def list_reviews(self, _branch, limit=200):
+            return [{"id": "running", "status": "running",
+                     "lineage_repository_id": "repo", "findings": [finding]}]
+
+    record = {"id": "current", "lineage_repository_id": "repo",
+              "findings": [finding]}
+    pipeline.annotate_lineage(StoreStub(), record)
+    assert record["findings"][0]["finding_lineage_v2"]["match_reason"] == "new"
 
 
 def test_terminal_store_write_persists_lineage_without_changing_legacy_fields(tmp_path):
