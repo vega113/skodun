@@ -1152,7 +1152,8 @@ class Store:
 
     def create_orchestration(
             self, orchestration_id: str, identity, *, requested_mode: str,
-            created_at: str, expires_at: str) -> dict:
+            created_at: str, expires_at: str,
+            reuse_existing: bool = True) -> dict:
         """Create one exact-identity orchestration and all planned pass rows."""
         from .checkpoints import OrchestrationIdentity
 
@@ -1174,12 +1175,14 @@ class Store:
             # resumer that arrives after the first transaction has created the
             # exact same identity receives that existing orchestration instead
             # of minting a competing plan whose pass claims would be separate.
-            existing = self._c.execute(
-                """SELECT * FROM review_orchestrations
-                    WHERE identity_digest=?
-                      AND state IN ('active','cancelled','complete')
-                    ORDER BY created_at DESC, id DESC LIMIT 1""",
-                (identity.digest(),)).fetchone()
+            existing = None
+            if reuse_existing:
+                existing = self._c.execute(
+                    """SELECT * FROM review_orchestrations
+                        WHERE identity_digest=?
+                          AND state IN ('active','cancelled','complete')
+                        ORDER BY created_at DESC, id DESC LIMIT 1""",
+                    (identity.digest(),)).fetchone()
             if existing is not None:
                 self._c.execute("COMMIT")
                 return dict(existing)
@@ -1907,17 +1910,26 @@ class Store:
             merged["superseded_by"] = row["superseded_by"]
             merged = _normalize_record(merged, label="finalize_review")
             batch_orchestration_id = merged.get("batch_orchestration_id")
+            incomplete_cancel = (
+                batch_orchestration_id is not None
+                and merged.get("status") == "failed"
+                and merged.get("degraded") is True
+                and "cancelled" in str(
+                    merged.get("failure_reason") or "").lower())
+            complete_checkpoint = batch_orchestration_id is None
             if batch_orchestration_id is not None:
                 batch_orchestration_id = _require_text(
                     "batch_orchestration_id", batch_orchestration_id)
                 batch_identity_digest = _require_text(
                     "batch_identity_digest", merged.get("batch_identity_digest"))
-                self._require_complete_orchestration(
-                    batch_orchestration_id, batch_identity_digest)
+                if not incomplete_cancel:
+                    self._require_complete_orchestration(
+                        batch_orchestration_id, batch_identity_digest)
+                    complete_checkpoint = True
             cur = self._c.execute(
                 _FINALIZE_REVIEW, _review_values(merged) + (record_id,))
             applied = cur.rowcount == 1
-            if applied and batch_orchestration_id is not None:
+            if applied and batch_orchestration_id is not None and complete_checkpoint:
                 self._consume_orchestration_in_transaction(
                     batch_orchestration_id, record_id, _iso_now())
             self._c.execute("COMMIT")

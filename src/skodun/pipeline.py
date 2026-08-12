@@ -2870,7 +2870,8 @@ def _begin_checkpoint_run(store: Store, identity: checkpoints.OrchestrationIdent
         created = store.create_orchestration(
             orchestration_id, identity,
             requested_mode=str(rec.get("mode") or "now"),
-            created_at=now, expires_at=_iso_after(CHECKPOINT_RETENTION_SEC))
+            created_at=now, expires_at=_iso_after(CHECKPOINT_RETENTION_SEC),
+            reuse_existing=resume)
     except Exception as exc:
         raise PersistenceFailed(
             f"could not create batch checkpoints: {exc!r}") from exc

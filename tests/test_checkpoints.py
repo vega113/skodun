@@ -209,6 +209,15 @@ def test_exact_orchestration_creation_is_idempotent_under_a_racing_starter(
     assert same["identity_digest"] == _identity().digest()
 
 
+def test_fresh_orchestration_creation_does_not_reuse_exact_prior_state(tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store, orchestration_id="orch-first")
+        fresh = store.create_orchestration(
+            "orch-fresh", _identity(), requested_mode="now",
+            created_at=NOW, expires_at=LATER, reuse_existing=False)
+    assert fresh["id"] == "orch-fresh"
+
+
 def test_resume_candidate_is_scoped_and_mismatch_is_durable(tmp_path):
     with Store.open(tmp_path / "s.db") as store:
         _created(store)
@@ -351,6 +360,26 @@ def test_incomplete_checkpoint_finalization_rolls_back_the_review_write(tmp_path
             store.save_checkpointed_review(_review())
         assert store.get_review("sk-final") is None
         assert store.get_orchestration("orch-1")["state"] == "active"
+
+
+def test_cancelled_incomplete_prepush_finalization_is_untrustworthy(tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store)
+        # A pre-push reservation row is the existing running review. This
+        # direct fixture uses the same identity fields and checks that the
+        # checkpoint guard does not turn cancellation into a persistence error.
+        reservation = store.reserve_prepush(
+            "feature", "h" * 40, "origin/main", "b" * 40, "d" * 40,
+            100, {}, repo="repo-1", now=NOW)
+        rec = store.get_review(reservation.record_id)
+        rec.update(status="failed", degraded=True,
+                   degraded_reason="cancelled: before it was recorded",
+                   failure_reason="cancelled: before it was recorded")
+        rec["batch_orchestration_id"] = "orch-1"
+        rec["batch_identity_digest"] = _identity().digest()
+        assert store.finalize_review(reservation.record_id, rec) is True
+        saved = store.get_review(reservation.record_id)
+    assert saved["trustworthy"] is False
 
 
 def test_final_review_and_checkpoint_consumption_commit_together(tmp_path):
