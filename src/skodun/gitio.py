@@ -229,7 +229,9 @@ class Diff:
     truncated_untracked: bool = False
 
 
-def _tracked_statuses(repo: Path, base_sha: str, *other: str) -> dict[str, str]:
+def _tracked_statuses(
+        repo: Path, base_sha: str, *other: str,
+        detect_renames: bool = False) -> dict[str, str]:
     """path -> one-letter status from `git diff --name-status -z`.
 
     NUL-delimited, never text-mode + `.strip()`: under default `core.quotepath`
@@ -242,7 +244,10 @@ def _tracked_statuses(repo: Path, base_sha: str, *other: str) -> dict[str, str]:
     commits only) — one parser shared between both callers, per the module's
     "reuse the shipped -z name-status parsing" contract.
     """
-    toks = _paths(_run(repo, "diff", *_DIFF_FLAGS, "--name-status", "-z", base_sha, *other).stdout)
+    detection = ("-M", "-C", "--find-copies-harder") if detect_renames else ()
+    toks = _paths(_run(
+        repo, "diff", *_DIFF_FLAGS, *detection, "--name-status", "-z",
+        base_sha, *other).stdout)
     statuses: dict[str, str] = {}
     i = 0
     while i < len(toks) and toks[i]:
@@ -254,7 +259,9 @@ def _tracked_statuses(repo: Path, base_sha: str, *other: str) -> dict[str, str]:
     return statuses
 
 
-def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
+def capture_diff(
+        repo: Path, base_sha: str, untracked_max: int,
+        *, detect_renames: bool = False) -> Diff:
     """Working tree vs `base_sha`, including untracked files, capped.
 
     `repo` may be any path inside the worktree; it is normalised to the
@@ -296,8 +303,10 @@ def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
     oracle's on a locale or code-point-vs-byte ordering difference.
     """
     repo = _worktree_root(repo)
-    tracked = _run(repo, "--no-pager", "diff", *_DIFF_FLAGS, base_sha).stdout
-    statuses = _tracked_statuses(repo, base_sha)
+    detection = ("-M", "-C", "--find-copies-harder") if detect_renames else ()
+    tracked = _run(
+        repo, "--no-pager", "diff", *_DIFF_FLAGS, *detection, base_sha).stdout
+    statuses = _tracked_statuses(repo, base_sha, detect_renames=detect_renames)
     files = list(statuses)
 
     all_untracked = [
@@ -328,7 +337,9 @@ def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
     return Diff(data=data, files=files, statuses=statuses, truncated_untracked=truncated)
 
 
-def capture_ref_diff(repo: Path, base_sha: str, local_oid: str) -> Diff:
+def capture_ref_diff(
+        repo: Path, base_sha: str, local_oid: str,
+        *, detect_renames: bool = False) -> Diff:
     """`base_sha..local_oid` — commits only. No untracked files, no working
     tree, no index: everything here comes from the two given oids.
 
@@ -349,8 +360,12 @@ def capture_ref_diff(repo: Path, base_sha: str, local_oid: str) -> Diff:
     untracked-file listing here to keep path-consistent with, since a
     ref-range diff between two commits has no untracked files by definition.
     """
-    tracked = _run(repo, "--no-pager", "diff", *_DIFF_FLAGS, base_sha, local_oid).stdout
-    statuses = _tracked_statuses(repo, base_sha, local_oid)
+    detection = ("-M", "-C", "--find-copies-harder") if detect_renames else ()
+    tracked = _run(
+        repo, "--no-pager", "diff", *_DIFF_FLAGS, *detection,
+        base_sha, local_oid).stdout
+    statuses = _tracked_statuses(
+        repo, base_sha, local_oid, detect_renames=detect_renames)
     files = list(statuses)
     return Diff(data=tracked.rstrip(b"\n"), files=files, statuses=statuses)
 

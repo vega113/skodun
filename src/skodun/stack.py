@@ -512,17 +512,16 @@ class StackValidation:
             "schema_version": None if manifest is None else manifest.schema_version,
             "status": self.status,
             "reason_code": self.reason_code,
-            "repository_id": None if manifest is None else manifest.repository_id,
             "manifest_digest": (
                 manifest.manifest_digest if manifest is not None
                 else self.claimed_manifest_digest),
-            "current_slice_id": (
-                None if manifest is None else manifest.current_slice.slice_id),
-            "direct_parent": None if manifest is None else manifest.direct_parent,
-            "dependency_count": (
-                0 if manifest is None else len(manifest.dependencies)),
-            "downstream_owner_count": (
-                0 if manifest is None else len(manifest.downstream_owners)),
+            **({
+                "repository_id": manifest.repository_id,
+                "current_slice_id": manifest.current_slice.slice_id,
+                "direct_parent": manifest.direct_parent,
+                "dependency_count": len(manifest.dependencies),
+                "downstream_owner_count": len(manifest.downstream_owners),
+            } if self.status == "valid" and manifest is not None else {}),
         }
 
 
@@ -736,10 +735,12 @@ def validate(
         dependencies: list[SliceEvidence] = []
         previous = manifest.certification_base
         for item in manifest.dependencies:
-            diff = gitio.capture_ref_diff(Path(repo), previous, item.commit)
+            diff = gitio.capture_ref_diff(
+                Path(repo), previous, item.commit, detect_renames=True)
             dependencies.append(_slice_evidence(item, diff))
             previous = item.commit
-        current_diff = gitio.capture_diff(Path(repo), previous, untracked_max)
+        current_diff = gitio.capture_diff(
+            Path(repo), previous, untracked_max, detect_renames=True)
         current = _slice_evidence(manifest.current_slice, current_diff)
         recaptured = gitio.capture_diff(
             Path(repo), certification_base, untracked_max)

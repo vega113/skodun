@@ -623,9 +623,9 @@ def test_tree_movement_during_stack_capture_disables_attribution(
     original = gitio.capture_diff
     moved = False
 
-    def capture_and_move(repo, base_sha, untracked_max):
+    def capture_and_move(repo, base_sha, untracked_max, **kwargs):
         nonlocal moved
-        captured = original(repo, base_sha, untracked_max)
+        captured = original(repo, base_sha, untracked_max, **kwargs)
         if base_sha == state["dep2"] and not moved:
             moved = True
             (state["repo"] / "src/current.py").write_text(

@@ -515,6 +515,13 @@
   remain ignored `git_error` attribution rather than escaping the ordinary
   full-diff review. Focused stack/Git verification passes (`68 passed`).
 
+  Final review follow-up: stack-only Git captures force `-M -C
+  --find-copies-harder` so ambient rename/copy configuration cannot turn an
+  uncertain path into exact ownership. Ignored projections now expose only
+  status, reason, and a safe claimed digest; repository/slice/count fields are
+  emitted only for valid validation. Impacted suites pass (`277 passed,
+  9 skipped`).
+
 - [ ] **Step 5: Verify merged main and close #144.**
 
   Fetch `origin/main`, verify the merge commit is present, run the focused
