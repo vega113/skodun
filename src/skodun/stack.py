@@ -738,11 +738,13 @@ def validate(
         previous = manifest.certification_base
         for item in manifest.dependencies:
             diff = gitio.capture_ref_diff(
-                Path(repo), previous, item.commit, detect_renames=True)
+                Path(repo), previous, item.commit, detect_renames=True,
+                stable_prefixes=True)
             dependencies.append(_slice_evidence(item, diff))
             previous = item.commit
         current_diff = gitio.capture_diff(
-            Path(repo), previous, untracked_max, detect_renames=True)
+            Path(repo), previous, untracked_max, detect_renames=True,
+            stable_prefixes=True)
         current = _slice_evidence(manifest.current_slice, current_diff)
         recaptured = gitio.capture_diff(
             Path(repo), certification_base, untracked_max)

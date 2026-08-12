@@ -268,7 +268,8 @@ def _tracked_statuses(
 
 def capture_diff(
         repo: Path, base_sha: str, untracked_max: int,
-        *, detect_renames: bool = False) -> Diff:
+        *, detect_renames: bool = False,
+        stable_prefixes: bool = False) -> Diff:
     """Working tree vs `base_sha`, including untracked files, capped.
 
     `repo` may be any path inside the worktree; it is normalised to the
@@ -311,9 +312,10 @@ def capture_diff(
     """
     repo = _worktree_root(repo)
     detection = ("-M", "-C", "--find-copies-harder", "-l0") if detect_renames else ()
+    prefixes = _DIFF_PREFIX_FLAGS if stable_prefixes else ()
     tracked = _run(
-        repo, "--no-pager", "diff", *_DIFF_FLAGS, *_DIFF_PREFIX_FLAGS,
-        *detection, base_sha).stdout
+        repo, "--no-pager", "diff", *_DIFF_FLAGS, *prefixes, *detection,
+        base_sha).stdout
     statuses = _tracked_statuses(repo, base_sha, detect_renames=detect_renames)
     files = list(statuses)
 
@@ -329,7 +331,7 @@ def capture_diff(
         if not (repo / f).is_file():  # `[ -f ]`: follows symlinks, rejects dangling
             continue
         cp = _run(
-            repo, "--no-pager", "diff", *_DIFF_FLAGS, *_DIFF_PREFIX_FLAGS,
+            repo, "--no-pager", "diff", *_DIFF_FLAGS, *prefixes,
             "--no-index", "--", "/dev/null", f,
             ok_codes=(0, 1),
         )
@@ -348,7 +350,8 @@ def capture_diff(
 
 def capture_ref_diff(
         repo: Path, base_sha: str, local_oid: str,
-        *, detect_renames: bool = False) -> Diff:
+        *, detect_renames: bool = False,
+        stable_prefixes: bool = False) -> Diff:
     """`base_sha..local_oid` — commits only. No untracked files, no working
     tree, no index: everything here comes from the two given oids.
 
@@ -370,9 +373,9 @@ def capture_ref_diff(
     ref-range diff between two commits has no untracked files by definition.
     """
     detection = ("-M", "-C", "--find-copies-harder", "-l0") if detect_renames else ()
+    prefixes = _DIFF_PREFIX_FLAGS if stable_prefixes else ()
     tracked = _run(
-        repo, "--no-pager", "diff", *_DIFF_FLAGS, *_DIFF_PREFIX_FLAGS,
-        *detection,
+        repo, "--no-pager", "diff", *_DIFF_FLAGS, *prefixes, *detection,
         base_sha, local_oid).stdout
     statuses = _tracked_statuses(
         repo, base_sha, local_oid, detect_renames=detect_renames)
