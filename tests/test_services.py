@@ -302,6 +302,7 @@ def test_bounded_recovery_records_each_attempt_and_avoids_terminal_provider(
     assert "trustworthy review reached" in text
     assert calls[0]["avoid_providers"] == set()
     assert calls[1]["avoid_providers"] == {"xai"}
+    assert all(call["resume_checkpoints"] is False for call in calls)
     assert rows[0]["orchestration_id"] == rows[1]["orchestration_id"]
     assert rows[0]["attempt_ordinal"] == 0
     assert rows[1]["attempt_ordinal"] == 1

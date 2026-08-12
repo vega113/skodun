@@ -54,7 +54,12 @@ def _payload(**changes):
             "detail": "The empty case is not handled.",
         }],
         "failure_reason": "",
-        "attempts": [{"provider": "xai", "model": "grok", "ordinal": 0}],
+        "attempts": [{
+            "n": 1, "provider": "xai", "model": "grok", "effort": None,
+            "rc": 0, "timed_out": False, "duration_sec": 1.0,
+            "first_output_sec": 0.2,
+            "classification": {"kind": "ok", "category": "", "detail": ""},
+        }],
         "provenance": {
             "provider": "xai", "model": "grok", "effort": None,
             "note": "",
@@ -137,6 +142,15 @@ def test_checkpoint_payload_refuses_unknown_or_sensitive_fields():
     with pytest.raises(ValueError, match="forbidden field"):
         checkpoints.CheckpointPayload.from_mapping(_payload(
             provenance={"provider": "xai", "transcript": "raw output"}))
+
+
+def test_checkpoint_payload_reuses_strict_finding_and_attempt_shapes():
+    with pytest.raises(ValueError, match="findings"):
+        checkpoints.CheckpointPayload.from_mapping(_payload(
+            findings=[{"severity": "medium"}]))
+    with pytest.raises(ValueError, match="attempt"):
+        checkpoints.CheckpointPayload.from_mapping(_payload(
+            attempts=[{"n": "one"}]))
 
 
 def test_checkpoint_payload_refuses_unbounded_content():

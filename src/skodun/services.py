@@ -643,7 +643,12 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             reviewer=reviewer, client_family=client_family,
             avoid_providers=(set(terminal_providers)
                              if reviewer is None else set()),
-            resume_checkpoints=not fresh)
+            # Recovery attempts are deliberately independent second looks.
+            # The caller may opt into checkpoint resume for an ordinary review,
+            # but the bounded recovery contract has always promised fresh
+            # records and provider diversity; reusing a partial batch here
+            # would silently turn a retry into the same interrupted run.
+            resume_checkpoints=False)
         try:
             last_rec, review_id = _annotate_recovery_attempt(
                 store, last_text, orchestration_id, ordinal)

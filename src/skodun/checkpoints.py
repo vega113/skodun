@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 from typing import Any, Mapping
 
 
@@ -203,6 +204,62 @@ def _scan_json(value: Any, *, label: str) -> None:
     raise ValueError(f"{label} contains non-JSON value {type(value).__name__}")
 
 
+def _optional_text(value: object, *, label: str) -> None:
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ValueError(f"{label} must be a non-empty string or null")
+
+
+def _attempt_shape(value: object, *, index: int) -> None:
+    label = f"checkpoint payload attempts[{index}]"
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    required = {
+        "n", "provider", "model", "effort", "rc", "timed_out",
+        "duration_sec", "first_output_sec", "classification",
+    }
+    missing = required - set(value)
+    if missing:
+        raise ValueError(f"{label} is missing fields: {sorted(missing)}")
+    if type(value["n"]) is not int or value["n"] < 1:
+        raise ValueError(f"{label}.n must be a positive integer")
+    for name in ("provider", "model"):
+        if not isinstance(value[name], str) or not value[name]:
+            raise ValueError(f"{label}.{name} must be a non-empty string")
+    _optional_text(value["effort"], label=f"{label}.effort")
+    for name in ("rc",):
+        if value[name] is not None and type(value[name]) is not int:
+            raise ValueError(f"{label}.{name} must be an integer or null")
+    if value["timed_out"] is not None and type(value["timed_out"]) is not bool:
+        raise ValueError(f"{label}.timed_out must be bool or null")
+    for name in ("duration_sec", "first_output_sec"):
+        number = value[name]
+        if number is not None:
+            try:
+                valid_number = (not isinstance(number, bool)
+                                and isinstance(number, (int, float))
+                                and math.isfinite(float(number))
+                                and number >= 0)
+            except OverflowError:
+                valid_number = False
+            if not valid_number:
+                raise ValueError(
+                    f"{label}.{name} must be a finite number or null")
+    classification = value["classification"]
+    if classification is not None:
+        if not isinstance(classification, Mapping):
+            raise ValueError(f"{label}.classification must be an object or null")
+        for name in ("kind", "category", "detail"):
+            if not isinstance(classification.get(name), str):
+                raise ValueError(f"{label}.classification.{name} must be a string")
+        if classification["kind"] not in ("ok", "degraded", "unavailable"):
+            raise ValueError(f"{label}.classification.kind is unknown")
+    if "skipped" in value:
+        if not isinstance(value["skipped"], str) or not value["skipped"]:
+            raise ValueError(f"{label}.skipped must be a non-empty string")
+    if "usage" in value and not isinstance(value["usage"], Mapping):
+        raise ValueError(f"{label}.usage must be an object")
+
+
 @dataclass(frozen=True)
 class CheckpointPayload:
     """Validated canonical JSON for one terminal normalized sub-review."""
@@ -230,18 +287,25 @@ class CheckpointPayload:
             if len(raw[name]) > MAX_TEXT_CHARS:
                 raise ValueError(
                     f"checkpoint payload {name} exceeds {MAX_TEXT_CHARS} characters")
-        if not isinstance(raw["findings"], list) \
-                or any(not isinstance(item, Mapping) for item in raw["findings"]):
-            raise ValueError("checkpoint payload findings must be a list of objects")
+        if not isinstance(raw["findings"], list):
+            raise ValueError("checkpoint payload findings must be a list")
         if len(raw["findings"]) > MAX_FINDINGS:
             raise ValueError(
                 f"checkpoint payload findings exceeds {MAX_FINDINGS} entries")
-        if not isinstance(raw["attempts"], list) \
-                or any(not isinstance(item, Mapping) for item in raw["attempts"]):
-            raise ValueError("checkpoint payload attempts must be a list of objects")
+        # Reuse the adapter's trust-critical review validator rather than
+        # accepting arbitrary mappings that later aggregation would quietly
+        # ignore. A malformed finding must make the checkpoint unusable.
+        from .adapters.base import _valid_payload
+        if not _valid_payload({"summary": raw["summary"],
+                               "findings": raw["findings"]}):
+            raise ValueError("checkpoint payload findings have invalid shape")
+        if not isinstance(raw["attempts"], list):
+            raise ValueError("checkpoint payload attempts must be a list")
         if len(raw["attempts"]) > MAX_ATTEMPTS:
             raise ValueError(
                 f"checkpoint payload attempts exceeds {MAX_ATTEMPTS} entries")
+        for index, attempt in enumerate(raw["attempts"]):
+            _attempt_shape(attempt, index=index)
         if not isinstance(raw["provenance"], Mapping):
             raise ValueError("checkpoint payload provenance must be an object")
         if raw["accepted"] is not None and not isinstance(raw["accepted"], Mapping):
