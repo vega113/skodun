@@ -620,9 +620,10 @@ def _portable_remote_identity(remote: str) -> str | None:
             or bare_host.startswith(".") or bare_host.endswith(".")
             or ".." in bare_host):
         return None
-    path = _decode_unreserved_path(path)
-    if path is None:
-        return None
+    if url_scheme is not None:
+        path = _decode_unreserved_path(path)
+        if path is None:
+            return None
     if path.endswith(".git"):
         path = path[:-4]
     parts = path.split("/")
