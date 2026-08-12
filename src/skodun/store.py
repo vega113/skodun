@@ -130,14 +130,12 @@ def inspect_schema(path: Path) -> SchemaInfo:
     if not path.is_file():
         return SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
                           reason_code="not_a_file")
-    snapshot = None
-    db_path = path
+    snapshot = tempfile.TemporaryDirectory(prefix="skodun-inspect-")
+    db_path = Path(snapshot.name) / path.name
+    shutil.copyfile(path, db_path)
     wal = Path(str(path) + "-wal")
     shm = Path(str(path) + "-shm")
     if wal.exists():
-        snapshot = tempfile.TemporaryDirectory(prefix="skodun-inspect-")
-        db_path = Path(snapshot.name) / path.name
-        shutil.copyfile(path, db_path)
         shutil.copyfile(wal, Path(str(db_path) + "-wal"))
         if shm.exists():
             shutil.copyfile(shm, Path(str(db_path) + "-shm"))
@@ -216,13 +214,11 @@ def migration_blockers(path: Path) -> tuple[str, ...]:
     info = inspect_schema(path)
     if info.state not in ("older", "current"):
         return ()
-    snapshot = None
-    db_path = Path(path)
-    wal = Path(str(db_path) + "-wal")
+    snapshot = tempfile.TemporaryDirectory(prefix="skodun-blockers-")
+    db_path = Path(snapshot.name) / Path(path).name
+    shutil.copyfile(path, db_path)
+    wal = Path(str(path) + "-wal")
     if wal.exists():
-        snapshot = tempfile.TemporaryDirectory(prefix="skodun-blockers-")
-        db_path = Path(snapshot.name) / db_path.name
-        shutil.copyfile(path, db_path)
         shutil.copyfile(wal, Path(str(db_path) + "-wal"))
         shm = Path(str(path) + "-shm")
         if shm.exists():
@@ -1222,6 +1218,21 @@ class Store:
             raise SchemaLifecycleError(
                 "migration_busy", f"migration lock is held: {migration_lock}",
                 version=None)
+        if existed:
+            info = inspect_schema(path)
+            if info.state == "newer":
+                raise SchemaLifecycleError(
+                    "schema_too_new", schema_too_new_message(int(info.version)),
+                    version=int(info.version))
+            if info.state == "older":
+                raise SchemaLifecycleError(
+                    "migration_required",
+                    schema_migration_required_message(int(info.version)),
+                    version=int(info.version))
+            if info.state != "current":
+                raise SchemaLifecycleError(
+                    info.reason_code or "invalid_schema",
+                    f"store cannot be opened: {path}", version=None)
         conn = sqlite3.connect(path, isolation_level=None, timeout=30)
         conn.row_factory = sqlite3.Row
         try:
