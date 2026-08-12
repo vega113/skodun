@@ -340,7 +340,7 @@ def test_orchestration_expiry_discards_terminal_checkpoint_payloads(tmp_path):
         identity = _identity().pass_identities[0]
         claim = store.claim_checkpoint(
             "orch-1", identity, owner="worker", now=EARLIER,
-            lease_expires_at=LATER)
+            lease_expires_at=EXPIRED)
         assert store.complete_checkpoint(
             "orch-1", "batch", 1, owner="worker",
             claim_token=claim["claim_token"], fence=claim["fence"],
