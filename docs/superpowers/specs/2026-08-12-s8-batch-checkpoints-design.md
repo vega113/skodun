@@ -72,6 +72,8 @@ transitions.
 
 `src/skodun/pipeline.py` prepares deterministic pass inputs, asks the checkpoint
 controller whether to reuse or run each pass, and aggregates exactly as today.
+The prepared-plan `sole` flag is defined before batch context packing and keeps
+the one-batch whole-diff behavior aligned with the unbatched path.
 The foreground and pre-push paths provide their already-captured repository
 identity. Unbatched reviews do not enter the subsystem.
 

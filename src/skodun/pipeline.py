@@ -2895,6 +2895,11 @@ def _checkpointed_sub(
                         label, cancel=cancel)
     now = _iso_now()
     width = max(1, len(_chain_for(cfg, reviewer)))
+    # The caller passes `_escalated(d, prompt.prompt_bytes, large_prompt)`
+    # here, so this lease uses the same raised timeout as the provider attempt
+    # for large prompts. Keeping the calculation at the claim boundary makes
+    # the lease cover retries plus grace, rather than a stale pre-escalation
+    # default.
     lease_seconds = budget.worst_runtime(d, width, 0)
     try:
         claim = store.claim_checkpoint(
