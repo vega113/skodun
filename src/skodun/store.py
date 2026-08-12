@@ -1431,15 +1431,37 @@ class Store:
             raise
 
     def expire_orchestrations(self, *, now: str) -> int:
-        """Mark incomplete expired orchestration state; never touch reviews."""
+        """Expire old orchestration state and discard bounded payload data.
+
+        Checkpoint rows are never coverage-bearing, so expiry can safely retain
+        their small identity/status envelope while clearing terminal payload
+        JSON. This keeps the seven-day retention policy from becoming an
+        unbounded transcript-like store without changing review rows.
+        """
         now = _require_ts("now", now)
-        cur = self._c.execute(
-            """UPDATE review_orchestrations
-                  SET state='expired', updated_at=?,
-                      terminal_reason='checkpoint retention expired'
-                WHERE state IN ('active','cancelled','failed','complete')
-                  AND expires_at <= ?""", (now, now))
-        return cur.rowcount
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._c.execute(
+                """UPDATE review_orchestrations
+                      SET state='expired', updated_at=?,
+                          terminal_reason='checkpoint retention expired'
+                    WHERE state IN ('active','cancelled','failed','complete')
+                      AND expires_at <= ?""", (now, now))
+            self._c.execute(
+                """UPDATE review_checkpoints
+                      SET payload_json=NULL
+                    WHERE orchestration_id IN (
+                        SELECT id FROM review_orchestrations
+                         WHERE state='expired' AND expires_at <= ?)""",
+                (now,))
+            self._c.execute("COMMIT")
+            return cur.rowcount
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except BaseException:
+                pass
+            raise
 
     def reuse_candidates(self, repo_id: str, base_sha: str,
                          diff_hash: str) -> list[dict]:

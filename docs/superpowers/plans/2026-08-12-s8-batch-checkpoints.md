@@ -160,17 +160,17 @@ Expected: CLI/MCP/service parity tests pass.
 **Files:**
 - Modify: `docs/superpowers/plans/2026-08-12-s8-batch-checkpoints.md`
 
-- [ ] **Step 1: Self-review exact acceptance coverage**
+- [x] **Step 1: Self-review exact acceptance coverage**
 
 Inspect the diff and map each #150 acceptance criterion to a test. Run `git diff --check`; compare `git hash-object src/skodun/gate.py src/skodun/trust.py` to `origin/main`; search checkpoint tables out of gate, trust, triage, delivery, and reuse code.
 
-- [ ] **Step 2: Run focused shipped-path verification**
+- [x] **Step 2: Run focused shipped-path verification**
 
 Run: `python3 -m pytest tests/test_checkpoints.py tests/test_batched_review.py tests/test_cancellation.py tests/test_store.py tests/test_services.py tests/test_cli.py tests/test_mcpserver.py -q --tb=short`
 
 Expected: exit 0 with no failures.
 
-- [ ] **Step 3: Run the full suite and prescribed ResourceWarning sweep**
+- [x] **Step 3: Run the full suite and prescribed ResourceWarning sweep**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q --tb=short`
 
@@ -178,10 +178,10 @@ Run: `python3 -m pytest tests/test_store.py --deselect tests/test_store.py::test
 
 Expected: both complete with exit 0; retain exact passed/skipped/deselected counts.
 
-- [ ] **Step 4: Exercise real CLI/MCP help and a hermetic resume smoke**
+- [x] **Step 4: Exercise real CLI/MCP help and a hermetic resume smoke**
 
 Run `PYTHONPATH=src python3 -m skodun review --help`, inspect MCP tool schema via its registry test, and run the four-batch fake-provider timeout/resume smoke through the shipped service entrypoint.
 
-- [ ] **Step 5: Commit the narrow issue implementation**
+- [x] **Step 5: Commit the narrow issue implementation**
 
 Stage only #150 files and commit with a complete-sentence message explaining the fail-closed checkpoint boundary and `refs #150`.

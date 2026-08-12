@@ -284,6 +284,25 @@ def test_incomplete_orchestration_expiry_never_creates_review_coverage(tmp_path)
             "repo-1", "b" * 40, "d" * 40) == []
 
 
+def test_orchestration_expiry_discards_terminal_checkpoint_payloads(tmp_path):
+    payload = checkpoints.CheckpointPayload.from_mapping(_payload())
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store, created_at="2026-08-12T09:00:00Z",
+                 expires_at=EXPIRED)
+        identity = _identity().pass_identities[0]
+        claim = store.claim_checkpoint(
+            "orch-1", identity, owner="worker", now=EARLIER,
+            lease_expires_at=LATER)
+        assert store.complete_checkpoint(
+            "orch-1", "batch", 1, owner="worker",
+            claim_token=claim["claim_token"], fence=claim["fence"],
+            payload=payload, completed_at=EARLIER)
+        assert store.expire_orchestrations(now=NOW) == 1
+        row = store.list_checkpoints("orch-1")[0]
+    assert row["state"] == "complete"
+    assert row["payload_json"] is None
+
+
 def _review(review_id="sk-final"):
     return {
         "id": review_id, "reviewed_at": NOW, "branch": "feature",
