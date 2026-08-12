@@ -906,9 +906,13 @@ def classify_findings(
                     scope.exclusive or bool(previous and previous[2]),
                 )
             owner_matches = list(stack_owners.values())
+            uncertain_path = any(
+                path in evidence.uncertain_files
+                for evidence in (*result.dependencies,
+                                 *((result.current_slice,) if
+                                   result.current_slice is not None else ())))
 
-            if any(path in evidence.uncertain_files
-                   for _kind, evidence, _exclusive in owner_matches):
+            if uncertain_path:
                 attribution = _attribution("unknown", "uncertain_git_mapping")
             elif len(owner_matches) == 1 and not downstream_matches:
                 kind, evidence, _exclusive = owner_matches[0]

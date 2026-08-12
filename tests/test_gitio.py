@@ -989,6 +989,8 @@ def test_canonical_repository_identity_normalizes_supported_remotes(
     "https://example.com/acme/control\x01project.git",
     "https://example.com/acme/%2Fproject.git",
     "https://example.com/acme/%2e%2e/project.git",
+    "https://example.com/acme/%0Arepo.git",
+    "https://example.com/acme/%00repo.git",
     "https://user:secret@example.com/acme/project.git",
 ])
 def test_canonical_repository_identity_refuses_unportable_or_unsafe_remotes(

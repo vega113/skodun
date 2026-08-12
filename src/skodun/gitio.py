@@ -586,9 +586,12 @@ def _decode_unreserved_path(value: str) -> str | None:
         encoded.append(decoded)
         index += 3
     try:
-        return bytes(encoded).decode("utf-8")
+        decoded = bytes(encoded).decode("utf-8")
     except UnicodeDecodeError:
         return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in decoded):
+        return None
+    return decoded
 
 
 def _portable_remote_identity(remote: str) -> str | None:
