@@ -38,15 +38,22 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import stat
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Mandatory on every diff: keeps no external-diff or textconv driver able to
 # alter the hashed bytes. Does NOT make the hashed bytes config-independent in
 # general — see the module docstring's core.quotepath note.
 _DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
+# Stack attribution parses the unified patch headers to map changed lines back
+# to manifest scopes. Pin Git's ordinary a/ and b/ prefixes so ambient
+# diff.noprefix or custom prefix configuration cannot turn a real path into a
+# header label that the parser cannot resolve.
+_DIFF_PREFIX_FLAGS = ("--src-prefix=a/", "--dst-prefix=b/")
 
 
 class GitError(RuntimeError):
@@ -227,7 +234,9 @@ class Diff:
     truncated_untracked: bool = False
 
 
-def _tracked_statuses(repo: Path, base_sha: str, *other: str) -> dict[str, str]:
+def _tracked_statuses(
+        repo: Path, base_sha: str, *other: str,
+        detect_renames: bool = False) -> dict[str, str]:
     """path -> one-letter status from `git diff --name-status -z`.
 
     NUL-delimited, never text-mode + `.strip()`: under default `core.quotepath`
@@ -240,7 +249,10 @@ def _tracked_statuses(repo: Path, base_sha: str, *other: str) -> dict[str, str]:
     commits only) — one parser shared between both callers, per the module's
     "reuse the shipped -z name-status parsing" contract.
     """
-    toks = _paths(_run(repo, "diff", *_DIFF_FLAGS, "--name-status", "-z", base_sha, *other).stdout)
+    detection = ("-M", "-C", "--find-copies-harder", "-l0") if detect_renames else ()
+    toks = _paths(_run(
+        repo, "diff", *_DIFF_FLAGS, *detection, "--name-status", "-z",
+        base_sha, *other).stdout)
     statuses: dict[str, str] = {}
     i = 0
     while i < len(toks) and toks[i]:
@@ -248,11 +260,16 @@ def _tracked_statuses(repo: Path, base_sha: str, *other: str) -> dict[str, str]:
         two_path = code in ("R", "C")
         path = toks[i + 2] if two_path else toks[i + 1]
         statuses[path] = code
+        if detect_renames and two_path:
+            statuses[toks[i + 1]] = code
         i += 3 if two_path else 2
     return statuses
 
 
-def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
+def capture_diff(
+        repo: Path, base_sha: str, untracked_max: int,
+        *, detect_renames: bool = False,
+        stable_prefixes: bool = False) -> Diff:
     """Working tree vs `base_sha`, including untracked files, capped.
 
     `repo` may be any path inside the worktree; it is normalised to the
@@ -294,8 +311,12 @@ def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
     oracle's on a locale or code-point-vs-byte ordering difference.
     """
     repo = _worktree_root(repo)
-    tracked = _run(repo, "--no-pager", "diff", *_DIFF_FLAGS, base_sha).stdout
-    statuses = _tracked_statuses(repo, base_sha)
+    detection = ("-M", "-C", "--find-copies-harder", "-l0") if detect_renames else ()
+    prefixes = _DIFF_PREFIX_FLAGS if stable_prefixes else ()
+    tracked = _run(
+        repo, "--no-pager", "diff", *_DIFF_FLAGS, *prefixes, *detection,
+        base_sha).stdout
+    statuses = _tracked_statuses(repo, base_sha, detect_renames=detect_renames)
     files = list(statuses)
 
     all_untracked = [
@@ -310,7 +331,8 @@ def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
         if not (repo / f).is_file():  # `[ -f ]`: follows symlinks, rejects dangling
             continue
         cp = _run(
-            repo, "--no-pager", "diff", *_DIFF_FLAGS, "--no-index", "--", "/dev/null", f,
+            repo, "--no-pager", "diff", *_DIFF_FLAGS, *prefixes,
+            "--no-index", "--", "/dev/null", f,
             ok_codes=(0, 1),
         )
         if not cp.stdout:
@@ -326,7 +348,10 @@ def capture_diff(repo: Path, base_sha: str, untracked_max: int) -> Diff:
     return Diff(data=data, files=files, statuses=statuses, truncated_untracked=truncated)
 
 
-def capture_ref_diff(repo: Path, base_sha: str, local_oid: str) -> Diff:
+def capture_ref_diff(
+        repo: Path, base_sha: str, local_oid: str,
+        *, detect_renames: bool = False,
+        stable_prefixes: bool = False) -> Diff:
     """`base_sha..local_oid` — commits only. No untracked files, no working
     tree, no index: everything here comes from the two given oids.
 
@@ -347,8 +372,13 @@ def capture_ref_diff(repo: Path, base_sha: str, local_oid: str) -> Diff:
     untracked-file listing here to keep path-consistent with, since a
     ref-range diff between two commits has no untracked files by definition.
     """
-    tracked = _run(repo, "--no-pager", "diff", *_DIFF_FLAGS, base_sha, local_oid).stdout
-    statuses = _tracked_statuses(repo, base_sha, local_oid)
+    detection = ("-M", "-C", "--find-copies-harder", "-l0") if detect_renames else ()
+    prefixes = _DIFF_PREFIX_FLAGS if stable_prefixes else ()
+    tracked = _run(
+        repo, "--no-pager", "diff", *_DIFF_FLAGS, *prefixes, *detection,
+        base_sha, local_oid).stdout
+    statuses = _tracked_statuses(
+        repo, base_sha, local_oid, detect_renames=detect_renames)
     files = list(statuses)
     return Diff(data=tracked.rstrip(b"\n"), files=files, statuses=statuses)
 
@@ -524,6 +554,159 @@ def git_common_dir(repo: Path) -> Path:
 def repository_identity(repo: Path) -> str:
     """Stable local identity for a repository and all linked worktrees."""
     return str(git_common_dir(Path(repo)))
+
+
+_REMOTE_HOST = re.compile(r"[A-Za-z0-9.-]+")
+_SCP_REMOTE = re.compile(
+    r"(?:(?P<user>[^@/:]+)@)?(?P<host>[^/:]+):(?P<path>.+)")
+_FULL_COMMIT_OID = re.compile(r"[0-9a-f]{40}")
+_HEX = frozenset("0123456789abcdefABCDEF")
+_URL_UNRESERVED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+
+
+def _decode_unreserved_path(value: str) -> str | None:
+    """Decode valid UTF-8 URI escapes, refusing encoded path separators."""
+    encoded: bytearray = bytearray()
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char != "%":
+            try:
+                encoded.extend(char.encode("utf-8"))
+            except UnicodeEncodeError:
+                return None
+            index += 1
+            continue
+        if (index + 2 >= len(value)
+                or value[index + 1] not in _HEX
+                or value[index + 2] not in _HEX):
+            return None
+        decoded = int(value[index + 1:index + 3], 16)
+        if decoded in b"/\\?#":
+            return None
+        if decoded < 128 and chr(decoded) not in _URL_UNRESERVED:
+            return None
+        encoded.append(decoded)
+        index += 3
+    try:
+        decoded = bytes(encoded).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in decoded):
+        return None
+    return decoded
+
+
+def _portable_remote_identity(remote: str) -> str | None:
+    """Normalize a clone-portable HTTPS/SSH remote, or refuse it.
+
+    The local git-common-dir identity above deliberately stays machine-local.
+    Stack manifests and evidence receipts need a separate identity that is
+    stable across clones, without accepting local paths or URL credentials.
+    """
+    if (not remote or any(ord(char) < 32 or ord(char) == 127
+                          for char in remote)):
+        return None
+    host = ""
+    path = ""
+    url_scheme: str | None = None
+    if "://" in remote:
+        try:
+            parsed = urlsplit(remote)
+            port = parsed.port
+        except ValueError:
+            return None
+        if parsed.scheme not in {"https", "ssh"}:
+            return None
+        if parsed.query or parsed.fragment or parsed.password is not None:
+            return None
+        host = parsed.hostname or ""
+        url_scheme = parsed.scheme
+        if port is not None:
+            host = f"{host}:{port}"
+        path = parsed.path.removeprefix("/")
+    else:
+        match = _SCP_REMOTE.fullmatch(remote)
+        if match is None:
+            return None
+        # SCP syntax has no URL parser to isolate credentials. Reject them
+        # explicitly when an @ appears before the host/path separator. Once
+        # that separator is crossed, @ and : are ordinary path characters.
+        at = remote.find("@")
+        separator = remote.find(":")
+        if at >= 0 and separator >= 0 and separator < at:
+            return None
+        host = match.group("host")
+        path = match.group("path")
+    bare_host = host.split(":", 1)[0]
+    if (_REMOTE_HOST.fullmatch(bare_host) is None
+            or bare_host.startswith(".") or bare_host.endswith(".")
+            or ".." in bare_host):
+        return None
+    if url_scheme is not None:
+        path = _decode_unreserved_path(path)
+        if path is None:
+            return None
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if (not parts or any(not part or part in {".", ".."} for part in parts)
+            or any("\\" in part for part in parts)):
+        return None
+    normalized_host = bare_host.lower()
+    if ":" in host:
+        try:
+            port = int(host.rsplit(":", 1)[1])
+        except ValueError:
+            return None
+        if ((url_scheme == "https" and port == 443)
+                or (url_scheme == "ssh" and port == 22)):
+            host = normalized_host
+    return f"{host.lower()}/{'/'.join(parts)}"
+
+
+def canonical_repository_identity(repo: Path) -> str | None:
+    """Return ``host/path`` for the repository's portable ``origin`` URL."""
+    result = _run(Path(repo), "config", "--null", "--get", "remote.origin.url",
+                  ok_codes=(0, 1))
+    if result.returncode != 0:
+        return None
+    raw = result.stdout
+    if raw.count(b"\0") != 1 or not raw.endswith(b"\0"):
+        return None
+    remote = raw[:-1].decode("utf-8", "strict")
+    return _portable_remote_identity(remote)
+
+
+def exact_commit_exists(repo: Path, oid: str) -> bool:
+    """Whether ``oid`` is one exact full SHA-1 naming a commit object."""
+    return exact_object_type(repo, oid) == "commit"
+
+
+def exact_object_type(repo: Path, oid: str) -> str | None:
+    """The type named by one exact full SHA-1, or ``None`` when absent/unsafe."""
+    if not isinstance(oid, str) or _FULL_COMMIT_OID.fullmatch(oid) is None:
+        return None
+    result = _run(
+        Path(repo), "cat-file", "-t", oid,
+        ok_codes=(0, 1, 128),
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.decode("ascii", "strict").strip()
+    return value if value in {"blob", "commit", "tag", "tree"} else None
+
+
+def is_ancestor(repo: Path, older_oid: str, newer_oid: str) -> bool:
+    """Whether two exact commit IDs have the claimed strict order."""
+    if (not exact_commit_exists(repo, older_oid)
+            or not exact_commit_exists(repo, newer_oid)):
+        return False
+    return _run(
+        Path(repo), "merge-base", "--is-ancestor", older_oid, newer_oid,
+        ok_codes=(0, 1, 128),
+    ).returncode == 0
 
 
 def observed_worktree_root(repo: Path) -> str:

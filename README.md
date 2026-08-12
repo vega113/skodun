@@ -64,7 +64,7 @@ Background:
 
 | Command | What it does | Exit codes |
 | --- | --- | --- |
-| `skodun review [--repo DIR] [--reviewer NAME] [--client-family FAMILY] [--recover] [--max-attempts N] [--max-wall-seconds S] [--reuse-trusted] [--fresh]` | Run a foreground review and record it. `--reviewer` heads this run's chain with a named `[[reviewers]]` entry; opt-in `--recover` makes bounded fresh attempts after an untrustworthy result, while opt-in `--reuse-trusted` reuses only an exact trustworthy foreground artifact. Incomplete batched work resumes only on an exact orchestration-identity match; `--fresh` bypasses both trusted reuse and incomplete batch checkpoints for a wholly fresh second opinion. Explicit reviewer and client-family intent also force a real review. | `0` trustworthy and clean · `1` trustworthy, findings open · `2` preflight refusal (nothing ran) · `3` gave up waiting for the lock · `4` no trustworthy review was recorded · `130` interrupted with Ctrl-C (stdout is left empty on purpose — an operator's own interruption, not a refusal). |
+| `skodun review [--repo DIR] [--reviewer NAME] [--client-family FAMILY] [--recover] [--max-attempts N] [--max-wall-seconds S] [--reuse-trusted] [--fresh] [--stack-manifest PATH]` | Run a foreground review and record it. `--reviewer` heads this run's chain with a named `[[reviewers]]` entry; opt-in `--recover` makes bounded fresh attempts after an untrustworthy result, while opt-in `--reuse-trusted` reuses only an exact trustworthy foreground artifact. `--fresh` bypasses reuse for a deliberate second opinion. `--stack-manifest` adds validated attribution to the same full certification diff and also bypasses older reuse; invalid metadata is reported and ignored. | `0` trustworthy and clean · `1` trustworthy, findings open · `2` preflight refusal (nothing ran) · `3` gave up waiting for the lock · `4` no trustworthy review was recorded · `130` interrupted with Ctrl-C (stdout is left empty on purpose — an operator's own interruption, not a refusal). |
 | `skodun review-readiness [--repo DIR] [--reviewer NAME] [--client-family FAMILY] [--json]` | Read-only, pre-capacity diagnosis of the configured trustworthy review topology: known-impossible paths report a stable reason code; unknown live provider health remains eligible. It never probes a model, changes gate/trust, or certifies a push. | `0` potentially available · `2` known-impossible, config, repository, or store-read failure. |
 | `skodun gate [--repo DIR]` | Fail closed unless a trustworthy review already covers this exact diff; every decision is written to the audit log. Wire it into pre-push or CI. | `0` clean or every finding triaged · `1` findings open · `2` no trustworthy review covers this diff. Every unexpected exception maps to `2`, never `1`. |
 | `skodun providers [--repo DIR]` | List every registered provider adapter, whether its CLI binary is resolvable and executable right now, and its cached availability state. Read-only; never gates anything. | `0` always, even with missing binaries — that is exactly what this command exists to report · `1` a reviewer in the loaded config (enabled or not) names a `provider` with no registered adapter · `2` `--repo`/config/store could not be read at all. |
@@ -103,6 +103,51 @@ loop for that runtime failure. Provider-chain fallback remains the inner rule an
 advances only on an `unavailable` attempt. Exact trustworthy reuse is opt-in with
 `--reuse-trusted`; `--fresh` forces a wholly new review without resuming
 incomplete batch checkpoints.
+
+### Stack-aware attribution
+
+`skodun review --stack-manifest PATH` accepts a strict, versioned JSON manifest
+bound to the repository, certification base, current head, and ordered local
+commit graph. A valid manifest annotates findings as `current_slice`,
+`inherited_dependency`, `downstream_owned`, `fixture_or_test`, `integration`, or
+`unknown`. It does not narrow the bytes reviewed, change the full diff identity,
+alter trust, or clear triage. Ambiguous ownership remains `unknown`, and caller
+`known_finding_refs` are display evidence only.
+
+The v1 shape is:
+
+```json
+{
+  "schema_version": 1,
+  "repository_id": "github.com/acme/project",
+  "certification_base": "0000000000000000000000000000000000000000",
+  "current_head": "1111111111111111111111111111111111111111",
+  "direct_parent": null,
+  "dependencies": [],
+  "current_slice": {
+    "slice_id": "pr-14",
+    "commit": "1111111111111111111111111111111111111111",
+    "tracking_ref": "github.com/acme/project#14",
+    "ownership": [{
+      "kind": "file", "path": "src/example.py", "exclusive": true,
+      "line_start": null, "line_end": null, "symbol": null
+    }]
+  },
+  "downstream_owners": [],
+  "producer": {"id": "stack-export", "version": "1.0"},
+  "manifest_digest": "sha256:<digest-of-canonical-json-without-this-field>"
+}
+```
+
+Files are capped at 64 KiB and must be single-link regular files. The parser
+rejects unknown or duplicate keys, unsafe paths, controls, unbounded fields, and
+noncanonical identities. Git validation uses exact commit IDs under the same
+foreground lock as the full review. A stale or invalid manifest produces a
+bounded `SKODUN STACK: status=ignored reason=<code>` line and an ordinary full
+review; it cannot make a review more or less trustworthy. Direct-parent advisory
+execution is reserved but not exposed by this release, so every runnable
+stack-aware artifact remains `coverage_scope=certification_full` and
+`gate_eligible=true`.
 
 ## Configuration
 
@@ -804,7 +849,7 @@ implementation both call. (Pinned by `tests/test_mcptools.py` `EXPECTED_TOOLS`.)
 | Tool | Role |
 |---|---|
 | `gate` | Does a trustworthy review cover this tree? Status 0/1/2 |
-| `review` | Foreground review (long-running; optional `reviewer` **entry name**, bounded recovery limits, and opt-in `reuse_trusted` / `fresh`) |
+| `review` | Foreground review (long-running; optional `reviewer` **entry name**, bounded recovery limits, opt-in `reuse_trusted` / `fresh`, and `stack_manifest` attribution for the unchanged full certification diff) |
 | `log` | Recent reviews (history; not a gate) |
 | `surface` | Undelivered background rounds (history; not a gate) |
 | `review_status` | Lifecycle of a review by id or current for `repo` (not a gate) |

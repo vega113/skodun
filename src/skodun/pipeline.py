@@ -167,7 +167,7 @@ from pathlib import Path
 
 from . import (batching, budget, capacity, chain, checklist, checkpoints,
                contextpack, gitio, ids, passes, promptbuild, provenance, reuse,
-               routing, runner, telemetry)
+               routing, runner, stack, telemetry)
 from .adapters import NORMAL_STOP_REASONS, REFUTER_CONTRACT, get_adapter
 from .config import Config, Defaults, Reviewer, quota_pool_for
 from .store import Store, _TS_FORMAT
@@ -1212,7 +1212,8 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
                reviewer: str | None = None,
                client_family: str | None = None,
                avoid_providers: set[str] | None = None,
-               resume_checkpoints: bool = True) -> dict:
+               resume_checkpoints: bool = True,
+               stack_request: "stack.StackRequest | None" = None) -> dict:
     """Run one foreground review and return the record that was persisted.
 
     WRITES NOTHING TO STDOUT. Progress goes to stderr (or to `progress_sink`);
@@ -1289,7 +1290,7 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
         return _run_review(repo, cfg, store, mode, lock_wait, lock_poll,
                            id_prefix, lock_stale, cancel, d, reviewer,
                            client_family, avoid_providers,
-                           resume_checkpoints)
+                           resume_checkpoints, stack_request)
     finally:
         if progress_sink is not None:
             _PROGRESS.sink = None
@@ -1302,7 +1303,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 requested: str | None = None,
                 client_family: str | None = None,
                 avoid_providers: set[str] | None = None,
-                resume_checkpoints: bool = True) -> dict:
+                resume_checkpoints: bool = True,
+                stack_request: "stack.StackRequest | None" = None) -> dict:
     """`run_review`'s body. Split off ONLY so the progress sink can be installed
     and removed around it without wrapping 400 lines in another indent level."""
 
@@ -1555,6 +1557,13 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         branch = gitio.current_branch(repo)
         head = gitio.head_sha(repo)
         tree_fingerprint = gitio.tree_fingerprint(repo, paths=diff.files)
+        stack_validation = None
+        if stack_request is not None:
+            stack_validation = stack.validate(
+                stack_request, repo=root, certification_base=base.sha,
+                current_head=head, full_diff=diff,
+                full_tree_fingerprint=tree_fingerprint,
+                untracked_max=d.untracked_max)
 
         # STAGE TWO of the two-stage ordering: the AUTHORITATIVE batch plan,
         # built from the capture above — the only diff this review persists
@@ -1636,6 +1645,10 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             # too so a peer can SIGTERM a live holder or demote a dead one.
             pid=os.getpid(),
         )
+        if stack_validation is not None:
+            common.update(
+                coverage_scope="certification_full", gate_eligible=True,
+                stack=stack_validation.to_dict())
 
         # THE PRE-PERSISTENCE BOUNDARY, and it covers all three of the persist
         # sites below (the empty-diff record, the no-batches record, and the
@@ -2021,6 +2034,11 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 rec = passes.skipped_refuter_pass(rec, skip_note)
 
         # --- 11. persist the final record and hand it back -----------------
+        if stack_validation is not None:
+            rec["findings"] = stack.classify_findings(
+                rec.get("findings", []), stack_validation)
+            rec["findings_total"] = len(rec["findings"])
+
         rec["trustworthy"] = is_trustworthy(
             rec["parse_ok"], rec["degraded"], rec["diff_truncated"])
         rec["status"] = _status_for(rec)

@@ -21,6 +21,7 @@ must not leak into a test's `Defaults`.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -32,13 +33,14 @@ from pathlib import Path
 
 import pytest
 
-from skodun import capacity, pipeline, runner
+from skodun import capacity, pipeline, runner, stack
 from skodun.adapters import REVIEW_CONTRACT
 from skodun.cli import main
 from skodun.config import Config, Defaults, Reviewer, load_config
 from skodun.gitio import capture_diff, diff_identity, git_common_dir, resolve_base
 from skodun.pipeline import LockTimeout, PersistenceFailed, PreflightRefused, run_review
 from skodun.store import Store
+from skodun.textnorm import finding_key
 from skodun.triage import load_valid_artifact
 from skodun.trust import banner
 from tests.test_gitio import _git, _mkrepo
@@ -164,6 +166,46 @@ def _store(tmp_path: Path) -> Store:
 
 def _run(repo: Path, store: Store, **kw) -> dict:
     return run_review(repo, load_config(repo), store, **kw)
+
+
+def _stack_request(tmp_path: Path, repo: Path, *, malformed=False):
+    path = tmp_path / "stack.json"
+    if malformed:
+        path.write_text("{not json", encoding="utf-8")
+        return stack.load_request(path)
+    _git(repo, "remote", "add", "origin",
+         "https://github.com/acme/project.git")
+    base = resolve_base(repo)
+    head = _git(repo, "rev-parse", "HEAD")
+    document = {
+        "schema_version": 1,
+        "repository_id": "github.com/acme/project",
+        "certification_base": base.sha,
+        "current_head": head,
+        "direct_parent": None,
+        "dependencies": [],
+        "current_slice": {
+            "slice_id": "pr-144",
+            "commit": head,
+            "tracking_ref": "github.com/acme/project#144",
+            "ownership": [{
+                "kind": "file", "path": "a.txt", "exclusive": True,
+                "line_start": None, "line_end": None, "symbol": None,
+            }],
+        },
+        "downstream_owners": [],
+        "producer": {"id": "pipeline-test", "version": "1.0"},
+        "manifest_digest": "",
+    }
+    semantic = dict(document)
+    semantic.pop("manifest_digest")
+    encoded = json.dumps(
+        semantic, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False).encode("utf-8")
+    document["manifest_digest"] = (
+        "sha256:" + hashlib.sha256(encoded).hexdigest())
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return stack.load_request(path)
 
 
 def test_skeptic_reuses_selected_finder_chain_not_refuter_role():
@@ -316,6 +358,75 @@ def test_persisted_record_carries_the_full_artifact_schema(tmp_path, capsys):
     assert rec["failure_reason"] == ""
     # ...and the gate's fail-closed artifact validator accepts it.
     assert load_valid_artifact(rec) is rec
+
+
+def test_stack_request_adds_attribution_without_changing_full_certification(
+        tmp_path, capsys):
+    _fake_grok(tmp_path, _emit(DIRTY))
+    repo = _repo(tmp_path)
+    st = _store(tmp_path)
+    request = _stack_request(tmp_path, repo)
+
+    with_stack = _run(repo, st, stack_request=request)
+    without_stack = _run(repo, st)
+
+    assert with_stack["coverage_scope"] == "certification_full"
+    assert with_stack["gate_eligible"] is True
+    assert with_stack["stack"] == {
+        "schema_version": 1,
+        "status": "valid",
+        "reason_code": "ok",
+        "repository_id": "github.com/acme/project",
+        "manifest_digest": request.manifest.manifest_digest,
+        "current_slice_id": "pr-144",
+        "direct_parent": None,
+        "dependency_count": 0,
+        "downstream_owner_count": 0,
+    }
+    assert with_stack["findings"][0]["scope_attribution"] == {
+        "scope": "current_slice",
+        "reason_code": "exact_current_scope",
+        "owner_slice_id": "pr-144",
+        "owner_ref": "github.com/acme/project#144",
+    }
+    for field in (
+            "base_sha", "head", "diff_hash", "tree_fingerprint", "parse_ok",
+            "degraded", "diff_truncated", "trustworthy", "findings_total"):
+        assert with_stack[field] == without_stack[field], field
+    assert finding_key(
+        with_stack["findings"][0]["file"],
+        with_stack["findings"][0]["title"],
+    ) == finding_key(
+        without_stack["findings"][0]["file"],
+        without_stack["findings"][0]["title"],
+    )
+    assert "stack" not in without_stack
+    assert "coverage_scope" not in without_stack
+    first_prompt = (tmp_path / "bin" / "prompt_1.txt").read_bytes()
+    second_prompt = (tmp_path / "bin" / "prompt_2.txt").read_bytes()
+    assert first_prompt == second_prompt
+    assert st.get_review(with_stack["id"]) == with_stack
+    _verdict(with_stack, capsys)
+
+
+def test_invalid_stack_request_is_visible_but_review_stays_full_and_trustworthy(
+        tmp_path, capsys):
+    _fake_grok(tmp_path, _emit(DIRTY))
+    repo = _repo(tmp_path)
+    request = _stack_request(tmp_path, repo, malformed=True)
+
+    rec = _run(repo, _store(tmp_path), stack_request=request)
+
+    assert _calls(tmp_path) == 1
+    assert rec["trustworthy"] is True
+    assert rec["coverage_scope"] == "certification_full"
+    assert rec["gate_eligible"] is True
+    assert rec["stack"]["status"] == "ignored"
+    assert rec["stack"]["reason_code"] == "malformed_json"
+    assert rec["findings"][0]["scope_attribution"]["scope"] == "unknown"
+    assert (rec["findings"][0]["scope_attribution"]["reason_code"]
+            == "malformed_json")
+    _verdict(rec, capsys)
 
 
 def test_a_clean_record_also_satisfies_the_strict_artifact_validator(tmp_path,

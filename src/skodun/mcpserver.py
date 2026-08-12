@@ -630,6 +630,10 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
     family, refusal = _opt_string_arg(call.params, "client_family", "review")
     if refusal:
         return _review_result(2, refusal)
+    stack_manifest, refusal = _opt_string_arg(
+        call.params, "stack_manifest", "review")
+    if refusal:
+        return _review_result(2, refusal)
     family = routing.resolve_client_family(family, client_name=call.client_name)
     recover, refusal = _bool_arg(call.params, "recover", "review")
     if refusal:
@@ -661,14 +665,16 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
                 max_wall_seconds=max_wall_seconds,
                 reuse_trusted=reuse_trusted, fresh=fresh,
                 batch_target_bytes=batch_target_bytes,
+                stack_manifest=stack_manifest,
                 reuse_client_family=(
                     family if call.params.get("client_family") is not None
                     else None))
-        elif reuse_trusted or fresh:
+        elif reuse_trusted or fresh or stack_manifest is not None:
             status, text, metadata = services.svc_review_detailed(
                 store, repo, cancel=call.cancel, reviewer=reviewer,
                 client_family=family, reuse_trusted=reuse_trusted,
                 fresh=fresh, batch_target_bytes=batch_target_bytes,
+                stack_manifest=stack_manifest,
                 reuse_client_family=(
                     family if call.params.get("client_family") is not None
                     else None))
@@ -677,6 +683,7 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
                 store, repo, cancel=call.cancel, reviewer=reviewer,
                 client_family=family, reuse_trusted=reuse_trusted,
                 fresh=fresh, batch_target_bytes=batch_target_bytes,
+                stack_manifest=stack_manifest,
                 reuse_client_family=(
                     family if call.params.get("client_family") is not None
                     else None))
@@ -1062,6 +1069,11 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                     "description": "optional non-negative deterministic "
                                    "per-batch diff target; zero selects the "
                                    "configured/default planner"},
+                "stack_manifest": {
+                    "type": "string",
+                    "description": "path to a bounded stack manifest that "
+                                   "annotates the full certified diff; invalid "
+                                   "metadata is reported and ignored"},
             }),
             handler=_handle_review,
             description="Review the outgoing change NOW, in the foreground, and "

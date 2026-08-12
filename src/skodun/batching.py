@@ -198,6 +198,11 @@ def _file_of(section: list[bytes]) -> str:
     return ""
 
 
+def file_of(section: list[bytes]) -> str:
+    """Return the changed-file label for one raw diff section."""
+    return _file_of(section)
+
+
 def _sections(lines: list[bytes]) -> list[list[bytes]]:
     """Cut `lines` into per-file sections at `diff --git` boundaries.
 
@@ -216,6 +221,11 @@ def _sections(lines: list[bytes]) -> list[list[bytes]]:
     if cur:
         sections.append(cur)
     return sections
+
+
+def sections(lines: list[bytes]) -> list[list[bytes]]:
+    """Split raw diff lines into deterministic per-file sections."""
+    return _sections(lines)
 
 
 def _units(section: list[bytes], budget: int) -> list[_Unit]:

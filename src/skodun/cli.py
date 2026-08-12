@@ -162,6 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="batch_target_bytes",
         help="optional non-negative deterministic per-batch diff target; "
              "zero selects the configured/default planner")
+    review.add_argument(
+        "--stack-manifest", type=Path, default=None, dest="stack_manifest",
+        metavar="PATH",
+        help="annotate the full review with a bounded stack manifest; invalid "
+             "metadata is reported and ignored, never used to narrow coverage")
 
     readiness = sub.add_parser(
         "review-readiness",
@@ -839,7 +844,8 @@ def _cmd_review(args) -> int:
             max_wall_seconds=getattr(args, "max_wall_seconds", None),
             reuse_trusted=getattr(args, "reuse_trusted", False),
             fresh=getattr(args, "fresh", False),
-            batch_target_bytes=getattr(args, "batch_target_bytes", None))
+            batch_target_bytes=getattr(args, "batch_target_bytes", None),
+            stack_manifest=getattr(args, "stack_manifest", None))
     return _emit(text, code)
 
 
