@@ -142,6 +142,9 @@ def test_checkpoint_payload_refuses_unknown_or_sensitive_fields():
     with pytest.raises(ValueError, match="forbidden field"):
         checkpoints.CheckpointPayload.from_mapping(_payload(
             provenance={"provider": "xai", "transcript": "raw output"}))
+    with pytest.raises(ValueError, match="forbidden field"):
+        checkpoints.CheckpointPayload.from_mapping(_payload(
+            provenance={"PATH": "/usr/bin:/secret"}))
 
 
 def test_checkpoint_payload_reuses_strict_finding_and_attempt_shapes():

@@ -34,6 +34,8 @@ _TEXT_FIELDS = ("degraded_reason", "summary", "failure_reason")
 _FORBIDDEN_FIELDS = frozenset({
     "prompt", "prompt_text", "full_prompt", "transcript", "stdout", "stderr",
     "environment", "environment_values", "env_values", "full_path", "path_env",
+    "path", "path_value", "path_values", "executable_path", "argv", "command",
+    "binary",
 })
 
 
