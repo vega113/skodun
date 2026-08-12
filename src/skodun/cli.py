@@ -194,6 +194,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo", type=Path, default=None,
         help="when no id is given, report the current review for this "
              "repository (default: host-wide current)")
+    rstatus.add_argument("--json", action="store_true", dest="json_output",
+                         help="render coverage and pass state as JSON")
 
     rcancel = sub.add_parser(
         "review-cancel",
@@ -1878,7 +1880,8 @@ def _cmd_review_status(args) -> int:
         return _emit(f"skodun review-status: could not read the store: {e!r}", 2)
     with store:
         code, text = svc_review_status(
-            store, review_id=getattr(args, "review_id", None), repo=repo)
+            store, review_id=getattr(args, "review_id", None), repo=repo,
+            output="json" if getattr(args, "json_output", False) else "text")
     return _emit(text, code)
 
 

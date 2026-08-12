@@ -940,7 +940,8 @@ def _handle_review_status(call: "HandlerCall") -> "HandlerResult":
                 text=f"skodun review-status: could not resolve repo: {e!r}")
     with call.store_factory() as store:
         status, text = services.svc_review_status(
-            store, review_id=review_id, repo=scope)
+            store, review_id=review_id, repo=scope,
+            output="json" if call.params.get("output") == "json" else "text")
     return HandlerResult(status=status, text=text)
 
 
@@ -1183,6 +1184,8 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                     "description": "id of the review to inspect; when omitted, "
                                    "reports the current review for `repo` "
                                    "(newest running, else newest terminal)"},
+                "output": {"type": "string", "enum": ["text", "json"],
+                           "description": "status representation (default text)"},
             }),
             handler=_handle_review_status,
             description="Observe a review's lifecycle state without gating. "
