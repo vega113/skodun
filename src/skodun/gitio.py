@@ -561,6 +561,8 @@ _SCP_REMOTE = re.compile(
     r"(?:(?P<user>[^@/:]+)@)?(?P<host>[^/:]+):(?P<path>.+)")
 _FULL_COMMIT_OID = re.compile(r"[0-9a-f]{40}")
 _HEX = frozenset("0123456789abcdefABCDEF")
+_URL_UNRESERVED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 
 
 def _decode_unreserved_path(value: str) -> str | None:
@@ -582,6 +584,8 @@ def _decode_unreserved_path(value: str) -> str | None:
             return None
         decoded = int(value[index + 1:index + 3], 16)
         if decoded in b"/\\?#":
+            return None
+        if decoded < 128 and chr(decoded) not in _URL_UNRESERVED:
             return None
         encoded.append(decoded)
         index += 3
