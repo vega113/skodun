@@ -1,4 +1,8 @@
-"""Shipped-path checks for non-mutating inspection and explicit migration."""
+"""Shipped-path checks for non-mutating inspection and explicit migration.
+
+Contract: read-only and refused schema paths preserve database bytes and
+filesystem entries, while only the explicit maintenance path advances schema.
+"""
 
 from __future__ import annotations
 
@@ -31,11 +35,11 @@ def test_inspection_and_ordinary_open_are_byte_stable_for_older_store(tmp_path):
         pass
     _downgrade(db)
     before = db.read_bytes()
-    assert inspect_schema(db)["state"] == "older"
+    assert inspect_schema(db).state == "older"
     with pytest.raises(SchemaLifecycleError, match="explicit migration"):
         Store.open(db)
     assert db.read_bytes() == before
-    assert inspect_schema(db)["version"] == 12
+    assert inspect_schema(db).version == 12
 
 
 def test_explicit_migration_creates_backup_and_bounded_receipt(tmp_path):
@@ -50,7 +54,21 @@ def test_explicit_migration_creates_backup_and_bounded_receipt(tmp_path):
     assert db.with_name(db.name + ".backup-before-v13").stat().st_mode & 0o077 == 0
     saved = json.loads(db.with_name(db.name + ".migration-receipt.json").read_text())
     assert saved["backup_sha256"] == receipt["backup_sha256"]
-    assert inspect_schema(db)["state"] == "current"
+    assert inspect_schema(db).state == "current"
+
+
+def test_cli_migration_apply_uses_the_shipped_maintenance_path(tmp_path, capsys,
+                                                              monkeypatch):
+    db = _authority_db(tmp_path)
+    with Store.open(db):
+        pass
+    _downgrade(db)
+    monkeypatch.setattr("skodun.provenance.code_provenance",
+                        lambda: {"skodun_commit": "b" * 40})
+    assert main(["store", "migrate", "--apply", "--db", str(db),
+                 "--build-commit", "b" * 40]) == 0
+    assert inspect_schema(db).state == "current"
+    assert "applied v12" in capsys.readouterr().out
 
 
 def test_migration_refuses_dirty_or_active_build(tmp_path):

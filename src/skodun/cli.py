@@ -726,7 +726,13 @@ def _cmd_store(args) -> int:
     path = Path(args.db) if args.db is not None else _store_path()
     info = inspect_schema(path)
     build = provenance.code_provenance()
-    commit = args.build_commit or build.get("skodun_commit")
+    authority_commit = build.get("skodun_commit")
+    requested_commit = args.build_commit
+    if requested_commit is not None and requested_commit != authority_commit:
+        return _emit(
+            "skodun store migrate: build_identity_mismatch; explicit commit "
+            "must match the clean installed authority", 2)
+    commit = authority_commit
     if args.apply:
         if not commit:
             return _emit(
@@ -746,17 +752,17 @@ def _cmd_store(args) -> int:
     if not args.plan:
         return _emit(
             "skodun store migrate: choose exactly one of --plan or --apply", 2)
-    if info["state"] == "missing":
+    if info.state == "missing":
         return _emit(
             f"skodun store migrate: plan path={path} state=missing "
             f"target_schema={SCHEMA_VERSION} (ordinary open initializes it)", 0)
     blockers = migration_blockers(path)
     return _emit(
-        f"skodun store migrate: plan path={path} state={info['state']} "
-        f"current_schema={info['version']} target_schema={SCHEMA_VERSION} "
+        f"skodun store migrate: plan path={path} state={info.state} "
+        f"current_schema={info.version} target_schema={SCHEMA_VERSION} "
         f"build_commit={commit or 'unknown'} backup={path}.backup-before-v"
         f"{SCHEMA_VERSION} blockers={','.join(blockers) or 'none'} "
-        "restart_mcp=true", 0 if info["state"] == "older" else 2)
+        "restart_mcp=true", 0 if info.state == "older" else 2)
 
 
 def _cmd_review(args) -> int:

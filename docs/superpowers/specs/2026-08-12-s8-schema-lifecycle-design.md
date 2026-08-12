@@ -13,7 +13,9 @@ The migration command is the only writer allowed to upgrade an existing store.
 It requires an exact clean build identity for the installed authority, takes an
 exclusive maintenance lock, refuses active review/checkpoint work, creates and
 verifies a restrictive SQLite backup, applies the existing additive migration
-ladder transactionally, verifies integrity and schema objects, and records a
+ladder with replay-idempotent string deltas applied directly and
+non-idempotent deltas applied transactionally, verifies integrity and schema
+objects, and records a
 bounded receipt. Failure leaves either the untouched old store or a verified
 backup with recovery instructions; it never reports a partial success.
 
@@ -38,8 +40,8 @@ existing/newer --(any non-maintenance open)--> schema_too_new, byte-stable
 * `Store.open(path)` initializes a missing database, but an existing database
   must already equal `SCHEMA_VERSION`; it refuses older and newer schemas with
   stable reason codes. `Store.open_readonly(path)` is byte-stable and exact.
-* `Store.open_for_migration(path, expected_build)` is private to the CLI
-  migration command and is never called by MCP or services.
+* `Store.migrate_existing(path, *, build_commit, receipt_path)` is private to
+  the CLI migration command and is never called by MCP or services.
 * `skodun store migrate --plan` is read-only. `--apply` is the sole upgrade
   action and emits a receipt path and digest.
 * Diagnostics (`doctor`, `review-readiness`, `providers`, `stats`, `log`, and

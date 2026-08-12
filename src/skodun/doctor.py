@@ -147,19 +147,29 @@ def run_doctor(
         from .store import SCHEMA_VERSION, Store, inspect_schema
 
         info = inspect_schema(store_path)
-        if info["state"] == "missing":
+        if info.state == "missing":
             report.add("store", True,
                        f"missing path={store_path}; no store bytes inspected")
             report.add("worker_logs", True,
                        f"not created for missing store {store_path}")
-        elif info["state"] != "current":
-            detail = (f"schema state={info['state']} path={store_path} "
-                      f"version={info.get('version')} (build expects v"
-                      f"{SCHEMA_VERSION}); explicit migration required")
-            if info["state"] == "newer":
-                detail += (" — newer than this skodun; upgrade this process and "
-                           "restart every MCP client")
-            report.add("store", False, detail)
+        elif info.state == "older":
+            report.add("store", False,
+                       f"schema state=older path={store_path} version={info.version} "
+                       f"(build expects v{SCHEMA_VERSION}); explicit migration "
+                       "required")
+            report.add("worker_logs", True, "not inspected by read-only doctor")
+        elif info.state == "newer":
+            report.add("store", False,
+                       f"schema state=newer path={store_path} version={info.version} "
+                       f"(build expects v{SCHEMA_VERSION}); upgrade this process "
+                       "because the store is newer than this skodun, then restart "
+                       "every MCP client")
+            report.add("worker_logs", True, "not inspected by read-only doctor")
+        elif info.state == "invalid":
+            report.add("store", False,
+                       f"schema state=invalid path={store_path} "
+                       f"reason_code={info.reason_code or 'invalid_schema'}; "
+                       "repair or restore the store before use")
             report.add("worker_logs", True, "not inspected by read-only doctor")
         else:
             with Store.open_readonly(store_path) as st:
