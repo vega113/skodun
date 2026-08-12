@@ -949,6 +949,13 @@ V10_OBJECTS = {
     ("index", "ix_reuse_events_at"),
     ("index", "ix_reuse_events_match"),
 }
+V13_OBJECTS = {
+    ("table", "review_orchestrations"),
+    ("table", "review_checkpoints"),
+    ("index", "ix_orchestrations_resume"),
+    ("index", "ix_orchestrations_expiry"),
+    ("index", "ix_checkpoints_state"),
+}
 
 #: One legacy `triage` row, in the shipped single-row-per-ledger-key shape the
 #: v3 migration has to seed an event from.
@@ -1035,13 +1042,14 @@ def test_schema_is_frozen_at_the_phase1_baseline():
 def test_fresh_db_lands_at_schema_version(tmp_path):
     db = tmp_path / "s.db"
     st = Store.open(db)
-    assert SCHEMA_VERSION == 12
+    assert SCHEMA_VERSION == 13
     assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert ("table", "provider_state") in _objects(db)
     assert V6_TABLE in _objects(db)
     assert V6_INDEX in _objects(db)
     assert V7_TABLE in _objects(db)
     assert V8_TABLE in _objects(db)
+    assert V13_OBJECTS <= _objects(db)
     for table in V3_TABLES:
         assert ("table", table) in _objects(db)
     assert V3_REVIEW_COLUMNS <= set(_columns(db, "reviews"))
@@ -1084,6 +1092,29 @@ def test_migration_ladder_is_ordered_and_reaches_schema_version():
     assert all(t > 0 for t in targets)
 
 
+def test_v12_store_gains_only_the_v13_checkpoint_objects(tmp_path):
+    """A shipped v12 database receives additive checkpoint state only."""
+    import unittest.mock as _mock
+
+    from skodun import store as store_mod
+
+    db = tmp_path / "v12.db"
+    with _mock.patch.object(store_mod, "SCHEMA_VERSION", 12), \
+            _mock.patch.object(
+                store_mod, "_MIGRATIONS",
+                tuple((target, delta) for target, delta
+                      in store_mod._MIGRATIONS if target <= 12)):
+        Store.open(db).close()
+    assert _user_version(db) == 12
+    before = _objects(db)
+    assert not (V13_OBJECTS & before)
+
+    Store.open(db).close()
+
+    assert _user_version(db) == SCHEMA_VERSION == 13
+    assert _objects(db) - before == V13_OBJECTS
+
+
 def test_migration_from_true_phase1_db(tmp_path):
     db = tmp_path / "s.db"
     raw = sqlite3.connect(db)
@@ -1115,7 +1146,7 @@ def test_phase1_store_upgrade_preserves_every_table_index_and_row(tmp_path):
     after = _objects(db)
     assert before <= after, before - after            # nothing dropped
     assert after - before == {("table", "provider_state"), V5_INDEX} | {
-        ("table", t) for t in V3_TABLES} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS  # nothing else
+        ("table", t) for t in V3_TABLES} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS  # nothing else
     assert sorted(r["id"] for r in st.list_reviews(None, 100)) == ["r1", "r2", "r3"]
     assert st.triage_for("b", "s" * 40)["k1"]["dismissed_reason"] == "wontfix"
     assert st._c.execute("SELECT count(*) FROM gate_events").fetchone()[0] == 1
@@ -1260,7 +1291,7 @@ def test_a_v2_store_gains_every_v3_delta(tmp_path):
     assert _user_version(db) == SCHEMA_VERSION
     assert before <= _objects(db)                          # nothing dropped
     assert _objects(db) - before == (
-        {("table", t) for t in V3_TABLES} | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS)
+        {("table", t) for t in V3_TABLES} | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS)
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     assert _columns(db, "dedup_events") == V3_DEDUP_EVENT_COLUMNS
     assert _columns(db, "deliveries") == V3_DELIVERY_COLUMNS
@@ -1569,7 +1600,7 @@ def test_no_non_transactional_delta_carries_a_non_idempotent_statement():
     # The last rung is what a fresh store is stamped with. v8 is the
     # v12 records the quota-pool persistence boundary; v11 is transactional
     # because it adds the exact-reuse security column.
-    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 12
+    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 13
     assert isinstance(_MIGRATIONS[-1][1], tuple)
     assert any(isinstance(d, tuple) for _, d in _MIGRATIONS)
 
@@ -1608,10 +1639,10 @@ def test_a_v3_store_gains_the_widened_vocabulary_and_the_reference_column(tmp_pa
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 12
+    assert _user_version(db) == SCHEMA_VERSION == 13
     # A v3 store climbs v4–v12 in one open: v5 index + capacity, feedback,
     # spend, and telemetry indexes.
-    assert _objects(db) == before | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS, (
+    assert _objects(db) == before | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS, (
         "the rebuild added or dropped an object")
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     # The seeded legacy dismissal came through the rebuild intact...
@@ -1912,7 +1943,7 @@ def test_a_v4_store_gains_the_repo_column_and_its_index(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 12
+    assert _user_version(db) == SCHEMA_VERSION == 13
     assert "repo" in _columns(db, "reviews")
     row = st._c.execute("SELECT repo FROM reviews WHERE id='r1'").fetchone()
     assert row["repo"] is None, "a pre-v5 row must not be backfilled"
@@ -1936,8 +1967,8 @@ def test_a_v5_store_gains_capacity_admissions(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 12
-    assert _objects(db) - before == V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS
+    assert _user_version(db) == SCHEMA_VERSION == 13
+    assert _objects(db) - before == V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS
     assert "repo" in _columns(db, "reviews")
     st.close()
 
@@ -1965,8 +1996,8 @@ def test_a_v6_store_gains_feedback_events(tmp_path):
 
     st = Store.open(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 12
-    assert _objects(db) - before == V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS
+    assert _user_version(db) == SCHEMA_VERSION == 13
+    assert _objects(db) - before == V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS
     st.close()
 
 
@@ -2373,6 +2404,7 @@ def test_operating_on_a_closed_store_raises_programming_error_not_swallowed(tmp_
 #: that every listed module be a grep hit.
 _STORE_TOUCHING_MODULES = (
     "tests/test_store.py",
+    "tests/test_checkpoints.py",
     "tests/test_cli.py",
     "tests/test_gate.py",
     "tests/test_fallback.py",

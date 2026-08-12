@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from skodun import checkpoints
+from skodun.store import Store
 
 
 def _identity(**changes):
@@ -155,3 +156,138 @@ def test_checkpoint_payload_refuses_unbounded_content():
 def test_bool_is_not_accepted_as_an_integer_identity():
     with pytest.raises(ValueError, match="batch_budget"):
         replace(_identity(), batch_budget=True)
+
+
+NOW = "2026-08-12T10:00:00Z"
+LATER = "2026-08-12T10:10:00Z"
+EXPIRED = "2026-08-12T09:59:59Z"
+EARLIER = "2026-08-12T09:00:00Z"
+
+
+def _created(store, identity=None, *, orchestration_id="orch-1",
+             created_at=NOW, expires_at=LATER):
+    return store.create_orchestration(
+        orchestration_id, identity or _identity(), requested_mode="now",
+        created_at=created_at, expires_at=expires_at)
+
+
+def test_store_creates_an_orchestration_and_ordered_planned_passes(tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        row = _created(store)
+        planned = store.list_checkpoints("orch-1")
+    assert row["state"] == "active"
+    assert row["identity_digest"] == _identity().digest()
+    assert [(item["pass_kind"], item["pass_index"], item["state"])
+            for item in planned] == [
+                ("batch", 1, "pending"),
+                ("integration", 0, "pending"),
+            ]
+
+
+def test_resume_candidate_is_scoped_and_mismatch_is_durable(tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store)
+        assert store.find_resume_candidate(
+            "repo-1", "/work/repo", "feature")["id"] == "orch-1"
+        assert store.find_resume_candidate(
+            "repo-1", "/work/other", "feature") is None
+        assert store.record_orchestration_mismatch(
+            "orch-1", "planner_version", at=NOW) is True
+        candidate = store.get_orchestration("orch-1")
+    assert candidate["first_mismatch"] == "planner_version"
+
+
+def test_one_live_checkpoint_claim_wins_and_the_other_is_in_flight(tmp_path):
+    db = tmp_path / "s.db"
+    with Store.open(db) as first, Store.open(db) as second:
+        _created(first)
+        won = first.claim_checkpoint(
+            "orch-1", _identity().pass_identities[0], owner="worker-a",
+            now=NOW, lease_expires_at=LATER)
+        lost = second.claim_checkpoint(
+            "orch-1", _identity().pass_identities[0], owner="worker-b",
+            now=NOW, lease_expires_at=LATER)
+    assert won["decision"] == "claimed"
+    assert won["fence"] == 1 and won["claim_token"]
+    assert lost["decision"] == "in_flight"
+    assert lost["claim_owner"] == "worker-a"
+
+
+def test_expired_claim_is_reclaimed_and_late_owner_is_fenced(tmp_path):
+    db = tmp_path / "s.db"
+    payload = checkpoints.CheckpointPayload.from_mapping(_payload())
+    with Store.open(db) as first, Store.open(db) as second:
+        _created(first)
+        stale = first.claim_checkpoint(
+            "orch-1", _identity().pass_identities[0], owner="worker-a",
+            now=EARLIER, lease_expires_at=EXPIRED)
+        current = second.claim_checkpoint(
+            "orch-1", _identity().pass_identities[0], owner="worker-b",
+            now=NOW, lease_expires_at=LATER)
+        assert first.complete_checkpoint(
+            "orch-1", "batch", 1, owner="worker-a",
+            claim_token=stale["claim_token"], fence=stale["fence"],
+            payload=payload, completed_at=NOW) is False
+        assert second.complete_checkpoint(
+            "orch-1", "batch", 1, owner="worker-b",
+            claim_token=current["claim_token"], fence=current["fence"],
+            payload=payload, completed_at=NOW) is True
+        completed = first.claim_checkpoint(
+            "orch-1", _identity().pass_identities[0], owner="worker-c",
+            now=NOW, lease_expires_at=LATER)
+    assert current["decision"] == "claimed" and current["fence"] == 2
+    assert completed["decision"] == "complete"
+    assert checkpoints.CheckpointPayload(
+        completed["payload_json"]).as_dict() == _payload()
+
+
+def test_release_only_applies_to_the_current_claim(tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store)
+        claim = store.claim_checkpoint(
+            "orch-1", _identity().pass_identities[0], owner="worker-a",
+            now=NOW, lease_expires_at=LATER)
+        assert store.release_checkpoint(
+            "orch-1", "batch", 1, owner="other",
+            claim_token=claim["claim_token"], fence=claim["fence"],
+            reason="cancelled", at=NOW) is False
+        assert store.release_checkpoint(
+            "orch-1", "batch", 1, owner="worker-a",
+            claim_token=claim["claim_token"], fence=claim["fence"],
+            reason="cancelled", at=NOW) is True
+        row = store.list_checkpoints("orch-1")[0]
+    assert row["state"] == "pending" and row["failure_reason"] == "cancelled"
+
+
+def test_incomplete_orchestration_expiry_never_creates_review_coverage(tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store, created_at="2026-08-12T09:00:00Z",
+                 expires_at=EXPIRED)
+        assert store.expire_orchestrations(now=NOW) == 1
+        assert store.get_orchestration("orch-1")["state"] == "expired"
+        assert store.list_reviews(None, 10) == []
+        assert store.reuse_candidates(
+            "repo-1", "b" * 40, "d" * 40) == []
+
+
+def test_orchestration_is_consumed_only_after_every_pass_is_complete(tmp_path):
+    payload = checkpoints.CheckpointPayload.from_mapping(_payload())
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store)
+        for identity in _identity().pass_identities:
+            # Integration prompt identity is frozen when its recovered prompt
+            # first exists; use a concrete exact hash at claim time.
+            if identity.prompt_hash is None:
+                identity = replace(identity, prompt_hash="z" * 64)
+            claim = store.claim_checkpoint(
+                "orch-1", identity, owner="worker", now=NOW,
+                lease_expires_at=LATER)
+            assert store.complete_checkpoint(
+                "orch-1", identity.kind, identity.index, owner="worker",
+                claim_token=claim["claim_token"], fence=claim["fence"],
+                payload=payload, completed_at=NOW)
+        assert store.consume_orchestration(
+            "orch-1", final_review_id="sk-final", at=NOW) is True
+        row = store.get_orchestration("orch-1")
+    assert row["state"] == "consumed"
+    assert row["final_review_id"] == "sk-final"

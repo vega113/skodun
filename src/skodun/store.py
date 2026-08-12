@@ -54,7 +54,7 @@ _REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 def schema_too_new_message(store_version: int) -> str:
@@ -396,6 +396,74 @@ _MIGRATION_V11: tuple[str, ...] = (
 # records that compatibility boundary in the migration ladder.
 _MIGRATION_V12: tuple[str, ...] = ()
 
+# --- v13: resumable batched orchestration checkpoints --------------------
+#
+# These tables are deliberately separate from `reviews`: incomplete sub-review
+# evidence cannot enter gate, triage, delivery, dedup, or exact-diff reuse by
+# accident.  The delta is transactional so both tables and all indexes arrive
+# under the same version stamp.
+_MIGRATION_V13: tuple[str, ...] = (
+"""CREATE TABLE IF NOT EXISTS review_orchestrations (
+  id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK(state IN
+    ('active','complete','cancelled','failed','expired','consumed')),
+  requested_mode TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  final_review_id TEXT,
+  repo_id TEXT NOT NULL,
+  worktree_root TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  head TEXT NOT NULL,
+  base_ref TEXT NOT NULL,
+  base_sha TEXT NOT NULL,
+  diff_hash TEXT NOT NULL,
+  tree_fingerprint TEXT NOT NULL,
+  context_hash TEXT,
+  checklist_hash TEXT,
+  reviewer_hash TEXT NOT NULL,
+  config_hash TEXT NOT NULL,
+  policy_hash TEXT NOT NULL,
+  planner_version TEXT NOT NULL,
+  batch_budget INTEGER NOT NULL,
+  batch_count INTEGER NOT NULL,
+  boundary_digest TEXT NOT NULL,
+  integration_plan_digest TEXT NOT NULL,
+  identity_digest TEXT NOT NULL,
+  identity_json TEXT NOT NULL,
+  terminal_reason TEXT,
+  first_mismatch TEXT
+)""",
+"""CREATE TABLE IF NOT EXISTS review_checkpoints (
+  orchestration_id TEXT NOT NULL,
+  pass_kind TEXT NOT NULL CHECK(pass_kind IN ('batch','integration')),
+  pass_index INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('pending','running','complete','failed')),
+  prompt_hash TEXT,
+  diff_hash TEXT NOT NULL,
+  boundary_hash TEXT NOT NULL,
+  payload_json TEXT,
+  completed_at TEXT,
+  claim_token TEXT,
+  fence INTEGER NOT NULL DEFAULT 0,
+  claim_owner TEXT,
+  claimed_at TEXT,
+  lease_expires_at TEXT,
+  failure_reason TEXT,
+  PRIMARY KEY(orchestration_id, pass_kind, pass_index),
+  FOREIGN KEY(orchestration_id) REFERENCES review_orchestrations(id)
+    ON DELETE CASCADE
+)""",
+"""CREATE INDEX IF NOT EXISTS ix_orchestrations_resume
+   ON review_orchestrations(repo_id, worktree_root, branch, state,
+                            created_at DESC, id DESC)""",
+"""CREATE INDEX IF NOT EXISTS ix_orchestrations_expiry
+   ON review_orchestrations(state, expires_at)""",
+"""CREATE INDEX IF NOT EXISTS ix_checkpoints_state
+   ON review_checkpoints(orchestration_id, state, pass_kind, pass_index)""",
+)
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -427,6 +495,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (10, _MIGRATION_V10),
     (11, _MIGRATION_V11),
     (12, _MIGRATION_V12),
+    (13, _MIGRATION_V13),
 )
 
 
@@ -459,6 +528,21 @@ def _require_text(label: str, value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be a non-empty string, got {value!r}")
     return value.strip()
+
+
+def _checkpoint_text(label: str, value: object) -> str:
+    """A bounded non-empty diagnostic/owner value for v13 state."""
+    value = _require_text(label, value)
+    if len(value) > 4096:
+        raise ValueError(f"{label} must be at most 4096 characters")
+    return value
+
+
+def _plain_nonnegative_int(label: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"{label} must be a non-negative integer, got {value!r}")
+    return value
 
 
 def _state_key(provider: str, quota_pool: str | None) -> str:
@@ -998,6 +1082,326 @@ class Store:
         row = self._c.execute("SELECT artifact_json FROM reviews WHERE id=?",
                               (review_id,)).fetchone()
         return json.loads(row["artifact_json"]) if row else None
+
+    # --- v13: resumable batch orchestration -------------------------------
+    #
+    # Checkpoints intentionally have no adapter into review queries.  Their
+    # only transition toward coverage is the explicit final-consumption path;
+    # until then they are orchestration evidence, never review artifacts.
+
+    def create_orchestration(
+            self, orchestration_id: str, identity, *, requested_mode: str,
+            created_at: str, expires_at: str) -> dict:
+        """Create one exact-identity orchestration and all planned pass rows."""
+        from .checkpoints import OrchestrationIdentity
+
+        orchestration_id = _require_text("orchestration_id", orchestration_id)
+        requested_mode = _require_text("requested_mode", requested_mode)
+        created_at = _require_ts("created_at", created_at)
+        expires_at = _require_ts("expires_at", expires_at)
+        if expires_at <= created_at:
+            raise ValueError("expires_at must be later than created_at")
+        if not isinstance(identity, OrchestrationIdentity):
+            raise ValueError("identity must be an OrchestrationIdentity")
+        keys = [(item.kind, item.index) for item in identity.pass_identities]
+        if len(keys) != len(set(keys)):
+            raise ValueError("orchestration pass identities must be unique")
+
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            self._c.execute(
+                """INSERT INTO review_orchestrations (
+                     id, state, requested_mode, created_at, updated_at,
+                     expires_at, repo_id, worktree_root, branch, head,
+                     base_ref, base_sha, diff_hash, tree_fingerprint,
+                     context_hash, checklist_hash, reviewer_hash, config_hash,
+                     policy_hash, planner_version, batch_budget, batch_count,
+                     boundary_digest, integration_plan_digest,
+                     identity_digest, identity_json)
+                   VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (orchestration_id, requested_mode, created_at, created_at,
+                 expires_at, identity.repo_id, identity.worktree_root,
+                 identity.branch, identity.head, identity.base_ref,
+                 identity.base_sha, identity.diff_hash,
+                 identity.tree_fingerprint, identity.context_hash,
+                 identity.checklist_hash, identity.reviewer_hash,
+                 identity.config_hash, identity.policy_hash,
+                 identity.planner_version, identity.batch_budget,
+                 identity.batch_count, identity.boundary_digest,
+                 identity.integration_plan_digest, identity.digest(),
+                 identity.canonical_json()))
+            self._c.executemany(
+                """INSERT INTO review_checkpoints (
+                     orchestration_id, pass_kind, pass_index, state,
+                     prompt_hash, diff_hash, boundary_hash)
+                   VALUES (?, ?, ?, 'pending', ?, ?, ?)""",
+                [(orchestration_id, item.kind, item.index, item.prompt_hash,
+                  item.diff_hash, item.boundary_hash)
+                 for item in identity.pass_identities])
+            self._c.execute("COMMIT")
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except BaseException:
+                pass
+            raise
+        row = self.get_orchestration(orchestration_id)
+        assert row is not None
+        return row
+
+    def get_orchestration(self, orchestration_id: str) -> dict | None:
+        orchestration_id = _require_text("orchestration_id", orchestration_id)
+        row = self._c.execute(
+            "SELECT * FROM review_orchestrations WHERE id=?",
+            (orchestration_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_resume_candidate(self, repo_id: str, worktree_root: str,
+                              branch: str) -> dict | None:
+        """Newest incomplete candidate in one exact repository/worktree lane."""
+        values = (
+            _require_text("repo_id", repo_id),
+            _require_text("worktree_root", worktree_root),
+            _require_text("branch", branch),
+        )
+        row = self._c.execute(
+            """SELECT * FROM review_orchestrations
+                WHERE repo_id=? AND worktree_root=? AND branch=?
+                  AND state IN ('active','cancelled','failed','complete')
+                ORDER BY created_at DESC, id DESC LIMIT 1""", values).fetchone()
+        return dict(row) if row is not None else None
+
+    def record_orchestration_mismatch(self, orchestration_id: str,
+                                      field_name: str, *, at: str) -> bool:
+        orchestration_id = _require_text("orchestration_id", orchestration_id)
+        field_name = _checkpoint_text("field_name", field_name)
+        at = _require_ts("at", at)
+        cur = self._c.execute(
+            """UPDATE review_orchestrations
+                  SET first_mismatch=?, updated_at=?
+                WHERE id=? AND state <> 'consumed'""",
+            (field_name, at, orchestration_id))
+        return cur.rowcount == 1
+
+    def list_checkpoints(self, orchestration_id: str) -> list[dict]:
+        orchestration_id = _require_text("orchestration_id", orchestration_id)
+        rows = self._c.execute(
+            """SELECT * FROM review_checkpoints
+                WHERE orchestration_id=?
+                ORDER BY CASE pass_kind WHEN 'batch' THEN 0 ELSE 1 END,
+                         pass_index""", (orchestration_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_checkpoint(self, orchestration_id: str, pass_identity, *,
+                         owner: str, now: str, lease_expires_at: str) -> dict:
+        """Claim a missing pass, reuse a complete one, or observe live work.
+
+        The returned `claim_token` plus monotonic `fence` is the completion
+        capability.  Reclaiming an expired lease changes both, so a late prior
+        owner cannot write through the new claim.
+        """
+        from .checkpoints import PassIdentity
+
+        orchestration_id = _require_text("orchestration_id", orchestration_id)
+        owner = _checkpoint_text("owner", owner)
+        now = _require_ts("now", now)
+        lease_expires_at = _require_ts("lease_expires_at", lease_expires_at)
+        if lease_expires_at <= now:
+            raise ValueError("lease_expires_at must be later than now")
+        if not isinstance(pass_identity, PassIdentity):
+            raise ValueError("pass_identity must be a PassIdentity")
+
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            orchestration = self._c.execute(
+                "SELECT state FROM review_orchestrations WHERE id=?",
+                (orchestration_id,)).fetchone()
+            if orchestration is None:
+                raise ValueError(f"orchestration {orchestration_id!r} does not exist")
+            if orchestration["state"] not in (
+                    "active", "cancelled", "failed", "complete"):
+                raise ValueError(
+                    f"orchestration {orchestration_id!r} is "
+                    f"{orchestration['state']!r}, not resumable")
+            row = self._c.execute(
+                """SELECT * FROM review_checkpoints
+                    WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",
+                (orchestration_id, pass_identity.kind,
+                 pass_identity.index)).fetchone()
+            if row is None:
+                raise ValueError("the claimed pass is not in the orchestration plan")
+            if row["diff_hash"] != pass_identity.diff_hash:
+                raise ValueError("checkpoint diff_hash does not match the plan")
+            if row["boundary_hash"] != pass_identity.boundary_hash:
+                raise ValueError("checkpoint boundary_hash does not match the plan")
+            stored_prompt = row["prompt_hash"]
+            if stored_prompt is None:
+                if pass_identity.kind != "integration":
+                    raise ValueError("checkpoint prompt_hash is missing")
+                self._c.execute(
+                    """UPDATE review_checkpoints SET prompt_hash=?
+                        WHERE orchestration_id=? AND pass_kind=? AND pass_index=?
+                          AND prompt_hash IS NULL""",
+                    (pass_identity.prompt_hash, orchestration_id,
+                     pass_identity.kind, pass_identity.index))
+            elif stored_prompt != pass_identity.prompt_hash:
+                raise ValueError("checkpoint prompt_hash does not match the plan")
+            if row["state"] == "complete":
+                result = dict(row)
+                result["decision"] = "complete"
+                self._c.execute("COMMIT")
+                return result
+            if (row["state"] == "running"
+                    and _is_canonical_ts(row["lease_expires_at"])
+                    and now < row["lease_expires_at"]):
+                result = dict(row)
+                result["decision"] = "in_flight"
+                self._c.execute("COMMIT")
+                return result
+
+            token = ids.new_review_id("sk_claim_")
+            fence = int(row["fence"] or 0) + 1
+            self._c.execute(
+                """UPDATE review_checkpoints
+                      SET state='running', claim_token=?, fence=?, claim_owner=?,
+                          claimed_at=?, lease_expires_at=?, failure_reason=NULL
+                    WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",
+                (token, fence, owner, now, lease_expires_at, orchestration_id,
+                 pass_identity.kind, pass_identity.index))
+            self._c.execute(
+                "UPDATE review_orchestrations SET state='active', updated_at=? WHERE id=?",
+                (now, orchestration_id))
+            claimed = self._c.execute(
+                """SELECT * FROM review_checkpoints
+                    WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",
+                (orchestration_id, pass_identity.kind,
+                 pass_identity.index)).fetchone()
+            self._c.execute("COMMIT")
+            result = dict(claimed)
+            result["decision"] = "claimed"
+            return result
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except BaseException:
+                pass
+            raise
+
+    def complete_checkpoint(
+            self, orchestration_id: str, pass_kind: str, pass_index: int, *,
+            owner: str, claim_token: str, fence: int, payload,
+            completed_at: str) -> bool:
+        """Conditionally complete the caller's exact fenced claim."""
+        from .checkpoints import CheckpointPayload
+
+        orchestration_id = _require_text("orchestration_id", orchestration_id)
+        pass_kind = _require_text("pass_kind", pass_kind)
+        pass_index = _plain_nonnegative_int("pass_index", pass_index)
+        owner = _checkpoint_text("owner", owner)
+        claim_token = _require_text("claim_token", claim_token)
+        fence = _plain_nonnegative_int("fence", fence)
+        completed_at = _require_ts("completed_at", completed_at)
+        if not isinstance(payload, CheckpointPayload):
+            raise ValueError("payload must be a CheckpointPayload")
+        # Direct dataclass construction must not bypass the strict mapping
+        # door. Re-validate before persistence even when the type is correct.
+        payload = CheckpointPayload.from_mapping(payload.as_dict())
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._c.execute(
+                """UPDATE review_checkpoints
+                      SET state='complete', payload_json=?, completed_at=?,
+                          claim_token=NULL, claim_owner=NULL, claimed_at=NULL,
+                          lease_expires_at=NULL, failure_reason=NULL
+                    WHERE orchestration_id=? AND pass_kind=? AND pass_index=?
+                      AND state='running' AND claim_owner=?
+                      AND claim_token=? AND fence=?""",
+                (payload.json_text, completed_at, orchestration_id, pass_kind,
+                 pass_index, owner, claim_token, fence))
+            if cur.rowcount == 1:
+                self._c.execute(
+                    "UPDATE review_orchestrations SET updated_at=? WHERE id=?",
+                    (completed_at, orchestration_id))
+            self._c.execute("COMMIT")
+            return cur.rowcount == 1
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except BaseException:
+                pass
+            raise
+
+    def release_checkpoint(
+            self, orchestration_id: str, pass_kind: str, pass_index: int, *,
+            owner: str, claim_token: str, fence: int, reason: str,
+            at: str) -> bool:
+        """Release only the caller's live fenced claim back to pending."""
+        orchestration_id = _require_text("orchestration_id", orchestration_id)
+        pass_kind = _require_text("pass_kind", pass_kind)
+        pass_index = _plain_nonnegative_int("pass_index", pass_index)
+        owner = _checkpoint_text("owner", owner)
+        claim_token = _require_text("claim_token", claim_token)
+        fence = _plain_nonnegative_int("fence", fence)
+        reason = _checkpoint_text("reason", reason)
+        at = _require_ts("at", at)
+        cur = self._c.execute(
+            """UPDATE review_checkpoints
+                  SET state='pending', claim_token=NULL, claim_owner=NULL,
+                      claimed_at=NULL, lease_expires_at=NULL, failure_reason=?
+                WHERE orchestration_id=? AND pass_kind=? AND pass_index=?
+                  AND state='running' AND claim_owner=?
+                  AND claim_token=? AND fence=?""",
+            (reason, orchestration_id, pass_kind, pass_index, owner,
+             claim_token, fence))
+        if cur.rowcount == 1:
+            self._c.execute(
+                "UPDATE review_orchestrations SET updated_at=? WHERE id=?",
+                (at, orchestration_id))
+        return cur.rowcount == 1
+
+    def expire_orchestrations(self, *, now: str) -> int:
+        """Mark incomplete expired orchestration state; never touch reviews."""
+        now = _require_ts("now", now)
+        cur = self._c.execute(
+            """UPDATE review_orchestrations
+                  SET state='expired', updated_at=?,
+                      terminal_reason='checkpoint retention expired'
+                WHERE state IN ('active','cancelled','failed','complete')
+                  AND expires_at <= ?""", (now, now))
+        return cur.rowcount
+
+    def consume_orchestration(self, orchestration_id: str, *,
+                              final_review_id: str, at: str) -> bool:
+        """Mark an orchestration consumed iff every planned pass is complete."""
+        orchestration_id = _require_text("orchestration_id", orchestration_id)
+        final_review_id = _require_text("final_review_id", final_review_id)
+        at = _require_ts("at", at)
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._c.execute(
+                """SELECT COUNT(*) AS total,
+                          SUM(CASE WHEN state='complete' THEN 1 ELSE 0 END) AS done
+                     FROM review_checkpoints WHERE orchestration_id=?""",
+                (orchestration_id,)).fetchone()
+            if row is None or int(row["total"] or 0) == 0 \
+                    or int(row["done"] or 0) != int(row["total"]):
+                self._c.execute("COMMIT")
+                return False
+            cur = self._c.execute(
+                """UPDATE review_orchestrations
+                      SET state='consumed', final_review_id=?, updated_at=?
+                    WHERE id=? AND state IN
+                      ('active','cancelled','failed','complete')""",
+                (final_review_id, at, orchestration_id))
+            self._c.execute("COMMIT")
+            return cur.rowcount == 1
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except BaseException:
+                pass
+            raise
 
     def reuse_candidates(self, repo_id: str, base_sha: str,
                          diff_hash: str) -> list[dict]:

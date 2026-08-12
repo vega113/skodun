@@ -43,21 +43,21 @@ Expected: all checkpoint identity/payload tests pass.
 - Modify: `tests/test_store.py`
 - Test: `tests/test_checkpoints.py`
 
-- [ ] **Step 1: Write failing migration and transaction tests**
+- [x] **Step 1: Write failing migration and transaction tests**
 
 Add tests for fresh v13, v12 upgrade, frozen `_SCHEMA`, orchestration insert/find/mismatch recording, ordered checkpoint rows, one winning live claim, in-flight contender, expired claim reclaim with incremented fence, late-owner completion refusal, immutable complete payloads, release-to-pending, expiry/pruning, and no checkpoint visibility through `list_reviews`, reuse candidates, finding keys, triage, or gate inputs.
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run: `python3 -m pytest tests/test_store.py tests/test_checkpoints.py -q --tb=short -k 'orchestration or checkpoint or schema_version'`
 
 Expected: failures for missing v13 tables/APIs and `SCHEMA_VERSION == 12`.
 
-- [ ] **Step 3: Implement additive schema and store APIs**
+- [x] **Step 3: Implement additive schema and store APIs**
 
 Bump `SCHEMA_VERSION` to 13 through `_MIGRATIONS` only. Add `create_orchestration`, `find_resume_candidate`, `record_orchestration_mismatch`, `claim_checkpoint`, `complete_checkpoint`, `release_checkpoint`, `list_checkpoints`, `consume_orchestration`, and bounded expiry/prune APIs. Use `BEGIN IMMEDIATE` for every non-idempotent state transition and conditional token/fence predicates for completion.
 
-- [ ] **Step 4: Run the focused tests and verify GREEN**
+- [x] **Step 4: Run the focused tests and verify GREEN**
 
 Run: `python3 -m pytest tests/test_store.py tests/test_checkpoints.py -q --tb=short -k 'orchestration or checkpoint or schema_version'`
 
