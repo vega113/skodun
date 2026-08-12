@@ -162,6 +162,11 @@ def annotate_findings(
                 structural = ("category", "anchor", "pass_source", "mutation",
                               "claim", "rename_ancestry")
                 if all(payload[name] == old_payload[name] for name in structural):
+                    if (payload["path"] != old_payload["path"]
+                            and payload["anchor"] == UNKNOWN
+                            and payload["rename_ancestry"] == UNKNOWN
+                            and old_payload["rename_ancestry"] == UNKNOWN):
+                        continue
                     near.append((old, old_review_id, old_index, old_at, old_payload))
             if len(near) == 1:
                 old, predecessor_review_id, predecessor, predecessor_at, old_payload = near[0]

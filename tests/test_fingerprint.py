@@ -61,8 +61,9 @@ def test_lineage_repeats_and_reports_ambiguous_matches_without_triage():
 
 
 def test_lineage_reports_moved_and_scope_changed_without_suppressing_claims():
-    old = {"file": "src/old.py", "title": "same"}
-    moved = fingerprint.annotate_findings([{"file": "src/new.py", "title": "same"}], [old])[0]
+    old = {"file": "src/old.py", "title": "same", "symbol": "run"}
+    moved = fingerprint.annotate_findings(
+        [{"file": "src/new.py", "title": "same", "symbol": "run"}], [old])[0]
     assert moved["finding_lineage_v2"]["match_reason"] == "moved"
     scoped = fingerprint.annotate_findings(
         [{"file": "src/old.py", "title": "same",
@@ -88,6 +89,13 @@ def test_same_claim_in_unrelated_structure_is_not_linked():
     old = {"file": "src/a.py", "title": "same", "category": "rule-1"}
     unrelated = {"file": "src/b.py", "title": "same", "category": "rule-2"}
     result = fingerprint.annotate_findings([unrelated], [old])[0]
+    assert result["finding_lineage_v2"]["match_reason"] == "new"
+
+
+def test_cross_file_near_match_requires_anchor_or_rename_ancestry():
+    old = {"file": "src/a.py", "title": "same"}
+    result = fingerprint.annotate_findings(
+        [{"file": "src/b.py", "title": "same"}], [old])[0]
     assert result["finding_lineage_v2"]["match_reason"] == "new"
 
 
