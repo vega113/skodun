@@ -1341,7 +1341,8 @@ def _status_field(label: str, val) -> str:
     return f"{label}={json.dumps(text)}"
 
 
-def format_status_line(rec: dict, *, now: float | None = None) -> str:
+def format_status_line(rec: dict, *, now: float | None = None,
+                       projection=None) -> str:
     """One machine-readable status line for CLI and MCP.
 
     Always includes `id=` and `state=` (the S1 vocabulary). Age, provider,
@@ -1370,6 +1371,13 @@ def format_status_line(rec: dict, *, now: float | None = None) -> str:
         val = rec.get(key)
         if val is not None and val != "":
             parts.append(_status_field(label, val))
+    if projection is not None:
+        parts.extend((_status_field("coverage", projection.coverage_state),
+                      _status_field("usable_evidence", projection.usable_evidence),
+                      _status_field("gate_eligible", projection.gate_eligible),
+                      _status_field("gate_reason", projection.gate_reason),
+                      _status_field("completed_passes", projection.completed_passes),
+                      _status_field("planned_passes", projection.planned_passes)))
     return " ".join(parts)
 
 
@@ -1393,7 +1401,7 @@ def _maybe_recover_stale(store) -> None:
         pass
 
 
-def svc_review_status(store, review_id=None, repo=None) -> tuple[int, str]:
+def svc_review_status(store, review_id=None, repo=None, *, output="text") -> tuple[int, str]:
     """Observe one review. `(0, line)` or `(2, why-not)`.
 
     `review_id` wins when both are given. Without an id, `repo` selects the
@@ -1425,7 +1433,25 @@ def svc_review_status(store, review_id=None, repo=None) -> tuple[int, str]:
         raise
     except BaseException as e:
         return 2, f"skodun review-status: could not read the store: {e!r}"
-    return 0, format_status_line(rec)
+    from .readmodel import project_review
+    orchestration = None
+    checkpoints = ()
+    oid = rec.get("batch_orchestration_id") or rec.get("orchestration_id")
+    if oid:
+        try:
+            orchestration = store.get_orchestration(oid)
+            checkpoints = store.list_checkpoints(oid)
+        except BaseException:
+            orchestration = None
+            checkpoints = ()
+    projection = project_review(rec, orchestration=orchestration,
+                                checkpoints=checkpoints)
+    if output == "json":
+        import json
+        payload = {"id": rec.get("id"), "state": report_state(rec),
+                   "coverage": projection.to_dict()}
+        return 0, json.dumps(payload, sort_keys=True)
+    return 0, format_status_line(rec, projection=projection)
 
 
 def svc_review_cancel(store, review_id) -> tuple[int, str]:
