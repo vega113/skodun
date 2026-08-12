@@ -494,6 +494,11 @@
   Added focused regression tests; stack/Git suites pass (`125 passed,
   9 skipped`) and pipeline/service suites pass (`150 passed`).
 
+  Final parser follow-up: unified-diff file-header detection is limited to
+  pre-hunk lines, so added source lines beginning `+++` (and deleted lines
+  beginning `---`) remain real body evidence. Regression coverage is included
+  in the stack suite (`58 passed`).
+
 - [ ] **Step 5: Verify merged main and close #144.**
 
   Fetch `origin/main`, verify the merge commit is present, run the focused

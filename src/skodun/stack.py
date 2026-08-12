@@ -620,10 +620,10 @@ def _slice_evidence(item: StackSlice, diff: object) -> SliceEvidence:
             if new_line is None or line.startswith(b"\\"):
                 continue
             prefix = line[:1]
-            if prefix == b"+" and not line.startswith(b"+++"):
+            if prefix == b"+":
                 added_lines.append(new_line)
                 new_line += 1
-            elif prefix == b"-" and not line.startswith(b"---"):
+            elif prefix == b"-":
                 continue
             elif prefix == b" ":
                 new_line += 1

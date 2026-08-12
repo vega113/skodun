@@ -726,14 +726,15 @@ def test_line_evidence_contains_only_added_new_side_lines():
         data=(
             b"diff --git a/src/a.py b/src/a.py\n"
             b"--- a/src/a.py\n+++ b/src/a.py\n"
-            b"@@ -1,3 +1,3 @@\n"
+            b"@@ -1,3 +1,4 @@\n"
             b" context\n-old\n+new\n context\n"
+            b"+++counter\n"
         ),
     )
 
     evidence = stack._slice_evidence(item, diff)
 
-    assert evidence.changed_lines == (("src/a.py", ((2, 2),)),)
+    assert evidence.changed_lines == (("src/a.py", ((2, 2), (4, 4))),)
 
 
 def test_distinct_symbol_scopes_do_not_overlap():
