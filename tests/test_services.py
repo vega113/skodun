@@ -99,6 +99,19 @@ def test_every_store_backed_service_takes_the_store_first():
         assert params[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD, name
 
 
+def test_status_line_exposes_fingerprint_version_and_lineage_reason():
+    line = services.format_status_line({
+        "id": "review-1", "status": "clean", "parse_ok": True,
+        "findings_total": 1,
+        "findings": [{
+            "finding_fingerprint_v2": "sha256:" + "a" * 64,
+            "finding_lineage_v2": {"match_reason": "moved"},
+        }],
+    })
+    assert "fingerprint_version=finding_fingerprint_v2" in line
+    assert "lineage_matches=moved" in line
+
+
 def test_opt_in_reuse_returns_existing_review_without_running_pipeline(
         tmp_path, monkeypatch):
     identity = reuse.ReuseIdentity(

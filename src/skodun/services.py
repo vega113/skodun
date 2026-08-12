@@ -1462,6 +1462,20 @@ def format_status_line(rec: dict, *, now: float | None = None,
             parts.append(_status_field("planner", projection.planner_version))
         if projection.boundary_digest:
             parts.append(_status_field("boundary_digest", projection.boundary_digest))
+    findings = rec.get("findings")
+    if isinstance(findings, list):
+        lineage = [
+            item.get("finding_lineage_v2", {}).get("match_reason")
+            for item in findings if isinstance(item, dict)
+            and isinstance(item.get("finding_lineage_v2"), dict)
+        ]
+        if any(isinstance(item, dict)
+               and item.get("finding_fingerprint_v2") for item in findings):
+            parts.append(_status_field("fingerprint_version",
+                                       "finding_fingerprint_v2"))
+            if lineage:
+                parts.append(_status_field("lineage_matches", ",".join(
+                    str(item) for item in lineage)))
     return " ".join(parts)
 
 

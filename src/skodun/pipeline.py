@@ -1589,6 +1589,10 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                   f"budget is now {int(needs)}s")
 
         review_started_at = _iso_now()
+        lineage_repository_id = (
+            stack_validation.manifest.repository_id
+            if stack_validation is not None and stack_validation.manifest is not None
+            else gitio.canonical_repository_identity(root)) or "unknown"
         common = dict(
             id=rid, reviewed_at=review_started_at,
             review_started_at=review_started_at,
@@ -1639,6 +1643,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             # apart, which is the intended equivalence.
             repo=scope,
             repo_id=scope,
+            lineage_repository_id=lineage_repository_id,
             worktree_root=str(root),
             # Process identity for cancel-by-id (S1). Background workers already
             # attach a pid via the reservation lease; foreground rows need it
@@ -2064,6 +2069,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     f"repository or checkpoint identity moved before "
                     f"finalization ({mismatch}); no aggregate was published")
             try:
+                annotate_lineage(store, rec)
                 stored = store.save_checkpointed_review(rec)
             except Exception as exc:
                 raise PersistenceFailed(
@@ -2306,6 +2312,7 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
     # would otherwise select a different checklist than a foreground review of
     # the same change.
     root = gitio._worktree_root(repo)
+    lineage_repository_id = gitio.canonical_repository_identity(root) or "unknown"
 
     finder = _reviewer_for(cfg, "finder")
     if finder is None:
@@ -2343,6 +2350,7 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
         # worker recomputing it could disagree with the row it is finalizing.
         repo=reserved.get("repo"),
         repo_id=reserved.get("repo_id") or reserved.get("repo"),
+        lineage_repository_id=lineage_repository_id,
         worktree_root=str(root),
         review_started_at=reserved.get("review_started_at")
                            or reserved.get("reviewed_at"),
@@ -2586,6 +2594,46 @@ def _save(store: Store, rec: dict) -> None:
         raise PersistenceFailed(f"could not record the review: {e!r}") from e
 
 
+def annotate_lineage(store: Store, rec: dict) -> dict:
+    """Attach additive finding lineage before any terminal store write.
+
+    The helper is shared by foreground, checkpointed, and detached worker
+    publication.  Failure is visible on the artifact but never changes the
+    authoritative trust or gate axes.
+    """
+    try:
+        from .fingerprint import annotate_findings
+        repository_id = rec.get("lineage_repository_id") or "unknown"
+        previous: list[dict] = []
+        # An unknown canonical remote is deliberately not a lineage scope:
+        # linking two unrelated local clones would be worse than a false
+        # negative.  Stack manifests and normal remotes provide this value.
+        if repository_id != "unknown":
+            for prior in store.list_reviews(None, limit=200):
+                if prior.get("id") == rec.get("id"):
+                    continue
+                if (prior.get("lineage_repository_id") or "unknown") != repository_id:
+                    continue
+                for prior_index, previous_finding in enumerate(
+                        prior.get("findings") or ()):
+                    if isinstance(previous_finding, dict):
+                        enriched = dict(previous_finding)
+                        enriched["_lineage_review_id"] = prior.get("id")
+                        enriched["_lineage_finding_index"] = prior_index
+                        enriched["_lineage_reviewed_at"] = prior.get("reviewed_at")
+                        previous.append(enriched)
+        rec["findings"] = annotate_findings(rec.get("findings") or (), previous)
+        rec["fingerprint_status"] = "complete"
+        rec.pop("fingerprint_error", None)
+    except Exception as exc:
+        # A read-model enrichment failure must never change review trust or
+        # block persistence of the authoritative artifact.  Persist only the
+        # bounded exception type, never provider output or local paths.
+        rec["fingerprint_status"] = "unavailable"
+        rec["fingerprint_error"] = type(exc).__name__
+    return rec
+
+
 def _persist(store: Store, rec: dict) -> dict:
     """Save the record and return it as READ BACK OUT of the store.
 
@@ -2594,6 +2642,7 @@ def _persist(store: Store, rec: dict) -> dict:
     rendered from exactly what the gate will later see. A record that cannot be
     read back was not recorded, whatever the write said.
     """
+    annotate_lineage(store, rec)
     _save(store, rec)
     stored = store.get_review(rec["id"])
     if stored is None:

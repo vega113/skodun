@@ -58,7 +58,7 @@ _REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 class SchemaLifecycleError(ValueError):
@@ -644,6 +644,26 @@ _MIGRATION_V13: tuple[str, ...] = (
    ON review_checkpoints(orchestration_id, state, pass_kind, pass_index)""",
 )
 
+# --- v14: additive finding lineage read model -----------------------------
+_MIGRATION_V14: tuple[str, ...] = (
+"""CREATE TABLE IF NOT EXISTS finding_lineage (
+  review_id TEXT NOT NULL,
+  finding_index INTEGER NOT NULL,
+  repository_id TEXT,
+  fingerprint_version TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  scope TEXT,
+  scope_reason TEXT,
+  predecessor_review_id TEXT,
+  predecessor_finding_index INTEGER,
+  match_reason TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(review_id, finding_index)
+);""",
+"""CREATE INDEX IF NOT EXISTS ix_finding_lineage_lookup
+  ON finding_lineage(repository_id, fingerprint_version, fingerprint, created_at)""",
+)
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -676,6 +696,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (11, _MIGRATION_V11),
     (12, _MIGRATION_V12),
     (13, _MIGRATION_V13),
+    (14, _MIGRATION_V14),
 )
 
 
@@ -1477,7 +1498,20 @@ class Store:
         return directory
 
     def save_review(self, rec: dict) -> None:
-        self._write_review(_normalize_record(rec, label="save_review"))
+        normalized = _normalize_record(rec, label="save_review")
+        # The artifact row and its additive lineage projection are one
+        # publication.  Keep both writes in the same transaction so a
+        # partially written read model can never be observed after a crash.
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            self._write_review(normalized)
+            self._c.execute("COMMIT")
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except BaseException:
+                pass
+            raise
 
     def save_checkpointed_review(self, rec: dict) -> dict:
         """Atomically publish a final review and consume its checkpoints.
@@ -1554,6 +1588,52 @@ class Store:
         transaction while `save_review` runs it in autocommit.
         """
         self._c.execute(_INSERT_REVIEW, (rec["id"],) + _review_values(rec))
+        self._write_lineage(rec)
+
+    def _write_lineage(self, rec: Mapping) -> None:
+        findings = rec.get("findings")
+        if not isinstance(findings, list) or rec.get("status") == RUNNING:
+            return
+        try:
+            self._c.execute("DELETE FROM finding_lineage WHERE review_id=?",
+                            (rec.get("id"),))
+        except sqlite3.OperationalError:
+            # A maintenance test or an older explicitly opened connection may
+            # not yet carry v14; the authoritative artifact still persists.
+            return
+        for index, finding in enumerate(findings):
+            if not isinstance(finding, Mapping):
+                continue
+            digest = finding.get("finding_fingerprint_v2")
+            lineage = finding.get("finding_lineage_v2")
+            if not isinstance(digest, str) or not isinstance(lineage, Mapping):
+                continue
+            scope = finding.get("scope_attribution")
+            self._c.execute(
+                """INSERT INTO finding_lineage
+                (review_id, finding_index, repository_id, fingerprint_version,
+                 fingerprint, scope, scope_reason, predecessor_review_id,
+                 predecessor_finding_index, match_reason, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (rec.get("id"), index,
+                 rec.get("lineage_repository_id") or "unknown",
+                 lineage.get("version", "finding_fingerprint_v2"), digest,
+                 scope.get("scope") if isinstance(scope, Mapping) else None,
+                 scope.get("reason_code") if isinstance(scope, Mapping) else None,
+                 lineage.get("predecessor_review_id"),
+                 lineage.get("predecessor_index"),
+                 lineage.get("match_reason", "new"),
+                 rec.get("reviewed_at") or _iso_now()))
+
+    def list_lineage(self, review_id: str | None = None) -> list[dict]:
+        if review_id is None:
+            rows = self._c.execute(
+                "SELECT * FROM finding_lineage ORDER BY created_at DESC").fetchall()
+        else:
+            rows = self._c.execute(
+                "SELECT * FROM finding_lineage WHERE review_id=?"
+                " ORDER BY finding_index", (review_id,)).fetchall()
+        return [dict(row) for row in rows]
 
     def get_review(self, review_id: str) -> dict | None:
         row = self._c.execute("SELECT artifact_json FROM reviews WHERE id=?",
@@ -2381,6 +2461,8 @@ class Store:
             if applied and batch_orchestration_id is not None and complete_checkpoint:
                 self._consume_orchestration_in_transaction(
                     batch_orchestration_id, record_id, _iso_now())
+            if applied:
+                self._write_lineage(merged)
             self._c.execute("COMMIT")
             return applied
         except BaseException:

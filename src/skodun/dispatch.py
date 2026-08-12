@@ -1235,6 +1235,7 @@ def _work(store: "Store", cancel: threading.Event, record_id: str, repo: Path,
         rec = pipeline.cancellation_transform(rec, boundary)
         _note(f"cancelled {boundary}; recording an untrustworthy record")
 
+    pipeline.annotate_lineage(store, rec)
     applied = store.finalize_review(record_id, rec)
     if not applied:
         # The reservation stopped being `running` while this worker was reviewing:
@@ -1300,6 +1301,7 @@ def _record_cancellation(store: "Store", record_id: str, exc) -> WorkerOutcome:
     if isinstance(partial, Mapping) and partial.get("id") == record_id:
         rec = pipeline.cancellation_transform(dict(partial), reason)
         try:
+            pipeline.annotate_lineage(store, rec)
             if store.finalize_review(record_id, rec):
                 current = store.get_review(record_id) or rec
                 return WorkerOutcome(0, banner(current))
