@@ -928,6 +928,7 @@ def test_git_common_dir_shared_between_worktrees(tmp_path):
     ("https://github.com/Acme/Project.git", "github.com/Acme/Project"),
     ("https://github.com:443/Acme/Project.git", "github.com/Acme/Project"),
     ("HTTPS://github.com:443/Acme/Project.git", "github.com/Acme/Project"),
+    ("https://git@github.com/Acme/Project.git", "github.com/Acme/Project"),
     ("git@github.com:Acme/Project.git", "github.com/Acme/Project"),
     ("ssh://git@github.com/Acme/Project.git", "github.com/Acme/Project"),
     ("ssh://git@github.com:22/Acme/Project.git", "github.com/Acme/Project"),

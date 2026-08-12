@@ -582,8 +582,6 @@ def _portable_remote_identity(remote: str) -> str | None:
             return None
         if parsed.query or parsed.fragment or parsed.password is not None:
             return None
-        if parsed.scheme == "https" and parsed.username is not None:
-            return None
         host = parsed.hostname or ""
         if port is not None:
             host = f"{host}:{port}"

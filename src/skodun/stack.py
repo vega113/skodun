@@ -689,7 +689,7 @@ def validate(
         return _ignored(request, "invalid_field")
     try:
         repository_id = gitio.canonical_repository_identity(Path(repo))
-    except gitio.GitError:
+    except (gitio.GitError, OSError, UnicodeError):
         return _ignored(request, "git_error")
     except (OSError, UnicodeError):
         repository_id = None
@@ -729,7 +729,7 @@ def validate(
                     and (older == newer
                          or not gitio.is_ancestor(Path(repo), older, newer))):
                 return _ignored(request, "dependency_reordered")
-    except gitio.GitError:
+    except (gitio.GitError, OSError, UnicodeError):
         return _ignored(request, "git_error")
 
     try:
@@ -754,7 +754,7 @@ def validate(
             and gitio.tree_fingerprint(Path(repo), paths=recaptured.files)
             == full_tree_fingerprint
         )
-    except Exception:
+    except (gitio.GitError, OSError, UnicodeError):
         return _ignored(request, "git_error")
     if not same_full_identity:
         return _ignored(request, "git_error")

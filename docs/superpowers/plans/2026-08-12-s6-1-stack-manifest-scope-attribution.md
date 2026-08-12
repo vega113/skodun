@@ -510,6 +510,11 @@
   correlate the artifact without treating the claim as trusted. The digest
   mismatch projection regression passes in the stack suite.
 
+  Final advisory-boundary follow-up: passwordless HTTPS usernames are
+  canonicalized like SSH usernames, while Git probe `OSError`/Unicode failures
+  remain ignored `git_error` attribution rather than escaping the ordinary
+  full-diff review. Focused stack/Git verification passes (`68 passed`).
+
 - [ ] **Step 5: Verify merged main and close #144.**
 
   Fetch `origin/main`, verify the merge commit is present, run the focused

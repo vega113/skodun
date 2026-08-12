@@ -519,6 +519,21 @@ def test_optional_git_validation_failure_is_ignored_not_raised(
     assert result.reason_code == "git_error"
 
 
+def test_optional_os_git_validation_failure_is_ignored_not_raised(
+        tmp_path, monkeypatch):
+    state = _stack_repo(tmp_path)
+
+    def fail(*args, **kwargs):
+        raise OSError("transient optional stack lookup failure")
+
+    monkeypatch.setattr(gitio, "exact_object_type", fail)
+    _state, _request, _full_diff, result = _validation(
+        tmp_path, state=state, document=_stack_document(state))
+
+    assert result.status == "ignored"
+    assert result.reason_code == "git_error"
+
+
 @pytest.mark.parametrize(("mutation", "reason"), [
     (lambda d: d["dependencies"][1].update(slice_id="pr-10"),
      "duplicate_slice"),
