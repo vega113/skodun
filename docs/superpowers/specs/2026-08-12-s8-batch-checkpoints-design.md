@@ -80,6 +80,10 @@ identity. Unbatched reviews do not enter the subsystem.
 `src/skodun/services.py` continues to own `fresh`: `fresh=true` disables
 checkpoint lookup and starts a new orchestration. CLI and MCP already route the
 same flag through this service, preserving parity without a new public option.
+The bounded `recover` loop is intentionally a sequence of fresh attempts (the
+pre-existing recovery contract), even when ordinary reviews resume checkpoints;
+this prevents a recovery retry from silently continuing the interrupted run it
+is meant to re-examine.
 
 ### Additive schema v13
 

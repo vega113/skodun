@@ -1352,8 +1352,12 @@ class Store:
                 (token, fence, owner, now, lease_expires_at, orchestration_id,
                  pass_identity.kind, pass_identity.index))
             self._c.execute(
-                "UPDATE review_orchestrations SET state='active', updated_at=? WHERE id=?",
-                (now, orchestration_id))
+                """UPDATE review_orchestrations
+                      SET state='active', updated_at=?,
+                          expires_at=CASE WHEN expires_at < ? THEN ?
+                                          ELSE expires_at END
+                    WHERE id=?""",
+                (now, lease_expires_at, lease_expires_at, orchestration_id))
             claimed = self._c.execute(
                 """SELECT * FROM review_checkpoints
                     WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",

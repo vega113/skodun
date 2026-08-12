@@ -292,6 +292,17 @@ def test_expired_claim_is_reclaimed_and_late_owner_is_fenced(tmp_path):
         completed["payload_json"]).as_dict() == _payload()
 
 
+def test_claim_renews_orchestration_retention_while_work_is_active(tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store, created_at=EARLIER, expires_at=EXPIRED)
+        claim = store.claim_checkpoint(
+            "orch-1", _identity().pass_identities[0], owner="worker",
+            now=NOW, lease_expires_at=LATER)
+        orchestration = store.get_orchestration("orch-1")
+    assert claim["decision"] == "claimed"
+    assert orchestration["expires_at"] == LATER
+
+
 def test_release_only_applies_to_the_current_claim(tmp_path):
     with Store.open(tmp_path / "s.db") as store:
         _created(store)
