@@ -282,8 +282,7 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
                          client_family=client_family,
                          avoid_providers=avoid_providers,
                          resume_checkpoints=resume_checkpoints,
-                         stack_request=stack_request,
-                         result_metadata=result_metadata)
+                         stack_request=stack_request)
     except PreflightRefused as e:
         return 2, banner_failure(str(e))
     except LockTimeout as e:
@@ -605,13 +604,14 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         intent_family = (client_family
                          if reuse_client_family is _REUSE_INTENT_UNSET
                          else reuse_client_family)
+        result_metadata = {}
         status, text = _svc_review_once(
             store, repo, progress_sink=progress_sink, cancel=cancel,
             reviewer=reviewer, client_family=client_family,
             resume_checkpoints=(not fresh and reviewer is None
                                 and intent_family is None),
             batch_target_bytes=batch_target_bytes,
-            stack_request=stack_request, result_metadata=(result_metadata := {}))
+            stack_request=stack_request, result_metadata=result_metadata)
         if "stack" in result_metadata:
             from .stack import render_projection
             stack_line = render_projection(result_metadata["stack"])
