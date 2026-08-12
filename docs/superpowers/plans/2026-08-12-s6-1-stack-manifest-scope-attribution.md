@@ -499,6 +499,12 @@
   beginning `---`) remain real body evidence. Regression coverage is included
   in the stack suite (`58 passed`).
 
+  Uncertainty follow-up: line-anchored scopes on rename/copy, deletion-only,
+  binary, or mode-only paths remain reachable as path evidence; classification
+  now carries the owner match through to `uncertain_git_mapping` instead of
+  rejecting the whole manifest. The deletion-only line-anchor regression is
+  covered by the stack suite.
+
 - [ ] **Step 5: Verify merged main and close #144.**
 
   Fetch `origin/main`, verify the merge commit is present, run the focused

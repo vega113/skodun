@@ -793,7 +793,8 @@ def test_deletion_only_current_scope_is_explicitly_unknown(tmp_path):
     _git(state["repo"], "commit", "-m", "delete current file")
     state["head"] = gitio.head_sha(state["repo"])
     document = _stack_document(state)
-    document["current_slice"]["ownership"] = [_scope("README.md")]
+    document["current_slice"]["ownership"] = [
+        _scope("README.md", line_start=1, line_end=1)]
     _state, _request, _full_diff, result = _validation(
         tmp_path, state=state, document=document)
 

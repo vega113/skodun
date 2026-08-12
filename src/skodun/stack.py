@@ -586,6 +586,8 @@ def _scope_is_reachable(scope: OwnershipScope, evidence: SliceEvidence) -> bool:
         return False
     if scope.line_start is None:
         return True
+    if any(path in evidence.uncertain_files for path in matched_paths):
+        return True
     changed = _changed_line_map(evidence)
     return any(
         not (end < scope.line_start or start > scope.line_end)
@@ -799,7 +801,8 @@ def _scope_matches_finding(
         if evidence is not None and not any(
                 start <= line <= end
                 for start, end in _changed_line_map(evidence).get(path, ())):
-            return False
+            if path not in evidence.uncertain_files:
+                return False
     if scope.symbol is not None and finding.get("symbol") != scope.symbol:
         return False
     return True
