@@ -488,6 +488,12 @@
   failing fixtures in `tests/test_stack.py` and `tests/test_gitio.py`; the
   impacted shipped-path suites pass (`763 passed, 9 skipped`).
 
+  Second review follow-up: changed-line evidence now records only added
+  new-side lines from unified diff bodies (not whole hunk ranges), and
+  distinct symbol-anchored exclusive scopes are treated as non-overlapping.
+  Added focused regression tests; stack/Git suites pass (`125 passed,
+  9 skipped`) and pipeline/service suites pass (`150 passed`).
+
 - [ ] **Step 5: Verify merged main and close #144.**
 
   Fetch `origin/main`, verify the merge commit is present, run the focused

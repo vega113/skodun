@@ -548,6 +548,9 @@ def _scope_path_matches(scope: OwnershipScope, path: str) -> bool:
 
 
 def _scopes_overlap(left: OwnershipScope, right: OwnershipScope) -> bool:
+    if (left.symbol is not None and right.symbol is not None
+            and left.symbol != right.symbol):
+        return False
     if left.kind == "file" and right.kind == "file":
         paths_overlap = left.path == right.path
     elif left.kind == "prefix" and right.kind == "prefix":
@@ -606,19 +609,34 @@ def _slice_evidence(item: StackSlice, diff: object) -> SliceEvidence:
     changed_lines: dict[str, list[tuple[int, int]]] = {}
     for section in batching.sections(lines):
         path = batching.file_of(section)
-        hunk_ranges: list[tuple[int, int]] = []
+        added_lines: list[int] = []
+        new_line: int | None = None
         for line in section:
             match = _HUNK_RANGE.match(line)
-            if match is None:
+            if match is not None:
+                start = int(match.group("start"))
+                new_line = start
                 continue
-            start = int(match.group("start"))
-            count = int(match.group("count") or b"1")
-            if count:
-                hunk_ranges.append((start, start + count - 1))
-        if path and not hunk_ranges:
+            if new_line is None or line.startswith(b"\\"):
+                continue
+            prefix = line[:1]
+            if prefix == b"+" and not line.startswith(b"+++"):
+                added_lines.append(new_line)
+                new_line += 1
+            elif prefix == b"-" and not line.startswith(b"---"):
+                continue
+            elif prefix == b" ":
+                new_line += 1
+        ranges: list[tuple[int, int]] = []
+        for line_number in sorted(set(added_lines)):
+            if ranges and line_number == ranges[-1][1] + 1:
+                ranges[-1] = (ranges[-1][0], line_number)
+            else:
+                ranges.append((line_number, line_number))
+        if path and not ranges:
             uncertain.add(path)
-        if path and hunk_ranges:
-            changed_lines.setdefault(path, []).extend(hunk_ranges)
+        if path and ranges:
+            changed_lines.setdefault(path, []).extend(ranges)
     return SliceEvidence(
         slice=item,
         files=files,

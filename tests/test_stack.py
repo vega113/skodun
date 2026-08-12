@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import subprocess
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -713,6 +714,39 @@ def test_multiple_nonexclusive_scopes_from_one_slice_are_not_integration(
 
     assert finding["scope_attribution"]["scope"] == "current_slice"
     assert finding["scope_attribution"]["owner_slice_id"] == "pr-14"
+
+
+def test_line_evidence_contains_only_added_new_side_lines():
+    item = stack.StackSlice(
+        slice_id="pr-14", commit=HEAD, tracking_ref=f"{REPOSITORY}#14",
+        ownership=(),
+    )
+    diff = SimpleNamespace(
+        files=("src/a.py",), statuses={"src/a.py": "M"},
+        data=(
+            b"diff --git a/src/a.py b/src/a.py\n"
+            b"--- a/src/a.py\n+++ b/src/a.py\n"
+            b"@@ -1,3 +1,3 @@\n"
+            b" context\n-old\n+new\n context\n"
+        ),
+    )
+
+    evidence = stack._slice_evidence(item, diff)
+
+    assert evidence.changed_lines == (("src/a.py", ((2, 2),)),)
+
+
+def test_distinct_symbol_scopes_do_not_overlap():
+    left = stack.OwnershipScope(
+        kind="file", path="src/a.py", exclusive=True,
+        line_start=None, line_end=None, symbol="left",
+    )
+    right = stack.OwnershipScope(
+        kind="file", path="src/a.py", exclusive=True,
+        line_start=None, line_end=None, symbol="right",
+    )
+
+    assert stack._scopes_overlap(left, right) is False
 
 
 def test_multiple_downstream_claims_are_reported_as_ambiguous(tmp_path):
