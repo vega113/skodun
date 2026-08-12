@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 
 from skodun import (batching, budget, chain, checklist, contextpack, gitio,
-                    passes, pipeline, promptbuild, runner, trust)
+                    passes, pipeline, promptbuild, runner, services, trust)
 from skodun.adapters import ParseResult
 from skodun.cli import main
 from skodun.config import Defaults, load_config
@@ -999,6 +999,50 @@ def test_cancel_after_three_batches_resumes_only_the_missing_work(
         "batch 1", "batch 2", "batch 3", "batch 4",
         "the integration pass"]
     assert _without_run_identity(resumed_rec) == _without_run_identity(fresh_rec)
+
+
+def test_global_wall_timeout_preserves_three_batches_for_resume(
+        tmp_path, monkeypatch):
+    """The service deadline uses the same cancellation token as process cleanup."""
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _oversized(tmp_path, files=4)
+    cfg = load_config(repo)
+    store = _store(tmp_path)
+    first_calls = []
+
+    def times_out_on_fourth(*args, **kwargs):
+        label = args[8] if len(args) > 8 else kwargs["label"]
+        first_calls.append(label)
+        if label == "batch 4":
+            cancel = kwargs["cancel"]
+            assert cancel.wait(5), "recovery deadline did not cancel the pass"
+            raise pipeline.ReviewCancelled("review cancelled")
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", times_out_on_fourth)
+    status, text, _metadata = services.svc_review_detailed(
+        store, repo, recover=True, max_attempts=1, max_wall_seconds=3)
+    assert status == 4
+    assert "wall budget exhausted" in text
+    assert first_calls == ["batch 1", "batch 2", "batch 3", "batch 4"]
+
+    candidate = store.find_resume_candidate(
+        gitio.repository_identity(repo),
+        gitio.observed_worktree_root(repo), gitio.current_branch(repo))
+    assert [row["state"] for row in store.list_checkpoints(candidate["id"])] == [
+        "complete", "complete", "complete", "pending", "pending"]
+
+    resumed_calls = []
+
+    def clean(*args, **kwargs):
+        label = args[8] if len(args) > 8 else kwargs["label"]
+        resumed_calls.append(label)
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", clean)
+    resumed = pipeline.run_review(repo, cfg, store, cancel=threading.Event())
+    assert resumed["trustworthy"] is True
+    assert resumed_calls == ["batch 4", "the integration pass"]
 
 
 def test_live_racing_resumer_invokes_no_provider(tmp_path, monkeypatch):

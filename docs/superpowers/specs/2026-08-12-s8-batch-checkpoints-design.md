@@ -203,4 +203,3 @@ compatible; new orchestration ids may be attached as non-trust metadata.
 #151 may project partial coverage from these tables. #152 may add telemetry and
 attach #147 receipt digests after those contracts land. This design deliberately
 does not invent a receipt envelope or a second trust axis.
-
