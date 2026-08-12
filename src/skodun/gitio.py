@@ -594,12 +594,21 @@ def canonical_repository_identity(repo: Path) -> str | None:
 
 def exact_commit_exists(repo: Path, oid: str) -> bool:
     """Whether ``oid`` is one exact full SHA-1 naming a commit object."""
+    return exact_object_type(repo, oid) == "commit"
+
+
+def exact_object_type(repo: Path, oid: str) -> str | None:
+    """The type named by one exact full SHA-1, or ``None`` when absent/unsafe."""
     if not isinstance(oid, str) or _FULL_COMMIT_OID.fullmatch(oid) is None:
-        return False
-    return _run(
-        Path(repo), "cat-file", "-e", f"{oid}^{{commit}}",
+        return None
+    result = _run(
+        Path(repo), "cat-file", "-t", oid,
         ok_codes=(0, 1, 128),
-    ).returncode == 0
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.decode("ascii", "strict").strip()
+    return value if value in {"blob", "commit", "tag", "tree"} else None
 
 
 def is_ancestor(repo: Path, older_oid: str, newer_oid: str) -> bool:

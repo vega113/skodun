@@ -169,7 +169,7 @@
 - Modify: `src/skodun/stack.py`
 - Modify: `tests/test_stack.py`
 
-- [ ] **Step 1: Write the failing TubeScribes-shaped Git fixture.**
+- [x] **Step 1: Write the failing TubeScribes-shaped Git fixture.**
 
   Build a hermetic linear stack with four commits/slices and an HTTPS origin.
   Each slice changes a distinct file; one file is deliberately touched by two
@@ -195,7 +195,7 @@
   `integration` for intentional non-exclusive cross-slice scope, and
   `downstream_owned` for one exact claimed downstream owner.
 
-- [ ] **Step 2: Run the focused test and confirm RED.**
+- [x] **Step 2: Run the focused test and confirm RED.**
 
   Run:
 
@@ -205,7 +205,7 @@
 
   Expected failure: `validate` / `classify_findings` are absent.
 
-- [ ] **Step 3: Implement graph and Git evidence validation.**
+- [x] **Step 3: Implement graph and Git evidence validation.**
 
   Add frozen validated projections containing only normalized slices, actual
   changed paths/statuses, and a bounded summary. Enforce repository/base/head,
@@ -219,7 +219,7 @@
   returns invalid attribution with `git_error`; it does not raise into the
   review pipeline.
 
-- [ ] **Step 4: Implement conservative pure classification.**
+- [x] **Step 4: Implement conservative pure classification.**
 
   Add `classify_findings(findings: list, result: StackValidation) ->
   list[dict]`. Shallow-copy each finding, preserve every raw field, and add only
@@ -228,7 +228,7 @@
   deletion mappings, invalid paths, and conflicts become `unknown` with a
   stable reason. Never omit or merge a finding.
 
-- [ ] **Step 5: Add adversarial RED cases, then make them GREEN.**
+- [x] **Step 5: Add adversarial RED cases, then make them GREEN.**
 
   Add tests for stale base/head, missing/non-commit OIDs, reordered ancestry,
   duplicate IDs/commits, cycle/current-as-dependency, wrong direct parent,
@@ -242,7 +242,7 @@
   python3 -m pytest tests/test_stack.py -q --tb=short
   ```
 
-- [ ] **Step 6: Commit the validated classifier.**
+- [x] **Step 6: Commit the validated classifier.**
 
   ```bash
   git diff --check

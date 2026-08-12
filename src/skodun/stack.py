@@ -34,6 +34,9 @@ _OID = re.compile(r"[0-9a-f]{40}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _HOST = re.compile(r"[a-z0-9.-]+(?::[1-9][0-9]{0,4})?")
 _ISSUE_NUMBER = re.compile(r"[1-9][0-9]*")
+_HUNK_RANGE = re.compile(
+    rb"^@@ -[0-9]+(?:,[0-9]+)? \+(?P<start>[0-9]+)"
+    rb"(?:,(?P<count>[0-9]+))? @@")
 
 
 @dataclass(frozen=True)
@@ -421,6 +424,16 @@ def _parse_manifest(document: object) -> StackManifest:
     )
     if total_scopes > MAX_TOTAL_SCOPES:
         raise _ManifestError("limit_exceeded", "ownership scopes exceed total limit")
+    dependency_ids = [item.slice_id for item in manifest.dependencies]
+    if manifest.current_slice.slice_id in dependency_ids:
+        raise _ManifestError(
+            "stack_cycle", "current slice also appears as a dependency")
+    if len(set(dependency_ids)) != len(dependency_ids):
+        raise _ManifestError("duplicate_slice", "slice ids must be unique")
+    commits = [item.commit for item in manifest.dependencies]
+    commits.append(manifest.current_slice.commit)
+    if len(set(commits)) != len(commits):
+        raise _ManifestError("duplicate_commit", "slice commits must be unique")
     expected_parent = (
         manifest.dependencies[-1].slice_id if manifest.dependencies else None)
     if manifest.direct_parent != expected_parent:
@@ -428,14 +441,6 @@ def _parse_manifest(document: object) -> StackManifest:
             "direct_parent_mismatch", "direct_parent is not the last dependency")
     if manifest.current_slice.commit != manifest.current_head:
         raise _ManifestError("stale_head", "current slice commit differs from current_head")
-    slice_ids = [item.slice_id for item in manifest.dependencies]
-    slice_ids.append(manifest.current_slice.slice_id)
-    if len(set(slice_ids)) != len(slice_ids):
-        raise _ManifestError("duplicate_slice", "slice ids must be unique")
-    commits = [item.commit for item in manifest.dependencies]
-    commits.append(manifest.current_slice.commit)
-    if len(set(commits)) != len(commits):
-        raise _ManifestError("duplicate_commit", "slice commits must be unique")
     if _DIGEST.fullmatch(manifest.manifest_digest) is None:
         raise _ManifestError("invalid_field", "manifest_digest is not canonical")
     if _manifest_digest(manifest) != manifest.manifest_digest:
@@ -462,3 +467,337 @@ def load_request(path: Path | str) -> StackRequest:
         return StackRequest(supplied=True, manifest=manifest, problem=None)
     except _ManifestError as exc:
         return _request_problem(exc.reason_code, exc.detail)
+
+
+@dataclass(frozen=True)
+class SliceEvidence:
+    slice: StackSlice
+    files: frozenset[str]
+    statuses: tuple[tuple[str, str], ...]
+    uncertain_files: frozenset[str]
+    changed_lines: tuple[tuple[str, tuple[tuple[int, int], ...]], ...]
+
+
+@dataclass(frozen=True)
+class StackValidation:
+    status: str
+    reason_code: str
+    manifest: StackManifest | None
+    dependencies: tuple[SliceEvidence, ...] = ()
+    current_slice: SliceEvidence | None = None
+
+
+def _ignored(request: StackRequest, reason_code: str) -> StackValidation:
+    return StackValidation(
+        status="ignored",
+        reason_code=reason_code,
+        manifest=request.manifest,
+    )
+
+
+def _scope_path_matches(scope: OwnershipScope, path: str) -> bool:
+    if scope.kind == "file":
+        return path == scope.path
+    return path == scope.path or path.startswith(scope.path + "/")
+
+
+def _scopes_overlap(left: OwnershipScope, right: OwnershipScope) -> bool:
+    if left.kind == "file" and right.kind == "file":
+        paths_overlap = left.path == right.path
+    elif left.kind == "prefix" and right.kind == "prefix":
+        paths_overlap = (
+            left.path == right.path
+            or left.path.startswith(right.path + "/")
+            or right.path.startswith(left.path + "/")
+        )
+    else:
+        file_scope = left if left.kind == "file" else right
+        prefix_scope = right if right.kind == "prefix" else left
+        paths_overlap = _scope_path_matches(prefix_scope, file_scope.path)
+    if not paths_overlap:
+        return False
+    if (left.line_start is None or right.line_start is None
+            or left.path != right.path):
+        return True
+    return not (left.line_end < right.line_start
+                or right.line_end < left.line_start)
+
+
+def _changed_line_map(
+    evidence: SliceEvidence,
+) -> dict[str, tuple[tuple[int, int], ...]]:
+    return dict(evidence.changed_lines)
+
+
+def _scope_is_reachable(scope: OwnershipScope, evidence: SliceEvidence) -> bool:
+    matched_paths = [
+        path for path in evidence.files if _scope_path_matches(scope, path)
+    ]
+    if not matched_paths:
+        return False
+    if scope.line_start is None:
+        return True
+    changed = _changed_line_map(evidence)
+    return any(
+        not (end < scope.line_start or start > scope.line_end)
+        for path in matched_paths
+        for start, end in changed.get(path, ())
+    )
+
+
+def _slice_evidence(item: StackSlice, diff: object) -> SliceEvidence:
+    from . import batching
+
+    files = frozenset(str(path) for path in getattr(diff, "files", ()) if path)
+    statuses = {
+        str(path): str(code)
+        for path, code in dict(getattr(diff, "statuses", {})).items()
+    }
+    uncertain = {
+        path for path, code in statuses.items() if code in {"R", "C", "D"}
+    }
+    lines = getattr(diff, "data", b"").splitlines(keepends=True)
+    changed_lines: dict[str, list[tuple[int, int]]] = {}
+    for section in batching._sections(lines):
+        path = batching._file_of(section)
+        hunk_ranges: list[tuple[int, int]] = []
+        for line in section:
+            match = _HUNK_RANGE.match(line)
+            if match is None:
+                continue
+            start = int(match.group("start"))
+            count = int(match.group("count") or b"1")
+            if count:
+                hunk_ranges.append((start, start + count - 1))
+        if path and not hunk_ranges:
+            uncertain.add(path)
+        if path and hunk_ranges:
+            changed_lines.setdefault(path, []).extend(hunk_ranges)
+    return SliceEvidence(
+        slice=item,
+        files=files,
+        statuses=tuple(sorted(statuses.items())),
+        uncertain_files=frozenset(uncertain),
+        changed_lines=tuple(
+            (path, tuple(ranges))
+            for path, ranges in sorted(changed_lines.items())
+        ),
+    )
+
+
+def validate(
+    request: StackRequest,
+    *,
+    repo: Path,
+    certification_base: str,
+    current_head: str,
+    full_diff: object,
+    full_tree_fingerprint: str,
+    untracked_max: int,
+) -> StackValidation:
+    """Validate attribution against one already captured full review identity."""
+    from . import gitio
+
+    if request.problem is not None:
+        return _ignored(request, request.problem.reason_code)
+    manifest = request.manifest
+    if manifest is None:
+        return _ignored(request, "invalid_field")
+    try:
+        repository_id = gitio.canonical_repository_identity(Path(repo))
+    except (OSError, UnicodeError):
+        repository_id = None
+    if repository_id is None:
+        return _ignored(request, "repository_unresolved")
+    if manifest.repository_id != repository_id:
+        return _ignored(request, "repository_mismatch")
+    if manifest.certification_base != certification_base:
+        return _ignored(request, "stale_base")
+    if manifest.current_head != current_head:
+        return _ignored(request, "stale_head")
+    if getattr(full_diff, "truncated_untracked", False) is True:
+        return _ignored(request, "git_error")
+
+    chain = [manifest.certification_base]
+    chain.extend(item.commit for item in manifest.dependencies)
+    chain.append(manifest.current_head)
+    for oid in chain:
+        object_type = gitio.exact_object_type(Path(repo), oid)
+        if object_type is None:
+            return _ignored(request, "missing_commit")
+        if object_type != "commit":
+            return _ignored(request, "not_commit")
+    for older, newer in zip(chain, chain[1:]):
+        if older == newer or not gitio.is_ancestor(Path(repo), older, newer):
+            return _ignored(request, "dependency_reordered")
+
+    try:
+        dependencies: list[SliceEvidence] = []
+        previous = manifest.certification_base
+        for item in manifest.dependencies:
+            diff = gitio.capture_ref_diff(Path(repo), previous, item.commit)
+            dependencies.append(_slice_evidence(item, diff))
+            previous = item.commit
+        current_diff = gitio.capture_diff(Path(repo), previous, untracked_max)
+        current = _slice_evidence(manifest.current_slice, current_diff)
+        recaptured = gitio.capture_diff(
+            Path(repo), certification_base, untracked_max)
+        same_full_identity = (
+            gitio.diff_identity(recaptured.data)
+            == gitio.diff_identity(getattr(full_diff, "data", b""))
+            and list(recaptured.files) == list(getattr(full_diff, "files", ()))
+            and dict(recaptured.statuses)
+            == dict(getattr(full_diff, "statuses", {}))
+            and recaptured.truncated_untracked
+            is getattr(full_diff, "truncated_untracked", False)
+            and gitio.tree_fingerprint(Path(repo), paths=recaptured.files)
+            == full_tree_fingerprint
+        )
+    except Exception:
+        return _ignored(request, "git_error")
+    if not same_full_identity:
+        return _ignored(request, "git_error")
+
+    all_evidence = [*dependencies, current]
+    for evidence in all_evidence:
+        if any(not _scope_is_reachable(scope, evidence)
+               for scope in evidence.slice.ownership):
+            return _ignored(request, "ownership_unreachable")
+    for index, left in enumerate(all_evidence):
+        for right in all_evidence[index + 1:]:
+            for left_scope in left.slice.ownership:
+                for right_scope in right.slice.ownership:
+                    if (left_scope.exclusive and right_scope.exclusive
+                            and _scopes_overlap(left_scope, right_scope)):
+                        return _ignored(request, "exclusive_scope_overlap")
+
+    return StackValidation(
+        status="valid",
+        reason_code="ok",
+        manifest=manifest,
+        dependencies=tuple(dependencies),
+        current_slice=current,
+    )
+
+
+def _finding_path(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return _path(value, "finding.file")
+    except _ManifestError:
+        return None
+
+
+def _fixture_or_test(path: str) -> bool:
+    parts = path.lower().split("/")
+    name = parts[-1]
+    return (
+        any(part in {"test", "tests", "fixtures", "__tests__"}
+            for part in parts[:-1])
+        or name.startswith("test_")
+        or name.endswith(("_test.py", ".test.js", ".test.ts", ".spec.js", ".spec.ts"))
+    )
+
+
+def _scope_matches_finding(
+    scope: OwnershipScope,
+    finding: dict[str, Any],
+    path: str,
+    evidence: SliceEvidence | None = None,
+) -> bool:
+    if not _scope_path_matches(scope, path):
+        return False
+    if scope.line_start is not None:
+        line = finding.get("line")
+        if type(line) is not int or not scope.line_start <= line <= scope.line_end:
+            return False
+        if evidence is not None and not any(
+                start <= line <= end
+                for start, end in _changed_line_map(evidence).get(path, ())):
+            return False
+    if scope.symbol is not None and finding.get("symbol") != scope.symbol:
+        return False
+    return True
+
+
+def _attribution(
+    scope: str,
+    reason_code: str,
+    *,
+    owner_slice_id: str | None = None,
+    owner_ref: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "scope": scope,
+        "reason_code": reason_code,
+        "owner_slice_id": owner_slice_id,
+        "owner_ref": owner_ref,
+    }
+
+
+def classify_findings(
+    findings: list,
+    result: StackValidation,
+) -> list[dict]:
+    """Return additive, conservative scope annotations for raw findings."""
+    out: list[dict] = []
+    for raw in findings if isinstance(findings, list) else []:
+        finding = dict(raw) if isinstance(raw, dict) else {}
+        path = _finding_path(finding.get("file"))
+        if result.status != "valid":
+            attribution = _attribution("unknown", result.reason_code)
+        elif path is None:
+            attribution = _attribution("unknown", "invalid_finding_path")
+        elif _fixture_or_test(path):
+            attribution = _attribution("fixture_or_test", "test_or_fixture_path")
+        else:
+            stack_matches: list[tuple[str, SliceEvidence, OwnershipScope]] = []
+            if result.current_slice is not None:
+                for scope in result.current_slice.slice.ownership:
+                    if (_scope_matches_finding(
+                            scope, finding, path, result.current_slice)
+                            and path in result.current_slice.files):
+                        stack_matches.append((
+                            "current_slice", result.current_slice, scope))
+            for evidence in result.dependencies:
+                for scope in evidence.slice.ownership:
+                    if (_scope_matches_finding(scope, finding, path, evidence)
+                            and path in evidence.files):
+                        stack_matches.append((
+                            "inherited_dependency", evidence, scope))
+            downstream_matches = []
+            if result.manifest is not None:
+                for owner in result.manifest.downstream_owners:
+                    if any(_scope_matches_finding(scope, finding, path)
+                           for scope in owner.ownership):
+                        downstream_matches.append(owner)
+
+            if any(path in evidence.uncertain_files
+                   for _kind, evidence, _scope in stack_matches):
+                attribution = _attribution("unknown", "uncertain_git_mapping")
+            elif len(stack_matches) == 1 and not downstream_matches:
+                kind, evidence, _scope = stack_matches[0]
+                attribution = _attribution(
+                    kind,
+                    ("exact_current_scope" if kind == "current_slice"
+                     else "exact_dependency_scope"),
+                    owner_slice_id=evidence.slice.slice_id,
+                    owner_ref=evidence.slice.tracking_ref,
+                )
+            elif (len(stack_matches) > 1 and not downstream_matches
+                  and all(not scope.exclusive
+                          for _kind, _evidence, scope in stack_matches)):
+                attribution = _attribution("integration", "cross_slice_scope")
+            elif not stack_matches and len(downstream_matches) == 1:
+                attribution = _attribution(
+                    "downstream_owned", "exact_downstream_scope",
+                    owner_ref=downstream_matches[0].tracking_ref,
+                )
+            elif stack_matches or downstream_matches:
+                attribution = _attribution("unknown", "ambiguous_owner")
+            else:
+                attribution = _attribution("unknown", "no_owner_evidence")
+        finding["scope_attribution"] = attribution
+        out.append(finding)
+    return out
