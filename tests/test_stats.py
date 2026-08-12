@@ -41,7 +41,7 @@ def test_v9_migration_adds_nullable_telemetry_columns(tmp_path):
     raw.commit()
     raw.close()
 
-    st = Store.open(db)
+    st = Store._open_for_migration_tests(db)
     assert SCHEMA_VERSION == 13
     cols = {r[1] for r in st._c.execute("PRAGMA table_info(reviews)")}
     assert {"review_started_at", "review_completed_at", "repo_id",

@@ -1073,10 +1073,32 @@ class Store:
     @classmethod
     def open(cls, path: Path) -> "Store":
         path = Path(path)
-        existed = path.exists()
-        if not existed:
+        # A brand-new SQLite file is visible before its first migration has
+        # committed.  Without a tiny creation fence, a racing opener can read
+        # that transient v0 header and (correctly for a real old store) refuse
+        # it as migration-required.  Fence only the missing-file path; an
+        # existing historical store still fails closed and is never upgraded
+        # by an ordinary open.
+        init_lock = Path(str(path) + ".init.lock")
+        owns_init_lock = False
+        while True:
+            if init_lock.exists():
+                time.sleep(0.01)
+                continue
+            existed = path.exists()
+            if existed:
+                break
             path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(path, isolation_level=None)
+            try:
+                fd = os.open(init_lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                             0o600)
+                os.write(fd, str(os.getpid()).encode("ascii"))
+                os.close(fd)
+                owns_init_lock = True
+                break
+            except FileExistsError:
+                continue
+        conn = sqlite3.connect(path, isolation_level=None, timeout=30)
         conn.row_factory = sqlite3.Row
         try:
             if not existed:
@@ -1098,6 +1120,12 @@ class Store:
         except BaseException:
             conn.close()        # never leave a refused store open or locked
             raise
+        finally:
+            if owns_init_lock:
+                try:
+                    init_lock.unlink()
+                except FileNotFoundError:
+                    pass
         return cls(conn, path)
 
     @classmethod
