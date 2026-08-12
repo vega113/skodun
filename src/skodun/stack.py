@@ -971,6 +971,8 @@ def classify_findings(
                 for index, evidence in enumerate(evidence_set)
             }
             shifted_dependency_uncertain = any(
+                type(finding_line) is int
+                and
                 scope.line_start is not None
                 and _scope_path_matches(scope, path)
                 and not _dependency_coordinates_stable(
