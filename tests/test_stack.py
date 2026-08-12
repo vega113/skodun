@@ -158,6 +158,9 @@ def test_manifest_digest_mismatch_is_refused(tmp_path):
     request = stack.load_request(path)
 
     assert request.problem.reason_code == "digest_mismatch"
+    assert request.claimed_manifest_digest == document["manifest_digest"]
+    assert (stack._ignored(request, "digest_mismatch").to_dict()
+            ["manifest_digest"] == document["manifest_digest"])
 
 
 def test_nonfinite_json_number_is_refused(tmp_path):

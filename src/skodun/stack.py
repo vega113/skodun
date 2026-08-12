@@ -95,6 +95,7 @@ class StackRequest:
     supplied: bool
     manifest: StackManifest | None
     problem: StackProblem | None
+    claimed_manifest_digest: str | None = None
 
 
 class _ManifestError(ValueError):
@@ -111,11 +112,17 @@ def _bounded_detail(detail: object) -> str:
     return " ".join(flattened.split())[:MAX_PROBLEM_DETAIL_CHARS]
 
 
-def _request_problem(reason_code: str, detail: object = "") -> StackRequest:
+def _request_problem(
+    reason_code: str,
+    detail: object = "",
+    *,
+    claimed_manifest_digest: str | None = None,
+) -> StackRequest:
     return StackRequest(
         supplied=True,
         manifest=None,
         problem=StackProblem(reason_code, _bounded_detail(detail)),
+        claimed_manifest_digest=claimed_manifest_digest,
     )
 
 
@@ -451,6 +458,7 @@ def _parse_manifest(document: object) -> StackManifest:
 
 def load_request(path: Path | str) -> StackRequest:
     """Load one untrusted manifest as a total, bounded result."""
+    claimed_digest: str | None = None
     try:
         data = _read_regular_file(Path(path))
         try:
@@ -464,10 +472,17 @@ def load_request(path: Path | str) -> StackRequest:
             raise
         except (json.JSONDecodeError, RecursionError, ValueError) as exc:
             raise _ManifestError("malformed_json", type(exc).__name__) from exc
+        if isinstance(document, dict):
+            candidate = document.get("manifest_digest")
+            if (isinstance(candidate, str)
+                    and _DIGEST.fullmatch(candidate) is not None):
+                claimed_digest = candidate
         manifest = _parse_manifest(document)
         return StackRequest(supplied=True, manifest=manifest, problem=None)
     except _ManifestError as exc:
-        return _request_problem(exc.reason_code, exc.detail)
+        return _request_problem(
+            exc.reason_code, exc.detail,
+            claimed_manifest_digest=claimed_digest)
     except (OSError, TypeError, ValueError) as exc:
         return _request_problem("unsafe_file", type(exc).__name__)
 
@@ -488,6 +503,7 @@ class StackValidation:
     manifest: StackManifest | None
     dependencies: tuple[SliceEvidence, ...] = ()
     current_slice: SliceEvidence | None = None
+    claimed_manifest_digest: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Bounded artifact/service projection; never the raw manifest."""
@@ -498,7 +514,8 @@ class StackValidation:
             "reason_code": self.reason_code,
             "repository_id": None if manifest is None else manifest.repository_id,
             "manifest_digest": (
-                None if manifest is None else manifest.manifest_digest),
+                manifest.manifest_digest if manifest is not None
+                else self.claimed_manifest_digest),
             "current_slice_id": (
                 None if manifest is None else manifest.current_slice.slice_id),
             "direct_parent": None if manifest is None else manifest.direct_parent,
@@ -538,6 +555,7 @@ def _ignored(request: StackRequest, reason_code: str) -> StackValidation:
         status="ignored",
         reason_code=reason_code,
         manifest=request.manifest,
+        claimed_manifest_digest=request.claimed_manifest_digest,
     )
 
 

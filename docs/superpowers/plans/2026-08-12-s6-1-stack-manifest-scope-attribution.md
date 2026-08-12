@@ -505,6 +505,11 @@
   rejecting the whole manifest. The deletion-only line-anchor regression is
   covered by the stack suite.
 
+  Digest follow-up: a syntactically canonical but mismatching manifest digest
+  is retained in the bounded ignored projection, allowing operators to
+  correlate the artifact without treating the claim as trusted. The digest
+  mismatch projection regression passes in the stack suite.
+
 - [ ] **Step 5: Verify merged main and close #144.**
 
   Fetch `origin/main`, verify the merge commit is present, run the focused
