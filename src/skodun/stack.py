@@ -970,6 +970,14 @@ def classify_findings(
                 id(evidence): index
                 for index, evidence in enumerate(evidence_set)
             }
+            shifted_dependency_uncertain = any(
+                scope.line_start is not None
+                and _scope_path_matches(scope, path)
+                and not _dependency_coordinates_stable(
+                    path, index, evidence_set)
+                for index, evidence in enumerate(result.dependencies)
+                for scope in evidence.slice.ownership
+            )
             dependency_coordinates_uncertain = any(
                 kind == "inherited_dependency"
                 and scope.line_start is not None
@@ -977,6 +985,11 @@ def classify_findings(
                 and not _dependency_coordinates_stable(
                     path, evidence_positions[id(evidence)], evidence_set)
                 for kind, evidence, scope in stack_matches
+            )
+            hard_status_uncertain = any(
+                kind in {"current_slice", "inherited_dependency"}
+                and _status_for_path(evidence, path) in {"R", "C", "D"}
+                for kind, evidence, _scope in stack_matches
             )
             current_exact_match = any(
                 kind == "current_slice"
@@ -1011,6 +1024,8 @@ def classify_findings(
                 for evidence in evidence_set)
             if dependency_coordinates_uncertain:
                 uncertain_path = uncertain_path or dependency_coordinates_uncertain
+            if shifted_dependency_uncertain or hard_status_uncertain:
+                uncertain_path = True
 
             if uncertain_path:
                 attribution = _attribution("unknown", "uncertain_git_mapping")

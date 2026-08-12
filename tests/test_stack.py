@@ -913,6 +913,62 @@ def test_matching_stale_dependency_keeps_current_line_uncertain():
     assert finding["scope_attribution"]["reason_code"] == "uncertain_git_mapping"
 
 
+def test_shifted_dependency_scope_is_uncertain_before_line_matching():
+    dependency_item = stack.StackSlice(
+        slice_id="dep", commit=HEAD, tracking_ref=f"{REPOSITORY}#13",
+        ownership=(stack.OwnershipScope(
+            kind="file", path="src/a.py", exclusive=True,
+            line_start=1, line_end=1, symbol=None),),
+    )
+    current_item = stack.StackSlice(
+        slice_id="current", commit=HEAD, tracking_ref=f"{REPOSITORY}#14",
+        ownership=(),
+    )
+    result = SimpleNamespace(
+        status="valid", reason_code="ok", manifest=None,
+        dependencies=(stack.SliceEvidence(
+            slice=dependency_item, files=frozenset({"src/a.py"}), statuses=(),
+            uncertain_files=frozenset(),
+            changed_lines=(("src/a.py", ((1, 1),)),),
+        ),),
+        current_slice=stack.SliceEvidence(
+            slice=current_item, files=frozenset({"src/a.py"}), statuses=(),
+            uncertain_files=frozenset(),
+            changed_lines=(("src/a.py", ((3, 3),)),),
+        ),
+    )
+
+    finding = stack.classify_findings(
+        [{"file": "src/a.py", "line": 3}], result)[0]
+
+    assert finding["scope_attribution"]["scope"] == "unknown"
+    assert finding["scope_attribution"]["reason_code"] == "uncertain_git_mapping"
+
+
+def test_edited_rename_destination_line_remains_uncertain():
+    current_item = stack.StackSlice(
+        slice_id="current", commit=HEAD, tracking_ref=f"{REPOSITORY}#14",
+        ownership=(stack.OwnershipScope(
+            kind="file", path="src/a.py", exclusive=True,
+            line_start=1, line_end=1, symbol=None),),
+    )
+    result = SimpleNamespace(
+        status="valid", reason_code="ok", manifest=None, dependencies=(),
+        current_slice=stack.SliceEvidence(
+            slice=current_item, files=frozenset({"src/a.py"}),
+            statuses=(("src/a.py", "R"),),
+            uncertain_files=frozenset({"src/a.py"}),
+            changed_lines=(("src/a.py", ((1, 1),)),),
+        ),
+    )
+
+    finding = stack.classify_findings(
+        [{"file": "src/a.py", "line": 1}], result)[0]
+
+    assert finding["scope_attribution"]["scope"] == "unknown"
+    assert finding["scope_attribution"]["reason_code"] == "uncertain_git_mapping"
+
+
 def test_stable_dependency_file_scope_remains_exact_after_mixed_deletion():
     dependency_item = stack.StackSlice(
         slice_id="dep", commit=HEAD, tracking_ref=f"{REPOSITORY}#13",
