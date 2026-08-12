@@ -109,7 +109,7 @@ def test_status_line_exposes_fingerprint_version_and_lineage_reason():
         }],
     })
     assert "fingerprint_version=finding_fingerprint_v2" in line
-    assert "lineage_matches=moved" in line
+    assert "lineage_counts=moved:1" in line
 
 
 def test_opt_in_reuse_returns_existing_review_without_running_pipeline(

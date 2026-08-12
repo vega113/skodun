@@ -44,16 +44,24 @@ def _field(finding: Mapping[str, Any], *names: str) -> str:
 
 def _source_and_claim(finding: Mapping[str, Any]) -> tuple[str, str]:
     explicit = _field(finding, "pass_source", "source", "pass")
+    marker = None
+    for candidate in (finding.get("title"), finding.get("detail")):
+        if candidate not in (None, ""):
+            marker = (_EXTRA_MARKER.match(str(candidate))
+                      or _PASS_MARKER.match(str(candidate)))
+            if marker is not None:
+                break
     raw = ""
     for name in ("claim", "semantic_claim", "description", "detail", "title"):
         value = finding.get(name)
         if value not in (None, ""):
             raw = str(value)
             break
-    marker = _EXTRA_MARKER.match(raw) or _PASS_MARKER.match(raw)
     if explicit == UNKNOWN and marker is not None:
         explicit = marker.group(1).casefold()
-        raw = raw[marker.end():]
+    claim_marker = _EXTRA_MARKER.match(raw) or _PASS_MARKER.match(raw)
+    if claim_marker is not None:
+        raw = raw[claim_marker.end():]
     return explicit, _norm(raw) or UNKNOWN
 
 
@@ -140,15 +148,11 @@ def annotate_findings(
             else:
                 reason = "repeated"
         elif len(matches) > 1:
-            identified = [match for match in matches
-                          if match[0] is not None and match[2] is not None]
-            if len(identified) == len(matches):
-                identified.sort(key=lambda match: (str(match[2]), str(match[0]), match[1]))
-                predecessor_review_id, predecessor, predecessor_at = identified[-1]
-                reason = "repeated"
-            else:
-                reason = "ambiguous"
-                predecessor = None
+            # Multiple exact occurrences are genuinely ambiguous even when a
+            # timestamp could provide a deterministic choice.  Never silently
+            # select one predecessor when location identity is not in the hash.
+            reason = "ambiguous"
+            predecessor = None
         else:
             payload = fingerprint_payload(finding)
             near = []

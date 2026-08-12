@@ -1589,10 +1589,16 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                   f"budget is now {int(needs)}s")
 
         review_started_at = _iso_now()
-        lineage_repository_id = (
-            stack_validation.manifest.repository_id
-            if stack_validation is not None and stack_validation.manifest is not None
-            else gitio.canonical_repository_identity(root)) or "unknown"
+        if (stack_validation is not None
+                and stack_validation.status == "valid"
+                and stack_validation.manifest is not None):
+            lineage_repository_id = stack_validation.manifest.repository_id
+        else:
+            try:
+                lineage_repository_id = (
+                    gitio.canonical_repository_identity(root) or "unknown")
+            except Exception:
+                lineage_repository_id = "unknown"
         common = dict(
             id=rid, reviewed_at=review_started_at,
             review_started_at=review_started_at,
@@ -2312,7 +2318,11 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
     # would otherwise select a different checklist than a foreground review of
     # the same change.
     root = gitio._worktree_root(repo)
-    lineage_repository_id = gitio.canonical_repository_identity(root) or "unknown"
+    try:
+        lineage_repository_id = (
+            gitio.canonical_repository_identity(root) or "unknown")
+    except Exception:
+        lineage_repository_id = "unknown"
 
     finder = _reviewer_for(cfg, "finder")
     if finder is None:
@@ -2611,6 +2621,8 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
         if repository_id != "unknown":
             for prior in store.list_reviews(None, limit=200):
                 if prior.get("id") == rec.get("id"):
+                    continue
+                if prior.get("status") == "running":
                     continue
                 if (prior.get("lineage_repository_id") or "unknown") != repository_id:
                     continue

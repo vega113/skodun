@@ -1,3 +1,5 @@
+"""Shipped-path tests for versioned fingerprint and lineage invariants."""
+
 from skodun import fingerprint
 from skodun.store import Store
 
@@ -25,6 +27,14 @@ def test_semantic_detail_keeps_a_retitled_finding_linked():
     old = {"file": "src/a.py", "title": "old wording", "detail": "same claim"}
     new = {"file": "src/a.py", "title": "new wording", "detail": "same claim"}
     assert fingerprint.finding_fingerprint(old) == fingerprint.finding_fingerprint(new)
+
+
+def test_extra_pass_marker_is_detected_even_when_detail_is_the_claim():
+    finding = {"file": "src/a.py", "title": "(security) unsafe call",
+               "detail": "user input reaches the shell"}
+    payload = fingerprint.fingerprint_payload(finding)
+    assert payload["pass_source"] == "security"
+    assert payload["claim"] == "user input reaches the shell"
 
 
 def test_lineage_repeats_and_reports_ambiguous_matches_without_triage():
