@@ -21,6 +21,10 @@ provider executable provenance (#152), or evidence receipts (#147).
    effective config/policy, planner version, batch budget, ordered boundaries,
    integration plan, and every pass prompt identity.
 3. A completed pass is reusable only when its exact prompt identity matches.
+   Batch prompt identities are frozen during plan preparation; the integration
+   prompt is data-dependent on terminal batch outputs, so its hash is computed
+   immediately before its claim and the store rejects any differing runtime
+   prompt before a provider call.
 4. A transactionally claimed pass has one lease/fencing generation. A second
    resumer never invokes the provider for that pass. An expired lease may be
    reclaimed with a greater fence, and a late prior owner cannot write through

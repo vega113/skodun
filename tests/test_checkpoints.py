@@ -247,6 +247,20 @@ def test_one_live_checkpoint_claim_wins_and_the_other_is_in_flight(tmp_path):
     assert lost["claim_owner"] == "worker-a"
 
 
+def test_integration_claim_requires_the_exact_runtime_prompt_identity(tmp_path):
+    integration = _identity().pass_identities[1]
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store)
+        claimed = store.claim_checkpoint(
+            "orch-1", replace(integration, prompt_hash="z" * 64),
+            owner="worker", now=NOW, lease_expires_at=LATER)
+        assert claimed["decision"] == "claimed"
+        with pytest.raises(ValueError, match="prompt_hash"):
+            store.claim_checkpoint(
+                "orch-1", replace(integration, prompt_hash="y" * 64),
+                owner="other", now=NOW, lease_expires_at=LATER)
+
+
 def test_expired_claim_is_reclaimed_and_late_owner_is_fenced(tmp_path):
     db = tmp_path / "s.db"
     payload = checkpoints.CheckpointPayload.from_mapping(_payload())
