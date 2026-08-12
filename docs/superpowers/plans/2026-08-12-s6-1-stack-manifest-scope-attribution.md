@@ -428,7 +428,10 @@
   ```
 
   Record exact passed/skipped counts. A stall or interruption is incomplete.
-  Verified on the frozen head: `3550 passed, 160 skipped in 957.60s`.
+  Verified on the final review head: `3558 passed, 160 skipped, 1 deselected in 437.69s`.
+  The deselected test is the nested heavy store ResourceWarning sweep; this
+  slice adds no store schema or process-lifecycle code, so the repository
+  instructions do not require that sweep here.
   The dedicated store ResourceWarning sweep is not required because this PR
   adds no store schema or process-lifecycle code.
 
@@ -464,7 +467,7 @@
   every real finding through a new failing test and focused fix, then rerun full
   verification and exact-head review. Do not weaken gate/trust to obtain a pass.
 
-- [ ] **Step 3: Push and open one issue-narrow PR.**
+- [x] **Step 3: Push and open one issue-narrow PR.**
 
   The PR body must include Lane A, shared seams (`pipeline.py`, `services.py`,
   `cli.py`, `mcpserver.py`), Summary, design/safety decisions, Test plan,
