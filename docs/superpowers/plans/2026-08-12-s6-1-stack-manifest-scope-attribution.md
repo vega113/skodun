@@ -522,6 +522,10 @@
   emitted only for valid validation. Impacted suites pass (`277 passed,
   9 skipped`).
 
+  Rename-limit follow-up: stack-only detection also pins `-l0`, preventing
+  ambient `diff.renameLimit` from silently disabling exhaustive rename/copy
+  analysis. Git/stack verification passes (`127 passed, 9 skipped`).
+
 - [ ] **Step 5: Verify merged main and close #144.**
 
   Fetch `origin/main`, verify the merge commit is present, run the focused

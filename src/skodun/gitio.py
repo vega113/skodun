@@ -244,7 +244,7 @@ def _tracked_statuses(
     commits only) — one parser shared between both callers, per the module's
     "reuse the shipped -z name-status parsing" contract.
     """
-    detection = ("-M", "-C", "--find-copies-harder") if detect_renames else ()
+    detection = ("-M", "-C", "--find-copies-harder", "-l0") if detect_renames else ()
     toks = _paths(_run(
         repo, "diff", *_DIFF_FLAGS, *detection, "--name-status", "-z",
         base_sha, *other).stdout)
@@ -303,7 +303,7 @@ def capture_diff(
     oracle's on a locale or code-point-vs-byte ordering difference.
     """
     repo = _worktree_root(repo)
-    detection = ("-M", "-C", "--find-copies-harder") if detect_renames else ()
+    detection = ("-M", "-C", "--find-copies-harder", "-l0") if detect_renames else ()
     tracked = _run(
         repo, "--no-pager", "diff", *_DIFF_FLAGS, *detection, base_sha).stdout
     statuses = _tracked_statuses(repo, base_sha, detect_renames=detect_renames)
@@ -360,7 +360,7 @@ def capture_ref_diff(
     untracked-file listing here to keep path-consistent with, since a
     ref-range diff between two commits has no untracked files by definition.
     """
-    detection = ("-M", "-C", "--find-copies-harder") if detect_renames else ()
+    detection = ("-M", "-C", "--find-copies-harder", "-l0") if detect_renames else ()
     tracked = _run(
         repo, "--no-pager", "diff", *_DIFF_FLAGS, *detection,
         base_sha, local_oid).stdout
