@@ -20,6 +20,12 @@ def test_case_sensitive_paths_remain_distinct():
         {"file": "src/foo.py", "title": "same"})
 
 
+def test_path_component_whitespace_remains_distinct():
+    assert fingerprint.finding_fingerprint(
+        {"file": "src/a  b.py", "title": "same"}) != fingerprint.finding_fingerprint(
+        {"file": "src/a b.py", "title": "same"})
+
+
 def test_fingerprint_changes_scope_claim_and_mutation():
     base = {"file": "src/a.py", "title": "bad", "symbol": "run"}
     assert fingerprint.finding_fingerprint(base) != fingerprint.finding_fingerprint(
