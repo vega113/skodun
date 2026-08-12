@@ -590,8 +590,8 @@ def _portable_remote_identity(remote: str) -> str | None:
             port = int(host.rsplit(":", 1)[1])
         except ValueError:
             return None
-        if ((remote.startswith("https://") and port == 443)
-                or (remote.startswith("ssh://") and port == 22)):
+        if ((parsed.scheme == "https" and port == 443)
+                or (parsed.scheme == "ssh" and port == 22)):
             host = normalized_host
     return f"{host.lower()}/{'/'.join(parts)}"
 
