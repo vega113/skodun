@@ -256,16 +256,6 @@ def test_manifest_unknown_nested_fields_are_refused(tmp_path):
     assert "must-not-survive" not in request.problem.detail
 
 
-def test_tracking_refs_must_match_manifest_repository(tmp_path):
-    document = _manifest()
-    document["current_slice"]["tracking_ref"] = "github.com/other/project#14"
-
-    request = stack.load_request(
-        _write(tmp_path / "other-tracking.json", document))
-
-    assert request.problem.reason_code == "tracking_repository_mismatch"
-
-
 def test_manifest_symlink_is_refused(tmp_path):
     target = _write(tmp_path / "target.json")
     link = tmp_path / "link.json"
@@ -454,14 +444,19 @@ def test_tubescribes_shaped_stack_validates_and_classifies_exact_owners(tmp_path
     ("repository_id", "github.com/other/project", "repository_mismatch"),
     ("certification_base", "a" * 40, "stale_base"),
     ("current_head", "b" * 40, "stale_head"),
+    ("tracking_ref", "github.com/other/project#14",
+     "tracking_repository_mismatch"),
 ])
 def test_validation_refuses_manifest_identity_mismatches(
         tmp_path, field, replacement, reason):
     state = _stack_repo(tmp_path)
     document = _stack_document(state)
-    document[field] = replacement
+    if field != "tracking_ref":
+        document[field] = replacement
     if field == "current_head":
         document["current_slice"]["commit"] = replacement
+    if field == "tracking_ref":
+        document["current_slice"]["tracking_ref"] = replacement
 
     _state, _request, _full_diff, result = _validation(
         tmp_path, state=state, document=document)

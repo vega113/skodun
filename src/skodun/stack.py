@@ -435,16 +435,6 @@ def _parse_manifest(document: object) -> StackManifest:
     commits.append(manifest.current_slice.commit)
     if len(set(commits)) != len(commits):
         raise _ManifestError("duplicate_commit", "slice commits must be unique")
-    tracking_refs = [
-        *(item.tracking_ref for item in manifest.dependencies),
-        manifest.current_slice.tracking_ref,
-        *(item.tracking_ref for item in manifest.downstream_owners),
-    ]
-    if any(ref.rpartition("#")[0] != manifest.repository_id
-           for ref in tracking_refs):
-        raise _ManifestError(
-            "tracking_repository_mismatch",
-            "tracking references must use the manifest repository")
     expected_parent = (
         manifest.dependencies[-1].slice_id if manifest.dependencies else None)
     if manifest.direct_parent != expected_parent:
@@ -669,6 +659,14 @@ def validate(
         return _ignored(request, "repository_unresolved")
     if manifest.repository_id != repository_id:
         return _ignored(request, "repository_mismatch")
+    tracking_refs = [
+        *(item.tracking_ref for item in manifest.dependencies),
+        manifest.current_slice.tracking_ref,
+        *(item.tracking_ref for item in manifest.downstream_owners),
+    ]
+    if any(ref.rpartition("#")[0] != manifest.repository_id
+           for ref in tracking_refs):
+        return _ignored(request, "tracking_repository_mismatch")
     if manifest.certification_base != certification_base:
         return _ignored(request, "stale_base")
     if manifest.current_head != current_head:
