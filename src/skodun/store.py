@@ -1635,6 +1635,26 @@ class Store:
                 " ORDER BY finding_index", (review_id,)).fetchall()
         return [dict(row) for row in rows]
 
+    def lineage_review_candidates(self, repository_id: str) -> list[dict]:
+        """Return terminal artifacts with persisted lineage for one repository.
+
+        Unlike the human-facing host-wide review log, this query is not capped
+        before repository qualification.  It is the conservative predecessor
+        source for cross-restack matching and contains no running rows because
+        lineage is written only at terminal publication.
+        """
+        repository_id = _require_text("repository_id", repository_id)
+        rows = self._c.execute(
+            "SELECT DISTINCT review_id FROM finding_lineage "
+            "WHERE repository_id=? ORDER BY review_id", (repository_id,)
+        ).fetchall()
+        candidates = []
+        for row in rows:
+            artifact = self.get_review(row["review_id"])
+            if isinstance(artifact, dict) and artifact.get("status") != RUNNING:
+                candidates.append(artifact)
+        return candidates
+
     def get_review(self, review_id: str) -> dict | None:
         row = self._c.execute("SELECT artifact_json FROM reviews WHERE id=?",
                               (review_id,)).fetchone()

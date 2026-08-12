@@ -28,7 +28,8 @@ def _norm(value: object) -> str:
 
 
 def _path(value: object) -> str:
-    text = _norm(value).replace("\\", "/")
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip().replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
     return text or UNKNOWN

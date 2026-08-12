@@ -2619,7 +2619,7 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
         # linking two unrelated local clones would be worse than a false
         # negative.  Stack manifests and normal remotes provide this value.
         if repository_id != "unknown":
-            for prior in store.list_reviews(None, limit=200):
+            for prior in store.lineage_review_candidates(repository_id):
                 if prior.get("id") == rec.get("id"):
                     continue
                 if prior.get("status") == "running":

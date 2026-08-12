@@ -14,6 +14,12 @@ def test_fingerprint_is_versioned_and_normalizes_path_claim_whitespace():
     assert fingerprint.fingerprint_payload(left)["version"] == "finding_fingerprint_v2"
 
 
+def test_case_sensitive_paths_remain_distinct():
+    assert fingerprint.finding_fingerprint(
+        {"file": "src/Foo.py", "title": "same"}) != fingerprint.finding_fingerprint(
+        {"file": "src/foo.py", "title": "same"})
+
+
 def test_fingerprint_changes_scope_claim_and_mutation():
     base = {"file": "src/a.py", "title": "bad", "symbol": "run"}
     assert fingerprint.finding_fingerprint(base) != fingerprint.finding_fingerprint(
@@ -89,7 +95,7 @@ def test_lineage_ignores_running_predecessor_rows():
     finding = {"file": "src/a.py", "title": "same"}
 
     class StoreStub:
-        def list_reviews(self, _branch, limit=200):
+        def lineage_review_candidates(self, _repository_id):
             return [{"id": "running", "status": "running",
                      "lineage_repository_id": "repo", "findings": [finding]}]
 
@@ -116,3 +122,5 @@ def test_terminal_store_write_persists_lineage_without_changing_legacy_fields(tm
     rows = store.list_lineage("r1")
     assert rows[0]["fingerprint"] == finding["finding_fingerprint_v2"]
     assert store.get_review("r1")["findings"][0]["finding_fingerprint_v2"]
+    assert [item["id"] for item in store.lineage_review_candidates("unknown")] == ["r1"]
+    assert [item["id"] for item in store.lineage_review_candidates("repo")] == []
