@@ -221,6 +221,18 @@ def test_fresh_orchestration_creation_does_not_reuse_exact_prior_state(tmp_path)
     assert fresh["id"] == "orch-fresh"
 
 
+def test_exact_creation_reuses_failed_resumable_orchestration(tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store, orchestration_id="orch-failed")
+        store._c.execute(
+            "UPDATE review_orchestrations SET state='failed' WHERE id=?",
+            ("orch-failed",))
+        same = store.create_orchestration(
+            "orch-new", _identity(), requested_mode="now",
+            created_at=NOW, expires_at=LATER)
+    assert same["id"] == "orch-failed"
+
+
 def test_resume_candidate_is_scoped_and_mismatch_is_durable(tmp_path):
     with Store.open(tmp_path / "s.db") as store:
         _created(store)

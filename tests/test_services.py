@@ -183,6 +183,22 @@ def test_explicit_review_intent_bypasses_incomplete_checkpoint_resume(
     assert seen == [False]
 
 
+def test_inferred_client_family_keeps_checkpoint_resume_enabled(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        services, "_try_reuse",
+        lambda *args, **kwargs: (None, None, {}))
+    seen = []
+    monkeypatch.setattr(
+        services, "_svc_review_once",
+        lambda *args, **kwargs: seen.append(kwargs["resume_checkpoints"])
+        or (0, "clean"))
+    with Store.open(tmp_path / "inferred-family.db") as store:
+        services.svc_review_detailed(
+            store, tmp_path, client_family="xai", reuse_client_family=None)
+    assert seen == [True]
+
+
 def test_opt_in_reuse_honors_cancellation_before_and_during_a_probe(
         tmp_path, monkeypatch):
     cancel = threading.Event()

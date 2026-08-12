@@ -544,11 +544,18 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
     if reuse_result is not None:
         return (*reuse_result, reuse_metadata)
     if not recover:
+        # MCP resolves an omitted family from the handshake, then passes the
+        # separate ``reuse_client_family`` intent marker.  A handshake guess
+        # must not turn an otherwise resumable call into a fresh run; only an
+        # explicitly declared family is a resume boundary.
+        intent_family = (client_family
+                         if reuse_client_family is _REUSE_INTENT_UNSET
+                         else reuse_client_family)
         status, text = _svc_review_once(
             store, repo, progress_sink=progress_sink, cancel=cancel,
             reviewer=reviewer, client_family=client_family,
             resume_checkpoints=(not fresh and reviewer is None
-                                and client_family is None))
+                                and intent_family is None))
         if reuse_note:
             text = f"{reuse_note}\n{text}"
         return status, text, reuse_metadata

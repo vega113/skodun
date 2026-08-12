@@ -1185,7 +1185,7 @@ class Store:
                 existing = self._c.execute(
                     """SELECT * FROM review_orchestrations
                         WHERE identity_digest=?
-                          AND state IN ('active','cancelled','complete')
+                          AND state IN ('active','cancelled','failed','complete')
                         ORDER BY created_at DESC, id DESC LIMIT 1""",
                     (identity.digest(),)).fetchone()
             if existing is not None:
