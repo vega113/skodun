@@ -2867,13 +2867,17 @@ def _begin_checkpoint_run(store: Store, identity: checkpoints.OrchestrationIdent
         _note(f"checkpoint resume refused: {mismatch} changed; starting fresh")
     orchestration_id = ids.new_review_id("sk_batch_")
     try:
-        store.create_orchestration(
+        created = store.create_orchestration(
             orchestration_id, identity,
             requested_mode=str(rec.get("mode") or "now"),
             created_at=now, expires_at=_iso_after(CHECKPOINT_RETENTION_SEC))
     except Exception as exc:
         raise PersistenceFailed(
             f"could not create batch checkpoints: {exc!r}") from exc
+    if created["id"] != orchestration_id:
+        _note(f"another resumer created exact batch orchestration {created['id']}")
+        return _CheckpointRun(
+            created["id"], ids.new_review_id("sk_owner_"), identity)
     _note(f"started batch orchestration {orchestration_id}")
     return _CheckpointRun(
         orchestration_id, ids.new_review_id("sk_owner_"), identity)

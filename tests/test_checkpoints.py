@@ -194,8 +194,19 @@ def test_store_creates_an_orchestration_and_ordered_planned_passes(tmp_path):
     assert [(item["pass_kind"], item["pass_index"], item["state"])
             for item in planned] == [
                 ("batch", 1, "pending"),
-                ("integration", 0, "pending"),
-            ]
+        ("integration", 0, "pending"),
+    ]
+
+
+def test_exact_orchestration_creation_is_idempotent_under_a_racing_starter(
+        tmp_path):
+    with Store.open(tmp_path / "s.db") as first, Store.open(tmp_path / "s.db") as second:
+        created = _created(first, orchestration_id="orch-first")
+        same = second.create_orchestration(
+            "orch-second", _identity(), requested_mode="now",
+            created_at=NOW, expires_at=LATER)
+    assert same["id"] == created["id"] == "orch-first"
+    assert same["identity_digest"] == _identity().digest()
 
 
 def test_resume_candidate_is_scoped_and_mismatch_is_durable(tmp_path):

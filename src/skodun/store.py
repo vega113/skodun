@@ -1170,6 +1170,19 @@ class Store:
 
         self._c.execute("BEGIN IMMEDIATE")
         try:
+            # Serialize the read-and-create decision with the insert. A second
+            # resumer that arrives after the first transaction has created the
+            # exact same identity receives that existing orchestration instead
+            # of minting a competing plan whose pass claims would be separate.
+            existing = self._c.execute(
+                """SELECT * FROM review_orchestrations
+                    WHERE identity_digest=?
+                      AND state IN ('active','cancelled','complete')
+                    ORDER BY created_at DESC, id DESC LIMIT 1""",
+                (identity.digest(),)).fetchone()
+            if existing is not None:
+                self._c.execute("COMMIT")
+                return dict(existing)
             self._c.execute(
                 """INSERT INTO review_orchestrations (
                      id, state, requested_mode, created_at, updated_at,
