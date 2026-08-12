@@ -157,6 +157,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--fresh", action="store_true", dest="fresh",
         help="run wholly fresh, bypassing trusted reuse and incomplete batch "
              "checkpoints")
+    review.add_argument(
+        "--batch-target-bytes", type=int, default=None,
+        dest="batch_target_bytes",
+        help="optional non-negative deterministic per-batch diff target; "
+             "zero selects the configured/default planner")
 
     readiness = sub.add_parser(
         "review-readiness",
@@ -833,7 +838,8 @@ def _cmd_review(args) -> int:
             max_attempts=getattr(args, "max_attempts", None),
             max_wall_seconds=getattr(args, "max_wall_seconds", None),
             reuse_trusted=getattr(args, "reuse_trusted", False),
-            fresh=getattr(args, "fresh", False))
+            fresh=getattr(args, "fresh", False),
+            batch_target_bytes=getattr(args, "batch_target_bytes", None))
     return _emit(text, code)
 
 

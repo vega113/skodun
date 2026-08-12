@@ -176,7 +176,8 @@ def svc_review_readiness(store, repo, *, reviewer=None, client_family=None,
 def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
                      reviewer=None, client_family=None,
                      avoid_providers=None,
-                     resume_checkpoints=True) -> tuple[int, str]:
+                     resume_checkpoints=True,
+                     batch_target_bytes=None) -> tuple[int, str]:
     """Run one foreground review. `(code, banner)`. Exit codes, and why:
 
       0  trustworthy and clean            3  gave up waiting for the lock
@@ -272,6 +273,10 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
         return 2, banner_failure(f"could not load the config: {e!r}")
 
     try:
+        if batch_target_bytes is not None:
+            from dataclasses import replace
+            cfg = replace(cfg, defaults=replace(
+                cfg.defaults, batch_target_bytes=batch_target_bytes))
         rec = run_review(root, cfg, store, progress_sink=progress_sink,
                          cancel=cancel, reviewer=reviewer,
                          client_family=client_family,
@@ -324,6 +329,22 @@ _RECOVERY_DEFAULT_ATTEMPTS = 3
 _RECOVERY_MAX_ATTEMPTS = 8
 _RECOVERY_DEFAULT_WALL_SECONDS = 900
 _REUSE_INTENT_UNSET = object()
+_BATCH_TARGET_MAX_BYTES = 10_000_000
+
+
+def _validate_batch_target(value):
+    """Validate the optional per-call planner hint shared by both surfaces."""
+    if value is None:
+        return None, None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return value, "batch_target_bytes must be a non-negative integer"
+    if value < 0 or value > _BATCH_TARGET_MAX_BYTES:
+        return value, ("batch_target_bytes must be between 0 and "
+                       f"{_BATCH_TARGET_MAX_BYTES}")
+    # Zero is the wire-level spelling for "use configured/default planner".
+    if value == 0:
+        return None, None
+    return value, None
 
 
 def _validate_recovery_limits(max_attempts, max_wall_seconds):
@@ -386,7 +407,7 @@ def _reuse_audit(store, probe, *, outcome: str, reason: str,
 
 def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
                reviewer=None, client_family=None, intent_client_family=None,
-               cancel=None):
+               cancel=None, batch_target_bytes=None):
     """Return a reused verdict or a diagnostic to prefix to a fresh review."""
     from . import reuse
     if not reuse_trusted:
@@ -415,6 +436,10 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
 
         root = _repo_root(Path(repo))
         cfg = load_config(root)
+        if batch_target_bytes is not None:
+            from dataclasses import replace
+            cfg = replace(cfg, defaults=replace(
+                cfg.defaults, batch_target_bytes=batch_target_bytes))
         result = reuse.probe(
             store, root, cfg=cfg, client_family=client_family,
             intent_client_family=intent_client_family)
@@ -520,11 +545,20 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         reviewer=None, client_family=None, recover=False,
                         max_attempts=None, max_wall_seconds=None,
                         reuse_trusted=False, fresh=False,
-                        reuse_client_family=_REUSE_INTENT_UNSET
+                        reuse_client_family=_REUSE_INTENT_UNSET,
+                        batch_target_bytes=None
                         ) -> tuple[int, str, dict]:
     """Shared review surface plus recovery metadata for MCP structured output."""
     import threading
     import time
+
+    batch_target_bytes, target_reason = _validate_batch_target(
+        batch_target_bytes)
+    if target_reason:
+        from .trust import banner_failure
+        return 2, banner_failure(target_reason), {
+            "telemetry": {"batch_target_bytes": batch_target_bytes,
+                           "validation_error": target_reason}}
 
     if recover:
         max_attempts, wall_seconds, reason = _validate_recovery_limits(
@@ -540,7 +574,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         intent_client_family=(client_family
                               if reuse_client_family is _REUSE_INTENT_UNSET
                               else reuse_client_family),
-        cancel=cancel)
+        cancel=cancel, batch_target_bytes=batch_target_bytes)
     if reuse_result is not None:
         return (*reuse_result, reuse_metadata)
     if not recover:
@@ -555,7 +589,8 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             store, repo, progress_sink=progress_sink, cancel=cancel,
             reviewer=reviewer, client_family=client_family,
             resume_checkpoints=(not fresh and reviewer is None
-                                and intent_family is None))
+                                and intent_family is None),
+            batch_target_bytes=batch_target_bytes)
         if reuse_note:
             text = f"{reuse_note}\n{text}"
         return status, text, reuse_metadata
@@ -656,7 +691,8 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             # but the bounded recovery contract has always promised fresh
             # records and provider diversity; reusing a partial batch here
             # would silently turn a retry into the same interrupted run.
-            resume_checkpoints=False)
+            resume_checkpoints=False,
+            batch_target_bytes=batch_target_bytes)
         try:
             last_rec, review_id = _annotate_recovery_attempt(
                 store, last_text, orchestration_id, ordinal)
@@ -759,13 +795,15 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
                reviewer=None, client_family=None, recover=False,
                max_attempts=None, max_wall_seconds=None,
                reuse_trusted=False, fresh=False,
-               reuse_client_family=_REUSE_INTENT_UNSET) -> tuple[int, str]:
+               reuse_client_family=_REUSE_INTENT_UNSET,
+               batch_target_bytes=None) -> tuple[int, str]:
     status, text, _ = svc_review_detailed(
         store, repo, progress_sink=progress_sink, cancel=cancel,
         reviewer=reviewer, client_family=client_family, recover=recover,
         max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
         reuse_trusted=reuse_trusted, fresh=fresh,
-        reuse_client_family=reuse_client_family)
+        reuse_client_family=reuse_client_family,
+        batch_target_bytes=batch_target_bytes)
     return status, text
 
 
@@ -1378,6 +1416,15 @@ def format_status_line(rec: dict, *, now: float | None = None,
                       _status_field("gate_reason", projection.gate_reason),
                       _status_field("completed_passes", projection.completed_passes),
                       _status_field("planned_passes", projection.planned_passes)))
+        if projection.prompt_bytes is not None:
+            parts.append(_status_field("prompt_bytes", projection.prompt_bytes))
+        if projection.batch_count:
+            parts.append(_status_field("batch_count", projection.batch_count))
+            parts.append(_status_field("failed_passes", projection.failed_passes))
+        if projection.planner_version:
+            parts.append(_status_field("planner", projection.planner_version))
+        if projection.boundary_digest:
+            parts.append(_status_field("boundary_digest", projection.boundary_digest))
     return " ".join(parts)
 
 

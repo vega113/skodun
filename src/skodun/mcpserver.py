@@ -648,6 +648,10 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
     fresh, refusal = _bool_arg(call.params, "fresh", "review")
     if refusal:
         return _review_result(2, refusal)
+    batch_target_bytes, refusal = _int_arg(
+        call.params, "batch_target_bytes", "review")
+    if refusal:
+        return _review_result(2, refusal)
     with call.store_factory() as store:
         if recover:
             status, text, metadata = services.svc_review_detailed(
@@ -656,6 +660,7 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
                 max_attempts=max_attempts,
                 max_wall_seconds=max_wall_seconds,
                 reuse_trusted=reuse_trusted, fresh=fresh,
+                batch_target_bytes=batch_target_bytes,
                 reuse_client_family=(
                     family if call.params.get("client_family") is not None
                     else None))
@@ -663,7 +668,7 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
             status, text, metadata = services.svc_review_detailed(
                 store, repo, cancel=call.cancel, reviewer=reviewer,
                 client_family=family, reuse_trusted=reuse_trusted,
-                fresh=fresh,
+                fresh=fresh, batch_target_bytes=batch_target_bytes,
                 reuse_client_family=(
                     family if call.params.get("client_family") is not None
                     else None))
@@ -671,7 +676,7 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
             status, text = services.svc_review(
                 store, repo, cancel=call.cancel, reviewer=reviewer,
                 client_family=family, reuse_trusted=reuse_trusted,
-                fresh=fresh,
+                fresh=fresh, batch_target_bytes=batch_target_bytes,
                 reuse_client_family=(
                     family if call.params.get("client_family") is not None
                     else None))
@@ -1052,6 +1057,11 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                     "description": "run wholly fresh, bypassing trusted reuse "
                                    "and incomplete batch checkpoints; useful "
                                    "for a second opinion"},
+                "batch_target_bytes": {
+                    "type": "integer", "minimum": 0,
+                    "description": "optional non-negative deterministic "
+                                   "per-batch diff target; zero selects the "
+                                   "configured/default planner"},
             }),
             handler=_handle_review,
             description="Review the outgoing change NOW, in the foreground, and "

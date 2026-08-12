@@ -32,6 +32,10 @@ class CoverageProjection:
     finder_only: bool
     cross_provider_complete: bool
     refuter_annotation_available: bool
+    batch_count: int = 0
+    prompt_bytes: int | None = None
+    planner_version: str | None = None
+    boundary_digest: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -47,12 +51,23 @@ class CoverageProjection:
             "finder_only": self.finder_only,
             "cross_provider_complete": self.cross_provider_complete,
             "refuter_annotation_available": self.refuter_annotation_available,
+            "batch_count": self.batch_count,
+            "prompt_bytes": self.prompt_bytes,
+            "planner_version": self.planner_version,
+            "boundary_digest": self.boundary_digest,
         }
 
 
 def _pass_state(value: object, default: str = "not_planned") -> str:
     state = value if isinstance(value, str) else default
     return state if state in PASS_STATES else "failed"
+
+
+def _nonnegative_int(value: object) -> int | None:
+    """Accept only persisted non-negative integers, excluding booleans."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
@@ -109,6 +124,35 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
     finder_only = (orchestration_state is None and passes["integration"] == "not_planned")
     refuter_available = passes["refuter"] in {"complete", "degraded"}
     cross_provider = passes["integration"] == "complete"
-    return CoverageProjection(coverage_state, parseable, eligible, reason,
-                              planned, completed, failed, next_pass, passes,
-                              finder_only, cross_provider, refuter_available)
+    telemetry_rows = [b.get("telemetry") for b in (batches or [])
+                      if isinstance(b, Mapping) and
+                      isinstance(b.get("telemetry"), Mapping)]
+    prompt_values = []
+    for row in telemetry_rows:
+        dimensions = row.get("bytes")
+        if not isinstance(dimensions, Mapping):
+            continue
+        value = _nonnegative_int(dimensions.get("prompt"))
+        if value is not None:
+            prompt_values.append(value)
+    prompt_bytes = sum(prompt_values) if prompt_values else None
+    first = telemetry_rows[0] if telemetry_rows else {}
+    plan = rec.get("batch_plan")
+    plan = plan if isinstance(plan, Mapping) else {}
+    planner_version = plan.get("planner_version")
+    if not isinstance(planner_version, str):
+        planner_version = first.get("planner_version")
+    boundary_digest = plan.get("boundary_digest")
+    if not isinstance(boundary_digest, str):
+        boundary_digest = first.get("boundary_digest")
+    return CoverageProjection(
+        coverage_state, parseable, eligible, reason,
+        planned, completed, failed, next_pass, passes,
+        finder_only, cross_provider, refuter_available,
+        batch_count=batch_count,
+        prompt_bytes=prompt_bytes,
+        planner_version=(planner_version if isinstance(planner_version, str)
+                         else None),
+        boundary_digest=(boundary_digest if isinstance(boundary_digest, str)
+                         else None),
+    )
