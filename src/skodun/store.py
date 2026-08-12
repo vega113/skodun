@@ -1915,19 +1915,17 @@ class Store:
             merged["superseded_by"] = row["superseded_by"]
             merged = _normalize_record(merged, label="finalize_review")
             batch_orchestration_id = merged.get("batch_orchestration_id")
-            incomplete_cancel = (
+            incomplete_failure = (
                 batch_orchestration_id is not None
                 and merged.get("status") == "failed"
-                and merged.get("degraded") is True
-                and "cancelled" in str(
-                    merged.get("failure_reason") or "").lower())
+                and merged.get("degraded") is True)
             complete_checkpoint = batch_orchestration_id is None
             if batch_orchestration_id is not None:
                 batch_orchestration_id = _require_text(
                     "batch_orchestration_id", batch_orchestration_id)
                 batch_identity_digest = _require_text(
                     "batch_identity_digest", merged.get("batch_identity_digest"))
-                if not incomplete_cancel:
+                if not incomplete_failure:
                     self._require_complete_orchestration(
                         batch_orchestration_id, batch_identity_digest)
                     complete_checkpoint = True

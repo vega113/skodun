@@ -362,7 +362,12 @@ def test_incomplete_checkpoint_finalization_rolls_back_the_review_write(tmp_path
         assert store.get_orchestration("orch-1")["state"] == "active"
 
 
-def test_cancelled_incomplete_prepush_finalization_is_untrustworthy(tmp_path):
+@pytest.mark.parametrize("reason", [
+    "cancelled: before it was recorded",
+    "batch 2 failed: provider unavailable",
+])
+def test_incomplete_degraded_prepush_finalization_is_untrustworthy(
+        tmp_path, reason):
     with Store.open(tmp_path / "s.db") as store:
         _created(store)
         # A pre-push reservation row is the existing running review. This
@@ -373,8 +378,7 @@ def test_cancelled_incomplete_prepush_finalization_is_untrustworthy(tmp_path):
             100, {}, repo="repo-1", now=NOW)
         rec = store.get_review(reservation.record_id)
         rec.update(status="failed", degraded=True,
-                   degraded_reason="cancelled: before it was recorded",
-                   failure_reason="cancelled: before it was recorded")
+                   degraded_reason=reason, failure_reason=reason)
         rec["batch_orchestration_id"] = "orch-1"
         rec["batch_identity_digest"] = _identity().digest()
         assert store.finalize_review(reservation.record_id, rec) is True
