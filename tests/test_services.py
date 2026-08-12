@@ -335,6 +335,48 @@ def test_recovery_reuses_one_parsed_stack_request_but_passes_it_to_each_run(
         "status": "ignored", "reason_code": "malformed_json"}
 
 
+def test_recovery_does_not_render_prior_stack_after_unpersisted_attempt(
+        tmp_path, monkeypatch):
+    from skodun import stack
+    from skodun.trust import banner, banner_failure
+
+    request = stack.StackRequest(
+        supplied=True, manifest=None,
+        problem=stack.StackProblem("malformed_json", "JSONDecodeError"))
+    identity_fields = {
+        "repo_id": "repo", "worktree_root": "worktree", "branch": "feat",
+        "head": "h", "base_sha": "s", "diff_hash": "d"}
+    first = _artifact([], review_id="stack-first", degraded=True,
+                      trustworthy=False, status="degraded",
+                      attempts=[{"provider": "xai"}], **identity_fields)
+    monkeypatch.setattr(stack, "load_request", lambda path: request)
+    monkeypatch.setattr(
+        services, "_recovery_identity",
+        lambda repo: ("repo", "worktree", "feat", "h", "s", "d"))
+    calls = 0
+
+    def fake_once(store, repo, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            kwargs["result_metadata"]["stack"] = {
+                "status": "ignored", "reason_code": "malformed_json"}
+            store.save_review(first)
+            return 4, banner(first)
+        return 2, banner_failure("preflight refusal")
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "stack-recovery-refusal.db") as store:
+        status, text, metadata = services.svc_review_detailed(
+            store, tmp_path, stack_manifest=tmp_path / "stack.json",
+            recover=True, max_attempts=2, max_wall_seconds=30)
+
+    assert status == 4
+    assert "SKODUN STACK:" not in text
+    assert "SKODUN RECOVERY:" in text
+    assert "stack" not in metadata
+
+
 def test_opt_in_reuse_honors_cancellation_before_and_during_a_probe(
         tmp_path, monkeypatch):
     cancel = threading.Event()

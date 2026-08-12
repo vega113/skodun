@@ -707,6 +707,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             break
 
         attempt_count += 1
+        attempt_metadata = {}
         last_status, last_text = _svc_review_once(
             store, repo, progress_sink=progress_sink, cancel=request_cancel,
             reviewer=reviewer, client_family=client_family,
@@ -718,7 +719,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             # records and provider diversity; reusing a partial batch here
             # would silently turn a retry into the same interrupted run.
             resume_checkpoints=False, batch_target_bytes=batch_target_bytes,
-            stack_request=stack_request, result_metadata=result_metadata)
+            result_metadata=attempt_metadata)
         try:
             last_rec, review_id = _annotate_recovery_attempt(
                 store, last_text, orchestration_id, ordinal)
@@ -727,6 +728,11 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         except BaseException as e:
             terminal_reason = f"could not persist recovery metadata: {e!r}"
             break
+        # Keep only metadata belonging to the persisted terminal attempt. A
+        # preflight refusal or lock timeout may leave no record at all; in that
+        # case a prior attempt's stack projection must not be rendered beside
+        # the later failure banner.
+        result_metadata = attempt_metadata if last_rec is not None else {}
         if review_id is not None:
             review_ids.append(review_id)
         if last_rec is None:

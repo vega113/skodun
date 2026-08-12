@@ -969,6 +969,8 @@ def test_canonical_repository_identity_normalizes_supported_remotes(
     "https://example.com/acme/../project.git",
     "https://example.com/acme/project.git?token=secret",
     "https://example.com/acme/project.git#fragment",
+    "https://example.com/acme/project.git\n",
+    "https://example.com/acme/project.git\r",
     "https://example.com/acme/control\x01project.git",
     "https://example.com/acme/%2Fproject.git",
     "https://example.com/acme/%2e%2e/project.git",

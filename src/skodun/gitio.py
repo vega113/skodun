@@ -654,11 +654,14 @@ def _portable_remote_identity(remote: str) -> str | None:
 
 def canonical_repository_identity(repo: Path) -> str | None:
     """Return ``host/path`` for the repository's portable ``origin`` URL."""
-    result = _run(Path(repo), "config", "--get", "remote.origin.url",
+    result = _run(Path(repo), "config", "--null", "--get", "remote.origin.url",
                   ok_codes=(0, 1))
     if result.returncode != 0:
         return None
-    remote = result.stdout.decode("utf-8", "strict").rstrip("\r\n")
+    raw = result.stdout
+    if raw.count(b"\0") != 1 or not raw.endswith(b"\0"):
+        return None
+    remote = raw[:-1].decode("utf-8", "strict")
     return _portable_remote_identity(remote)
 
 
