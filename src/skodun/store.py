@@ -1068,6 +1068,67 @@ class Store:
     def save_review(self, rec: dict) -> None:
         self._write_review(_normalize_record(rec, label="save_review"))
 
+    def save_checkpointed_review(self, rec: dict) -> None:
+        """Atomically publish a final review and consume its checkpoints.
+
+        No review row can become coverage-bearing while its orchestration is
+        still incomplete, and no completed orchestration can point at a review
+        write that rolled back.  This is the foreground counterpart of the
+        checkpoint-aware branch inside `finalize_review`.
+        """
+        normalized = _normalize_record(rec, label="save_checkpointed_review")
+        orchestration_id = _require_text(
+            "batch_orchestration_id", normalized.get("batch_orchestration_id"))
+        identity_digest = _require_text(
+            "batch_identity_digest", normalized.get("batch_identity_digest"))
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_complete_orchestration(
+                orchestration_id, identity_digest)
+            self._write_review(normalized)
+            self._consume_orchestration_in_transaction(
+                orchestration_id, normalized["id"], _iso_now())
+            self._c.execute("COMMIT")
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except BaseException:
+                pass
+            raise
+
+    def _require_complete_orchestration(self, orchestration_id: str,
+                                        identity_digest: str) -> None:
+        row = self._c.execute(
+            "SELECT state, identity_digest FROM review_orchestrations WHERE id=?",
+            (orchestration_id,)).fetchone()
+        if row is None:
+            raise ValueError(
+                f"batch orchestration {orchestration_id!r} does not exist")
+        if row["identity_digest"] != identity_digest:
+            raise ValueError("batch orchestration identity digest changed")
+        if row["state"] not in ("active", "cancelled", "failed", "complete"):
+            raise ValueError(
+                f"batch orchestration is {row['state']!r}, not finalizable")
+        counts = self._c.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN state='complete' THEN 1 ELSE 0 END) AS done
+                 FROM review_checkpoints WHERE orchestration_id=?""",
+            (orchestration_id,)).fetchone()
+        if (counts is None or int(counts["total"] or 0) == 0
+                or int(counts["done"] or 0) != int(counts["total"])):
+            raise ValueError("batch orchestration has incomplete checkpoints")
+
+    def _consume_orchestration_in_transaction(
+            self, orchestration_id: str, final_review_id: str, at: str) -> None:
+        cur = self._c.execute(
+            """UPDATE review_orchestrations
+                  SET state='consumed', final_review_id=?, updated_at=?
+                WHERE id=? AND state IN
+                  ('active','cancelled','failed','complete')""",
+            (final_review_id, at, orchestration_id))
+        if cur.rowcount != 1:
+            raise ValueError("batch orchestration could not be consumed")
+
     def _write_review(self, rec: Mapping) -> None:
         """Upsert an ALREADY-normalized record. Never call with a raw dict.
 
@@ -1833,9 +1894,20 @@ class Store:
             merged["pid"] = row["pid"]
             merged["superseded_by"] = row["superseded_by"]
             merged = _normalize_record(merged, label="finalize_review")
+            batch_orchestration_id = merged.get("batch_orchestration_id")
+            if batch_orchestration_id is not None:
+                batch_orchestration_id = _require_text(
+                    "batch_orchestration_id", batch_orchestration_id)
+                batch_identity_digest = _require_text(
+                    "batch_identity_digest", merged.get("batch_identity_digest"))
+                self._require_complete_orchestration(
+                    batch_orchestration_id, batch_identity_digest)
             cur = self._c.execute(
                 _FINALIZE_REVIEW, _review_values(merged) + (record_id,))
             applied = cur.rowcount == 1
+            if applied and batch_orchestration_id is not None:
+                self._consume_orchestration_in_transaction(
+                    batch_orchestration_id, record_id, _iso_now())
             self._c.execute("COMMIT")
             return applied
         except BaseException:

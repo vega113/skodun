@@ -291,3 +291,54 @@ def test_orchestration_is_consumed_only_after_every_pass_is_complete(tmp_path):
         row = store.get_orchestration("orch-1")
     assert row["state"] == "consumed"
     assert row["final_review_id"] == "sk-final"
+
+
+def _review(review_id="sk-final"):
+    return {
+        "id": review_id, "reviewed_at": NOW, "branch": "feature",
+        "head": "h" * 40, "base_ref": "origin/main",
+        "base_sha": "b" * 40, "diff_hash": "d" * 40,
+        "context_hash": "c" * 64, "mode": "now", "model": "grok",
+        "adapter": "grok", "status": "clean", "parse_ok": True,
+        "degraded": False, "diff_truncated": False, "stop_reason": "EndTurn",
+        "findings_total": 0, "severity": {
+            "high": 0, "medium": 0, "low": 0},
+        "summary": "clean", "findings": [],
+        "batch_orchestration_id": "orch-1",
+        "batch_identity_digest": _identity().digest(),
+    }
+
+
+def _complete_all(store):
+    payload = checkpoints.CheckpointPayload.from_mapping(_payload())
+    for identity in _identity().pass_identities:
+        if identity.prompt_hash is None:
+            identity = replace(identity, prompt_hash="z" * 64)
+        claim = store.claim_checkpoint(
+            "orch-1", identity, owner="worker", now=NOW,
+            lease_expires_at=LATER)
+        assert store.complete_checkpoint(
+            "orch-1", identity.kind, identity.index, owner="worker",
+            claim_token=claim["claim_token"], fence=claim["fence"],
+            payload=payload, completed_at=NOW)
+
+
+def test_incomplete_checkpoint_finalization_rolls_back_the_review_write(tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store)
+        with pytest.raises(ValueError, match="incomplete checkpoints"):
+            store.save_checkpointed_review(_review())
+        assert store.get_review("sk-final") is None
+        assert store.get_orchestration("orch-1")["state"] == "active"
+
+
+def test_final_review_and_checkpoint_consumption_commit_together(tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store)
+        _complete_all(store)
+        store.save_checkpointed_review(_review())
+        review = store.get_review("sk-final")
+        orchestration = store.get_orchestration("orch-1")
+    assert review["trustworthy"] is True
+    assert orchestration["state"] == "consumed"
+    assert orchestration["final_review_id"] == "sk-final"

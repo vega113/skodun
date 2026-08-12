@@ -145,6 +145,28 @@ class OrchestrationIdentity:
     def digest(self) -> str:
         return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
 
+    @classmethod
+    def from_json(cls, text: str) -> "OrchestrationIdentity":
+        try:
+            raw = json.loads(text)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid orchestration identity JSON: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ValueError("orchestration identity JSON must be an object")
+        expected = set(_IDENTITY_FIELDS)
+        if set(raw) != expected:
+            raise ValueError(
+                "orchestration identity fields differ: "
+                f"missing={sorted(expected - set(raw))} "
+                f"unknown={sorted(set(raw) - expected)}")
+        passes = raw.pop("pass_identities")
+        if not isinstance(passes, list):
+            raise ValueError("pass_identities must be an array")
+        raw["pass_identities"] = tuple(
+            PassIdentity(**value) if isinstance(value, dict) else value
+            for value in passes)
+        return cls(**raw)
+
 
 def first_mismatch(left: OrchestrationIdentity,
                    right: OrchestrationIdentity) -> str | None:
@@ -247,3 +269,16 @@ class CheckpointPayload:
         if not isinstance(value, dict):  # defensive against direct construction
             raise ValueError("checkpoint payload JSON must decode to an object")
         return value
+
+
+def payload_from_sub(sub: object) -> CheckpointPayload:
+    """Copy the normalized pipeline `_Sub` vocabulary through the strict door."""
+    raw = {name: getattr(sub, name) for name in _PAYLOAD_FIELDS}
+    return CheckpointPayload.from_mapping(raw)
+
+
+def sub_fields_from_payload(payload: CheckpointPayload) -> dict[str, Any]:
+    """A fresh mapping suitable for constructing pipeline `_Sub`."""
+    if not isinstance(payload, CheckpointPayload):
+        raise ValueError("payload must be a CheckpointPayload")
+    return CheckpointPayload.from_mapping(payload.as_dict()).as_dict()

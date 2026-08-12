@@ -916,6 +916,172 @@ def test_prepared_plan_builds_the_complete_checkpoint_identity(tmp_path):
     assert identity.pass_identities[-1].prompt_hash is None
 
 
+def _clean_checkpoint_sub(label: str) -> pipeline._Sub:
+    return pipeline._Sub(
+        parse_ok=True, degraded=False, degraded_reason="",
+        stop_reason="EndTurn", diff_truncated=False,
+        summary=f"clean {label}", findings=[], failure_reason="", attempts=[],
+        provenance={"provider": "xai", "model": "grok", "effort": None},
+        accepted={"adapter_name": "grok", "model": "grok",
+                  "provider": "xai", "effort": None})
+
+
+def _without_run_identity(rec: dict) -> dict:
+    """Comparable aggregate fields across two independently minted reviews."""
+    ignored = {
+        "id", "reviewed_at", "review_started_at", "review_completed_at",
+        "batch_orchestration_id", "tree_fingerprint",
+    }
+    out = {key: value for key, value in rec.items() if key not in ignored}
+    out["batches"] = [
+        {key: value for key, value in batch.items() if key != "id"}
+        for batch in out.get("batches", [])]
+    return out
+
+
+def test_cancel_after_three_batches_resumes_only_the_missing_work(
+        tmp_path, monkeypatch):
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _oversized(tmp_path, files=4)
+    cfg = load_config(repo)
+    store = _store(tmp_path)
+    cancel = threading.Event()
+    first_calls = []
+
+    def first(*_args, **kwargs):
+        label = _args[8] if len(_args) > 8 else kwargs["label"]
+        first_calls.append(label)
+        if label == "batch 3":
+            cancel.set()
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", first)
+    with pytest.raises(pipeline.ReviewCancelled):
+        pipeline.run_review(repo, cfg, store, cancel=cancel)
+
+    orchestration = store._c.execute(
+        "SELECT id FROM review_orchestrations").fetchone()
+    checkpoints = store.list_checkpoints(orchestration["id"])
+    assert first_calls == ["batch 1", "batch 2", "batch 3"]
+    assert [row["state"] for row in checkpoints] == [
+        "complete", "complete", "complete", "pending", "pending"]
+
+    resumed_calls = []
+
+    def resumed(*_args, **kwargs):
+        label = _args[8] if len(_args) > 8 else kwargs["label"]
+        resumed_calls.append(label)
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", resumed)
+    resumed_rec = pipeline.run_review(
+        repo, cfg, store, cancel=threading.Event())
+
+    assert resumed_calls == ["batch 4", "the integration pass"]
+    assert resumed_rec["trustworthy"] is True
+    consumed = store.get_orchestration(
+        resumed_rec["batch_orchestration_id"])
+    assert consumed["state"] == "consumed"
+    assert consumed["final_review_id"] == resumed_rec["id"]
+
+    fresh_calls = []
+
+    def fresh(*_args, **kwargs):
+        label = _args[8] if len(_args) > 8 else kwargs["label"]
+        fresh_calls.append(label)
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", fresh)
+    fresh_rec = pipeline.run_review(
+        repo, cfg, store, cancel=threading.Event(),
+        resume_checkpoints=False)
+    assert fresh_calls == [
+        "batch 1", "batch 2", "batch 3", "batch 4",
+        "the integration pass"]
+    assert _without_run_identity(resumed_rec) == _without_run_identity(fresh_rec)
+
+
+def test_live_racing_resumer_invokes_no_provider(tmp_path, monkeypatch):
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _oversized(tmp_path, files=4)
+    cfg = load_config(repo)
+    store = _store(tmp_path)
+    cancel = threading.Event()
+
+    def stop_after_three(*_args, **kwargs):
+        label = _args[8] if len(_args) > 8 else kwargs["label"]
+        if label == "batch 3":
+            cancel.set()
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", stop_after_three)
+    with pytest.raises(pipeline.ReviewCancelled):
+        pipeline.run_review(repo, cfg, store, cancel=cancel)
+    orchestration = store.find_resume_candidate(
+        gitio.repository_identity(repo),
+        gitio.observed_worktree_root(repo), gitio.current_branch(repo))
+    rows = store.list_checkpoints(orchestration["id"])
+    fourth = rows[3]
+    from skodun.checkpoints import PassIdentity
+    store.claim_checkpoint(
+        orchestration["id"], PassIdentity(
+            kind="batch", index=4, prompt_hash=fourth["prompt_hash"],
+            diff_hash=fourth["diff_hash"],
+            boundary_hash=fourth["boundary_hash"]),
+        owner="other-resumer", now="2026-08-12T10:00:00Z",
+        lease_expires_at="2099-08-12T10:00:00Z")
+
+    monkeypatch.setattr(
+        pipeline, "_run_sub",
+        lambda *_args, **_kwargs: pytest.fail("racing resumer invoked provider"))
+    with pytest.raises(pipeline.CheckpointInFlight, match="batch 4"):
+        pipeline.run_review(repo, cfg, store, cancel=threading.Event())
+
+
+def test_resume_mismatch_restarts_fresh_and_explains_the_first_field(
+        tmp_path, monkeypatch):
+    from dataclasses import replace as dc_replace
+
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _oversized(tmp_path, files=4)
+    cfg = load_config(repo)
+    store = _store(tmp_path)
+    cancel = threading.Event()
+
+    def stop_after_one(*_args, **kwargs):
+        label = _args[8] if len(_args) > 8 else kwargs["label"]
+        if label == "batch 1":
+            cancel.set()
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", stop_after_one)
+    with pytest.raises(pipeline.ReviewCancelled):
+        pipeline.run_review(repo, cfg, store, cancel=cancel)
+
+    changed = dc_replace(
+        cfg, defaults=dc_replace(
+            cfg.defaults, max_turns=cfg.defaults.max_turns + 1))
+    calls = []
+    progress = []
+
+    def clean(*_args, **kwargs):
+        label = _args[8] if len(_args) > 8 else kwargs["label"]
+        calls.append(label)
+        return _clean_checkpoint_sub(label)
+
+    monkeypatch.setattr(pipeline, "_run_sub", clean)
+    pipeline.run_review(
+        repo, changed, store, cancel=threading.Event(),
+        progress_sink=progress.append)
+
+    assert calls == [
+        "batch 1", "batch 2", "batch 3", "batch 4",
+        "the integration pass"]
+    assert any(
+        "checkpoint resume refused: config_hash changed" in line
+        for line in progress)
+
+
 # --------------------------------------------------------------------------
 # what each prompt is allowed to carry
 # --------------------------------------------------------------------------

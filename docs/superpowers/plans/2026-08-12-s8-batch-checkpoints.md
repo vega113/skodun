@@ -99,25 +99,25 @@ Expected: all preparation and identity tests pass.
 - Modify: `tests/test_batched_review.py`
 - Modify: `tests/test_cancellation.py`
 
-- [ ] **Step 1: Write failing shipped-path resume tests**
+- [x] **Step 1: Write failing shipped-path resume tests**
 
 Create a deterministic four-batch fixture whose cancellation fires before batch 4. Assert batches 1-3 are complete checkpoints, no checkpoint is a review, the resumed run invokes only batch 4 plus integration, and the final aggregate matches a fresh uninterrupted aggregate except permitted orchestration metadata. Add exact-mismatch refusal, live racing resumer, expired-lease reclaim, and cancellation-during-integration tests.
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run: `python3 -m pytest tests/test_batched_review.py tests/test_cancellation.py -q --tb=short -k 'resume or checkpoint or racing_resumer'`
 
 Expected: repeated provider calls or missing checkpoint APIs demonstrate the absent feature.
 
-- [ ] **Step 3: Integrate claim/reuse/complete into `_orchestrate`**
+- [x] **Step 3: Integrate claim/reuse/complete into `_orchestrate`**
 
 For each prepared pass, reuse a strictly validated complete payload or claim and run it once. On live in-flight observation, fail closed without a provider call. Release the caller's claim on cancellation/exception, retain completed payloads, and build the aggregate through the existing field/ordering logic. Revalidate full identity before final persistence.
 
-- [ ] **Step 4: Make final review persistence and orchestration consumption atomic**
+- [x] **Step 4: Make final review persistence and orchestration consumption atomic**
 
 Add a store transaction that verifies all planned checkpoints complete, conditionally finalizes the existing foreground/pre-push running row through the same normalization/identity rules, and marks the orchestration consumed. A missing/changed checkpoint or moved identity rolls back the whole transaction.
 
-- [ ] **Step 5: Run the focused tests and verify GREEN**
+- [x] **Step 5: Run the focused tests and verify GREEN**
 
 Run: `python3 -m pytest tests/test_batched_review.py tests/test_cancellation.py tests/test_checkpoints.py -q --tb=short -k 'resume or checkpoint or racing_resumer'`
 
