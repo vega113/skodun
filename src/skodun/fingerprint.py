@@ -32,6 +32,14 @@ def _claim_norm(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def _identity_field(finding: Mapping[str, Any], *names: str) -> str:
+    for name in names:
+        value = finding.get(name)
+        if value not in (None, ""):
+            return _claim_norm(value) or UNKNOWN
+    return UNKNOWN
+
+
 def _path(value: object) -> str:
     # Git paths are byte/Unicode identities.  Only normalize repository path
     # syntax; compatibility or case folding could merge distinct files.
@@ -91,7 +99,7 @@ def fingerprint_payload(finding: Mapping[str, Any]) -> dict[str, Any]:
         rename_value: Any = [_path(item) for item in rename]
     else:
         rename_value = _path(rename) if rename not in (None, "") else UNKNOWN
-    anchor = _field(finding, "symbol", "hunk_anchor", "anchor")
+    anchor = _identity_field(finding, "symbol", "hunk_anchor", "anchor")
     pass_source, claim = _source_and_claim(finding)
     scope_owner = (scope.get("owner_slice_id") or scope.get("dependency_id")
                    if isinstance(scope, Mapping) else None)
@@ -177,8 +185,13 @@ def annotate_findings(
             for old, old_review_id, old_index, old_at in prior_payloads:
                 old_payload = fingerprint_payload(old)
                 structural = ("category", "anchor", "pass_source", "mutation",
-                              "claim", "rename_ancestry")
+                              "claim")
                 if all(payload[name] == old_payload[name] for name in structural):
+                    rename_ok = payload["rename_ancestry"] == old_payload["rename_ancestry"]
+                    if not rename_ok and isinstance(payload["rename_ancestry"], list):
+                        rename_ok = old_payload["path"] in payload["rename_ancestry"]
+                    if not rename_ok:
+                        continue
                     if (payload["path"] != old_payload["path"]
                             and payload["anchor"] == UNKNOWN
                             and payload["rename_ancestry"] == UNKNOWN

@@ -32,6 +32,12 @@ def test_case_sensitive_claims_remain_distinct():
         {"file": "src/a.py", "title": "foo()"})
 
 
+def test_case_sensitive_anchors_remain_distinct():
+    assert fingerprint.finding_fingerprint(
+        {"file": "src/a.py", "title": "same", "symbol": "Foo"}) != fingerprint.finding_fingerprint(
+        {"file": "src/a.py", "title": "same", "symbol": "foo"})
+
+
 def test_unicode_path_codepoints_remain_distinct():
     assert fingerprint.finding_fingerprint(
         {"file": "src/\ufb01.py", "title": "same"}) != fingerprint.finding_fingerprint(
@@ -129,6 +135,14 @@ def test_cross_file_near_match_requires_anchor_or_rename_ancestry():
     result = fingerprint.annotate_findings(
         [{"file": "src/b.py", "title": "same"}], [old])[0]
     assert result["finding_lineage_v2"]["match_reason"] == "new"
+
+
+def test_rename_ancestry_links_to_prior_path():
+    old = {"file": "src/old.py", "title": "same", "symbol": "run"}
+    result = fingerprint.annotate_findings(
+        [{"file": "src/new.py", "title": "same", "symbol": "run",
+          "rename_ancestry": ["src/old.py"]}], [old])[0]
+    assert result["finding_lineage_v2"]["match_reason"] == "moved"
 
 
 def test_lineage_ignores_running_predecessor_rows():
