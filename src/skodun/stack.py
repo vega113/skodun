@@ -597,6 +597,47 @@ def _changed_line_map(
     return dict(evidence.changed_lines)
 
 
+def _status_for_path(evidence: SliceEvidence, path: str) -> str | None:
+    return dict(evidence.statuses).get(path)
+
+
+def _dependency_coordinates_stable(
+    path: str,
+    evidence_index: int,
+    evidence_set: tuple[SliceEvidence, ...],
+    finding_line: int,
+) -> bool:
+    """Return whether a dependency's post-image line numbers remain final.
+
+    Dependency evidence is captured against that slice's post-image, while a
+    provider finding is anchored to the final reviewed tree.  We do not retain
+    enough raw patch data to translate arbitrary historical coordinates here,
+    so any later change to the same path keeps a line-scoped dependency
+    attribution explicitly uncertain.  Unchanged paths remain coordinate
+    stable, and this conservative boundary never turns a coincidental line
+    number into trusted lineage.
+    """
+    for later in evidence_set[evidence_index + 1:]:
+        if path not in later.files:
+            continue
+        if path in later.uncertain_files:
+            return False
+        later_ranges = _changed_line_map(later).get(path, ())
+        if any(start <= finding_line for start, _end in later_ranges):
+            return False
+    return True
+
+
+def _dependency_file_scope_stable(
+    path: str,
+    evidence_index: int,
+    evidence_set: tuple[SliceEvidence, ...],
+) -> bool:
+    """Return whether a dependency's unanchored file scope stays present."""
+    return all(path not in later.files
+               for later in evidence_set[evidence_index + 1:])
+
+
 def _scope_is_reachable(scope: OwnershipScope, evidence: SliceEvidence) -> bool:
     matched_paths = [
         path for path in evidence.files if _scope_path_matches(scope, path)
@@ -632,9 +673,21 @@ def _slice_evidence(item: StackSlice, diff: object) -> SliceEvidence:
         path = batching.file_of(section)
         added_lines: list[int] = []
         new_line: int | None = None
+        change_run_has_change = False
+        change_run_has_addition = False
+
+        def finish_change_run() -> None:
+            nonlocal change_run_has_change, change_run_has_addition
+            if (change_run_has_change and not change_run_has_addition
+                    and path):
+                uncertain.add(path)
+            change_run_has_change = False
+            change_run_has_addition = False
+
         for line in section:
             match = _HUNK_RANGE.match(line)
             if match is not None:
+                finish_change_run()
                 start = int(match.group("start"))
                 new_line = start
                 continue
@@ -644,10 +697,15 @@ def _slice_evidence(item: StackSlice, diff: object) -> SliceEvidence:
             if prefix == b"+":
                 added_lines.append(new_line)
                 new_line += 1
+                change_run_has_change = True
+                change_run_has_addition = True
             elif prefix == b"-":
+                change_run_has_change = True
                 continue
             elif prefix == b" ":
+                finish_change_run()
                 new_line += 1
+        finish_change_run()
         ranges: list[tuple[int, int]] = []
         for line_number in sorted(set(added_lines)):
             if ranges and line_number == ranges[-1][1] + 1:
@@ -906,11 +964,83 @@ def classify_findings(
                     scope.exclusive or bool(previous and previous[2]),
                 )
             owner_matches = list(stack_owners.values())
-            uncertain_path = any(
+            finding_line = finding.get("line")
+            evidence_set = (*result.dependencies,
+                            *((result.current_slice,) if
+                              result.current_slice is not None else ()))
+            evidence_positions = {
+                id(evidence): index
+                for index, evidence in enumerate(evidence_set)
+            }
+            shifted_dependency_uncertain = any(
+                type(finding_line) is int
+                and
+                scope.line_start is not None
+                and _scope_path_matches(scope, path)
+                and not _dependency_coordinates_stable(
+                    path, index, evidence_set, finding_line)
+                for index, evidence in enumerate(result.dependencies)
+                for scope in evidence.slice.ownership
+            )
+            matching_shifted_dependency_uncertain = any(
+                kind == "inherited_dependency"
+                and scope.line_start is not None
+                and not _dependency_coordinates_stable(
+                    path, evidence_positions[id(evidence)], evidence_set,
+                    finding_line)
+                for kind, evidence, scope in stack_matches
+            )
+            dependency_coordinates_uncertain = any(
+                kind == "inherited_dependency"
+                and scope.line_start is not None
+                and type(finding_line) is int
+                and not _dependency_coordinates_stable(
+                    path, evidence_positions[id(evidence)], evidence_set,
+                    finding_line)
+                for kind, evidence, scope in stack_matches
+            )
+            hard_status_uncertain = any(
+                _status_for_path(evidence, path) in {"R", "C", "D"}
+                for evidence in evidence_set
+            )
+            current_exact_match = any(
+                kind == "current_slice"
+                and (_status_for_path(evidence, path) not in {"R", "C", "D"})
+                and (((scope.line_start is None and scope.symbol is None)
+                      and bool(_changed_line_map(evidence).get(path)))
+                     or (scope.line_start is not None
+                         and type(finding_line) is int
+                         and any(start <= finding_line <= end
+                                 for start, end in _changed_line_map(evidence)
+                                 .get(path, ()))))
+                for kind, evidence, scope in stack_matches
+            )
+            exact_unanchored_match = any(
+                scope.line_start is None
+                and scope.symbol is None
+                and _status_for_path(evidence, path) not in {"R", "C", "D"}
+                and bool(_changed_line_map(evidence).get(path))
+                and (kind == "current_slice"
+                     or _dependency_file_scope_stable(
+                         path, evidence_positions[id(evidence)], evidence_set))
+                for kind, evidence, scope in stack_matches
+            )
+            uncertainty_is_relevant = not (
+                current_exact_match or exact_unanchored_match)
+            uncertain_path = False if not uncertainty_is_relevant else any(
                 path in evidence.uncertain_files
-                for evidence in (*result.dependencies,
-                                 *((result.current_slice,) if
-                                   result.current_slice is not None else ())))
+                and (type(finding_line) is not int
+                     or not any(start <= finding_line <= end
+                                for start, end in _changed_line_map(evidence)
+                                .get(path, ())))
+                for evidence in evidence_set)
+            if dependency_coordinates_uncertain:
+                uncertain_path = uncertain_path or dependency_coordinates_uncertain
+            if ((shifted_dependency_uncertain and
+                 (not current_exact_match
+                  or matching_shifted_dependency_uncertain))
+                    or hard_status_uncertain):
+                uncertain_path = True
 
             if uncertain_path:
                 attribution = _attribution("unknown", "uncertain_git_mapping")
