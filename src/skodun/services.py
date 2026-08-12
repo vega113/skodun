@@ -176,8 +176,8 @@ def svc_review_readiness(store, repo, *, reviewer=None, client_family=None,
 def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
                      reviewer=None, client_family=None,
                      avoid_providers=None,
-                     resume_checkpoints=True,
-                     batch_target_bytes=None) -> tuple[int, str]:
+                     resume_checkpoints=True, batch_target_bytes=None,
+                     stack_request=None, result_metadata=None) -> tuple[int, str]:
     """Run one foreground review. `(code, banner)`. Exit codes, and why:
 
       0  trustworthy and clean            3  gave up waiting for the lock
@@ -281,7 +281,9 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
                          cancel=cancel, reviewer=reviewer,
                          client_family=client_family,
                          avoid_providers=avoid_providers,
-                         resume_checkpoints=resume_checkpoints)
+                         resume_checkpoints=resume_checkpoints,
+                         stack_request=stack_request,
+                         result_metadata=result_metadata)
     except PreflightRefused as e:
         return 2, banner_failure(str(e))
     except LockTimeout as e:
@@ -312,7 +314,11 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
         # Anything else: the review did not complete, so it certifies nothing.
         return 4, banner_failure(f"the review failed: {e!r}")
 
-    # The verdict, rendered from the PERSISTED record and nothing recomputed.
+    # The verdict and optional stack projection are derived from the PERSISTED
+    # record. The caller owns presentation so the verdict remains the final
+    # line on both CLI and MCP surfaces.
+    if result_metadata is not None and isinstance(rec.get("stack"), dict):
+        result_metadata["stack"] = dict(rec["stack"])
     text = banner(rec)
     if rec.get("trustworthy") is not True:
         return 4, text
@@ -407,11 +413,17 @@ def _reuse_audit(store, probe, *, outcome: str, reason: str,
 
 def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
                reviewer=None, client_family=None, intent_client_family=None,
-               cancel=None, batch_target_bytes=None):
+               cancel=None, batch_target_bytes=None, bypass_reason=None):
     """Return a reused verdict or a diagnostic to prefix to a fresh review."""
     from . import reuse
     if not reuse_trusted:
         return None, None, {}
+    if bypass_reason is not None:
+        reason = bypass_reason
+        _reuse_audit(store, None, outcome="bypass", reason=reason,
+                     reviewer=reviewer, client_family=client_family)
+        return None, f"SKODUN REUSE: bypass reason={reason}", {
+            "reuse": {"hit": False, "reason": reason}}
     if fresh:
         reason = "explicit fresh requested"
         _reuse_audit(store, None, outcome="bypass", reason=reason,
@@ -546,7 +558,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         max_attempts=None, max_wall_seconds=None,
                         reuse_trusted=False, fresh=False,
                         reuse_client_family=_REUSE_INTENT_UNSET,
-                        batch_target_bytes=None
+                        batch_target_bytes=None, stack_manifest=None
                         ) -> tuple[int, str, dict]:
     """Shared review surface plus recovery metadata for MCP structured output."""
     import threading
@@ -568,13 +580,21 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             return 2, banner_failure(reason), {
                 "recovery": {"terminal_reason": reason}}
 
+    stack_request = None
+    if stack_manifest is not None:
+        from . import stack
+        stack_request = stack.load_request(stack_manifest)
+
     reuse_result, reuse_note, reuse_metadata = _try_reuse(
         store, repo, reuse_trusted=reuse_trusted, fresh=fresh,
         reviewer=reviewer, client_family=client_family,
         intent_client_family=(client_family
                               if reuse_client_family is _REUSE_INTENT_UNSET
                               else reuse_client_family),
-        cancel=cancel, batch_target_bytes=batch_target_bytes)
+        cancel=cancel, batch_target_bytes=batch_target_bytes,
+        bypass_reason=(
+            "stack_attribution_requested" if stack_request is not None
+            else None))
     if reuse_result is not None:
         return (*reuse_result, reuse_metadata)
     if not recover:
@@ -590,10 +610,15 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             reviewer=reviewer, client_family=client_family,
             resume_checkpoints=(not fresh and reviewer is None
                                 and intent_family is None),
-            batch_target_bytes=batch_target_bytes)
+            batch_target_bytes=batch_target_bytes,
+            stack_request=stack_request, result_metadata=(result_metadata := {}))
+        if "stack" in result_metadata:
+            from .stack import render_projection
+            stack_line = render_projection(result_metadata["stack"])
+            text = f"{stack_line}\n{text}"
         if reuse_note:
             text = f"{reuse_note}\n{text}"
-        return status, text, reuse_metadata
+        return status, text, {**reuse_metadata, **result_metadata}
 
     from . import ids
     from .store import RUNNING
@@ -658,6 +683,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
     last_status, last_text = 4, banner_failure("no review was recorded")
     last_rec: dict | None = None
     terminal_reason = ""
+    result_metadata = {}
     for ordinal in range(max_attempts):
         reason = cancellation_reason()
         if reason is not None:
@@ -691,8 +717,8 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             # but the bounded recovery contract has always promised fresh
             # records and provider diversity; reusing a partial batch here
             # would silently turn a retry into the same interrupted run.
-            resume_checkpoints=False,
-            batch_target_bytes=batch_target_bytes)
+            resume_checkpoints=False, batch_target_bytes=batch_target_bytes,
+            stack_request=stack_request, result_metadata=result_metadata)
         try:
             last_rec, review_id = _annotate_recovery_attempt(
                 store, last_text, orchestration_id, ordinal)
@@ -782,8 +808,11 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
     }}
     if reuse_note:
         prefix = f"{reuse_note}\n{prefix}"
+    if "stack" in result_metadata:
+        from .stack import render_projection
+        prefix = f"{render_projection(result_metadata['stack'])}\n{prefix}"
     return last_status, f"{prefix}\n{last_text}", {
-        **reuse_metadata, **metadata}
+        **reuse_metadata, **metadata, **result_metadata}
 
 
 def _render_review_banner(rec: dict) -> str:
@@ -796,14 +825,14 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
                max_attempts=None, max_wall_seconds=None,
                reuse_trusted=False, fresh=False,
                reuse_client_family=_REUSE_INTENT_UNSET,
-               batch_target_bytes=None) -> tuple[int, str]:
+               batch_target_bytes=None, stack_manifest=None) -> tuple[int, str]:
     status, text, _ = svc_review_detailed(
         store, repo, progress_sink=progress_sink, cancel=cancel,
         reviewer=reviewer, client_family=client_family, recover=recover,
         max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
         reuse_trusted=reuse_trusted, fresh=fresh,
         reuse_client_family=reuse_client_family,
-        batch_target_bytes=batch_target_bytes)
+        batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest)
     return status, text
 
 

@@ -197,6 +197,138 @@ def test_inferred_client_family_keeps_checkpoint_resume_enabled(
         services.svc_review_detailed(
             store, tmp_path, client_family="xai", reuse_client_family=None)
     assert seen == [True]
+def test_stack_manifest_is_loaded_once_projected_and_bypasses_trusted_reuse(
+        tmp_path, monkeypatch):
+    from skodun import stack
+
+    request = stack.StackRequest(
+        supplied=True, manifest=None,
+        problem=stack.StackProblem("malformed_json", "JSONDecodeError"))
+    loads = []
+    seen = []
+    monkeypatch.setattr(
+        stack, "load_request",
+        lambda path: loads.append(Path(path)) or request)
+    monkeypatch.setattr(
+        reuse, "probe",
+        lambda *args, **kwargs: pytest.fail("stack attribution reused an old review"))
+
+    def fake_once(store, repo, **kwargs):
+        seen.append(kwargs["stack_request"])
+        kwargs["result_metadata"]["stack"] = {
+            "schema_version": None,
+            "status": "ignored",
+            "reason_code": "malformed_json",
+            "repository_id": None,
+            "manifest_digest": None,
+            "current_slice_id": None,
+            "direct_parent": None,
+            "dependency_count": 0,
+            "downstream_owner_count": 0,
+        }
+        return 0, "SKODUN VERDICT: trustworthy=true findings=0"
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    manifest_path = tmp_path / "stack.json"
+    with Store.open(tmp_path / "stack.db") as store:
+        status, text, metadata = services.svc_review_detailed(
+            store, tmp_path, stack_manifest=manifest_path,
+            reuse_trusted=True)
+        events = store.reuse_events()
+
+    assert status == 0
+    assert loads == [manifest_path]
+    assert seen == [request]
+    assert text.splitlines() == [
+        "SKODUN REUSE: bypass reason=stack_attribution_requested",
+        "SKODUN STACK: status=ignored reason=malformed_json",
+        "SKODUN VERDICT: trustworthy=true findings=0",
+    ]
+    assert metadata["stack"]["reason_code"] == "malformed_json"
+    assert metadata["reuse"] == {
+        "hit": False, "reason": "stack_attribution_requested"}
+    assert events[0]["outcome"] == "bypass"
+    assert events[0]["reason"] == "stack_attribution_requested"
+
+
+def test_valid_stack_projection_comes_from_the_persisted_review_result(
+        tmp_path, monkeypatch):
+    from skodun import stack
+
+    request = object()
+    monkeypatch.setattr(stack, "load_request", lambda path: request)
+
+    def fake_once(store, repo, **kwargs):
+        assert kwargs["stack_request"] is request
+        kwargs["result_metadata"]["stack"] = {
+            "status": "valid", "reason_code": "ok",
+            "current_slice_id": "pr-14", "dependency_count": 2,
+            "manifest_digest": "sha256:" + "a" * 64,
+        }
+        return 1, "SKODUN VERDICT: trustworthy=true findings=1"
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "valid-stack.db") as store:
+        status, text, metadata = services.svc_review_detailed(
+            store, tmp_path, stack_manifest=tmp_path / "stack.json")
+
+    assert status == 1
+    assert text.splitlines() == [
+        "SKODUN STACK: status=valid slice=pr-14 dependencies=2 "
+        "digest=sha256:" + "a" * 64,
+        "SKODUN VERDICT: trustworthy=true findings=1",
+    ]
+    assert metadata["stack"]["status"] == "valid"
+
+
+def test_recovery_reuses_one_parsed_stack_request_but_passes_it_to_each_run(
+        tmp_path, monkeypatch):
+    from skodun import stack
+    from skodun.trust import banner
+
+    request = stack.StackRequest(
+        supplied=True, manifest=None,
+        problem=stack.StackProblem("malformed_json", "JSONDecodeError"))
+    loads = []
+    monkeypatch.setattr(
+        stack, "load_request",
+        lambda path: loads.append(Path(path)) or request)
+    identity_fields = {
+        "repo_id": "repo", "worktree_root": "worktree", "branch": "feat",
+        "head": "h", "base_sha": "s", "diff_hash": "d"}
+    attempts = [
+        _artifact([], review_id="stack-first", degraded=True,
+                  trustworthy=False, status="degraded",
+                  attempts=[{"provider": "xai"}], **identity_fields),
+        _artifact([], review_id="stack-second",
+                  attempts=[{"provider": "openai"}], **identity_fields),
+    ]
+    seen = []
+    monkeypatch.setattr(
+        services, "_recovery_identity",
+        lambda repo: ("repo", "worktree", "feat", "h", "s", "d"))
+
+    def fake_once(store, repo, **kwargs):
+        seen.append(kwargs["stack_request"])
+        kwargs["result_metadata"]["stack"] = {
+            "status": "ignored", "reason_code": "malformed_json"}
+        rec = attempts.pop(0)
+        store.save_review(rec)
+        return (4 if rec["trustworthy"] is not True else 0), banner(rec)
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    manifest_path = tmp_path / "stack.json"
+    with Store.open(tmp_path / "stack-recovery.db") as store:
+        status, text, metadata = services.svc_review_detailed(
+            store, tmp_path, stack_manifest=manifest_path, recover=True,
+            max_attempts=3, max_wall_seconds=30)
+
+    assert status == 0
+    assert loads == [manifest_path]
+    assert seen == [request, request]
+    assert text.count("SKODUN STACK:") == 1
+    assert metadata["stack"] == {
+        "status": "ignored", "reason_code": "malformed_json"}
 
 
 def test_opt_in_reuse_honors_cancellation_before_and_during_a_probe(

@@ -329,7 +329,7 @@
 - Modify: `tests/test_mcpserver.py`
 - Modify: `tests/test_mcptools.py`
 
-- [ ] **Step 1: Write failing service parity and reuse-bypass tests.**
+- [x] **Step 1: Write failing service parity and reuse-bypass tests.**
 
   Test one valid and one malformed manifest through `svc_review_detailed`.
   Assert the text prefix is produced by `stack.render_summary`, metadata has
@@ -339,7 +339,7 @@
   event records outcome `bypass` with reason
   `stack_attribution_requested` rather than returning an older artifact.
 
-- [ ] **Step 2: Run the service tests and confirm RED.**
+- [x] **Step 2: Run the service tests and confirm RED.**
 
   ```bash
   python3 -m pytest tests/test_services.py -q --tb=short
@@ -347,7 +347,7 @@
 
   Expected failure: service signatures do not accept `stack_manifest`.
 
-- [ ] **Step 3: Implement the shared service door.**
+- [x] **Step 3: Implement the shared service door.**
 
   Extend `svc_review_detailed`, `svc_review`, and `_svc_review_once` with an
   optional `stack_manifest`/parsed request. Load the file once per user request,
@@ -356,7 +356,7 @@
   the stored result. Existing calls with no manifest must take the exact old
   path and text.
 
-- [ ] **Step 4: Write failing CLI and MCP transport tests.**
+- [x] **Step 4: Write failing CLI and MCP transport tests.**
 
   CLI parser assertion:
 
@@ -372,13 +372,13 @@
   Update the closed review-property snapshot in `tests/test_mcptools.py`; do not
   add a new tool.
 
-- [ ] **Step 5: Run the transport tests and confirm RED.**
+- [x] **Step 5: Run the transport tests and confirm RED.**
 
   ```bash
   python3 -m pytest tests/test_cli.py tests/test_mcpserver.py tests/test_mcptools.py -q --tb=short
   ```
 
-- [ ] **Step 6: Implement transport forwarding and make GREEN.**
+- [x] **Step 6: Implement transport forwarding and make GREEN.**
 
   Add CLI `--stack-manifest` with `type=Path`. In MCP, parse only its string
   type with `_opt_string_arg`; the shared service owns path/file/schema
@@ -391,7 +391,7 @@
   python3 -m pytest tests/test_services.py tests/test_cli.py tests/test_mcpserver.py tests/test_mcptools.py -q --tb=short
   ```
 
-- [ ] **Step 7: Commit the parity surface.**
+- [x] **Step 7: Commit the parity surface.**
 
   ```bash
   git diff --check

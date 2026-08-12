@@ -703,10 +703,41 @@ def test_the_review_tool_takes_a_reviewer_by_name_in_its_schema():
     props = spec.input_schema["properties"]
     assert set(props) == {"repo", "reviewer", "client_family", "recover",
                           "max_attempts", "max_wall_seconds",
-                          "reuse_trusted", "fresh", "batch_target_bytes"}
+                          "reuse_trusted", "fresh", "batch_target_bytes",
+                          "stack_manifest"}
     assert props["reviewer"]["type"] == "string"
     assert props["reviewer"]["description"]
     assert spec.input_schema["required"] == []
+
+
+def test_the_review_tool_forwards_stack_manifest_and_projects_metadata(
+        tmp_path, monkeypatch):
+    seen: dict = {}
+
+    def fake_detailed(store, repo, **kwargs):
+        seen.update(kwargs)
+        return 0, "SKODUN STACK: status=valid\nSKODUN VERDICT: trustworthy=true findings=0", {
+            "stack": {"status": "valid", "reason_code": "valid"}}
+
+    monkeypatch.setattr(services, "svc_review_detailed", fake_detailed)
+    result = _specs()["review"].handler(HandlerCall(
+        params={"repo": str(tmp_path), "stack_manifest": "stack.json"},
+        store_factory=lambda: Store.open(tmp_path / "s.db"),
+        cancel=threading.Event()))
+    assert seen["stack_manifest"] == "stack.json"
+    assert result.metadata["stack"] == {
+        "status": "valid", "reason_code": "valid"}
+
+
+def test_a_stack_manifest_of_the_wrong_type_is_refused_before_store_open(
+        tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "t.db"
+    for bad in (["stack.json"], 7, True, {"path": "stack.json"}):
+        result = _tool("review", db, stack_manifest=bad)
+        assert result.status == 2, (bad, result)
+        assert "stack_manifest must be" in result.text, (bad, result.text)
+    assert not db.exists(), "a malformed call opened a store"
 
 
 def test_the_review_tool_publishes_client_family_and_says_it_is_soft():

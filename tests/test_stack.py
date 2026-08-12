@@ -81,6 +81,20 @@ def test_load_request_parses_a_canonical_v1_manifest(tmp_path):
     assert request.manifest.manifest_digest.startswith("sha256:")
 
 
+def test_service_projection_is_bounded_and_status_specific():
+    assert stack.render_projection({
+        "status": "valid", "reason_code": "ok",
+        "current_slice_id": "pr-14", "dependency_count": 2,
+        "manifest_digest": "sha256:" + "a" * 64,
+    }) == (
+        "SKODUN STACK: status=valid slice=pr-14 dependencies=2 "
+        "digest=sha256:" + "a" * 64)
+    assert stack.render_projection({
+        "status": "ignored", "reason_code": "stale_head",
+        "current_slice_id": "untrusted", "dependency_count": 99,
+    }) == "SKODUN STACK: status=ignored reason=stale_head"
+
+
 def test_manifest_digest_is_over_normalized_semantics_not_json_layout(tmp_path):
     document = _manifest()
     document["manifest_digest"] = _digest(document)
@@ -436,6 +450,22 @@ def test_validation_refuses_reordered_dependencies(tmp_path):
     assert result.reason_code == "dependency_reordered"
 
 
+@pytest.mark.parametrize("helper", ["exact_object_type", "is_ancestor"])
+def test_optional_git_validation_failure_is_ignored_not_raised(
+        tmp_path, monkeypatch, helper):
+    state = _stack_repo(tmp_path)
+
+    def fail(*args, **kwargs):
+        raise gitio.GitError("transient optional stack lookup failure")
+
+    monkeypatch.setattr(gitio, helper, fail)
+    _state, _request, _full_diff, result = _validation(
+        tmp_path, state=state, document=_stack_document(state))
+
+    assert result.status == "ignored"
+    assert result.reason_code == "git_error"
+
+
 @pytest.mark.parametrize(("mutation", "reason"), [
     (lambda d: d["dependencies"][1].update(slice_id="pr-10"),
      "duplicate_slice"),
@@ -606,6 +636,26 @@ def test_prefix_scope_classifies_only_actual_current_slice_paths(tmp_path):
 
     assert current["scope_attribution"]["scope"] == "current_slice"
     assert inherited["scope_attribution"]["scope"] == "unknown"
+
+
+def test_multiple_nonexclusive_scopes_from_one_slice_are_not_integration(
+        tmp_path):
+    state = _stack_repo(tmp_path)
+    document = _stack_document(state)
+    document["dependencies"][0]["ownership"] = []
+    document["dependencies"][1]["ownership"] = []
+    document["current_slice"]["ownership"] = [
+        _scope("src", kind="prefix", exclusive=False),
+        _scope("src/current.py", exclusive=False),
+    ]
+    _state, _request, _full_diff, result = _validation(
+        tmp_path, state=state, document=document)
+
+    finding = stack.classify_findings(
+        [{"file": "src/current.py", "line": 1}], result)[0]
+
+    assert finding["scope_attribution"]["scope"] == "current_slice"
+    assert finding["scope_attribution"]["owner_slice_id"] == "pr-14"
 
 
 def test_multiple_downstream_claims_are_reported_as_ambiguous(tmp_path):

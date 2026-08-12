@@ -3287,6 +3287,24 @@ def test_reuse_flags_reach_the_shared_service(tmp_path, monkeypatch, capsys):
     assert seen["fresh"] is True
 
 
+def test_stack_manifest_reaches_the_shared_service_as_a_path(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SKODUN_DB", str(tmp_path / "s.db"))
+    manifest = tmp_path / "stack.json"
+    seen = _svc_review_kwargs(
+        monkeypatch,
+        ["review", "--repo", str(tmp_path),
+         "--stack-manifest", str(manifest)], capsys)
+    assert seen["stack_manifest"] == manifest
+
+
+def test_review_parser_exposes_stack_manifest_path():
+    from skodun.cli import build_parser
+    args = build_parser().parse_args(
+        ["review", "--stack-manifest", "stack.json"])
+    assert args.stack_manifest == Path("stack.json")
+
+
 def test_review_help_documents_the_flag_and_its_env_fallback(capsys):
     main(["review", "--help"])
     out = capsys.readouterr().out

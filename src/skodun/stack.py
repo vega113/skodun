@@ -467,6 +467,8 @@ def load_request(path: Path | str) -> StackRequest:
         return StackRequest(supplied=True, manifest=manifest, problem=None)
     except _ManifestError as exc:
         return _request_problem(exc.reason_code, exc.detail)
+    except (OSError, TypeError, ValueError) as exc:
+        return _request_problem("unsafe_file", type(exc).__name__)
 
 
 @dataclass(frozen=True)
@@ -504,6 +506,30 @@ class StackValidation:
             "downstream_owner_count": (
                 0 if manifest is None else len(manifest.downstream_owners)),
         }
+
+
+def render_projection(value: dict[str, Any]) -> str:
+    """Render one bounded service line from a persisted stack projection."""
+    status = value.get("status")
+    reason = value.get("reason_code")
+    if not isinstance(status, str) or not status:
+        status = "ignored"
+    if not isinstance(reason, str) or not reason:
+        reason = "missing_projection"
+    parts = [f"SKODUN STACK: status={status}"]
+    if status != "valid":
+        parts.append(f"reason={reason}")
+    optional = () if status != "valid" else (
+        ("slice", value.get("current_slice_id")),
+        ("dependencies", value.get("dependency_count")),
+        ("digest", value.get("manifest_digest")),
+    )
+    for label, item in optional:
+        if isinstance(item, str) and item:
+            parts.append(f"{label}={item}")
+        elif label == "dependencies" and type(item) is int and item >= 0:
+            parts.append(f"{label}={item}")
+    return " ".join(parts)
 
 
 def _ignored(request: StackRequest, reason_code: str) -> StackValidation:
@@ -624,6 +650,8 @@ def validate(
         return _ignored(request, "invalid_field")
     try:
         repository_id = gitio.canonical_repository_identity(Path(repo))
+    except gitio.GitError:
+        return _ignored(request, "git_error")
     except (OSError, UnicodeError):
         repository_id = None
     if repository_id is None:
@@ -640,19 +668,22 @@ def validate(
     chain = [manifest.certification_base]
     chain.extend(item.commit for item in manifest.dependencies)
     chain.append(manifest.current_head)
-    for oid in chain:
-        object_type = gitio.exact_object_type(Path(repo), oid)
-        if object_type is None:
-            return _ignored(request, "missing_commit")
-        if object_type != "commit":
-            return _ignored(request, "not_commit")
-    for edge, (older, newer) in enumerate(zip(chain, chain[1:])):
-        dirty_only_identity = (
-            not manifest.dependencies and edge == 0 and older == newer)
-        if (not dirty_only_identity
-                and (older == newer
-                     or not gitio.is_ancestor(Path(repo), older, newer))):
-            return _ignored(request, "dependency_reordered")
+    try:
+        for oid in chain:
+            object_type = gitio.exact_object_type(Path(repo), oid)
+            if object_type is None:
+                return _ignored(request, "missing_commit")
+            if object_type != "commit":
+                return _ignored(request, "not_commit")
+        for edge, (older, newer) in enumerate(zip(chain, chain[1:])):
+            dirty_only_identity = (
+                not manifest.dependencies and edge == 0 and older == newer)
+            if (not dirty_only_identity
+                    and (older == newer
+                         or not gitio.is_ancestor(Path(repo), older, newer))):
+                return _ignored(request, "dependency_reordered")
+    except gitio.GitError:
+        return _ignored(request, "git_error")
 
     try:
         dependencies: list[SliceEvidence] = []
@@ -796,11 +827,27 @@ def classify_findings(
                            for scope in owner.ownership):
                         downstream_matches.append(owner)
 
+            # Several scopes from one slice are one ownership match. Counting
+            # scopes would mislabel a file+prefix declaration from one owner as
+            # cross-slice integration.
+            stack_owners: dict[
+                tuple[str, str, str], tuple[str, SliceEvidence, bool]
+            ] = {}
+            for kind, evidence, scope in stack_matches:
+                key = (kind, evidence.slice.slice_id,
+                       evidence.slice.tracking_ref)
+                previous = stack_owners.get(key)
+                stack_owners[key] = (
+                    kind, evidence,
+                    scope.exclusive or bool(previous and previous[2]),
+                )
+            owner_matches = list(stack_owners.values())
+
             if any(path in evidence.uncertain_files
-                   for _kind, evidence, _scope in stack_matches):
+                   for _kind, evidence, _exclusive in owner_matches):
                 attribution = _attribution("unknown", "uncertain_git_mapping")
-            elif len(stack_matches) == 1 and not downstream_matches:
-                kind, evidence, _scope = stack_matches[0]
+            elif len(owner_matches) == 1 and not downstream_matches:
+                kind, evidence, _exclusive = owner_matches[0]
                 attribution = _attribution(
                     kind,
                     ("exact_current_scope" if kind == "current_slice"
@@ -808,16 +855,16 @@ def classify_findings(
                     owner_slice_id=evidence.slice.slice_id,
                     owner_ref=evidence.slice.tracking_ref,
                 )
-            elif (len(stack_matches) > 1 and not downstream_matches
-                  and all(not scope.exclusive
-                          for _kind, _evidence, scope in stack_matches)):
+            elif (len(owner_matches) > 1 and not downstream_matches
+                  and all(not exclusive
+                          for _kind, _evidence, exclusive in owner_matches)):
                 attribution = _attribution("integration", "cross_slice_scope")
-            elif not stack_matches and len(downstream_matches) == 1:
+            elif not owner_matches and len(downstream_matches) == 1:
                 attribution = _attribution(
                     "downstream_owned", "exact_downstream_scope",
                     owner_ref=downstream_matches[0].tracking_ref,
                 )
-            elif stack_matches or downstream_matches:
+            elif owner_matches or downstream_matches:
                 attribution = _attribution("unknown", "ambiguous_owner")
             else:
                 attribution = _attribution("unknown", "no_owner_evidence")
