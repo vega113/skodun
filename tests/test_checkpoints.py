@@ -424,3 +424,15 @@ def test_final_review_and_checkpoint_consumption_commit_together(tmp_path):
     assert review["trustworthy"] is True
     assert orchestration["state"] == "consumed"
     assert orchestration["final_review_id"] == "sk-final"
+
+
+def test_post_commit_cancellation_reopens_consumed_orchestration_for_resume(
+        tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        _created(store)
+        _complete_all(store)
+        store.save_checkpointed_review(_review())
+        assert store.mark_cancelled("sk-final", "cancelled during finalization")
+        orchestration = store.get_orchestration("orch-1")
+    assert orchestration["state"] == "failed"
+    assert orchestration["final_review_id"] is None
