@@ -260,6 +260,19 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+#: `reserve_prepush` inserts `running` with `pid=NULL`, then `attach_pid`
+#: after spawn. Fresh unproven rows are treated as live work; stale ones
+#: are the crashed-dispatcher case and must not block migrate forever.
+_UNPROVEN_RUNNING_GRACE_SEC = 60.0
+
+
+def _unproven_running_is_fresh(reviewed_at: object, now: str) -> bool:
+    age_ms = _duration_ms(reviewed_at, now)
+    if age_ms is None:
+        return False
+    return age_ms <= int(_UNPROVEN_RUNNING_GRACE_SEC * 1000)
+
+
 def _lock_owner(lock: Path) -> int | None:
     try:
         value = lock.read_text(encoding="ascii").strip()
@@ -361,21 +374,35 @@ def migration_blockers(path: Path) -> tuple[str, ...]:
         tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         blockers: list[str] = []
+        now = _iso_now()
         if "reviews" in tables:
             columns = _table_columns(conn, "reviews")
-            # Pre-v3 stores have no pid column, and a current row may have a
-            # NULL pid. Neither can prove a live process; treating them as
-            # blockers would strand migrate --apply on a crashed historical
-            # review. Live work is still fenced by the FG lock and capacity
-            # admissions below.
+            live_review = False
             if "pid" in columns:
-                running = conn.execute(
-                    "SELECT pid FROM reviews WHERE status='running' "
-                    "AND pid IS NOT NULL").fetchall()
-                if any(_pid_alive(int(row[0])) for row in running):
-                    blockers.append("active_review")
+                has_reviewed_at = "reviewed_at" in columns
+                query = ("SELECT pid, reviewed_at FROM reviews "
+                         "WHERE status='running'" if has_reviewed_at else
+                         "SELECT pid, NULL AS reviewed_at FROM reviews "
+                         "WHERE status='running'")
+                for row in conn.execute(query):
+                    pid = row[0]
+                    if pid is not None:
+                        if _pid_alive(int(pid)):
+                            live_review = True
+                            break
+                        continue
+                    if _unproven_running_is_fresh(row[1], now):
+                        live_review = True
+                        break
+            elif "reviewed_at" in columns:
+                for row in conn.execute(
+                        "SELECT reviewed_at FROM reviews WHERE status='running'"):
+                    if _unproven_running_is_fresh(row[0], now):
+                        live_review = True
+                        break
+            if live_review:
+                blockers.append("active_review")
         if "review_checkpoints" in tables:
-            now = _iso_now()
             columns = _table_columns(conn, "review_checkpoints")
             if "lease_expires_at" in columns:
                 live = conn.execute(

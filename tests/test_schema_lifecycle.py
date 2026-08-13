@@ -215,6 +215,29 @@ def test_dead_pid_running_review_does_not_block_migration(tmp_path):
     assert receipt["result"] == "success"
 
 
+def test_fresh_null_pid_running_review_blocks_migration(tmp_path):
+    db = _authority_db(tmp_path)
+    with Store.open(db) as store:
+        store._c.execute(
+            "INSERT INTO reviews(id, status, pid, reviewed_at) VALUES (?,?,?,?)",
+            ("sk_preattach", "running", None, time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+    _downgrade(db)
+    assert "active_review" in migration_blockers(db)
+
+
+def test_stale_null_pid_running_review_does_not_block_migration(tmp_path):
+    db = _authority_db(tmp_path)
+    with Store.open(db) as store:
+        store._c.execute(
+            "INSERT INTO reviews(id, status, pid, reviewed_at) VALUES (?,?,?,?)",
+            ("sk_orphan", "running", None, "2020-01-01T00:00:00Z"))
+    _downgrade(db)
+    assert "active_review" not in migration_blockers(db)
+    receipt = Store.migrate_existing(db, build_commit="a" * 40)
+    assert receipt["result"] == "success"
+
+
 def test_dead_capacity_admission_does_not_block_migration(tmp_path):
     db = _authority_db(tmp_path)
     with Store.open(db) as store:
