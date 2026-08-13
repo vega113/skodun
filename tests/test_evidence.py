@@ -177,14 +177,13 @@ def test_identity_and_protected_policy_mismatches_never_verify():
     assert result.accepted is False
     assert result.reason_code == "evidence_kind_mismatch"
 
-    forged_proof = parse_receipt(json.dumps(receipt_mapping(
-        counters={"checks": 4})))
-    result = verify_receipt(forged_proof, identity(),
-                            ProducerPolicy(policy().policy_id,
-                                           policy().commands,
-                                           b"different-provenance-key"))
+    raw = receipt_mapping()
+    raw["counters"] = {"checks": 4}
+    raw["receipt_digest"] = receipt_digest(raw)
+    forged_proof = parse_receipt(json.dumps(raw))
+    result = verify_receipt(forged_proof, identity(), policy())
     assert result.accepted is False
-    assert result.reason_code == "policy_mismatch"
+    assert result.reason_code == "provenance_mismatch"
 
 
 @pytest.mark.parametrize("argv", [

@@ -2178,6 +2178,17 @@ class Store:
                 (identity_digest, nonce)).fetchone()
             if conflict is not None:
                 self._c.execute(
+                    """DELETE FROM evidence_receipt_conflicts
+                       WHERE identity_digest=? AND rowid IN (
+                         SELECT rowid FROM evidence_receipt_conflicts
+                         WHERE identity_digest=?
+                         ORDER BY ingested_at ASC, rowid ASC
+                         LIMIT MAX(0, (SELECT COUNT(*)
+                                      FROM evidence_receipt_conflicts
+                                      WHERE identity_digest=?) - 31)
+                       )""",
+                    (identity_digest, identity_digest, identity_digest))
+                self._c.execute(
                     """INSERT OR IGNORE INTO evidence_receipt_conflicts
                        (identity_digest, receipt_digest, nonce,
                         existing_receipt_digest, reason_code, evidence_kind,
