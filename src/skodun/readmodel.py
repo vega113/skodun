@@ -93,6 +93,8 @@ def _extra_pass_state(value: object, *, refuter: bool = False) -> str:
     status = value.get("status")
     if value.get("failed") is True:
         return "failed"
+    if "parse_ok" in value and value.get("parse_ok") is not True:
+        return "failed"
     if status == "pending":
         return "queued"
     if status in {"failed", "unavailable"}:
@@ -115,13 +117,17 @@ def _checkpoint_state(row: Mapping, rec: Mapping) -> str:
         return _pass_state(state)
     payload = _checkpoint_payload(row)
     if payload is not None:
-        return "complete" if payload.get("parse_ok") is True else "failed"
+        if payload.get("parse_ok") is not True:
+            return "failed"
+        return "degraded" if payload.get("degraded") is True else "complete"
     if row.get("pass_kind") == "integration":
         integration = rec.get("integration")
         if (isinstance(integration, Mapping)
                 and "parse_ok" in integration):
-            return ("complete" if integration.get("parse_ok") is True
-                    else "failed")
+            if integration.get("parse_ok") is not True:
+                return "failed"
+            return ("degraded" if integration.get("degraded") is True
+                    else "complete")
     return "complete"
 
 
@@ -190,6 +196,8 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
             passes["finder"] = "queued"
         elif "running" in batch_checkpoint_states:
             passes["finder"] = "running"
+        elif "degraded" in batch_checkpoint_states:
+            passes["finder"] = "degraded"
         elif all(state == "complete" for state in batch_checkpoint_states):
             passes["finder"] = "complete"
     for row, checkpoint_state in zip(checkpoint_rows, checkpoint_states):
