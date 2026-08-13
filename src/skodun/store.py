@@ -1967,39 +1967,62 @@ class Store:
         """Return bounded prior findings for one repository, newest first.
 
         The limit is a flattened finding count, not a predecessor review count.
-        `limit + 1` detects truncation without a separate COUNT(DISTINCT) scan.
+        Pages of `limit + 1` raw rows skip unreadable or invalid indexes so a
+        ghost row cannot starve older valid predecessors. A raw-scan cap keeps
+        the terminal writer transaction bounded.
         """
         repository_id = _require_text("repository_id", repository_id)
         if type(limit) is not int or limit <= 0:
             raise ValueError("lineage candidate limit must be a positive int")
-        where = "repository_id=?"
-        params: list[object] = [repository_id]
-        if before_reviewed_at is not None:
-            where += " AND created_at < ?"
-            params.append(before_reviewed_at)
-        rows = self._c.execute(
-            f"""SELECT review_id, finding_index
-                  FROM finding_lineage WHERE {where}
-                 ORDER BY created_at DESC, review_id DESC, finding_index DESC
-                 LIMIT ?""",
-            tuple(params) + (limit + 1,)).fetchall()
-        truncated = len(rows) > limit
-        selected = rows[:limit]
-        by_review: dict[str, list[int]] = {}
-        order: list[str] = []
-        for row in selected:
-            review_id = row["review_id"]
-            if review_id not in by_review:
-                by_review[review_id] = []
-                order.append(review_id)
-            by_review[review_id].append(row["finding_index"])
+        want = limit + 1
+        scan_cap = min(want * 4, 1024)
         findings: list[dict] = []
-        for review_id in order:
-            artifact = self.get_review(review_id)
-            if not isinstance(artifact, dict) or artifact.get("status") == RUNNING:
-                continue
-            stored = artifact.get("findings") or ()
-            for index in by_review[review_id]:
+        cache: dict[str, dict | None] = {}
+        examined = 0
+        cursor: tuple[str, str, int] | None = None
+        exhausted = False
+        while len(findings) < want and examined < scan_cap:
+            where = "repository_id=?"
+            params: list[object] = [repository_id]
+            if before_reviewed_at is not None:
+                where += " AND created_at < ?"
+                params.append(before_reviewed_at)
+            if cursor is not None:
+                created_at, review_id, finding_index = cursor
+                where += (
+                    " AND (created_at < ? OR (created_at = ? AND review_id < ?)"
+                    " OR (created_at = ? AND review_id = ? AND finding_index < ?))"
+                )
+                params.extend([created_at, created_at, review_id,
+                               created_at, review_id, finding_index])
+            batch = min(want, scan_cap - examined)
+            rows = self._c.execute(
+                f"""SELECT review_id, finding_index, created_at
+                      FROM finding_lineage WHERE {where}
+                     ORDER BY created_at DESC, review_id DESC, finding_index DESC
+                     LIMIT ?""",
+                tuple(params) + (batch,)).fetchall()
+            examined += len(rows)
+            if len(rows) < batch:
+                exhausted = True
+            if not rows:
+                break
+            cursor = (rows[-1]["created_at"], rows[-1]["review_id"],
+                      rows[-1]["finding_index"])
+            for row in rows:
+                review_id = row["review_id"]
+                if review_id not in cache:
+                    artifact = self.get_review(review_id)
+                    if (not isinstance(artifact, dict)
+                            or artifact.get("status") == RUNNING):
+                        cache[review_id] = None
+                    else:
+                        cache[review_id] = artifact
+                artifact = cache[review_id]
+                if artifact is None:
+                    continue
+                index = row["finding_index"]
+                stored = artifact.get("findings") or ()
                 if not isinstance(index, int) or index < 0 or index >= len(stored):
                     continue
                 previous_finding = stored[index]
@@ -2010,7 +2033,15 @@ class Store:
                 enriched["_lineage_finding_index"] = index
                 enriched["_lineage_reviewed_at"] = artifact.get("reviewed_at")
                 findings.append(enriched)
-        return findings, truncated
+                if len(findings) >= want:
+                    break
+            if exhausted:
+                break
+        truncated = len(findings) > limit
+        if (not truncated and len(findings) == limit
+                and not exhausted and examined >= scan_cap):
+            truncated = True
+        return findings[:limit], truncated
 
     def lineage_review_candidates(self, repository_id: str) -> list[dict]:
         """Compatibility wrapper for the bounded lineage candidate read."""
