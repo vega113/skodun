@@ -557,6 +557,44 @@ def test_a_prompt_within_the_cap_is_not_flagged():
     assert got.prompt_bytes == len(got.text)
 
 
+def test_integration_prompt_carries_stack_and_lineage_context():
+    stack_context = (
+        b"----- BEGIN STACK CONTEXT -----\n"
+        b"version=1 status=valid\n"
+        b"----- END STACK CONTEXT -----\n")
+    lineage_context = (
+        b"----- BEGIN PRIOR FINDINGS -----\n"
+        b"count=1 truncated=false\n"
+        b"----- END PRIOR FINDINGS -----\n")
+    got = integration_prompt(
+        TWO, stack_context=stack_context, lineage_context=lineage_context)
+    assert stack_context.rstrip(b"\n") in got.text
+    assert lineage_context.rstrip(b"\n") in got.text
+    assert got.stack_context_bytes == len(stack_context)
+    assert got.lineage_context_bytes == len(lineage_context)
+    assert got.diff_truncated is False
+
+
+def test_integration_truncation_reserves_stack_and_lineage_blocks():
+    stack_context = (
+        b"----- BEGIN STACK CONTEXT -----\n"
+        b"version=1 status=valid\n"
+        b"----- END STACK CONTEXT -----\n")
+    lineage_context = (
+        b"----- BEGIN PRIOR FINDINGS -----\n"
+        b"count=1 truncated=true\n"
+        b"----- END PRIOR FINDINGS -----\n")
+    got = integration_prompt(
+        TWO, max_prompt_bytes=400, stack_context=stack_context,
+        stack_context_truncated=True, lineage_context=lineage_context,
+        lineage_context_truncated=True)
+    assert got.diff_truncated is True
+    assert stack_context.rstrip(b"\n") in got.text
+    assert lineage_context.rstrip(b"\n") in got.text
+    assert got.stack_context_truncated is True
+    assert got.lineage_context_truncated is True
+
+
 def test_a_non_positive_cap_raises_like_every_other_prompt_builder():
     for bad in (0, -1):
         with pytest.raises(ValueError, match="max_prompt_bytes"):

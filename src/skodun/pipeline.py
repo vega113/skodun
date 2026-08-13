@@ -1659,6 +1659,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             lineage_repository_id=lineage_repository_id,
             stack_context_bytes=len(stack_prompt_context),
             stack_context_truncated=stack_prompt_truncated,
+            lineage_context_bytes=len(lineage_prompt_context),
+            lineage_context_truncated=lineage_prompt_truncated,
             worktree_root=str(root),
             # Process identity for cancel-by-id (S1). Background workers already
             # attach a pid via the reservation lease; foreground rows need it
@@ -2362,6 +2364,10 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
             _adapter_for(entry)
 
     reserved = store.get_review(record_id) or {}
+    review_started_at = (
+        reserved.get("review_started_at") or reserved.get("reviewed_at"))
+    lineage_prompt_context, lineage_prompt_truncated = _lineage_prompt_context(
+        store, lineage_repository_id, before=review_started_at)
     diff_hash = gitio.diff_identity(diff.data)
     common = dict(
         id=record_id, reviewed_at=reserved.get("reviewed_at") or _iso_now(),
@@ -2386,8 +2392,9 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
         repo_id=reserved.get("repo_id") or reserved.get("repo"),
         lineage_repository_id=lineage_repository_id,
         worktree_root=str(root),
-        review_started_at=reserved.get("review_started_at")
-                           or reserved.get("reviewed_at"),
+        review_started_at=review_started_at,
+        lineage_context_bytes=len(lineage_prompt_context),
+        lineage_context_truncated=lineage_prompt_truncated,
     )
     #: `(threshold, foreground cap)`, or None when the two caps coincide.
     large_prompt = (cfg.dispatch.large_prompt_bytes, cfg.defaults.timeout_sec)
@@ -2439,7 +2446,9 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                     diff, batches=plan, cfg=cfg, d=d, root=root,
                     finder=finder, branch=branch, base_ref=base.ref,
                     base_sha=base.sha, head_label=local_oid,
-                    context_source="oid", context_oid=local_oid)
+                    context_source="oid", context_oid=local_oid,
+                    lineage_context=lineage_prompt_context,
+                    lineage_context_truncated=lineage_prompt_truncated)
                 checkpoint_identity = _orchestration_identity(
                     rec, diff, prepared_plan, cfg=cfg, d=d, root=root,
                     finder=finder, branch=branch, head=local_oid,
@@ -2465,7 +2474,9 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                     common, diff, cfg=cfg, d=d, root=root, store=store,
                     scratch=scratch, finder=finder, branch=branch, base=base,
                     local_oid=local_oid, large_prompt=large_prompt,
-                    cancel=cancel, record_id=record_id)
+                    cancel=cancel, record_id=record_id,
+                    lineage_context=lineage_prompt_context,
+                    lineage_context_truncated=lineage_prompt_truncated)
 
         rec["trustworthy"] = is_trustworthy(
             rec["parse_ok"], rec["degraded"], rec["diff_truncated"])
@@ -2528,7 +2539,11 @@ def _empty_shell() -> dict:
 def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
                  store: Store, scratch: Path, finder: Reviewer, branch: str,
                  base, local_oid: str, large_prompt: tuple[int, int] | None,
-                 cancel: "threading.Event | None", record_id: str) -> dict:
+                 cancel: "threading.Event | None", record_id: str,
+                 stack_context: bytes | None = None,
+                 stack_context_truncated: bool = False,
+                 lineage_context: bytes | None = None,
+                 lineage_context_truncated: bool = False) -> dict:
     """One prompt, one chain, one record: the UNBATCHED background review.
 
     Deliberately mirrors `run_review`'s 6b branch, with the two differences a
@@ -2582,7 +2597,11 @@ def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
         pack_body = pack.body
 
     prompt = promptbuild.build(branch, base.ref, base.sha, local_oid, diff.data,
-                              mdb, selection, pack_body)
+                              mdb, selection, pack_body,
+                              stack_context=stack_context,
+                              stack_context_truncated=stack_context_truncated,
+                              lineage_context=lineage_context,
+                              lineage_context_truncated=lineage_context_truncated)
     if prompt.diff_truncated:
         _note(f"diff is {len(diff.data)} bytes (> {mdb}); the "
               f"prompt is truncated and this review cannot be trustworthy")
@@ -3013,6 +3032,10 @@ class _PreparedPlan:
     checklist_hash: str | None
     boundary_digest: str
     integration_plan_digest: str
+    stack_context: bytes = b""
+    stack_context_truncated: bool = False
+    lineage_context: bytes = b""
+    lineage_context_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -3357,7 +3380,11 @@ def _prepare_batch_plan(
             batch_boundaries=[gitio.diff_identity(batch.data)
                               for batch in batches]),
         boundary_digest=boundary_digest,
-        integration_plan_digest=integration_plan_digest)
+        integration_plan_digest=integration_plan_digest,
+        stack_context=stack_context or b"",
+        stack_context_truncated=stack_context_truncated is True,
+        lineage_context=lineage_context or b"",
+        lineage_context_truncated=lineage_context_truncated is True)
 
 
 def _orchestration_identity(
@@ -3649,7 +3676,11 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 [passes.BatchSummary(files=list(b.files), diff=b.data,
                                      summary=s.summary, findings=s.findings)
                  for b, s in zip(batches, subs)],
-                selection, integration_mdb)
+                selection, integration_mdb,
+                stack_context=prepared_plan.stack_context or None,
+                stack_context_truncated=prepared_plan.stack_context_truncated,
+                lineage_context=prepared_plan.lineage_context or None,
+                lineage_context_truncated=prepared_plan.lineage_context_truncated)
         except Exception as e:
             # ORACLE: "integration context build produced no prompt" is a FAILED
             # pass, not an absent one -- the aggregate is demoted rather than

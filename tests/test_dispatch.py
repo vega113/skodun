@@ -2597,6 +2597,33 @@ def test_run_prepush_review_persists_nothing_of_its_own(tmp_path):
     assert rec["status"] == "clean" and rec["id"] == rid
 
 
+def test_prepush_prompt_includes_prior_finding_lineage(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        gitio, "canonical_repository_identity", lambda root: "canonical")
+    repo = _bg_repo(tmp_path)
+    db = tmp_path / "s.db"
+    from skodun import fingerprint
+    finding = fingerprint.annotate_findings(
+        [{"file": "src/a.py", "title": "prior leak"}])[0]
+    with Store.open(db) as st:
+        st.save_review({
+            "id": "prior", "reviewed_at": "2026-08-12T09:00:00Z",
+            "branch": "feat", "head": "h", "base_ref": "origin/main",
+            "base_sha": "b", "diff_hash": "d", "context_hash": "",
+            "mode": "now", "model": "m", "adapter": "a", "status": "clean",
+            "parse_ok": True, "degraded": False, "diff_truncated": False,
+            "trustworthy": True, "stop_reason": "done", "findings_total": 1,
+            "severity": {"high": 0, "medium": 0, "low": 0}, "summary": "ok",
+            "repo_id": "repo", "lineage_repository_id": "canonical",
+            "findings": [finding],
+        })
+    rec = _prepush(db, repo)
+    prompt = (tmp_path / "bin" / "prompt_1.txt").read_bytes()
+    assert b"----- BEGIN PRIOR FINDINGS -----" in prompt
+    assert rec["lineage_context_bytes"] > 0
+    assert rec["lineage_repository_id"] == "canonical"
+
+
 def test_the_background_worker_does_not_auto_route(tmp_path):
     """Phase A scope (epic S5): auto-routing is the FOREGROUND loop's.
 

@@ -412,6 +412,8 @@ def test_stack_request_adds_attribution_without_changing_full_certification(
         return prompt.split(b"----- BEGIN DIFF -----", 1)[1].split(
             b"----- END DIFF -----", 1)[0]
     assert diff_bytes(first_prompt) == diff_bytes(second_prompt)
+    assert with_stack["stack_context_bytes"] > 0
+    assert isinstance(with_stack["lineage_context_bytes"], int)
     assert st.get_review(with_stack["id"]) == with_stack
     _verdict(with_stack, capsys)
 

@@ -886,6 +886,8 @@ def test_prepared_batch_prompts_include_stack_and_lineage_context(tmp_path):
     assert lineage_context.rstrip(b"\n") in with_context.batches[0].prompt.text
     assert with_context.batches[0].identity.prompt_hash != \
         without.batches[0].identity.prompt_hash
+    assert with_context.stack_context == stack_context
+    assert with_context.lineage_context == lineage_context
 
 
 def test_prepared_prompts_are_the_prompts_the_orchestrator_sends(tmp_path):
@@ -917,6 +919,48 @@ def test_prepared_prompts_are_the_prompts_the_orchestrator_sends(tmp_path):
     for index, item in enumerate(prepared.batches, 1):
         assert (tmp_path / "bin" / f"prompt_{index}.txt").read_bytes() == \
             item.prompt.text
+
+
+def test_orchestrator_sends_stack_and_lineage_to_the_integration_pass(tmp_path):
+    _fake_grok(tmp_path, _emit(CLEAN))
+    repo = _oversized(tmp_path)
+    cfg = load_config(repo)
+    d = cfg.defaults
+    root = gitio._worktree_root(repo)
+    base = resolve_base(repo)
+    diff = capture_diff(repo, base.sha, d.untracked_max)
+    finder = pipeline._reviewer_for(cfg, "finder")
+    batches = pipeline.batch_plan(diff.data, d, finder)
+    assert batches is not None and len(batches) >= 2
+    branch = gitio.current_branch(repo)
+    head = gitio.head_sha(repo)
+    stack_context = (
+        b"----- BEGIN STACK CONTEXT -----\n"
+        b"version=1 status=valid\n"
+        b"----- END STACK CONTEXT -----\n")
+    lineage_context = (
+        b"----- BEGIN PRIOR FINDINGS -----\n"
+        b"count=1 truncated=false\n"
+        b"----- END PRIOR FINDINGS -----\n")
+    prepared = pipeline._prepare_batch_plan(
+        diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, base_ref=base.ref, base_sha=base.sha,
+        head_label=f"{head} (working tree)",
+        stack_context=stack_context, lineage_context=lineage_context)
+
+    with tempfile.TemporaryDirectory() as scratch:
+        pipeline._orchestrate(
+            {"id": "sk_integration_ctx", "mode": "now", "model": finder.model,
+             "adapter": "grok", "summary": "", "findings": []}, diff,
+            batches=batches, cfg=cfg, d=d, root=root, store=_store(tmp_path),
+            scratch=Path(scratch), finder=finder, branch=branch,
+            base_ref=base.ref, base_sha=base.sha,
+            head_label=f"{head} (working tree)", prepared_plan=prepared)
+
+    seam = (tmp_path / "bin" / f"prompt_{len(batches) + 1}.txt").read_bytes()
+    assert stack_context.rstrip(b"\n") in seam
+    assert lineage_context.rstrip(b"\n") in seam
+    assert b"FINAL CROSS-FILE INTEGRATION" in seam
 
 
 def test_prepared_plan_builds_the_complete_checkpoint_identity(tmp_path):

@@ -428,7 +428,11 @@ def _findings_lines(rec: Mapping) -> list[str]:
             suffix = f" reason={reason}" if reason else ""
             if context is True:
                 suffix += " context=truncated"
+            if rec.get("lineage_context_truncated") is True:
+                suffix += " lineage=truncated"
             lines.append(f"      stack: {status}{suffix}")
+    elif rec.get("lineage_context_truncated") is True:
+        lines.append("      lineage: truncated")
     findings = rec.get("findings")
     findings = findings if isinstance(findings, list) else []
     for i, f in enumerate(findings[:MAX_FINDINGS_SHOWN]):

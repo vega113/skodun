@@ -139,6 +139,15 @@ def test_status_line_exposes_stack_context_and_truncation():
     assert "stack_context_truncated=true" in line
 
 
+def test_status_line_exposes_lineage_context_truncation():
+    line = services.format_status_line({
+        "id": "review-1", "status": "clean", "parse_ok": True,
+        "lineage_context_bytes": 1024, "lineage_context_truncated": True,
+    })
+    assert "lineage_context_bytes=1024" in line
+    assert "lineage_context_truncated=true" in line
+
+
 def test_triage_list_exposes_audited_deferral_and_lineage_scope(tmp_path):
     finding = _finding(0)
     finding.update(

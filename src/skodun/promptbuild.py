@@ -176,6 +176,18 @@ class Prompt:
     lineage_context_truncated: bool = False
 
 
+def advisory_context(
+        stack_context: bytes | None = None,
+        lineage_context: bytes | None = None) -> bytes:
+    """Encode stack/lineage blocks the same way every prompt builder does."""
+    extra = bytearray()
+    if stack_context:
+        extra += b"\n" + stack_context.rstrip(b"\n") + b"\n"
+    if lineage_context:
+        extra += b"\n" + lineage_context.rstrip(b"\n") + b"\n"
+    return bytes(extra)
+
+
 def build(
     branch: str,
     base_ref: str,
@@ -225,10 +237,7 @@ def build(
     out += f"Branch: {branch}\n".encode("utf-8")
     out += f"Base:   {base_ref} ({base_sha})\n".encode("utf-8")
     out += f"Head:   {head}\n".encode("utf-8")
-    if stack_context:
-        out += b"\n" + stack_context.rstrip(b"\n") + b"\n"
-    if lineage_context:
-        out += b"\n" + lineage_context.rstrip(b"\n") + b"\n"
+    out += advisory_context(stack_context, lineage_context)
 
     # Oracle: `$(...)` capture strips every trailing newline, `printf '%s\n'`
     # re-adds exactly one, and `[ -n "$_cl_body" ]` tests the stripped value.
