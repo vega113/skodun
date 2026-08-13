@@ -182,6 +182,8 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
     ("cmd", "/c", "echo unsafe"),
     ("perl", "-e", "print unsafe"),
     ("powershell", "-EncodedCommand", "unsafe"),
+    ("perl", "-eprint(1)"),
+    ("ruby", "-eputs(1)"),
 ])
 def test_each_interpreter_command_string_flag_is_rejected(argv):
     with pytest.raises(EvidenceError):
@@ -215,6 +217,15 @@ def test_windows_policy_working_directories_are_rejected(cwd):
 def test_non_ok_diagnostics_never_verify(diagnostic):
     receipt = parse_receipt(json.dumps(receipt_mapping(
         diagnostic_category=diagnostic)))
+    result = verify_receipt(receipt, identity(), policy())
+    assert result.accepted is False
+    assert result.reason_code == "diagnostic_mismatch"
+
+
+def test_signal_exit_codes_are_queryable_rejected_evidence():
+    receipt = parse_receipt(json.dumps(receipt_mapping(
+        exit_code=-15, terminal_state="failed",
+        diagnostic_category="failed")))
     result = verify_receipt(receipt, identity(), policy())
     assert result.accepted is False
     assert result.reason_code == "diagnostic_mismatch"

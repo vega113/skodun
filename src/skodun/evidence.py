@@ -162,13 +162,15 @@ def _is_shell_command_flag(executable: str, arg: str) -> bool:
         return False
     lowered = arg.lower()
     if name == "cmd":
-        return lowered in {"/c", "/k"}
+        return lowered.startswith(("/c", "/k"))
     if name in {"perl", "ruby", "node"}:
-        return lowered in {"-e", "--eval", "--execute"}
+        return (lowered == "-e" or lowered.startswith("-e")
+                or lowered.startswith("--eval")
+                or lowered.startswith("--execute"))
     if name in {"powershell", "pwsh"}:
         return (lowered in {"-c", "-command", "-ec", "-encodedcommand"}
-                or lowered.startswith("-command:")
-                or lowered.startswith("-encodedcommand:"))
+                or lowered.startswith(("-c", "-command", "-ec",
+                                       "-encodedcommand")))
     if lowered in {"-c", "--command"}:
         return True
     if lowered.startswith("--command="):
@@ -374,7 +376,8 @@ def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
         raise EvidenceError("duration_mismatch", "duration_ms")
     exit_code = raw["exit_code"]
     if exit_code is not None:
-        exit_code = _plain_int(exit_code, "exit_code")
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            raise EvidenceError("invalid_field", "exit_code")
     terminal = raw["terminal_state"]
     if not isinstance(terminal, str) or terminal not in _TERMINAL:
         raise EvidenceError("invalid_field", "terminal_state")
