@@ -159,11 +159,12 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
                            if payload is not None]
     integration_evidence = ([integration_record]
                              if isinstance(integration_record, Mapping) else [])
-    evidence_batches = ((batches + integration_evidence) if batches else
-                        [payload for _, payload in checkpoint_payloads]
+    evidence_batches = (batches
+                        + [payload for _, payload in checkpoint_payloads]
                         + integration_evidence)
-    finder_evidence = batches or [payload for kind, payload in checkpoint_payloads
-                                  if kind == "batch"]
+    finder_evidence = (batches
+                       + [payload for kind, payload in checkpoint_payloads
+                          if kind == "batch"])
     parseable = rec.get("usable_output") is True or any(
         isinstance(b, Mapping) and b.get("parse_ok") is True
         for b in evidence_batches)
@@ -219,7 +220,8 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
         elif batch_states:
             passes["finder"] = "complete"
     batch_checkpoint_states = [checkpoint_state for row, checkpoint_state in
-                               zip(checkpoint_rows, checkpoint_states)
+                               zip(checkpoint_rows, checkpoint_states,
+                                   strict=True)
                                if row.get("pass_kind") == "batch"]
     if batch_checkpoint_states:
         if "failed" in batch_checkpoint_states:
@@ -232,7 +234,8 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
             passes["finder"] = "queued"
         elif all(state == "complete" for state in batch_checkpoint_states):
             passes["finder"] = "complete"
-    for row, checkpoint_state in zip(checkpoint_rows, checkpoint_states):
+    for row, checkpoint_state in zip(checkpoint_rows, checkpoint_states,
+                                     strict=True):
         key = "finder" if row.get("pass_kind") == "batch" else "integration"
         if (key == "finder" and row.get("state") == "running"
                 and passes[key] != "failed"):

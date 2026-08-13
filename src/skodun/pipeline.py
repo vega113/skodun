@@ -3170,8 +3170,9 @@ def _checkpointed_sub(
         capacity_timing = sub.provenance.get("capacity_timing")
         checkpoint_timing = (dict(capacity_timing)
                              if isinstance(capacity_timing, dict) else {})
-        checkpoint_timing.setdefault("started_at", started_at)
-        checkpoint_timing["completed_at"] = completed_at
+        if sub.attempts:
+            checkpoint_timing.setdefault("started_at", started_at)
+            checkpoint_timing["completed_at"] = completed_at
         sub = replace(sub, provenance={
             **sub.provenance,
             "checkpoint_timing": checkpoint_timing,

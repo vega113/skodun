@@ -182,7 +182,7 @@ def test_integration_evidence_does_not_complete_finder():
             {"pass_kind": "batch", "pass_index": 2, "state": "failed"},
             {"pass_kind": "integration", "pass_index": 0,
              "state": "complete", "payload_json": json.dumps(payload)},
-        ])
+    ])
     assert p.usable_evidence is True
     assert p.passes["finder"] == "failed"
 
@@ -340,6 +340,24 @@ def test_completed_integration_checkpoint_is_usable_evidence():
         ])
     assert p.usable_evidence is True
     assert p.coverage_state == "partial"
+
+
+def test_completed_checkpoint_payload_adds_evidence_to_persisted_batches():
+    payload = {
+        "parse_ok": True, "degraded": False, "degraded_reason": "",
+        "stop_reason": "done", "diff_truncated": False,
+        "summary": "resumed batch", "findings": [], "failure_reason": "",
+        "attempts": [], "provenance": {}, "accepted": None,
+    }
+    p = project_review(
+        _record(status="failed", trustworthy=False, usable_output=False,
+                batches=[{"parse_ok": False}]),
+        orchestration={"state": "active", "batch_count": 2},
+        checkpoints=[
+            {"pass_kind": "batch", "pass_index": 2, "state": "complete",
+             "payload_json": json.dumps(payload)},
+        ])
+    assert p.usable_evidence is True
 
 
 def test_unbatched_clean_round_counts_its_finder_and_rejects_string_booleans():
