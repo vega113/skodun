@@ -83,6 +83,10 @@ class AdmissionError(RuntimeError):
 class AdmissionTimeout(AdmissionError):
     """The waiter exhausted its bounded admission budget."""
 
+    def __init__(self, message: str, *, ticket: object | None = None) -> None:
+        super().__init__(message)
+        self.ticket = ticket
+
 
 class AdmissionCancelled(AdmissionError):
     """The cancel token fired while waiting for capacity."""
@@ -469,7 +473,7 @@ def acquire(store: "Store", *, scope: str,
                        expire_reason=REASON_ADMISSION_TIMEOUT)
                 raise AdmissionTimeout(
                     f"gave up after {budget:g}s waiting for {resource_class} "
-                    f"capacity (scope={scope})")
+                    f"capacity (scope={scope})", ticket=ticket)
 
             # Drop dead/stale peers before position/admit so FIFO is honest.
             reclaim_stale(
@@ -497,7 +501,7 @@ def acquire(store: "Store", *, scope: str,
                        expire_reason=REASON_ADMISSION_TIMEOUT)
                 raise AdmissionTimeout(
                     f"gave up after {budget:g}s waiting for {resource_class} "
-                    f"capacity (scope={scope})")
+                    f"capacity (scope={scope})", ticket=ticket)
             slice_sleep = min(float(poll_sec), remaining)
             if slice_sleep > 0:
                 pause(slice_sleep)

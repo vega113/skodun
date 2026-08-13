@@ -576,11 +576,22 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
             except capacity.AdmissionTimeout as e:
                 # Slot contention or effective capacity 0 (quota pressure):
                 # hop to the next chain entry rather than spinning forever.
+                provider_ticket = getattr(e, "ticket", None)
+                if isinstance(provider_ticket, capacity.Ticket):
+                    capacity_timing = {
+                        "queued_at": provider_ticket.queued_at,
+                        "admitted_at": provider_ticket.admitted_at,
+                        "started_at": provider_ticket.started_at,
+                        "ended_at": provider_ticket.ended_at,
+                        "wait_ms": provider_ticket.wait_ms,
+                        "queue_wait_ms": provider_ticket.queue_wait_ms,
+                    }
                 n += 1
                 detail = str(e)
                 _note(f"{entry.name} ({entry.provider}): {detail}")
                 attempts.append(_attempt(
-                    n, entry, skipped=f"provider capacity: {detail}"))
+                    n, entry, skipped=f"provider capacity: {detail}",
+                    capacity_timing=capacity_timing))
                 exhausted.append(
                     f"{entry.name}/{entry.provider}: provider capacity wait")
                 continue
