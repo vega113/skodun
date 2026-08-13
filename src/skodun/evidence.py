@@ -157,6 +157,7 @@ _COMMAND_STRING_EXECUTABLES = frozenset({
 def _is_shell_command_flag(executable: str, arg: str) -> bool:
     """Reject shell command-string flags, including combined spellings."""
     name = os.path.basename(executable).lower()
+    name = name.removesuffix(".exe")
     name = re.sub(r"(python|perl|ruby|node)\d+(?:\.\d+)*$", r"\1", name)
     if name not in _COMMAND_STRING_EXECUTABLES:
         return False
@@ -180,8 +181,20 @@ def _is_shell_command_flag(executable: str, arg: str) -> bool:
 
 
 def _contains_shell_command(argv: tuple[str, ...]) -> bool:
-    """Reject recognized interpreters even when argv uses a thin wrapper."""
-    for index, executable in enumerate(argv):
+    """Reject recognized interpreters and explicitly supported wrappers."""
+    executable_positions = [0]
+    wrapper = os.path.basename(argv[0]).lower().removesuffix(".exe")
+    if wrapper == "busybox" and len(argv) > 1:
+        executable_positions.append(1)
+    elif wrapper == "env":
+        index = 1
+        while index < len(argv) and ("=" in argv[index]
+                                     or argv[index].startswith("-")):
+            index += 1
+        if index < len(argv):
+            executable_positions.append(index)
+    for index in executable_positions:
+        executable = argv[index]
         if any(_is_shell_command_flag(executable, flag)
                for flag in argv[index + 1:]):
             return True

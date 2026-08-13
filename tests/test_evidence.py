@@ -193,10 +193,16 @@ def test_each_interpreter_command_string_flag_is_rejected(argv):
 @pytest.mark.parametrize("argv", [
     ("/usr/bin/env", "bash", "-c", "echo unsafe"),
     ("busybox", "sh", "-c", "echo unsafe"),
+    ("bash.exe", "-c", "echo unsafe"),
+    ("cmd.exe", "/c", "echo unsafe"),
 ])
 def test_wrapped_interpreter_command_string_flags_are_rejected(argv):
     with pytest.raises(EvidenceError):
         ProducerCommand("unsafe", argv, ".", ())
+
+
+def test_interpreter_like_arguments_are_not_scanned_as_executables():
+    ProducerCommand("valid", ("/usr/bin/printf", "%s", "bash", "-c"), ".", ())
 
 
 @pytest.mark.parametrize("argv", [
