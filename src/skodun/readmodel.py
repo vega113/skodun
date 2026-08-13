@@ -75,6 +75,8 @@ def _extra_pass_state(meta: object) -> str:
         return "not_planned"
     status = meta.get("status")
     if status == "ran":
+        if meta.get("failed") is True or meta.get("parse_ok") is False:
+            return "failed"
         return "degraded" if meta.get("degraded") is True else "complete"
     if status == "pending":
         return "queued"

@@ -153,6 +153,20 @@ def test_security_and_skeptic_use_persisted_ran_parse_ok_shape():
     assert p.gate_eligible is True
 
 
+def test_ran_status_does_not_override_failed_or_unparsed_extra_passes():
+    failed = project_review(_record(
+        status="clean", trustworthy=True, usable_output=True,
+        extra_passes={"refuter": {"status": "ran", "failed": True}}))
+    unparsed = project_review(_record(
+        status="clean", trustworthy=True, usable_output=True,
+        extra_passes={"security": {"ran": True, "status": "ran",
+                                   "parse_ok": False}}))
+    assert failed.passes["refuter"] == "failed"
+    assert failed.refuter_annotation_available is False
+    assert unparsed.passes["security"] == "failed"
+    assert unparsed.gate_eligible is False
+
+
 def test_unbatched_completed_finder_counts_one_planned_and_one_completed_pass():
     p = project_review(_record(status="clean", trustworthy=True,
                                usable_output=True))
