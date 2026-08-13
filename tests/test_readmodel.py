@@ -1,5 +1,7 @@
 """Coverage projection contract: incomplete evidence stays visible and ineligible."""
 
+import json
+
 from skodun.readmodel import project_review
 
 
@@ -77,3 +79,74 @@ def test_malformed_prompt_bytes_are_ignored_and_plan_digest_wins():
     assert p.prompt_bytes == 12
     assert p.planner_version == "plan-v1"
     assert p.boundary_digest == "plan"
+
+
+def test_completed_checkpoint_payload_is_projected_as_partial_evidence():
+    payload = {
+        "parse_ok": True, "degraded": False, "degraded_reason": "",
+        "stop_reason": "done", "diff_truncated": False,
+        "summary": "batch one", "findings": [], "failure_reason": "",
+        "attempts": [], "provenance": {}, "accepted": None,
+    }
+    p = project_review(
+        _record(batches=[], usable_output=False),
+        orchestration={"state": "active", "batch_count": 4},
+        checkpoints=[
+            {"pass_kind": "batch", "pass_index": 1, "state": "complete",
+             "payload_json": json.dumps(payload)},
+            {"pass_kind": "batch", "pass_index": 2, "state": "pending"},
+            {"pass_kind": "batch", "pass_index": 3, "state": "pending"},
+            {"pass_kind": "batch", "pass_index": 4, "state": "pending"},
+        ])
+    assert p.coverage_state == "partial"
+    assert p.usable_evidence is True
+    assert p.gate_eligible is False
+    assert p.completed_passes == 1
+    assert p.next_resumable_pass == 2
+
+
+def test_pending_checkpoint_is_queued_and_extra_pass_shapes_are_decoded():
+    p = project_review(
+        _record(status="clean", trustworthy=True, usable_output=True,
+                extra_passes={
+                    "security": {"ran": True, "parse_ok": True,
+                                 "degraded": False},
+                    "skeptic": {"ran": True, "parse_ok": False,
+                                "degraded": False},
+                    "refuter": {"ran": True, "parse_ok": True,
+                                "degraded": False},
+                }),
+        orchestration={"state": "active", "batch_count": 1},
+        checkpoints=[
+            {"pass_kind": "batch", "pass_index": 1, "state": "complete"},
+            {"pass_kind": "integration", "pass_index": 0, "state": "pending"},
+        ])
+    assert p.passes["integration"] == "queued"
+    assert p.passes["security"] == "complete"
+    assert p.passes["skeptic"] == "failed"
+    assert p.passes["refuter"] == "complete"
+
+
+def test_unbatched_clean_round_counts_its_finder_and_rejects_string_booleans():
+    complete = project_review(_record(status="clean", trustworthy=True,
+                                       usable_output=True), checkpoints=[])
+    assert complete.planned_passes == 1
+    assert complete.completed_passes == 1
+    assert complete.coverage_state == "complete"
+
+    forged = project_review(_record(status="clean", trustworthy=True,
+                                     usable_output="false"), checkpoints=[])
+    assert forged.usable_evidence is False
+    assert forged.coverage_state == "none"
+    assert forged.gate_eligible is False
+
+
+def test_projection_prompt_bytes_includes_integration_telemetry():
+    p = project_review(_record(
+        status="clean", trustworthy=True, usable_output=True,
+        batches=[{"parse_ok": True,
+                   "telemetry": {"bytes": {"prompt": 10}}}],
+        integration={"status": "ran", "telemetry":
+                     {"bytes": {"prompt": 20}}},
+    ))
+    assert p.prompt_bytes == 30

@@ -167,6 +167,36 @@ def test_review_status_json_exposes_lineage_context_telemetry(tmp_path):
     assert payload["fingerprint_candidate_limit"] == 200
     assert payload["fingerprint_candidates_truncated"] is True
 
+
+def test_review_status_json_projects_completed_checkpoint_evidence(
+        tmp_path, monkeypatch):
+    payload = {
+        "parse_ok": True, "degraded": False, "degraded_reason": "",
+        "stop_reason": "done", "diff_truncated": False,
+        "summary": "batch one", "findings": [], "failure_reason": "",
+        "attempts": [], "provenance": {}, "accepted": None,
+    }
+    db = _db(tmp_path, _round(status="running", usable_output=False,
+                              batches=[], batch_orchestration_id="orch-1"))
+    monkeypatch.setattr(services, "_maybe_recover_stale", lambda store: None)
+    monkeypatch.setattr(Store, "get_orchestration", lambda self, oid: {
+        "id": oid, "state": "active", "batch_count": 2})
+    monkeypatch.setattr(Store, "list_checkpoints", lambda self, oid: [
+        {"pass_kind": "batch", "pass_index": 1, "state": "complete",
+         "payload_json": json.dumps(payload)},
+        {"pass_kind": "batch", "pass_index": 2, "state": "pending",
+         "payload_json": None},
+    ])
+    with Store.open(db) as store:
+        code, text = services.svc_review_status(store, "sk_1", output="json")
+    projection = json.loads(text)["coverage"]
+    assert code == 0
+    assert projection["coverage_state"] == "partial"
+    assert projection["usable_evidence"] is True
+    assert projection["gate_eligible"] is False
+    assert projection["completed_passes"] == 1
+    assert projection["next_resumable_pass"] == 2
+
 def test_triage_list_exposes_audited_deferral_and_lineage_scope(tmp_path):
     finding = _finding(0)
     finding.update(

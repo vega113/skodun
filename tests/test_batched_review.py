@@ -318,10 +318,17 @@ def test_an_over_budget_diff_is_reviewed_in_batches_and_recorded_once(tmp_path,
     assert all(b["id"] == f"{rec['id']}.b{b['index']}" for b in rec["batches"])
     assert all(b["attempts"] and b["attempts"][0]["provider"] == "xai"
                for b in rec["batches"])
+    assert all(b["telemetry"]["timing"]["started_at"]
+               and b["telemetry"]["timing"]["completed_at"]
+               and b["telemetry"]["timing"]["run_duration_sec"] is not None
+               for b in rec["batches"])
     assert rec["integration"]["ran"] is True
     assert rec["integration"]["status"] == "ran"
     assert rec["integration"]["parse_ok"] is True
     assert rec["integration"]["attempts"]
+    assert rec["integration"]["telemetry"]["timing"]["started_at"]
+    assert rec["integration"]["telemetry"]["timing"]["completed_at"]
+    assert rec["integration"]["telemetry"]["timing"]["run_duration_sec"] is not None
 
     # The record persists the budget its own shape implies -- what
     # `recover_stale` reads instead of recomputing from the current config.
@@ -1018,6 +1025,27 @@ def _without_run_identity(rec: dict) -> dict:
     out["batches"] = [
         {key: value for key, value in batch.items() if key != "id"}
         for batch in out.get("batches", [])]
+    for batch in out.get("batches", []):
+        telemetry = batch.get("telemetry")
+        timing = dict(telemetry.get("timing", {})) if isinstance(
+            telemetry, dict) else {}
+        for key in ("started_at", "completed_at", "run_duration_sec",
+                    "wall_duration_sec"):
+            timing.pop(key, None)
+        if isinstance(telemetry, dict):
+            batch["telemetry"] = {**telemetry, "timing": timing}
+    integration = out.get("integration")
+    if isinstance(integration, dict):
+        integration = dict(integration)
+        out["integration"] = integration
+        telemetry = integration.get("telemetry")
+        timing = dict(telemetry.get("timing", {})) if isinstance(
+            telemetry, dict) else {}
+        for key in ("started_at", "completed_at", "run_duration_sec",
+                    "wall_duration_sec"):
+            timing.pop(key, None)
+        if isinstance(telemetry, dict):
+            integration["telemetry"] = {**telemetry, "timing": timing}
     return out
 
 

@@ -60,6 +60,8 @@ class CoverageProjection:
 
 def _pass_state(value: object, default: str = "not_planned") -> str:
     state = value if isinstance(value, str) else default
+    if state == "pending":
+        return "queued"
     return state if state in PASS_STATES else "failed"
 
 
@@ -70,12 +72,45 @@ def _nonnegative_int(value: object) -> int | None:
     return value
 
 
+def _checkpoint_payload(row: Mapping) -> Mapping | None:
+    """Decode one bounded completed payload for read-only partial evidence."""
+    if row.get("state") != "complete":
+        return None
+    raw = row.get("payload_json")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, Mapping) else None
+
+
+def _extra_pass_state(value: object) -> str:
+    """Normalize legacy optional-pass metadata without treating missing fields as success."""
+    if not isinstance(value, Mapping):
+        return "not_planned"
+    status = value.get("status")
+    if status == "pending":
+        return "queued"
+    if status in {"failed", "unavailable"}:
+        return status
+    if status == "degraded" or value.get("degraded") is True:
+        return "degraded"
+    if status in {"ran", "complete"}:
+        return "complete" if value.get("parse_ok") is not False else "failed"
+    if value.get("ran") is True:
+        return "complete" if value.get("parse_ok") is True else "failed"
+    return _pass_state(status)
+
+
 def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
                    checkpoints: Sequence[Mapping] = ()) -> CoverageProjection:
     """Derive bounded coverage/pass/gate fields without changing trust."""
     batches = rec.get("batches")
+    batches = batches if isinstance(batches, list) else []
     batch_count = int((orchestration or {}).get("batch_count") or
-                      (len(batches) if isinstance(batches, list) else 0))
+                      len(batches))
     checkpoint_rows = list(checkpoints)
     planned = batch_count + (1 if any(
         row.get("pass_kind") == "integration" for row in checkpoint_rows) else 0)
@@ -85,18 +120,25 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
     failed_rows = [r for r in checkpoint_rows if r.get("state") == "failed"]
     completed = len(complete_rows)
     failed = len(failed_rows)
-    parseable = bool(rec.get("usable_output")) or any(
+    checkpoint_batches = [payload for row in checkpoint_rows
+                          if row.get("pass_kind") == "batch"
+                          for payload in [_checkpoint_payload(row)]
+                          if payload is not None]
+    evidence_batches = batches or checkpoint_batches
+    parseable = rec.get("usable_output") is True or any(
         isinstance(b, Mapping) and b.get("parse_ok") is True
-        for b in (batches or []) if isinstance(batches, list))
+        for b in evidence_batches)
     if not checkpoint_rows and isinstance(batches, list):
         completed = sum(1 for b in batches if isinstance(b, Mapping) and
                         b.get("parse_ok") is True)
         failed = sum(1 for b in batches if isinstance(b, Mapping) and
                      b.get("parse_ok") is False)
+        if not batches and parseable:
+            completed = 1
     orchestration_state = (orchestration or {}).get("state")
     complete = (orchestration_state == "consumed" or
                 (not orchestration_state and rec.get("status") in
-                 {"clean", "findings"}) or
+                 {"clean", "findings"} and parseable) or
                 (planned > 0 and completed == planned and not failed))
     coverage_state = "complete" if complete else ("partial" if parseable else "none")
     extras = rec.get("extra_passes")
@@ -104,9 +146,9 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
     passes = {
         "finder": "complete" if parseable else _pass_state(rec.get("status"), "failed"),
         "integration": "not_planned",
-        "security": _pass_state((extras.get("security") or {}).get("status")),
-        "skeptic": _pass_state((extras.get("skeptic") or {}).get("status")),
-        "refuter": _pass_state((extras.get("refuter") or {}).get("status")),
+        "security": _extra_pass_state(extras.get("security")),
+        "skeptic": _extra_pass_state(extras.get("skeptic")),
+        "refuter": _extra_pass_state(extras.get("refuter")),
     }
     for row in checkpoint_rows:
         key = "finder" if row.get("pass_kind") == "batch" else "integration"
@@ -114,19 +156,28 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
             passes[key] = "running"
         elif key == "integration":
             passes[key] = _pass_state(row.get("state"))
-    next_pass = next((i + 1 for i, row in enumerate(checkpoint_rows)
-                      if row.get("state") in {"pending", "failed"}), None)
+    next_pass = None
+    for row in checkpoint_rows:
+        if row.get("state") in {"pending", "failed"}:
+            next_pass = (row.get("pass_index") if row.get("pass_kind") == "batch"
+                         else batch_count + 1)
+            break
     required_fail = any(passes[k] == "failed" for k in ("integration", "security", "skeptic"))
     eligible = coverage_state == "complete" and rec.get("trustworthy") is True and not required_fail
     reason = "eligible" if eligible else (
         "coverage_incomplete" if coverage_state != "complete" else
         "untrustworthy" if rec.get("trustworthy") is not True else "required_pass_failed")
-    finder_only = (orchestration_state is None and passes["integration"] == "not_planned")
+    finder_only = (orchestration_state is None and
+                   passes["integration"] == "not_planned")
     refuter_available = passes["refuter"] in {"complete", "degraded"}
     cross_provider = passes["integration"] == "complete"
     telemetry_rows = [b.get("telemetry") for b in (batches or [])
                       if isinstance(b, Mapping) and
                       isinstance(b.get("telemetry"), Mapping)]
+    integration = rec.get("integration")
+    if (isinstance(integration, Mapping)
+            and isinstance(integration.get("telemetry"), Mapping)):
+        telemetry_rows.append(integration["telemetry"])
     prompt_values = []
     for row in telemetry_rows:
         dimensions = row.get("bytes")
