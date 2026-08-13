@@ -197,6 +197,31 @@ def test_failed_extra_pass_flag_and_missing_parse_boolean_stay_failed():
     assert p.gate_reason == "required_pass_failed"
 
 
+def test_failed_required_pass_takes_priority_over_untrustworthy_reason():
+    p = project_review(_record(
+        status="clean", trustworthy=False, usable_output=True,
+        extra_passes={"security": {"ran": False, "failed": True}}))
+    assert p.gate_reason == "required_pass_failed"
+
+
+def test_mixed_finder_checkpoint_payloads_do_not_complete_finder():
+    good = {"parse_ok": True, "degraded": False, "degraded_reason": "",
+            "stop_reason": "done", "diff_truncated": False,
+            "summary": "", "findings": [], "failure_reason": "",
+            "attempts": [], "provenance": {}, "accepted": None}
+    bad = {**good, "parse_ok": False, "stop_reason": "parse_failed"}
+    p = project_review(
+        _record(status="clean", trustworthy=True, usable_output=False),
+        orchestration={"state": "active", "batch_count": 2},
+        checkpoints=[
+            {"pass_kind": "batch", "pass_index": 1, "state": "complete",
+             "payload_json": json.dumps(good)},
+            {"pass_kind": "batch", "pass_index": 2, "state": "complete",
+             "payload_json": json.dumps(bad)},
+        ])
+    assert p.passes["finder"] == "failed"
+
+
 def test_completed_integration_checkpoint_is_usable_evidence():
     payload = {
         "parse_ok": True, "degraded": False, "degraded_reason": "",

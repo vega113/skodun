@@ -180,6 +180,18 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
         "skeptic": _extra_pass_state(extras.get("skeptic")),
         "refuter": _extra_pass_state(extras.get("refuter"), refuter=True),
     }
+    batch_checkpoint_states = [checkpoint_state for row, checkpoint_state in
+                               zip(checkpoint_rows, checkpoint_states)
+                               if row.get("pass_kind") == "batch"]
+    if batch_checkpoint_states:
+        if "failed" in batch_checkpoint_states:
+            passes["finder"] = "failed"
+        elif "queued" in batch_checkpoint_states:
+            passes["finder"] = "queued"
+        elif "running" in batch_checkpoint_states:
+            passes["finder"] = "running"
+        elif all(state == "complete" for state in batch_checkpoint_states):
+            passes["finder"] = "complete"
     for row, checkpoint_state in zip(checkpoint_rows, checkpoint_states):
         key = "finder" if row.get("pass_kind") == "batch" else "integration"
         if key == "finder" and row.get("state") == "running":
@@ -196,6 +208,7 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
     eligible = coverage_state == "complete" and rec.get("trustworthy") is True and not required_fail
     reason = "eligible" if eligible else (
         "coverage_incomplete" if coverage_state != "complete" else
+        "required_pass_failed" if required_fail else
         "untrustworthy" if rec.get("trustworthy") is not True else "required_pass_failed")
     finder_only = (orchestration_state is None and
                    passes["integration"] == "not_planned")

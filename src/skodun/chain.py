@@ -656,7 +656,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                     # same bytes would fail the same way at every other entry.
                     attempts.append(_attempt(
                         n, entry,
-                        skipped=f"could not build the invocation: {e!r}"))
+                        skipped=f"could not build the invocation: {e!r}",
+                        capacity_timing=capacity_timing))
                     return _Outcome(None, attempts,
                                     f"reviewer {entry.name!r} could not be "
                                     f"invoked: {e!r}")
