@@ -192,6 +192,7 @@ def test_each_interpreter_command_string_flag_is_rejected(argv):
 
 @pytest.mark.parametrize("argv", [
     ("/usr/bin/env", "bash", "-c", "echo unsafe"),
+    ("/usr/bin/env", "-u", "LD_PRELOAD", "bash", "-c", "echo unsafe"),
     ("busybox", "sh", "-c", "echo unsafe"),
     ("bash.exe", "-c", "echo unsafe"),
     ("cmd.exe", "/c", "echo unsafe"),
@@ -231,10 +232,18 @@ def test_non_ok_diagnostics_never_verify(diagnostic):
 def test_signal_exit_codes_are_queryable_rejected_evidence():
     receipt = parse_receipt(json.dumps(receipt_mapping(
         exit_code=-15, terminal_state="failed",
-        diagnostic_category="failed")))
+        diagnostic_category="ok")))
     result = verify_receipt(receipt, identity(), policy())
     assert result.accepted is False
-    assert result.reason_code == "diagnostic_mismatch"
+    assert result.reason_code == "producer_failed"
+
+
+def test_service_rejects_controlled_identity_digest(tmp_path):
+    with Store.open(tmp_path / "store.db") as store:
+        code, message = services.svc_evidence_summary(
+            store, "sha256:" + "a" * 63 + "\nforged", output="text")
+    assert code == 2
+    assert message.endswith("identity digest is invalid")
 
 
 def test_receipt_nested_counters_are_immutable_and_invalid_constructed_receipts_reject():

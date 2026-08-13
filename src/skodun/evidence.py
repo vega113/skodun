@@ -188,9 +188,21 @@ def _contains_shell_command(argv: tuple[str, ...]) -> bool:
         executable_positions.append(1)
     elif wrapper == "env":
         index = 1
-        while index < len(argv) and ("=" in argv[index]
-                                     or argv[index].startswith("-")):
-            index += 1
+        while index < len(argv):
+            option = argv[index]
+            if "=" in option and not option.startswith("-"):
+                index += 1
+                continue
+            if option in {"-u", "--unset", "-C", "--chdir"}:
+                index += 2
+                continue
+            if option.startswith(("--unset=", "--chdir=")):
+                index += 1
+                continue
+            if option in {"-i", "--ignore-environment"}:
+                index += 1
+                continue
+            break
         if index < len(argv):
             executable_positions.append(index)
     for index in executable_positions:
