@@ -322,6 +322,7 @@ def test_partial_ladder_keeps_pre_migration_backup(tmp_path, monkeypatch):
         pass
     _downgrade(db, version=12)
     import skodun.store as store_mod
+    real = store_mod._migrate
 
     def wrap(conn):
         conn.execute("PRAGMA user_version = 13")
@@ -330,10 +331,13 @@ def test_partial_ladder_keeps_pre_migration_backup(tmp_path, monkeypatch):
     monkeypatch.setattr(store_mod, "_migrate", wrap)
     with pytest.raises(ValueError, match="injected mid-ladder"):
         Store.migrate_existing(db, build_commit="a" * 40)
-    assert inspect_schema(db).version == 13
+    monkeypatch.setattr(store_mod, "_migrate", real)
+    assert inspect_schema(db).version == 12
     backup = Path(str(db) + ".backup-before-v" + str(SCHEMA_VERSION))
-    assert backup.exists()
+    assert not backup.exists()
     assert not Path(str(db) + ".migration.lock").exists()
+    receipt = Store.migrate_existing(db, build_commit="a" * 40)
+    assert receipt["result"] == "success"
 
 
 def test_failed_apply_is_retryable_when_store_stays_old(tmp_path, monkeypatch):

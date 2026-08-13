@@ -246,6 +246,28 @@ def migration_receipt_path(path: Path, target: int | None = None) -> Path:
     return Path(str(path) + f".migration-receipt-v{version}.json")
 
 
+def _restore_from_backup(path: Path, backup: Path) -> bool:
+    """Copy an integrity-ok backup over `path`. False if restore cannot run."""
+    try:
+        if not backup.is_file() or backup.stat().st_size == 0:
+            return False
+    except OSError:
+        return False
+    uri = f"file:{quote(str(backup.resolve()))}?mode=ro"
+    source = sqlite3.connect(uri, uri=True)
+    try:
+        if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            return False
+        dest = sqlite3.connect(path, isolation_level=None)
+        try:
+            source.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        source.close()
+    return True
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -1694,13 +1716,11 @@ class Store:
         except BaseException:
             if not migrated:
                 destination.unlink(missing_ok=True)
-                current = inspect_schema(path)
-                # Keep the verified pre-migration backup whenever the store
-                # advanced off the original version; deleting it would leave
-                # a partial ladder with no restore image.
-                if (current.state == "older"
-                        and current.version == original_version):
-                    backup.unlink(missing_ok=True)
+                try:
+                    if _restore_from_backup(path, backup):
+                        backup.unlink(missing_ok=True)
+                except Exception:
+                    pass
             raise
 
     def close(self) -> None:
