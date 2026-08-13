@@ -365,6 +365,40 @@ def test_lineage_prompt_context_is_bounded_and_utf8_safe():
     assert b"\n\nsha256:" not in context
 
 
+def test_truncated_lineage_prompt_keeps_complete_quoted_path_lines():
+    digest = "sha256:" + "a" * 64
+    rows = [{
+        "finding_fingerprint_v2": digest,
+        "file": "x" * 200,
+        "finding_lineage_v2": {"match_reason": "repeated"},
+    }] * 8
+    context, truncated = fingerprint.render_prompt_context(rows, max_bytes=400)
+    assert truncated is True
+    text = context.decode("utf-8")
+    for line in text.splitlines():
+        if line.startswith("sha256:"):
+            assert ' path="' in line
+            assert line.endswith('" reason=repeated')
+            assert line.count('"') == 2
+
+
+def test_truncated_lineage_prompt_skips_an_oversized_first_row():
+    long_digest = "sha256:" + "a" * 64
+    short_digest = "sha256:" + "b" * 64
+    rows = [
+        {"finding_fingerprint_v2": long_digest, "file": "L" * 400,
+         "finding_lineage_v2": {"match_reason": "new"}},
+        {"finding_fingerprint_v2": short_digest, "file": "src/b.py",
+         "finding_lineage_v2": {"match_reason": "repeated"}},
+    ]
+    context, truncated = fingerprint.render_prompt_context(rows, max_bytes=256)
+    assert truncated is True
+    text = context.decode("utf-8")
+    assert short_digest in text
+    assert long_digest not in text
+    assert 'path="src/b.py" reason=repeated' in text
+
+
 def test_lineage_prompt_context_cannot_break_out_of_a_single_line():
     rows = [{
         "finding_fingerprint_v2": "sha256:" + "a" * 64,
@@ -380,3 +414,32 @@ def test_lineage_prompt_context_cannot_break_out_of_a_single_line():
                  if line == "----- END PRIOR FINDINGS -----"]
     assert exact_end == ["----- END PRIOR FINDINGS -----"]
     assert "reason=prior" in text
+
+
+def test_lineage_prompt_path_cannot_spoof_reason_tokens():
+    digest = "sha256:" + "a" * 64
+    rows = [{
+        "finding_fingerprint_v2": digest,
+        "file": "foo reason=moved",
+        "finding_lineage_v2": {"match_reason": "new"},
+    }]
+    context, truncated = fingerprint.render_prompt_context(rows)
+    text = context.decode("utf-8")
+    assert truncated is False
+    assert f'{digest} path="foo reason=moved" reason=new' in text
+    assert "path=foo reason=moved" not in text
+
+
+def test_lineage_prompt_path_quoting_survives_surrogate_filenames():
+    digest = "sha256:" + "b" * 64
+    rows = [{
+        "finding_fingerprint_v2": digest,
+        "file": "src/\udcff.py",
+        "finding_lineage_v2": {"match_reason": "prior"},
+    }]
+    context, truncated = fingerprint.render_prompt_context(rows)
+    assert truncated is False
+    text = context.decode("utf-8")
+    assert digest in text
+    assert "reason=prior" in text
+    assert "\udcff" not in text
