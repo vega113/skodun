@@ -20,6 +20,11 @@ ALGORITHM = "canonical-json-sha256-v1"
 UNKNOWN = "unknown"
 CANDIDATE_LIMIT = 200
 MAX_LINEAGE_PROMPT_BYTES = 1024
+_PROMPT_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_PROMPT_REASONS = frozenset({
+    "new", "repeated", "moved", "scope_changed", "ambiguous", "prior",
+})
+_PROMPT_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _PASS_MARKER = re.compile(r"^\s*\((security|skeptic|integration|refuter)\)\s*", re.I)
 _EXTRA_MARKER = re.compile(r"^\s*\(extra-pass:\s*(security|skeptic|integration|refuter)\)\s*", re.I)
 
@@ -237,6 +242,12 @@ def annotate_findings(
     return out
 
 
+def _prompt_field(value: object, *, limit: int = 256) -> str:
+    """Flatten untrusted finding text so it cannot break a prompt line."""
+    text = _PROMPT_CONTROL.sub("", str(value or "").replace("\r", " ").replace("\n", " "))
+    return " ".join(text.split())[:limit]
+
+
 def render_prompt_context(rows: Iterable[object],
                           max_bytes: int = MAX_LINEAGE_PROMPT_BYTES) -> tuple[bytes, bool]:
     """Render a compact prior-fingerprint hint for provider prompts.
@@ -256,10 +267,12 @@ def render_prompt_context(rows: Iterable[object],
         digest = item.get("finding_fingerprint_v2")
         if not isinstance(digest, str) or not digest:
             digest = finding_fingerprint(item)
-        path = _path(item.get("file"))
+        if not isinstance(digest, str) or _PROMPT_DIGEST.fullmatch(digest) is None:
+            continue
+        path = _prompt_field(_path(item.get("file"))) or UNKNOWN
         lineage = item.get("finding_lineage_v2")
         reason = lineage.get("match_reason") if isinstance(lineage, Mapping) else None
-        if not isinstance(reason, str) or not reason:
+        if reason not in _PROMPT_REASONS:
             reason = "prior"
         lines.append(f"{digest} path={path} reason={reason}")
         count += 1
