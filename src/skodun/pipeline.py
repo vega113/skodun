@@ -157,6 +157,7 @@ from __future__ import annotations
 
 import calendar
 import inspect
+import math
 import os
 import shutil
 import sys
@@ -3102,15 +3103,17 @@ def _begin_checkpoint_run(store: Store, identity: checkpoints.OrchestrationIdent
         orchestration_id, ids.new_review_id("sk_owner_"), identity)
 
 
-def _checkpoint_claim_lease_seconds(d: Defaults, width: int) -> int:
+def _checkpoint_claim_lease_seconds(d: Defaults, width: int,
+                                    env: dict[str, str] | None = None) -> int:
     """Provider worst-case plus configured admission wait.
 
     `_run_sub` waits for a provider slot after the checkpoint is claimed, so
     the lease must cover that wait. The default matches `chain`'s provider
     admission floor when ``SKODUN_ADMISSION_WAIT_SECONDS`` is unset.
+    Fractional waits round up so the lease cannot expire during the wait.
     """
-    wait = capacity.admission_wait_from_env(chain._DEFAULT_PROVIDER_WAIT_SEC)
-    return budget.worst_runtime(d, width, 0) + int(wait)
+    wait = capacity.admission_wait_from_env(chain._DEFAULT_PROVIDER_WAIT_SEC, env)
+    return budget.worst_runtime(d, width, 0) + math.ceil(wait)
 
 
 def _sub_telemetry_timing(sub: _Sub) -> dict:

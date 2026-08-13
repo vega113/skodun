@@ -998,11 +998,14 @@ def test_prepared_plan_builds_the_complete_checkpoint_identity(tmp_path):
     assert identity.pass_identities[-1].prompt_hash is None
 
 
-def test_checkpoint_claim_lease_includes_configured_admission_wait(monkeypatch):
-    monkeypatch.setenv("SKODUN_ADMISSION_WAIT_SECONDS", "90")
+def test_checkpoint_claim_lease_includes_configured_admission_wait():
     defaults = Defaults(timeout_sec=1, timeout_retries=0, degraded_retries=0)
-    lease = pipeline._checkpoint_claim_lease_seconds(defaults, 1)
-    assert lease == budget.worst_runtime(defaults, 1, 0) + 90
+    assert pipeline._checkpoint_claim_lease_seconds(
+        defaults, 1, env={"SKODUN_ADMISSION_WAIT_SECONDS": "90"}) == (
+        budget.worst_runtime(defaults, 1, 0) + 90)
+    assert pipeline._checkpoint_claim_lease_seconds(
+        defaults, 1, env={"SKODUN_ADMISSION_WAIT_SECONDS": "1.9"}) == (
+        budget.worst_runtime(defaults, 1, 0) + 2)
 
 
 def _clean_checkpoint_sub(label: str) -> pipeline._Sub:
