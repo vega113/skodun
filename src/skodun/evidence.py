@@ -179,6 +179,9 @@ def _is_shell_command_flag(executable: str, arg: str) -> bool:
         return True
     if arg.startswith("--command="):
         return True
+    if name == "fish" and (arg in {"-C", "--init-command"}
+                            or arg.startswith("--init-command=")):
+        return True
     return (arg.startswith("-c")
             or re.fullmatch(r"-[A-Za-z]*c(?:=.*)?", arg) is not None)
 

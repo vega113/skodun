@@ -198,6 +198,8 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
     ("bash", "-o", "pipefail", "-c", "echo unsafe"),
     ("sh", "-o", "errexit", "-c", "echo unsafe"),
     ("dash", "-o", "errexit", "-c", "echo unsafe"),
+    ("fish", "-C", "echo unsafe"),
+    ("fish", "--init-command=echo unsafe"),
     ("python3", "--check-hash-based-pycs", "always", "-c", "print(1)"),
     ("ruby", "-C", "/tmp", "-e", "puts 1"),
 ])
