@@ -1558,12 +1558,16 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         head = gitio.head_sha(repo)
         tree_fingerprint = gitio.tree_fingerprint(repo, paths=diff.files)
         stack_validation = None
+        stack_prompt_context = b""
+        stack_prompt_truncated = False
         if stack_request is not None:
             stack_validation = stack.validate(
                 stack_request, repo=root, certification_base=base.sha,
                 current_head=head, full_diff=diff,
                 full_tree_fingerprint=tree_fingerprint,
                 untracked_max=d.untracked_max)
+            stack_prompt_context, stack_prompt_truncated = stack.render_prompt_context(
+                stack_validation)
 
         # STAGE TWO of the two-stage ordering: the AUTHORITATIVE batch plan,
         # built from the capture above — the only diff this review persists
@@ -1650,6 +1654,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             repo=scope,
             repo_id=scope,
             lineage_repository_id=lineage_repository_id,
+            stack_context_bytes=len(stack_prompt_context),
+            stack_context_truncated=stack_prompt_truncated,
             worktree_root=str(root),
             # Process identity for cancel-by-id (S1). Background workers already
             # attach a pid via the reservation lease; foreground rows need it
@@ -1842,7 +1848,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
 
                 prompt = promptbuild.build(
                     branch, base.ref, base.sha, f"{head} (working tree)",
-                    diff.data, mdb, selection, pack_body)
+                    diff.data, mdb, selection, pack_body,
+                    stack_context=stack_prompt_context)
 
                 # The first route happens before the diff and prompt exist so
                 # it can participate in preflight. Once the shipped prompt is
@@ -1896,10 +1903,11 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                                         root, diff.files, diff.statuses,
                                         headroom, pack_large_added=False)
                                     pack_body = pack.body
-                                prompt = promptbuild.build(
-                                    branch, base.ref,
-                                    base.sha, f"{head} (working tree)",
-                                    diff.data, mdb, selection, pack_body)
+                            prompt = promptbuild.build(
+                                branch, base.ref,
+                                base.sha, f"{head} (working tree)",
+                                diff.data, mdb, selection, pack_body,
+                                stack_context=stack_prompt_context)
                 if prompt.diff_truncated:
                     # Reachable only for a diff that is over the envelope and
                     # was NOT batched, i.e. one this build refused to split.

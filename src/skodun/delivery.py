@@ -419,6 +419,16 @@ def _findings_lines(rec: Mapping) -> list[str]:
     if rec.get("artifact_unreadable") is True:
         lines.append("      note: this round's stored artifact could not be "
                      "read, so only its indexed summary is shown")
+    stack = rec.get("stack")
+    if isinstance(stack, Mapping):
+        status = shown_field(stack.get("status"))
+        reason = shown_field(stack.get("reason_code"))
+        context = rec.get("stack_context_truncated")
+        if status:
+            suffix = f" reason={reason}" if reason else ""
+            if context is True:
+                suffix += " context=truncated"
+            lines.append(f"      stack: {status}{suffix}")
     findings = rec.get("findings")
     findings = findings if isinstance(findings, list) else []
     for i, f in enumerate(findings[:MAX_FINDINGS_SHOWN]):
@@ -426,6 +436,15 @@ def _findings_lines(rec: Mapping) -> list[str]:
         lines.append(f"      [{i}] {shown_field(f.get('severity'))} "
                      f"{shown_field(f.get('file'))}:{shown_field(f.get('line'))} "
                      f"{shown_field(f.get('title'))}")
+        scope = f.get("scope_attribution")
+        lineage = f.get("finding_lineage_v2")
+        annotations = []
+        if isinstance(scope, Mapping) and shown_field(scope.get("scope")):
+            annotations.append(f"scope={shown_field(scope.get('scope'))}")
+        if isinstance(lineage, Mapping) and shown_field(lineage.get("match_reason")):
+            annotations.append(f"lineage={shown_field(lineage.get('match_reason'))}")
+        if annotations:
+            lines[-1] += " " + " ".join(annotations)
     hidden = len(findings) - MAX_FINDINGS_SHOWN
     if hidden > 0:
         lines.append(f"      ... and {hidden} more finding(s) not shown")

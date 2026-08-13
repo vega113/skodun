@@ -306,6 +306,19 @@ def test_a_trustworthy_round_with_findings_renders_them_normally(tmp_path):
         assert "skodun triage --list sk_1" in text
 
 
+def test_surface_exposes_stack_and_lineage_annotations(tmp_path):
+    with _store(tmp_path) as st:
+        _save(st, status="clean", findings=[_finding(
+            scope_attribution={"scope": "current_slice"},
+            finding_lineage_v2={"match_reason": "moved"})],
+              findings_total=1, severity={"high": 1, "medium": 0, "low": 0},
+              stack={"status": "valid", "reason_code": "ok"},
+              stack_context_truncated=True)
+        text = _surface(st).text
+    assert "stack: valid reason=ok context=truncated" in text
+    assert "scope=current_slice lineage=moved" in text
+
+
 def test_a_quiet_round_says_nothing_and_is_acknowledged_immediately(tmp_path):
     """Trustworthy, zero findings: there is nothing a reader must act on, and
     re-scanning it at every session start forever is pure waste. Nothing

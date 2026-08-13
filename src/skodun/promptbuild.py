@@ -170,6 +170,8 @@ class Prompt:
     text: bytes
     diff_truncated: bool
     prompt_bytes: int
+    stack_context_bytes: int = 0
+    stack_context_truncated: bool = False
 
 
 def build(
@@ -181,6 +183,7 @@ def build(
     max_diff_bytes: int,
     selection: Selection | None,
     pack_body: bytes | None,
+    stack_context: bytes | None = None,
 ) -> Prompt:
     """Render the review prompt.
 
@@ -217,6 +220,8 @@ def build(
     out += f"Branch: {branch}\n".encode("utf-8")
     out += f"Base:   {base_ref} ({base_sha})\n".encode("utf-8")
     out += f"Head:   {head}\n".encode("utf-8")
+    if stack_context:
+        out += b"\n" + stack_context.rstrip(b"\n") + b"\n"
 
     # Oracle: `$(...)` capture strips every trailing newline, `printf '%s\n'`
     # re-adds exactly one, and `[ -n "$_cl_body" ]` tests the stripped value.
@@ -237,4 +242,5 @@ def build(
 
     text = bytes(out)
     return Prompt(text=text, diff_truncated=diff_truncated,
-                  prompt_bytes=len(text))
+                  prompt_bytes=len(text),
+                  stack_context_bytes=len(stack_context or b""))
