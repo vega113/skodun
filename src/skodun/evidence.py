@@ -33,6 +33,7 @@ _DIFF = re.compile(r"[0-9a-f]{40,64}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _ENV = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 _TS = "%Y-%m-%dT%H:%M:%SZ"
+_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+:-]{0,127}")
 _KINDS = frozenset({"preflight", "full_gate", "mutation", "ci_run",
                     "review_threads"})
 _TERMINAL = frozenset({"passed", "failed", "cancelled", "unavailable"})
@@ -160,23 +161,24 @@ def _is_shell_command_flag(executable: str, arg: str) -> bool:
     name = _normalized_executable(executable)
     if name not in _COMMAND_STRING_EXECUTABLES:
         return False
-    lowered = arg.lower()
     if name == "cmd":
+        lowered = arg.lower()
         return lowered.startswith(("/c", "/k"))
     if name in {"perl", "ruby", "node"}:
-        return (lowered == "-e" or lowered.startswith("-e")
-                or lowered.startswith("--eval")
-                or lowered.startswith("--execute")
-                or (name == "node" and lowered.startswith(("-p", "--print"))))
+        return (arg == "-e" or arg.startswith("-e")
+                or arg.startswith("--eval")
+                or arg.startswith("--execute")
+                or (name == "node" and arg.startswith(("-p", "--print"))))
     if name in {"powershell", "pwsh"}:
+        lowered = arg.lower()
         return (lowered in {"-c", "-command", "-ec", "-encodedcommand"}
                 or lowered.startswith(("-c", "-command", "-ec",
                                        "-encodedcommand")))
-    if lowered in {"-c", "--command"}:
+    if arg in {"-c", "--command"}:
         return True
-    if lowered.startswith("--command="):
+    if arg.startswith("--command="):
         return True
-    return (lowered.startswith("-c")
+    return (arg.startswith("-c")
             or re.fullmatch(r"-[A-Za-z]*c(?:=.*)?", arg) is not None)
 
 
@@ -492,8 +494,11 @@ def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
                    for value in artifacts if isinstance(value, str))
             or any(not isinstance(value, str) for value in artifacts)):
         raise EvidenceError("invalid_field", "artifact_digests")
-    tool = _text("tool", raw["tool"])
-    runtime = _text("runtime", raw["runtime"])
+    tool = _text("tool", raw["tool"], maximum=128)
+    runtime = _text("runtime", raw["runtime"], maximum=128)
+    if (_IDENTIFIER.fullmatch(tool) is None
+            or _IDENTIFIER.fullmatch(runtime) is None):
+        raise EvidenceError("invalid_field", "tool/runtime")
     diagnostic = raw["diagnostic_category"]
     if not isinstance(diagnostic, str) or diagnostic not in _DIAGNOSTICS:
         raise EvidenceError("invalid_field", "diagnostic_category")

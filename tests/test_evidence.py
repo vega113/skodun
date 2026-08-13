@@ -231,6 +231,19 @@ def test_non_interpreter_command_flags_remain_valid(argv):
     ProducerCommand("valid", argv, ".", ())
 
 
+def test_case_sensitive_interpreter_options_remain_valid():
+    ProducerCommand("ruby-valid", ("ruby", "-E", "UTF-8", "script.rb"), ".", ())
+    ProducerCommand("bash-valid", ("bash", "-C", "script.sh"), ".", ())
+
+
+def test_receipt_metadata_is_bounded_to_identifiers():
+    for field in ("tool", "runtime"):
+        raw = receipt_mapping(**{field: "token=plaintext"})
+        with pytest.raises(EvidenceError) as exc:
+            parse_receipt(json.dumps(raw))
+        assert exc.value.reason_code == "invalid_field"
+
+
 @pytest.mark.parametrize("cwd", ["..\\outside", "C:\\Windows", "\\\\server\\share"])
 def test_windows_policy_working_directories_are_rejected(cwd):
     with pytest.raises(EvidenceError):
