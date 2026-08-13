@@ -38,6 +38,7 @@ _KINDS = frozenset({"preflight", "full_gate", "mutation", "ci_run",
 _TERMINAL = frozenset({"passed", "failed", "cancelled", "unavailable"})
 _DIAGNOSTICS = frozenset({"ok", "failed", "cancelled", "unavailable",
                           "mismatch", "redacted", "unverifiable"})
+_NONCE = re.compile(r"[A-Za-z0-9._-]{1,512}")
 
 
 class EvidenceError(ValueError):
@@ -190,6 +191,9 @@ def _contains_shell_command(argv: tuple[str, ...]) -> bool:
         index = 1
         while index < len(argv):
             option = argv[index]
+            if (option in {"-S", "--split-string"}
+                    or option.startswith(("-S", "--split-string="))):
+                return True
             if "=" in option and not option.startswith("-"):
                 index += 1
                 continue
@@ -207,10 +211,32 @@ def _contains_shell_command(argv: tuple[str, ...]) -> bool:
             executable_positions.append(index)
     for index in executable_positions:
         executable = argv[index]
-        if any(_is_shell_command_flag(executable, flag)
-               for flag in argv[index + 1:]):
+        flags = argv[index + 1:]
+        if (os.path.basename(executable).lower().removesuffix(".exe")
+                in {"python", "python3", "perl", "ruby", "node"}):
+            flags = tuple(_interpreter_option_segment(flags))
+        if any(_is_shell_command_flag(executable, flag) for flag in flags):
             return True
     return False
+
+
+def _interpreter_option_segment(args: tuple[str, ...]):
+    """Return only interpreter options before a script/module operand."""
+    result: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if not arg.startswith("-") or arg == "-":
+            break
+        result.append(arg)
+        if arg in {"-m", "--module", "-W", "--warn", "-X", "--execute"}:
+            index += 1
+            if index < len(args):
+                result.append(args[index])
+        index += 1
+    return result
 
 
 @dataclass(frozen=True)
@@ -430,6 +456,8 @@ def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
     if not isinstance(diagnostic, str) or diagnostic not in _DIAGNOSTICS:
         raise EvidenceError("invalid_field", "diagnostic_category")
     nonce = _text("nonce", raw["nonce"])
+    if _NONCE.fullmatch(nonce) is None:
+        raise EvidenceError("invalid_field", "nonce")
     redaction = raw["redaction"]
     if (not isinstance(redaction, dict)
             or set(redaction) != {"applied", "secrets_removed", "logs_included"}

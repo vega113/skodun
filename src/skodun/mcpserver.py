@@ -1239,19 +1239,6 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                         "terminal when the holder is gone. Same words as "
                         "`skodun review-cancel`. Refuses missing ids and "
                         "already-terminal rows."),
-        HandlerSpec(
-            name="evidence", long_running=False,
-            input_schema=_schema({
-                "identity_digest": {
-                    "type": "string",
-                    "description": "canonical review identity digest to inspect"},
-                "output": {"type": "string", "enum": ["text", "json"],
-                           "description": "summary representation (default text)"},
-            }, ("identity_digest",)),
-            handler=_handle_evidence,
-            description="Read bounded advisory repository-evidence receipts. "
-                        "Receipts never alter gate or trust; JSON matches the "
-                        "CLI `skodun evidence --json` projection."),
         # Non-gate feedback: agent/human judgment + product bugs. Appended
         # (not reordered) so the tool-list snapshot only grows at the end.
         HandlerSpec(
@@ -1305,6 +1292,19 @@ def default_registry() -> tuple[HandlerSpec, ...]:
             description="List non-gate feedback notes, newest first. Use to "
                         "inspect agent judgment and product_bug notes before "
                         "filing issues. Same words as `skodun feedback list`."),
+        HandlerSpec(
+            name="evidence", long_running=False,
+            input_schema=_schema({
+                "identity_digest": {
+                    "type": "string",
+                    "description": "canonical review identity digest to inspect"},
+                "output": {"type": "string", "enum": ["text", "json"],
+                           "description": "summary representation (default text)"},
+            }, ("identity_digest",)),
+            handler=_handle_evidence,
+            description="Read bounded advisory repository-evidence receipts. "
+                        "Receipts never alter gate or trust; JSON matches the "
+                        "CLI `skodun evidence --json` projection."),
     )
 
 
