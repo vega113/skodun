@@ -252,6 +252,8 @@ def test_interpreter_like_arguments_are_not_scanned_as_executables():
     ProducerCommand("valid", ("/usr/bin/printf", "%s", "bash", "-c"), ".", ())
     ProducerCommand("valid-python", ("python3.12", "script.py", "-c"), ".", ())
     ProducerCommand("valid-bash", ("bash", "script.sh", "-c"), ".", ())
+    ProducerCommand("valid-ruby-require", ("ruby", "-rset", "script.rb"), ".", ())
+    ProducerCommand("valid-ruby-include", ("ruby", "-Itest", "script.rb"), ".", ())
 
 
 @pytest.mark.parametrize("argv", [
@@ -427,8 +429,15 @@ def test_store_receipt_rows_are_bounded_per_identity(tmp_path):
                 nonce=f"run-new-{index}")))
             store.save_evidence_receipt(
                 identity(), policy(), parsed.canonical_json,
-                "2026-08-13T16:00:03Z")
-        assert len(store.list_evidence_receipts(identity().digest, 32)) == 32
+                f"2026-08-13T16:01:{index:02d}Z")
+        stored = store._c.execute(
+            "SELECT nonce FROM evidence_receipts WHERE identity_digest=? "
+            "ORDER BY ingested_at ASC", (identity().digest,)).fetchall()
+        assert [row["nonce"] for row in stored] == [
+            f"run-new-{index}" for index in range(8, 40)]
+        assert [row["nonce"] for row in store.list_evidence_receipts(
+                identity().digest, 32) if row["status"] == "accepted"] == [
+            f"run-new-{index}" for index in range(39, 7, -1)]
 
 
 def test_store_derives_rejection_and_keeps_identity_mismatches_queryable(tmp_path):

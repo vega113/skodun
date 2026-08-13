@@ -174,6 +174,7 @@ def _is_shell_command_flag(executable: str, arg: str) -> bool:
         perl_cluster = (name == "perl"
                         and re.fullmatch(r"-[anp]*[eE].*", arg) is not None)
         ruby_cluster = (name == "ruby"
+                        and not arg.startswith(("-r", "-I"))
                         and re.fullmatch(r"-[A-Za-z0-9]*e.*", arg) is not None)
         return (perl_cluster or ruby_cluster
                 or arg in eval_flags or arg.startswith(eval_flags)
