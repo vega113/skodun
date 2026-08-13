@@ -136,6 +136,23 @@ def test_inspect_schema_refuses_symlink(tmp_path):
     assert info.reason_code == "symlink"
 
 
+def test_source_layout_refuses_default_shared_with_embed(tmp_path, monkeypatch,
+                                                         capsys):
+    shared = tmp_path / "shared.db"
+    with Store.open(shared):
+        pass
+    _downgrade(shared)
+    monkeypatch.setattr("skodun.cli._DEFAULT_DB", shared)
+    monkeypatch.delenv("SKODUN_DB", raising=False)
+    monkeypatch.setattr("skodun.provenance.code_provenance",
+                        lambda: {"skodun_commit": "c" * 40})
+    monkeypatch.setattr("skodun.provenance._embedded_identity",
+                        lambda: {"skodun_commit": "c" * 40, "source": "sdist"})
+    assert main(["store", "migrate", "--apply"]) == 2
+    assert inspect_schema(shared).state == "older"
+    assert "source_checkout_default_store" in capsys.readouterr().out
+
+
 def test_cli_wheel_apply_uses_embedded_commit(tmp_path, capsys, monkeypatch):
     db = _authority_db(tmp_path)
     with Store.open(db):

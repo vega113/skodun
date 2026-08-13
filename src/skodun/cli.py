@@ -756,8 +756,10 @@ def _cmd_store(args) -> int:
                 "skodun store migrate: build_not_clean; migration requires a "
                 "clean immutable build identity", 2)
         default_shared = Path.home() / _DEFAULT_DB
-        from .provenance import _embedded_identity
-        if (_embedded_identity() is None
+        # `src/skodun` layout is a checkout or unpacked sdist, even if the
+        # sdist baked `_build.py` in. Only a site-packages wheel may apply
+        # against the shared default database.
+        if (Path(__file__).resolve().parent.parent.name == "src"
                 and path.resolve() == default_shared.resolve()):
             return _emit(
                 "skodun store migrate: source_checkout_default_store; refuse "
