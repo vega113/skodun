@@ -231,9 +231,23 @@ def _env_target_index(argv: tuple[str, ...], start: int) -> int:
         if option.startswith(("--unset=", "--chdir=")):
             index += 1
             continue
-        if option in {"-i", "--ignore-environment"}:
+        if option in {
+            "-0", "-i", "--debug", "--ignore-environment", "--help",
+            "--list-signal-handling", "--null", "-v",
+        }:
             index += 1
             continue
+        if option in {
+            "--block-signal", "--default-signal", "--ignore-signal",
+        }:
+            index += 2
+            continue
+        if option.startswith(("--block-signal=", "--default-signal=",
+                              "--ignore-signal=")):
+            index += 1
+            continue
+        if option.startswith("-"):
+            return -1
         break
     return index
 
@@ -255,8 +269,10 @@ def _interpreter_option_segment(args: tuple[str, ...], name: str):
                 result.append(args[index])
             break
         value_options = {
+            "bash": {"-O", "-o", "--init-file", "--rcfile"},
             "node": {"-C", "--conditions", "-r", "--require",
                      "--loader", "--import"},
+            "python": {"--check-hash-based-pycs"},
             "perl": {"-I", "-M", "--include", "--require"},
             "ruby": {"-I", "-r", "--require"},
         }.get(name, set())

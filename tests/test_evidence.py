@@ -187,6 +187,9 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
     ("ruby", "-eputs(1)"),
     ("node", "-p", "1+1"),
     ("node", "--conditions", "development", "-e", "1+1"),
+    ("bash", "-O", "extglob", "-c", "echo unsafe"),
+    ("bash", "-o", "pipefail", "-c", "echo unsafe"),
+    ("python3", "--check-hash-based-pycs", "always", "-c", "print(1)"),
 ])
 def test_each_interpreter_command_string_flag_is_rejected(argv):
     with pytest.raises(EvidenceError):
@@ -200,6 +203,8 @@ def test_each_interpreter_command_string_flag_is_rejected(argv):
     ("env", "--", "bash", "-c", "echo unsafe"),
     ("env", "-S", "bash -c echo unsafe"),
     ("env", "env", "bash", "-c", "echo unsafe"),
+    ("env", "--default-signal", "TERM", "bash", "-c", "echo unsafe"),
+    ("env", "-v", "bash", "-c", "echo unsafe"),
     ("busybox", "sh", "-c", "echo unsafe"),
     ("bash.exe", "-c", "echo unsafe"),
     ("cmd.exe", "/c", "echo unsafe"),
