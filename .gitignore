@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 dist/
 *.egg-info/
+src/skodun/_build.py
 
 # Per-machine Claude Code settings. Local-only by design and it records
 # absolute paths from the machine that wrote it, so it must never be committed

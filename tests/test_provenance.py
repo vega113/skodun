@@ -70,15 +70,25 @@ def test_a_modified_checkout_says_so():
         f"checkout clean={clean} but commit reads {commit!r}")
 
 
-def test_a_frozen_install_reports_no_commit(monkeypatch, tmp_path):
-    """A wheel is not a checkout. `None` is the honest answer, and the version
-    still identifies the code."""
+def test_a_frozen_install_without_embed_reports_no_commit(monkeypatch, tmp_path):
+    """A wheel without embedded identity still reports None."""
     monkeypatch.setattr(provenance, "_package_root", lambda: tmp_path)
+    monkeypatch.setattr(provenance, "_embedded_identity", lambda: None)
 
     got = provenance.code_provenance()
 
     assert got["skodun_commit"] is None
     assert got["skodun_version"] == skodun.__version__
+
+
+def test_embedded_wheel_identity_is_preferred_over_git(monkeypatch):
+    monkeypatch.setattr(provenance, "_embedded_identity",
+                        lambda: {"skodun_commit": "a" * 40, "source": "wheel"})
+    monkeypatch.setattr(provenance, "_read_commit", lambda root: "b" * 40)
+
+    got = provenance.code_provenance()
+
+    assert got["skodun_commit"] == "a" * 40
 
 
 def test_an_install_nested_in_someone_else_s_repo_reports_no_commit(

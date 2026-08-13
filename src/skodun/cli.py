@@ -749,18 +749,35 @@ def _cmd_store(args) -> int:
         if not commit:
             return _emit(
                 "skodun store migrate: build_identity_required; use a clean "
-                "immutable checkout or provide an explicit release build", 2)
+                "immutable checkout or an installed release wheel with an "
+                "embedded commit", 2)
+        if isinstance(commit, str) and commit.endswith(("-dirty", "-unknown")):
+            return _emit(
+                "skodun store migrate: build_not_clean; migration requires a "
+                "clean immutable build identity", 2)
+        default_shared = Path.home() / _DEFAULT_DB
+        # `src/skodun` layout is a checkout or unpacked sdist, even if the
+        # sdist baked `_build.py` in. Only a site-packages wheel may apply
+        # against the shared default database.
+        if (Path(__file__).resolve().parent.parent.name == "src"
+                and path.resolve() == default_shared.resolve()):
+            return _emit(
+                "skodun store migrate: source_checkout_default_store; refuse "
+                "migrating the shared authority from a source/editable "
+                "checkout. Set SKODUN_DB to a disposable database or apply "
+                "from an immutable release wheel", 2)
         try:
             receipt = Store.migrate_existing(path, build_commit=commit)
         except (SchemaLifecycleError, OSError, sqlite3.Error, ValueError) as exc:
             reason = getattr(exc, "reason_code", "migration_failed")
             return _emit(
                 f"skodun store migrate: refused reason_code={reason}: {exc}", 2)
+        receipt_name = (f"{path}.migration-receipt-v{SCHEMA_VERSION}.json")
         return _emit(
             f"skodun store migrate: applied v{receipt['schema_from']} -> "
             f"v{SCHEMA_VERSION}; backup={receipt['backup_path']} "
             f"sha256={receipt['backup_sha256']} receipt="
-            f"{path}.migration-receipt.json", 0)
+            f"{receipt.get('receipt_path', receipt_name)}", 0)
     if not args.plan:
         return _emit(
             "skodun store migrate: choose exactly one of --plan or --apply", 2)
