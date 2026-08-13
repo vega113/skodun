@@ -361,11 +361,15 @@ def _discovered_lock_scopes(conn: sqlite3.Connection,
 def migration_blockers(path: Path) -> tuple[str, ...]:
     """Return active review/claim/capacity blockers using a read-only snapshot."""
     info = inspect_schema(path)
-    if info.state not in ("older", "current"):
+    if info.state == "missing":
         return ()
+    if info.state not in ("older", "current"):
+        # Cannot prove the store is idle; apply must refuse rather than
+        # treat an unreadable snapshot as an empty blocker set.
+        return ("blockers_unreadable",)
     snapshot, db_path, error = _snapshot_database(path)
     if error is not None:
-        return ()
+        return ("blockers_unreadable",)
     assert snapshot is not None and db_path is not None
     uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=0)

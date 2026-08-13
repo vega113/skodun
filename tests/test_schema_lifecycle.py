@@ -17,8 +17,8 @@ from pathlib import Path
 import pytest
 
 from skodun.cli import main
-from skodun.store import (SCHEMA_VERSION, SchemaLifecycleError, Store,
-                          inspect_schema, migration_blockers,
+from skodun.store import (SCHEMA_VERSION, SchemaInfo, SchemaLifecycleError,
+                          Store, inspect_schema, migration_blockers,
                           migration_receipt_path)
 
 
@@ -293,6 +293,24 @@ def test_failed_apply_is_retryable_when_store_stays_old(tmp_path, monkeypatch):
     assert not migration_receipt_path(db).exists()
     receipt = Store.migrate_existing(db, build_commit="a" * 40)
     assert receipt["result"] == "success"
+
+
+def test_unreadable_blocker_snapshot_refuses_migration(tmp_path, monkeypatch):
+    db = _authority_db(tmp_path)
+    with Store.open(db):
+        pass
+    _downgrade(db)
+    info = inspect_schema(db)
+    import skodun.store as store_mod
+    monkeypatch.setattr(store_mod, "inspect_schema", lambda path: info)
+    monkeypatch.setattr(
+        store_mod, "_snapshot_database",
+        lambda path: (None, None, SchemaInfo(
+            "invalid", str(path), None, SCHEMA_VERSION,
+            reason_code="temp_unavailable")))
+    assert "blockers_unreadable" in migration_blockers(db)
+    with pytest.raises(SchemaLifecycleError, match="blockers_unreadable"):
+        Store.migrate_existing(db, build_commit="a" * 40)
 
 
 def test_open_readonly_does_not_create_shm_beside_original(tmp_path):
