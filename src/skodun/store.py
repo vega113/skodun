@@ -2110,49 +2110,52 @@ class Store:
     # --- v16: advisory evidence receipts ----------------------------------
 
     def save_evidence_receipt(
-            self, identity_digest: str, receipt_digest: str, nonce: str,
-            status: str, reason_code: str, receipt_json: str,
-            ingested_at: str, evidence_kind: str,
-            terminal_state: str) -> dict:
+            self, expected_identity, protected_policy, receipt_json: str,
+            ingested_at: str) -> dict:
         """Persist one bounded receipt without touching review trust.
+
+        The expected identity and producer policy are protected inputs.  The
+        store reparses the envelope, verifies it against those inputs, and
+        derives the persisted status and reason code; callers cannot label a
+        candidate-policy receipt as accepted.  A rejected identity mismatch
+        remains queryable under the identity being inspected.
 
         The identity+digest key makes exact retries harmless.  A different
         digest for the same identity+nonce is a replay conflict and is refused
         before insertion, so a producer cannot rewrite one run's evidence.
         """
-        from .evidence import EvidenceError, EvidenceIdentity, parse_receipt
+        from .evidence import (EvidenceError, EvidenceIdentity, ProducerPolicy,
+                                parse_receipt, verify_receipt)
 
-        identity_digest = _require_text("identity_digest", identity_digest)
-        receipt_digest = _require_text("receipt_digest", receipt_digest)
-        nonce = _require_text("nonce", nonce)
-        status = _require_text("status", status)
-        if status not in {"accepted", "rejected"}:
-            raise ValueError("evidence receipt status is invalid")
-        reason_code = _require_text("reason_code", reason_code)
-        evidence_kind = _require_text("evidence_kind", evidence_kind)
-        terminal_state = _require_text("terminal_state", terminal_state)
+        if not isinstance(expected_identity, EvidenceIdentity):
+            raise TypeError("expected_identity must be EvidenceIdentity")
+        if not isinstance(protected_policy, ProducerPolicy):
+            raise TypeError("protected_policy must be ProducerPolicy")
         ingested_at = _require_ts("ingested_at", ingested_at)
-        receipt_json = _require_text("receipt_json", receipt_json)
-        if len(receipt_json.encode("utf-8")) > 64 * 1024:
+        if not isinstance(receipt_json, str):
+            raise ValueError("evidence receipt JSON must be text")
+        try:
+            encoded_size = len(receipt_json.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError("evidence receipt JSON is not UTF-8") from exc
+        if encoded_size > 64 * 1024:
             raise ValueError("evidence receipt JSON exceeds 65536 bytes")
         try:
             parsed = parse_receipt(receipt_json)
         except EvidenceError as exc:
             raise ValueError(
                 f"evidence receipt is invalid: {exc.reason_code}") from exc
-        expected_identity = EvidenceIdentity(
-            parsed.repository_id, parsed.worktree_root,
-            parsed.certification_base, parsed.current_head,
-            parsed.diff_hash, parsed.stack_slice_id)
-        if (identity_digest != expected_identity.digest
-                or receipt_digest != parsed.receipt_digest
-                or nonce != parsed.nonce
-                or evidence_kind != parsed.evidence_kind
-                or terminal_state != parsed.terminal_state
-                or receipt_json != parsed.canonical_json):
-            raise ValueError("evidence receipt indexed fields do not match payload")
-        if status == "accepted" and parsed.terminal_state != "passed":
-            raise ValueError("failed evidence cannot be stored as accepted")
+        if receipt_json != parsed.canonical_json:
+            raise ValueError("evidence receipt JSON is not canonical")
+        verification = verify_receipt(parsed, expected_identity,
+                                       protected_policy)
+        identity_digest = expected_identity.digest
+        receipt_digest = parsed.receipt_digest
+        nonce = parsed.nonce
+        status = verification.status
+        reason_code = verification.reason_code
+        evidence_kind = parsed.evidence_kind
+        terminal_state = parsed.terminal_state
         self._c.execute("BEGIN IMMEDIATE")
         try:
             existing = self._c.execute(

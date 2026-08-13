@@ -50,8 +50,12 @@ output. `redaction` is exactly `{applied, secrets_removed, logs_included}` and
 must be `true,true,false`.
 
 Identity binding is the canonical digest of repository id, worktree root,
-base, head, diff hash, and optional stack slice. Ingestion compares every
-identity field and the protected policy/command digests before persistence.
+base, head, diff hash, and optional stack slice. Ingestion receives the
+expected identity and protected policy from outside the receipt, reparses the
+canonical envelope, derives its status and reason from verification, and only
+then persists it. A rejected receipt is indexed under the expected identity so
+stale or mismatched attempts remain queryable; the receipt's claimed identity
+is retained only in the validated JSON.
 
 ## Ingestion and persistence
 

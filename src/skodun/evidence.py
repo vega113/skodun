@@ -148,6 +148,17 @@ class EvidenceIdentity:
         return _sha256(self.to_mapping())
 
 
+def _is_shell_command_flag(arg: str) -> bool:
+    """Reject shell command-string flags, including combined spellings."""
+    if arg in {"-c", "--command", "-Command"}:
+        return True
+    if (arg.startswith("--command=") or arg.startswith("-Command=")
+            or arg.startswith("-Command:")):
+        return True
+    return (arg.startswith("-c")
+            or re.fullmatch(r"-[A-Za-z]*c(?:=.*)?", arg) is not None)
+
+
 @dataclass(frozen=True)
 class ProducerCommand:
     command_id: str
@@ -162,7 +173,7 @@ class ProducerCommand:
             raise EvidenceError("invalid_command", "argv")
         for arg in self.argv:
             _text("argv", arg, maximum=1024)
-        if any(arg in {"-c", "--command", "-Command"} for arg in self.argv[1:]):
+        if any(_is_shell_command_flag(arg) for arg in self.argv[1:]):
             raise EvidenceError("invalid_command", "shell command strings are forbidden")
         _text("cwd", self.cwd)
         if self.cwd != ".":
@@ -241,7 +252,7 @@ class EvidenceReceipt:
     exit_code: int | None
     terminal_state: str
     duration_ms: int
-    counters: dict[str, int]
+    counters: Mapping[str, int]
     artifact_digests: tuple[str, ...]
     tool: str
     runtime: str
@@ -251,6 +262,9 @@ class EvidenceReceipt:
     receipt_digest: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.counters, MappingProxyType):
+            object.__setattr__(self, "counters",
+                               MappingProxyType(dict(self.counters)))
         if not isinstance(self.redaction, MappingProxyType):
             object.__setattr__(self, "redaction",
                                MappingProxyType(dict(self.redaction)))
@@ -303,7 +317,8 @@ def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
         raise EvidenceError("unknown_field", unknown[0])
     if missing:
         raise EvidenceError("missing_field", missing[0])
-    if raw.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
+    if (_plain_int(raw["schema_version"], "schema_version", minimum=1)
+            != EVIDENCE_SCHEMA_VERSION):
         raise EvidenceError("schema_version", "unsupported")
     kind = raw["evidence_kind"]
     if not isinstance(kind, str) or kind not in _KINDS:
@@ -396,7 +411,7 @@ def parse_receipt(text: str) -> EvidenceReceipt:
                          parse_constant=_no_constant)
     except EvidenceError:
         raise
-    except (TypeError, UnicodeError, json.JSONDecodeError) as exc:
+    except (TypeError, UnicodeError, ValueError) as exc:
         raise EvidenceError("malformed_json", str(exc)) from exc
     if not isinstance(raw, dict):
         raise EvidenceError("invalid_field", "receipt object")
@@ -456,6 +471,10 @@ class EvidenceVerification:
 
 def verify_receipt(receipt: EvidenceReceipt, expected: EvidenceIdentity,
                    protected_policy: ProducerPolicy) -> EvidenceVerification:
+    try:
+        _validate_mapping(receipt.canonical_mapping)
+    except EvidenceError as exc:
+        return EvidenceVerification(False, exc.reason_code)
     checks = (
         ("repository_mismatch", receipt.repository_id == expected.repository_id),
         ("worktree_mismatch", receipt.worktree_root == expected.worktree_root),

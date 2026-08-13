@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -120,6 +121,18 @@ def test_duplicate_json_keys_and_nonfinite_numbers_fail_closed():
     assert nonfinite.value.reason_code == "malformed_json"
 
 
+def test_schema_version_bool_and_oversized_integer_fail_as_malformed_input():
+    raw = receipt_mapping(schema_version=True)
+    raw["receipt_digest"] = receipt_digest(raw)
+    with pytest.raises(EvidenceError) as boolean_version:
+        parse_receipt(json.dumps(raw))
+    assert boolean_version.value.reason_code == "invalid_field"
+
+    with pytest.raises(EvidenceError) as oversized:
+        parse_receipt('{"schema_version":' + "9" * 5000 + "}")
+    assert oversized.value.reason_code == "malformed_json"
+
+
 def test_identity_and_protected_policy_mismatches_never_verify():
     receipt = parse_receipt(json.dumps(receipt_mapping()))
     mismatch = verify_receipt(
@@ -142,6 +155,30 @@ def test_identity_and_protected_policy_mismatches_never_verify():
     result = verify_receipt(forged, identity(), policy())
     assert result.accepted is False
     assert result.reason_code == "policy_mismatch"
+
+
+@pytest.mark.parametrize("argv", [
+    ("bash", "-lc", "echo unsafe"),
+    ("sh", "-xc", "echo unsafe"),
+    ("pwsh", "-Command:Write-Host", "unsafe"),
+    ("python", "-cprint('unsafe')"),
+])
+def test_producer_policy_rejects_combined_command_string_flags(argv):
+    with pytest.raises(EvidenceError) as exc:
+        ProducerCommand("unsafe", argv, ".", ())
+    assert exc.value.reason_code == "invalid_command"
+
+
+def test_receipt_nested_counters_are_immutable_and_invalid_constructed_receipts_reject():
+    parsed = parse_receipt(json.dumps(receipt_mapping()))
+    with pytest.raises(TypeError):
+        parsed.counters["checks"] = 4
+    assert verify_receipt(parsed, identity(), policy()).accepted is True
+
+    forged = replace(parsed, schema_version=True)
+    result = verify_receipt(forged, identity(), policy())
+    assert result.accepted is False
+    assert result.reason_code == "invalid_field"
 
 
 def test_receipt_file_rejects_symlink_and_oversize(tmp_path: Path):
@@ -168,29 +205,61 @@ def test_store_receipt_ingestion_is_idempotent_and_nonce_conflicts(tmp_path):
     assert verified.accepted is True
     with Store.open(tmp_path / "store.db") as store:
         first = store.save_evidence_receipt(
-            identity().digest, parsed.receipt_digest, parsed.nonce,
-            verified.status, verified.reason_code, parsed.canonical_json,
-            "2026-08-13T16:00:03Z", parsed.evidence_kind,
-            parsed.terminal_state)
+            identity(), policy(), parsed.canonical_json,
+            "2026-08-13T16:00:03Z")
         second = store.save_evidence_receipt(
-            identity().digest, parsed.receipt_digest, parsed.nonce,
-            verified.status, verified.reason_code, parsed.canonical_json,
-            "2026-08-13T16:00:04Z", parsed.evidence_kind,
-            parsed.terminal_state)
+            identity(), policy(), parsed.canonical_json,
+            "2026-08-13T16:00:04Z")
         assert first["status"] == "accepted"
         assert second["status"] == "duplicate"
         conflicting = parse_receipt(json.dumps(
             receipt_mapping(counters={"checks": 4})))
         conflict = store.save_evidence_receipt(
-            identity().digest, conflicting.receipt_digest, conflicting.nonce,
-            "accepted", "ok", conflicting.canonical_json,
-            "2026-08-13T16:00:05Z", parsed.evidence_kind,
-            parsed.terminal_state)
+            identity(), policy(), conflicting.canonical_json,
+            "2026-08-13T16:00:05Z")
         assert conflict["status"] == "conflict"
         rows = store.list_evidence_receipts(identity().digest, 32)
         assert len(rows) == 2
         assert rows[0]["status"] == "conflict"
         assert rows[1]["receipt_digest"] == parsed.receipt_digest
+
+
+def test_store_derives_rejection_and_keeps_identity_mismatches_queryable(tmp_path):
+    candidate = ProducerPolicy(
+        policy_id="candidate-policy",
+        commands=(ProducerCommand("preflight", ("python3", "-m", "candidate"), ".", ()),),
+    )
+    forged = parse_receipt(json.dumps(receipt_mapping(
+        producer_policy_id=candidate.policy_id,
+        producer_policy_digest=candidate.digest,
+        command_digest=candidate.commands[0].digest,
+        nonce="candidate-policy-run")))
+    stale = parse_receipt(json.dumps(receipt_mapping(
+        current_head="e" * 40, nonce="stale-run")))
+    with Store.open(tmp_path / "store.db") as store:
+        policy_row = store.save_evidence_receipt(
+            identity(), policy(), forged.canonical_json,
+            "2026-08-13T16:00:03Z")
+        stale_row = store.save_evidence_receipt(
+            identity(), policy(), stale.canonical_json,
+            "2026-08-13T16:00:04Z")
+        assert policy_row == {
+            "status": "rejected", "receipt_digest": forged.receipt_digest,
+            "reason_code": "policy_mismatch",
+        }
+        assert stale_row["status"] == "rejected"
+        assert stale_row["reason_code"] == "head_mismatch"
+        rows = store.list_evidence_receipts(identity().digest, 32)
+        assert {row["reason_code"] for row in rows} == {
+            "policy_mismatch", "head_mismatch",
+        }
+
+
+def test_store_rejects_invalid_utf8_text_before_size_check(tmp_path):
+    with Store.open(tmp_path / "store.db") as store:
+        with pytest.raises(ValueError, match="not UTF-8"):
+            store.save_evidence_receipt(
+                identity(), policy(), "\ud800", "2026-08-13T16:00:03Z")
 
 
 def test_cli_mcp_and_service_json_projections_are_identical(tmp_path, monkeypatch,
@@ -199,10 +268,8 @@ def test_cli_mcp_and_service_json_projections_are_identical(tmp_path, monkeypatc
     parsed = parse_receipt(json.dumps(raw))
     with Store.open(tmp_path / "store.db") as store:
         store.save_evidence_receipt(
-            identity().digest, parsed.receipt_digest, parsed.nonce,
-            "accepted", "ok", parsed.canonical_json,
-            "2026-08-13T16:00:03Z", parsed.evidence_kind,
-            parsed.terminal_state)
+            identity(), policy(), parsed.canonical_json,
+            "2026-08-13T16:00:03Z")
     monkeypatch.setenv("SKODUN_DB", str(tmp_path / "store.db"))
     with Store.open(tmp_path / "store.db") as store:
         code, service_json = services.svc_evidence_summary(
