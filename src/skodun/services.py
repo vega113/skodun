@@ -1654,7 +1654,8 @@ def svc_evidence_summary(store, identity_digest: str, *, output="text") -> tuple
     return 0, "\n".join(
         f"skodun evidence: identity={digest} receipt={row['receipt_digest']} "
         f"kind={row['evidence_kind']} status={row['status']} "
-        f"reason={row['reason_code']} nonce={row['nonce']}"
+        f"reason={row['reason_code']} terminal={row['terminal_state']} "
+        f"nonce={row['nonce']}"
         for row in rows)
 
 

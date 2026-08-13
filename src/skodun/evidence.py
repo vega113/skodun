@@ -149,21 +149,31 @@ class EvidenceIdentity:
 
 
 _COMMAND_STRING_EXECUTABLES = frozenset({
-    "bash", "cmd", "csh", "dash", "fish", "ksh", "perl", "powershell",
-    "pwsh", "python", "python3", "ruby", "sh", "tcsh", "zsh",
+    "bash", "cmd", "csh", "dash", "fish", "ksh", "node", "perl",
+    "powershell", "pwsh", "python", "ruby", "sh", "tcsh", "zsh",
 })
 
 
 def _is_shell_command_flag(executable: str, arg: str) -> bool:
     """Reject shell command-string flags, including combined spellings."""
-    if os.path.basename(executable).lower() not in _COMMAND_STRING_EXECUTABLES:
+    name = os.path.basename(executable).lower()
+    name = re.sub(r"(python|perl|ruby|node)\d+(?:\.\d+)*$", r"\1", name)
+    if name not in _COMMAND_STRING_EXECUTABLES:
         return False
-    if arg in {"-c", "--command", "-Command"}:
+    lowered = arg.lower()
+    if name == "cmd":
+        return lowered in {"/c", "/k"}
+    if name in {"perl", "ruby", "node"}:
+        return lowered in {"-e", "--eval", "--execute"}
+    if name in {"powershell", "pwsh"}:
+        return (lowered in {"-c", "-command", "-ec", "-encodedcommand"}
+                or lowered.startswith("-command:")
+                or lowered.startswith("-encodedcommand:"))
+    if lowered in {"-c", "--command"}:
         return True
-    if (arg.startswith("--command=") or arg.startswith("-Command=")
-            or arg.startswith("-Command:")):
+    if lowered.startswith("--command="):
         return True
-    return (arg.startswith("-c")
+    return (lowered.startswith("-c")
             or re.fullmatch(r"-[A-Za-z]*c(?:=.*)?", arg) is not None)
 
 
@@ -186,9 +196,11 @@ class ProducerCommand:
             raise EvidenceError("invalid_command", "shell command strings are forbidden")
         _text("cwd", self.cwd)
         if self.cwd != ".":
-            parts = self.cwd.split("/")
-            if (self.cwd.startswith("/") or any(part in {"", ".", ".."}
-                                                  for part in parts)):
+            normalized_cwd = self.cwd.replace("\\", "/")
+            parts = normalized_cwd.split("/")
+            if (normalized_cwd.startswith("/")
+                    or re.match(r"^[A-Za-z]:", normalized_cwd)
+                    or any(part in {"", ".", ".."} for part in parts)):
                 raise EvidenceError("invalid_command", "cwd")
         if (not isinstance(self.env_allowlist, tuple)
                 or len(self.env_allowlist) > MAX_ENV_NAMES

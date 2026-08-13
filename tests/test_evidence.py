@@ -179,11 +179,27 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
 
 
 @pytest.mark.parametrize("argv", [
+    ("cmd", "/c", "echo unsafe"),
+    ("perl", "-e", "print unsafe"),
+    ("powershell", "-EncodedCommand", "unsafe"),
+])
+def test_each_interpreter_command_string_flag_is_rejected(argv):
+    with pytest.raises(EvidenceError):
+        ProducerCommand("unsafe", argv, ".", ())
+
+
+@pytest.mark.parametrize("argv", [
     ("cc", "-c", "check.c"),
     ("git", "-c", "core.pager=cat", "status"),
 ])
 def test_non_interpreter_command_flags_remain_valid(argv):
     ProducerCommand("valid", argv, ".", ())
+
+
+@pytest.mark.parametrize("cwd", ["..\\outside", "C:\\Windows", "\\\\server\\share"])
+def test_windows_policy_working_directories_are_rejected(cwd):
+    with pytest.raises(EvidenceError):
+        ProducerCommand("unsafe", ("python3", "-m", "repo"), cwd, ())
 
 
 @pytest.mark.parametrize("diagnostic", ["failed", "mismatch", "unverifiable"])
