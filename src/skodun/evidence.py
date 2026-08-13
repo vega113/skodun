@@ -148,8 +148,16 @@ class EvidenceIdentity:
         return _sha256(self.to_mapping())
 
 
-def _is_shell_command_flag(arg: str) -> bool:
+_COMMAND_STRING_EXECUTABLES = frozenset({
+    "bash", "cmd", "csh", "dash", "fish", "ksh", "perl", "powershell",
+    "pwsh", "python", "python3", "ruby", "sh", "tcsh", "zsh",
+})
+
+
+def _is_shell_command_flag(executable: str, arg: str) -> bool:
     """Reject shell command-string flags, including combined spellings."""
+    if os.path.basename(executable).lower() not in _COMMAND_STRING_EXECUTABLES:
+        return False
     if arg in {"-c", "--command", "-Command"}:
         return True
     if (arg.startswith("--command=") or arg.startswith("-Command=")
@@ -173,7 +181,8 @@ class ProducerCommand:
             raise EvidenceError("invalid_command", "argv")
         for arg in self.argv:
             _text("argv", arg, maximum=1024)
-        if any(_is_shell_command_flag(arg) for arg in self.argv[1:]):
+        if any(_is_shell_command_flag(self.argv[0], arg)
+               for arg in self.argv[1:]):
             raise EvidenceError("invalid_command", "shell command strings are forbidden")
         _text("cwd", self.cwd)
         if self.cwd != ".":
@@ -492,6 +501,8 @@ def verify_receipt(receipt: EvidenceReceipt, expected: EvidenceIdentity,
     command = protected_policy.command(receipt.command_id)
     if command is None or command.digest != receipt.command_digest:
         return EvidenceVerification(False, "command_mismatch")
+    if receipt.diagnostic_category != "ok":
+        return EvidenceVerification(False, "diagnostic_mismatch")
     if receipt.terminal_state != "passed" or receipt.exit_code != 0:
         return EvidenceVerification(False, "producer_failed")
     return EvidenceVerification(True, "ok")

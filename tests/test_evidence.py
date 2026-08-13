@@ -178,6 +178,23 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
     assert exc.value.reason_code == "invalid_command"
 
 
+@pytest.mark.parametrize("argv", [
+    ("cc", "-c", "check.c"),
+    ("git", "-c", "core.pager=cat", "status"),
+])
+def test_non_interpreter_command_flags_remain_valid(argv):
+    ProducerCommand("valid", argv, ".", ())
+
+
+@pytest.mark.parametrize("diagnostic", ["failed", "mismatch", "unverifiable"])
+def test_non_ok_diagnostics_never_verify(diagnostic):
+    receipt = parse_receipt(json.dumps(receipt_mapping(
+        diagnostic_category=diagnostic)))
+    result = verify_receipt(receipt, identity(), policy())
+    assert result.accepted is False
+    assert result.reason_code == "diagnostic_mismatch"
+
+
 def test_receipt_nested_counters_are_immutable_and_invalid_constructed_receipts_reject():
     parsed = parse_receipt(json.dumps(receipt_mapping()))
     with pytest.raises(TypeError):
