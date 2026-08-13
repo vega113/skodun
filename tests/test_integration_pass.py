@@ -591,6 +591,8 @@ def test_integration_prompt_carries_stack_and_lineage_context():
         TWO, stack_context=stack_context, lineage_context=lineage_context)
     assert stack_context.rstrip(b"\n") in got.text
     assert lineage_context.rstrip(b"\n") in got.text
+    assert got.text.count(b"----- BEGIN STACK CONTEXT -----") == 1
+    assert got.text.count(b"----- BEGIN PRIOR FINDINGS -----") == 1
     assert got.stack_context_bytes == len(stack_context)
     assert got.lineage_context_bytes == len(lineage_context)
     assert got.diff_truncated is False

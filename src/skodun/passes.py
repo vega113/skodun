@@ -1030,11 +1030,6 @@ def integration_prompt(
         lines.extend([RULES_BEGIN.decode("utf-8").rstrip("\n"), rules,
                       RULES_END.decode("utf-8").rstrip("\n"), ""])
 
-    if stack_context:
-        lines.extend([stack_context.decode("utf-8", "replace").rstrip("\n"), ""])
-    if lineage_context:
-        lines.extend([lineage_context.decode("utf-8", "replace").rstrip("\n"), ""])
-
     for position, batch in enumerate(summaries, 1):
         lines.append(_INTEGRATION_BATCH % position)
         files = [collapse_ws(f) for f in (batch.files or ())]
