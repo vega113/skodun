@@ -93,6 +93,20 @@ def test_batch_telemetry_has_identity_and_byte_dimensions():
         "diff": 80, "context": 10, "checklist": 20, "prompt": 110,
     }
     assert result["attempts"] == []
+    assert result["timing"]["queued_at"] is None
+    assert result["timing"]["admitted_at"] is None
+    assert result["timing"]["started_at"] is None
+    assert result["timing"]["completed_at"] is None
+    assert result["timing"]["run_duration_sec"] is None
+    assert result["timing"]["wall_duration_sec"] is None
+
+
+def test_run_duration_stays_unknown_when_attempts_omit_timing():
+    from skodun.telemetry import run_duration_sec
+    assert run_duration_sec([]) is None
+    assert run_duration_sec([{"n": 1}]) is None
+    assert run_duration_sec([{"duration_sec": 0}]) == 0.0
+    assert run_duration_sec([{"duration_sec": 1.25}, {"duration_sec": 0.75}]) == 2.0
 
 
 def test_shared_surface_validation_rejects_bool_negative_and_unbounded_targets():

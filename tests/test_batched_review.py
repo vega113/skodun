@@ -998,6 +998,13 @@ def test_prepared_plan_builds_the_complete_checkpoint_identity(tmp_path):
     assert identity.pass_identities[-1].prompt_hash is None
 
 
+def test_checkpoint_claim_lease_includes_configured_admission_wait(monkeypatch):
+    monkeypatch.setenv("SKODUN_ADMISSION_WAIT_SECONDS", "90")
+    defaults = Defaults(timeout_sec=1, timeout_retries=0, degraded_retries=0)
+    lease = pipeline._checkpoint_claim_lease_seconds(defaults, 1)
+    assert lease == budget.worst_runtime(defaults, 1, 0) + 90
+
+
 def _clean_checkpoint_sub(label: str) -> pipeline._Sub:
     return pipeline._Sub(
         parse_ok=True, degraded=False, degraded_reason="",
@@ -1014,11 +1021,36 @@ def _without_run_identity(rec: dict) -> dict:
         "id", "reviewed_at", "review_started_at", "review_completed_at",
         "batch_orchestration_id", "tree_fingerprint",
     }
+    timing_keys = {
+        "queued_at", "admitted_at", "started_at", "completed_at",
+        "queue_duration_sec", "run_duration_sec", "wall_duration_sec",
+    }
     out = {key: value for key, value in rec.items() if key not in ignored}
     out["batches"] = [
-        {key: value for key, value in batch.items() if key != "id"}
+        _without_timing({key: value for key, value in batch.items()
+                         if key != "id" and key not in timing_keys},
+                        timing_keys)
         for batch in out.get("batches", [])]
+    if isinstance(out.get("integration"), dict):
+        out["integration"] = _without_timing(
+            {key: value for key, value in out["integration"].items()
+             if key not in timing_keys},
+            timing_keys)
     return out
+
+
+def _without_timing(item: dict, timing_keys: set[str]) -> dict:
+    telemetry = item.get("telemetry")
+    if not isinstance(telemetry, dict):
+        return item
+    timing = telemetry.get("timing")
+    if not isinstance(timing, dict):
+        return item
+    cleaned = dict(item)
+    cleaned["telemetry"] = dict(telemetry)
+    cleaned["telemetry"]["timing"] = {
+        key: value for key, value in timing.items() if key not in timing_keys}
+    return cleaned
 
 
 def test_cancel_after_three_batches_resumes_only_the_missing_work(
@@ -1047,6 +1079,18 @@ def test_cancel_after_three_batches_resumes_only_the_missing_work(
     assert first_calls == ["batch 1", "batch 2", "batch 3"]
     assert [row["state"] for row in checkpoints] == [
         "complete", "complete", "complete", "pending", "pending"]
+    from skodun.readmodel import project_review
+    projection = project_review(
+        {"status": "failed", "trustworthy": False, "usable_output": False,
+         "batches": [], "extra_passes": {}},
+        orchestration=store.get_orchestration(orchestration["id"]),
+        checkpoints=checkpoints)
+    assert projection.usable_evidence is True
+    assert projection.coverage_state == "partial"
+    assert projection.gate_eligible is False
+    assert projection.completed_passes == 3
+    assert projection.passes["integration"] == "queued"
+    assert projection.next_resumable_pass == 4
 
     resumed_calls = []
 

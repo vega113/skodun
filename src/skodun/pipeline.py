@@ -3102,6 +3102,29 @@ def _begin_checkpoint_run(store: Store, identity: checkpoints.OrchestrationIdent
         orchestration_id, ids.new_review_id("sk_owner_"), identity)
 
 
+def _checkpoint_claim_lease_seconds(d: Defaults, width: int) -> int:
+    """Provider worst-case plus configured admission wait.
+
+    `_run_sub` waits for a provider slot after the checkpoint is claimed, so
+    the lease must cover that wait. The default matches `chain`'s provider
+    admission floor when ``SKODUN_ADMISSION_WAIT_SECONDS`` is unset.
+    """
+    wait = capacity.admission_wait_from_env(chain._DEFAULT_PROVIDER_WAIT_SEC)
+    return budget.worst_runtime(d, width, 0) + int(wait)
+
+
+def _sub_telemetry_timing(sub: _Sub) -> dict:
+    provenance = sub.provenance if isinstance(sub.provenance, dict) else {}
+    return {
+        "queued_at": provenance.get("queued_at"),
+        "admitted_at": provenance.get("admitted_at"),
+        "started_at": provenance.get("started_at"),
+        "completed_at": provenance.get("completed_at"),
+        "run_duration_sec": telemetry.run_duration_sec(sub.attempts),
+        "wall_duration_sec": provenance.get("wall_duration_sec"),
+    }
+
+
 def _checkpointed_sub(
         checkpoint_run: _CheckpointRun | None,
         pass_identity: checkpoints.PassIdentity, *, reviewer: Reviewer,
@@ -3119,7 +3142,7 @@ def _checkpointed_sub(
     # for large prompts. Keeping the calculation at the claim boundary makes
     # the lease cover retries plus grace, rather than a stale pre-escalation
     # default.
-    lease_seconds = budget.worst_runtime(d, width, 0)
+    lease_seconds = _checkpoint_claim_lease_seconds(d, width)
     try:
         claim = store.claim_checkpoint(
             checkpoint_run.orchestration_id, pass_identity,
@@ -3142,10 +3165,12 @@ def _checkpointed_sub(
         raise CheckpointInFlight(
             f"{label} is already in flight under another exact resumer; "
             "no duplicate provider call was launched")
+    started_at = now
     try:
         started = time.monotonic()
         sub = _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
                        label, cancel=cancel)
+        completed_at = _iso_now()
         sub = replace(sub, provenance={
             **sub.provenance,
             # Empty synthetic sub-results have no process or admission work;
@@ -3154,6 +3179,8 @@ def _checkpointed_sub(
             "wall_duration_sec": (
                 round(max(0.0, time.monotonic() - started), 3)
                 if sub.attempts else None),
+            "started_at": started_at,
+            "completed_at": completed_at,
         })
         payload = checkpoints.payload_from_sub(sub)
         applied = store.complete_checkpoint(
@@ -3627,10 +3654,6 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             d=effective_d, prompt=prompt,
             root=root, store=store, scratch=scratch, tag=f"{tag}.b{index}",
             label=f"batch {index}", cancel=cancel)
-        run_duration_sec = round(sum(
-            float(a.get("duration_sec") or 0.0)
-            for a in sub.attempts if isinstance(a, dict)
-            and isinstance(a.get("duration_sec"), (int, float))), 3)
         subs.append(sub)
         findings.extend(sub.findings)
         checklist_meta = passes.checklist_meta(mode, selection)
@@ -3667,8 +3690,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 checklist_bytes=int(checklist_meta.get("bytes_total") or 0),
                 prompt_bytes=prompt.prompt_bytes,
                 attempts=sub.attempts, timeout_sec=effective_d.timeout_sec,
-                run_duration_sec=run_duration_sec,
-                wall_duration_sec=sub.provenance.get("wall_duration_sec")),
+                **_sub_telemetry_timing(sub)),
         })
 
     # --- the cross-file pass over the seams the split just cut --------------
@@ -3741,10 +3763,6 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 root=root, store=store, scratch=scratch,
                 tag=passes.INTEGRATION_PASS, label="the integration pass",
                 cancel=cancel)
-            run_duration_sec = round(sum(
-                float(a.get("duration_sec") or 0.0)
-                for a in integration_sub.attempts if isinstance(a, dict)
-                and isinstance(a.get("duration_sec"), (int, float))), 3)
             # Tagged BEFORE they are merged: nothing downstream can tell a
             # cross-file finding from a within-batch one afterwards.
             tagged = passes.tag_integration_findings(integration_sub.findings)
@@ -3771,9 +3789,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 prompt_bytes=prompt.prompt_bytes,
                 attempts=integration_sub.attempts,
                 timeout_sec=effective_d.timeout_sec,
-                run_duration_sec=run_duration_sec,
-                wall_duration_sec=integration_sub.provenance.get(
-                    "wall_duration_sec"))
+                **_sub_telemetry_timing(integration_sub))
 
     # --- aggregate ---------------------------------------------------------
     # ORACLE (`grok-prepush-review.sh:3703-3820`): parse_ok is ALL, degraded and

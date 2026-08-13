@@ -1,5 +1,6 @@
 """Coverage projection contract: incomplete evidence stays visible and ineligible."""
 
+from skodun.checkpoints import CheckpointPayload
 from skodun.readmodel import project_review
 
 
@@ -77,3 +78,102 @@ def test_malformed_prompt_bytes_are_ignored_and_plan_digest_wins():
     assert p.prompt_bytes == 12
     assert p.planner_version == "plan-v1"
     assert p.boundary_digest == "plan"
+
+
+def _checkpoint_payload(**changes) -> str:
+    data = {
+        "parse_ok": True,
+        "degraded": False,
+        "degraded_reason": "",
+        "stop_reason": "EndTurn",
+        "diff_truncated": False,
+        "summary": "batch reviewed",
+        "findings": [{
+            "file": "src/a.py", "line": 3, "severity": "medium",
+            "category": "correctness", "title": "Bad edge",
+            "detail": "The empty case is not handled.",
+        }],
+        "failure_reason": "",
+        "attempts": [],
+        "provenance": {"provider": "xai", "model": "grok", "effort": None,
+                       "note": ""},
+        "accepted": None,
+    }
+    data.update(changes)
+    return CheckpointPayload.from_mapping(data).json_text
+
+
+def test_completed_checkpoint_payload_is_usable_when_artifact_batches_are_empty():
+    payload = _checkpoint_payload()
+    p = project_review(
+        _record(status="running", batches=[]),
+        orchestration={"state": "active", "batch_count": 4},
+        checkpoints=[
+            {"pass_kind": "batch", "pass_index": 1, "state": "complete",
+             "payload_json": payload},
+            {"pass_kind": "batch", "pass_index": 2, "state": "complete",
+             "payload_json": payload},
+            {"pass_kind": "batch", "pass_index": 3, "state": "complete",
+             "payload_json": payload},
+            {"pass_kind": "batch", "pass_index": 4, "state": "pending"},
+            {"pass_kind": "integration", "pass_index": 0, "state": "pending"},
+        ])
+    assert p.coverage_state == "partial"
+    assert p.usable_evidence is True
+    assert p.gate_eligible is False
+    assert p.completed_passes == 3 and p.planned_passes == 5
+    assert p.passes["integration"] == "queued"
+    assert p.next_resumable_pass == 4
+
+
+def test_pending_checkpoint_is_queued_never_failed():
+    p = project_review(
+        _record(status="running"),
+        orchestration={"state": "active", "batch_count": 1},
+        checkpoints=[{"pass_kind": "integration", "pass_index": 0,
+                      "state": "pending"}])
+    assert p.passes["integration"] == "queued"
+    assert p.failed_passes == 0
+    assert p.gate_eligible is False
+
+
+def test_security_and_skeptic_use_persisted_ran_parse_ok_shape():
+    p = project_review(_record(
+        status="clean", trustworthy=True, usable_output=True,
+        extra_passes={
+            "security": {"ran": True, "parse_ok": True, "degraded": False},
+            "skeptic": {"ran": True, "parse_ok": True, "degraded": False},
+            "refuter": {"ran": True, "status": "ran", "degraded": False,
+                        "failed": False},
+        }))
+    assert p.passes["security"] == "complete"
+    assert p.passes["skeptic"] == "complete"
+    assert p.passes["refuter"] == "complete"
+    assert p.refuter_annotation_available is True
+    assert p.gate_eligible is True
+
+
+def test_unbatched_completed_finder_counts_one_planned_and_one_completed_pass():
+    p = project_review(_record(status="clean", trustworthy=True,
+                               usable_output=True))
+    assert p.planned_passes == 1
+    assert p.completed_passes == 1
+    assert p.failed_passes == 0
+    assert p.finder_only is True
+
+
+def test_string_false_usable_output_is_not_evidence():
+    p = project_review(_record(status="failed", usable_output="false",
+                               parse_ok=False, batches=[]))
+    assert p.usable_evidence is False
+    assert p.coverage_state == "none"
+
+
+def test_integration_prompt_bytes_join_batch_totals():
+    rec = _record(
+        status="clean", trustworthy=True, usable_output=True,
+        batches=[{"parse_ok": True,
+                  "telemetry": {"bytes": {"prompt": 10}}}],
+        integration={"telemetry": {"bytes": {"prompt": 7}}})
+    p = project_review(rec, orchestration={"state": "consumed", "batch_count": 1})
+    assert p.prompt_bytes == 17

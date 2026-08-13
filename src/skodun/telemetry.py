@@ -50,6 +50,28 @@ def _token_usage(raw: object) -> dict[str, int | None]:
     }
 
 
+def _duration(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0 or value != value or value in (float("inf"), float("-inf")):
+        return None
+    return float(value)
+
+
+def run_duration_sec(attempts: Iterable[Mapping]) -> float | None:
+    """Sum reported attempt durations; missing timing stays unknown."""
+    values = []
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping) or "duration_sec" not in attempt:
+            continue
+        parsed = _duration(attempt.get("duration_sec"))
+        if parsed is not None:
+            values.append(parsed)
+    if not values:
+        return None
+    return round(sum(values), 3)
+
+
 def attempt_telemetry(attempt: Mapping, *, timeout_sec: int | None) -> dict:
     """Project one attempt into a stable, allowlisted telemetry row."""
     classification = attempt.get("classification")

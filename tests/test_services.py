@@ -167,6 +167,24 @@ def test_review_status_json_exposes_lineage_context_telemetry(tmp_path):
     assert payload["fingerprint_candidate_limit"] == 200
     assert payload["fingerprint_candidates_truncated"] is True
 
+
+def test_review_status_json_projects_unbatched_completion_and_ran_refuter(
+        tmp_path):
+    db = _db(tmp_path, _round(
+        extra_passes={"refuter": {
+            "pass": "refuter", "ran": True, "status": "ran",
+            "degraded": False,
+        }},
+        usable_output=True, status="clean"))
+    with Store.open(db) as store:
+        code, text = services.svc_review_status(store, "sk_1", output="json")
+    payload = json.loads(text)
+    assert code == 0
+    assert payload["coverage"]["planned_passes"] == 1
+    assert payload["coverage"]["completed_passes"] == 1
+    assert payload["coverage"]["passes"]["refuter"] == "complete"
+    assert payload["coverage"]["usable_evidence"] is True
+
 def test_triage_list_exposes_audited_deferral_and_lineage_scope(tmp_path):
     finding = _finding(0)
     finding.update(
