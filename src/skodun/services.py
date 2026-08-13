@@ -46,7 +46,6 @@ An ORDINARY exception still produces the conservative code it always did.
 """
 
 from pathlib import Path
-import re
 
 # --- the refusal strings both surfaces share --------------------------------
 #
@@ -1639,6 +1638,7 @@ def svc_evidence_summary(store, identity_digest: str, *, output="text") -> tuple
         digest = str(identity_digest).strip()
         if not digest:
             return 2, "skodun evidence: identity digest is required"
+        import re
         if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
             return 2, "skodun evidence: identity digest is invalid"
         rows = store.list_evidence_receipts(digest, 32)
