@@ -253,7 +253,18 @@ def test_the_reservation_covers_the_maximum_stack_and_lineage_prompt_blocks():
     from skodun import fingerprint, stack
 
     assert budget.PROMPT_OVERHEAD_BYTES >= (
-        stack.MAX_STACK_PROMPT_BYTES + fingerprint.MAX_LINEAGE_PROMPT_BYTES)
+        stack.MAX_STACK_PROMPT_BYTES
+        + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES
+        + fingerprint.MAX_LINEAGE_PROMPT_BYTES
+        + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES)
+    wrapped = promptbuild.advisory_context(
+        b"S" * stack.MAX_STACK_PROMPT_BYTES,
+        b"L" * fingerprint.MAX_LINEAGE_PROMPT_BYTES)
+    assert len(wrapped) <= (
+        stack.MAX_STACK_PROMPT_BYTES
+        + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES
+        + fingerprint.MAX_LINEAGE_PROMPT_BYTES
+        + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES)
 
 
 def test_a_full_prompt_with_max_advisory_context_fits_the_declared_ceiling():

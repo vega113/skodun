@@ -193,7 +193,9 @@ PROMPT_OVERHEAD_BYTES: int = (
     + checklist.BUDGET
     + _IDENTITY_SLACK
     + stack.MAX_STACK_PROMPT_BYTES
+    + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES
     + fingerprint.MAX_LINEAGE_PROMPT_BYTES
+    + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES
 )
 
 

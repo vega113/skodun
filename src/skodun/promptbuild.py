@@ -188,6 +188,13 @@ def advisory_context(
     return bytes(extra)
 
 
+#: Worst-case wrapper cost of one `advisory_context` block: a leading newline
+#: plus a restored trailing newline when the bounded payload had none. The
+#: MAX_* constants bound the payload itself; this is charged separately so
+#: argv-bound adapters cannot go over their declared ceiling by two bytes.
+ADVISORY_BLOCK_WRAPPER_BYTES = 2
+
+
 def build(
     branch: str,
     base_ref: str,
