@@ -1305,13 +1305,19 @@ def _record_cancellation(store: "Store", record_id: str, exc) -> WorkerOutcome:
         rec = pipeline.cancellation_transform(dict(partial), reason)
         try:
             if pipeline._accepts_keyword(store.finalize_review, "lineage_annotator"):
+                class _AnnotatorFailed(Exception):
+                    pass
+
+                def _annotator(store, rec):
+                    try:
+                        pipeline.annotate_lineage(store, rec)
+                    except Exception as exc:
+                        raise _AnnotatorFailed from exc
+
                 try:
                     applied = store.finalize_review(
-                        record_id, rec,
-                        lineage_annotator=pipeline.annotate_lineage)
-                except Exception:
-                    # Lineage is additive. A callback failure must not discard
-                    # the cancelled partial; persist it without enrichment.
+                        record_id, rec, lineage_annotator=_annotator)
+                except _AnnotatorFailed:
                     applied = store.finalize_review(record_id, rec)
             else:
                 applied = store.finalize_review(record_id, rec)
