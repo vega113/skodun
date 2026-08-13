@@ -189,6 +189,15 @@ def test_each_interpreter_command_string_flag_is_rejected(argv):
 
 
 @pytest.mark.parametrize("argv", [
+    ("/usr/bin/env", "bash", "-c", "echo unsafe"),
+    ("busybox", "sh", "-c", "echo unsafe"),
+])
+def test_wrapped_interpreter_command_string_flags_are_rejected(argv):
+    with pytest.raises(EvidenceError):
+        ProducerCommand("unsafe", argv, ".", ())
+
+
+@pytest.mark.parametrize("argv", [
     ("cc", "-c", "check.c"),
     ("git", "-c", "core.pager=cat", "status"),
 ])
@@ -221,6 +230,13 @@ def test_receipt_nested_counters_are_immutable_and_invalid_constructed_receipts_
     result = verify_receipt(forged, identity(), policy())
     assert result.accepted is False
     assert result.reason_code == "invalid_field"
+
+
+def test_directly_constructed_artifact_digests_are_immutable():
+    parsed = parse_receipt(json.dumps(receipt_mapping()))
+    forged = replace(parsed, artifact_digests=list(parsed.artifact_digests))
+    assert isinstance(forged.artifact_digests, tuple)
+    assert verify_receipt(forged, identity(), policy()).accepted is True
 
 
 def test_receipt_file_rejects_symlink_and_oversize(tmp_path: Path):

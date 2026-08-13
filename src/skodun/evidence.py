@@ -177,6 +177,15 @@ def _is_shell_command_flag(executable: str, arg: str) -> bool:
             or re.fullmatch(r"-[A-Za-z]*c(?:=.*)?", arg) is not None)
 
 
+def _contains_shell_command(argv: tuple[str, ...]) -> bool:
+    """Reject recognized interpreters even when argv uses a thin wrapper."""
+    for index, executable in enumerate(argv):
+        if any(_is_shell_command_flag(executable, flag)
+               for flag in argv[index + 1:]):
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class ProducerCommand:
     command_id: str
@@ -191,8 +200,7 @@ class ProducerCommand:
             raise EvidenceError("invalid_command", "argv")
         for arg in self.argv:
             _text("argv", arg, maximum=1024)
-        if any(_is_shell_command_flag(self.argv[0], arg)
-               for arg in self.argv[1:]):
+        if _contains_shell_command(self.argv):
             raise EvidenceError("invalid_command", "shell command strings are forbidden")
         _text("cwd", self.cwd)
         if self.cwd != ".":
@@ -283,6 +291,9 @@ class EvidenceReceipt:
     receipt_digest: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.artifact_digests, tuple):
+            object.__setattr__(self, "artifact_digests",
+                               tuple(self.artifact_digests))
         if not isinstance(self.counters, MappingProxyType):
             object.__setattr__(self, "counters",
                                MappingProxyType(dict(self.counters)))
