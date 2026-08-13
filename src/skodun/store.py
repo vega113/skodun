@@ -29,11 +29,13 @@ the only thing that keeps it honest is its filed reference, which is why
 from __future__ import annotations
 
 import json
+import errno
 import hashlib
 import os
 import re
 import shutil
 import sqlite3
+import stat
 import tempfile
 import time
 from urllib.parse import quote
@@ -122,23 +124,106 @@ def schema_too_new_message(store_version: int) -> str:
     )
 
 
+def _open_regular_file(path: Path) -> tuple[int | None, SchemaInfo | None]:
+    """Open `path` without following links or blocking on FIFOs."""
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None, SchemaInfo("missing", str(path), None, SCHEMA_VERSION)
+    except OSError as exc:
+        code = getattr(exc, "errno", None)
+        if code in {errno.ELOOP, getattr(errno, "EMLINK", errno.ELOOP)}:
+            return None, SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
+                                    reason_code="symlink", detail=repr(exc))
+        if code in {errno.ENXIO, errno.EAGAIN, errno.EWOULDBLOCK, errno.EISDIR,
+                    errno.ENOTDIR}:
+            return None, SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
+                                    reason_code="not_a_file", detail=repr(exc))
+        return None, SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
+                                reason_code="not_a_file", detail=repr(exc))
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError as exc:
+        os.close(fd)
+        return None, SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
+                                reason_code="not_a_file", detail=repr(exc))
+    if not stat.S_ISREG(mode):
+        os.close(fd)
+        return None, SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
+                                reason_code="not_a_file")
+    return fd, None
+
+
+def _copy_fd_to(fd: int, destination: Path) -> None:
+    with os.fdopen(fd, "rb", closefd=True) as src, destination.open("wb") as dst:
+        shutil.copyfileobj(src, dst, length=1024 * 1024)
+
+
+def _copy_sidecar(src: Path, destination: Path) -> SchemaInfo | None:
+    """Copy a WAL/SHM sidecar with the same descriptor rules as the database."""
+    if not src.exists():
+        return None
+    fd, error = _open_regular_file(src)
+    if error is not None:
+        if error.state == "missing":
+            return None
+        reason = error.reason_code if error.reason_code == "symlink" else (
+            "unreadable_sidecar")
+        return SchemaInfo("invalid", error.path, None, SCHEMA_VERSION,
+                          reason_code=reason, detail=error.detail)
+    try:
+        _copy_fd_to(fd, destination)
+    except OSError as exc:
+        return SchemaInfo("invalid", str(src), None, SCHEMA_VERSION,
+                          reason_code="unreadable_sidecar", detail=repr(exc))
+    return None
+
+
+def _snapshot_database(path: Path) -> tuple[tempfile.TemporaryDirectory | None,
+                                            Path | None, SchemaInfo | None]:
+    """Copy a store (and WAL/SHM) onto a disposable snapshot for inspection."""
+    fd, error = _open_regular_file(path)
+    if error is not None:
+        return None, None, error
+    try:
+        snapshot = tempfile.TemporaryDirectory(prefix="skodun-inspect-")
+    except OSError as exc:
+        os.close(fd)
+        return None, None, SchemaInfo(
+            "invalid", str(path), None, SCHEMA_VERSION,
+            reason_code="temp_unavailable", detail=repr(exc))
+    db_path = Path(snapshot.name) / path.name
+    try:
+        _copy_fd_to(fd, db_path)
+        wal_error = _copy_sidecar(Path(str(path) + "-wal"),
+                                  Path(str(db_path) + "-wal"))
+        if wal_error is not None:
+            snapshot.cleanup()
+            return None, None, wal_error
+        shm_error = _copy_sidecar(Path(str(path) + "-shm"),
+                                  Path(str(db_path) + "-shm"))
+        if shm_error is not None:
+            snapshot.cleanup()
+            return None, None, shm_error
+    except OSError as exc:
+        snapshot.cleanup()
+        return None, None, SchemaInfo(
+            "invalid", str(path), None, SCHEMA_VERSION,
+            reason_code="snapshot_failed", detail=repr(exc))
+    return snapshot, db_path, None
+
+
 def inspect_schema(path: Path) -> SchemaInfo:
     """Inspect a database without creating or mutating filesystem state."""
     path = Path(path)
-    if not path.exists():
-        return SchemaInfo("missing", str(path), None, SCHEMA_VERSION)
-    if not path.is_file():
-        return SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
-                          reason_code="not_a_file")
-    snapshot = tempfile.TemporaryDirectory(prefix="skodun-inspect-")
-    db_path = Path(snapshot.name) / path.name
-    shutil.copyfile(path, db_path)
-    wal = Path(str(path) + "-wal")
-    shm = Path(str(path) + "-shm")
-    if wal.exists():
-        shutil.copyfile(wal, Path(str(db_path) + "-wal"))
-        if shm.exists():
-            shutil.copyfile(shm, Path(str(db_path) + "-shm"))
+    snapshot, db_path, error = _snapshot_database(path)
+    if error is not None:
+        return error
+    assert snapshot is not None and db_path is not None
     uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
     conn = None
     try:
@@ -153,8 +238,12 @@ def inspect_schema(path: Path) -> SchemaInfo:
     finally:
         if conn is not None:
             conn.close()
-        if snapshot is not None:
-            snapshot.cleanup()
+        snapshot.cleanup()
+
+
+def migration_receipt_path(path: Path, target: int | None = None) -> Path:
+    version = SCHEMA_VERSION if target is None else int(target)
+    return Path(str(path) + f".migration-receipt-v{version}.json")
 
 
 def _pid_alive(pid: int) -> bool:
@@ -209,49 +298,118 @@ def _discard_dead_lock(lock: Path) -> bool:
     return True
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {row[1] for row in rows}
+
+
+def _legacy_fg_lock_live(common_dir: Path) -> bool:
+    """True when the interop FG lock exists and is not provably dead."""
+    from .pipeline import (LOCK_NAME, LOCK_WRITE_GRACE_SEC, _lock_age,
+                           _owner_pid, _owner_started, _pid_alive)
+    lock = Path(common_dir) / LOCK_NAME
+    try:
+        if not lock.is_dir():
+            return False
+    except OSError:
+        return False
+    pid = _owner_pid(lock)
+    if pid is not None:
+        return _pid_alive(pid)
+    age = _lock_age(lock, _owner_started(lock))
+    return age < float(LOCK_WRITE_GRACE_SEC)
+
+
+def _discovered_lock_scopes(conn: sqlite3.Connection,
+                            tables: set[str]) -> set[str]:
+    scopes: set[str] = set()
+    if "capacity_admissions" in tables:
+        for row in conn.execute(
+                "SELECT DISTINCT scope FROM capacity_admissions").fetchall():
+            if row[0]:
+                scopes.add(str(row[0]))
+    if "reviews" in tables:
+        columns = _table_columns(conn, "reviews")
+        if "worktree_root" in columns:
+            for row in conn.execute(
+                    "SELECT DISTINCT worktree_root FROM reviews "
+                    "WHERE worktree_root IS NOT NULL").fetchall():
+                if row[0]:
+                    try:
+                        from . import gitio
+                        scopes.add(str(gitio.git_common_dir(Path(row[0]))))
+                    except Exception:
+                        guess = Path(str(row[0])) / ".git"
+                        if guess.is_dir():
+                            scopes.add(str(guess.resolve()))
+    return scopes
+
+
 def migration_blockers(path: Path) -> tuple[str, ...]:
-    """Return active review/claim/capacity blockers using a read-only connection."""
+    """Return active review/claim/capacity blockers using a read-only snapshot."""
     info = inspect_schema(path)
     if info.state not in ("older", "current"):
         return ()
-    snapshot = tempfile.TemporaryDirectory(prefix="skodun-blockers-")
-    db_path = Path(snapshot.name) / Path(path).name
-    shutil.copyfile(path, db_path)
-    wal = Path(str(path) + "-wal")
-    if wal.exists():
-        shutil.copyfile(wal, Path(str(db_path) + "-wal"))
-        shm = Path(str(path) + "-shm")
-        if shm.exists():
-            shutil.copyfile(shm, Path(str(db_path) + "-shm"))
+    snapshot, db_path, error = _snapshot_database(path)
+    if error is not None:
+        return ()
+    assert snapshot is not None and db_path is not None
     uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=0)
+    conn.row_factory = sqlite3.Row
     try:
         tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         blockers: list[str] = []
         if "reviews" in tables:
-            running = conn.execute(
-                "SELECT pid FROM reviews WHERE status='running'").fetchall()
-            if any(row[0] is None or _pid_alive(int(row[0])) for row in running):
+            columns = _table_columns(conn, "reviews")
+            if "pid" in columns:
+                running = conn.execute(
+                    "SELECT pid FROM reviews WHERE status='running'").fetchall()
+                if any(row[0] is None or _pid_alive(int(row[0]))
+                       for row in running):
+                    blockers.append("active_review")
+            elif conn.execute(
+                    "SELECT 1 FROM reviews WHERE status='running' LIMIT 1"
+            ).fetchone():
                 blockers.append("active_review")
-        if "review_checkpoints" in tables and conn.execute(
-                "SELECT 1 FROM review_checkpoints WHERE state='running' LIMIT 1"
-        ).fetchone():
-            blockers.append("active_checkpoint_claim")
+        if "review_checkpoints" in tables:
+            now = _iso_now()
+            columns = _table_columns(conn, "review_checkpoints")
+            if "lease_expires_at" in columns:
+                live = conn.execute(
+                    "SELECT 1 FROM review_checkpoints WHERE state='running' "
+                    "AND lease_expires_at IS NOT NULL AND lease_expires_at > ? "
+                    "LIMIT 1", (now,)).fetchone()
+            else:
+                live = conn.execute(
+                    "SELECT 1 FROM review_checkpoints WHERE state='running' "
+                    "LIMIT 1").fetchone()
+            if live:
+                blockers.append("active_checkpoint_claim")
         if "capacity_admissions" in tables:
-            active = conn.execute(
-                "SELECT DISTINCT scope FROM capacity_admissions "
+            from .capacity import DEFAULT_STALE_SEC, should_reclaim_admission
+            rows = conn.execute(
+                "SELECT status, pid, queued_at FROM capacity_admissions "
                 "WHERE status IN ('queued','admitted','running')").fetchall()
-            if active:
+            live_capacity = False
+            for row in rows:
+                if should_reclaim_admission(
+                        status=row["status"], pid=row["pid"],
+                        queued_at=row["queued_at"],
+                        stale_sec=DEFAULT_STALE_SEC) is None:
+                    live_capacity = True
+                    break
+            if live_capacity:
                 blockers.append("active_capacity_admission")
-                if any((Path(str(row[0])) / "grok-reviews-foreground.lock").exists()
-                       for row in active if row[0]):
-                    blockers.append("legacy_fg_lock")
+        for scope in _discovered_lock_scopes(conn, tables):
+            if _legacy_fg_lock_live(Path(scope)):
+                blockers.append("legacy_fg_lock")
+                break
         return tuple(blockers)
     finally:
         conn.close()
-        if snapshot is not None:
-            snapshot.cleanup()
+        snapshot.cleanup()
 
 #: Set to anything other than "0", unset, or blank to ignore `provider_state`
 #: entirely.
@@ -1198,11 +1356,13 @@ class Reservation:
 
 
 class Store:
-    def __init__(self, conn: sqlite3.Connection, path: Path | None = None):
+    def __init__(self, conn: sqlite3.Connection, path: Path | None = None,
+                 *, _snapshot: tempfile.TemporaryDirectory | None = None):
         self._c = conn
         #: The file this store lives in, when it was opened from one. Only
         #: `log_dir` reads it, and it falls back to asking SQLite itself.
         self._path = None if path is None else Path(path)
+        self._snapshot = _snapshot
 
     @classmethod
     def open(cls, path: Path) -> "Store":
@@ -1254,9 +1414,10 @@ class Store:
                 raise SchemaLifecycleError(
                     info.reason_code or "invalid_schema",
                     f"store cannot be opened: {path}", version=None)
-        conn = sqlite3.connect(path, isolation_level=None, timeout=30)
-        conn.row_factory = sqlite3.Row
+        conn = None
         try:
+            conn = sqlite3.connect(path, isolation_level=None, timeout=30)
+            conn.row_factory = sqlite3.Row
             if not existed:
                 _migrate(conn)
             else:
@@ -1273,8 +1434,10 @@ class Store:
                 # Connection-local; unlike WAL/DDL this does not alter the
                 # store bytes and is safe for an already-current authority.
                 conn.execute("PRAGMA foreign_keys=ON")
+            return cls(conn, path)
         except BaseException:
-            conn.close()        # never leave a refused store open or locked
+            if conn is not None:
+                conn.close()        # never leave a refused store open or locked
             raise
         finally:
             if owns_init_lock:
@@ -1282,7 +1445,6 @@ class Store:
                     init_lock.unlink()
                 except FileNotFoundError:
                     pass
-        return cls(conn, path)
 
     @classmethod
     def open_readonly(cls, path: Path) -> "Store":
@@ -1304,11 +1466,17 @@ class Store:
             raise SchemaLifecycleError(
                 info.reason_code or "invalid_schema",
                 f"store cannot be opened read-only: {path}", version=None)
-        uri = f"file:{quote(str(Path(path).resolve()))}?mode=ro"
+        snapshot, db_path, error = _snapshot_database(path)
+        if error is not None:
+            raise SchemaLifecycleError(
+                error.reason_code or "invalid_schema",
+                f"store cannot be opened read-only: {path}", version=None)
+        assert snapshot is not None and db_path is not None
+        uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
-        return cls(conn, Path(path))
+        return cls(conn, Path(path), _snapshot=snapshot)
 
     @classmethod
     def _open_for_migration_tests(cls, path: Path) -> "Store":
@@ -1372,7 +1540,7 @@ class Store:
                 version=int(info.version))
         backup = Path(str(path) + ".backup-before-v" + str(SCHEMA_VERSION))
         destination = (Path(receipt_path) if receipt_path is not None
-                       else Path(str(path) + ".migration-receipt.json"))
+                       else migration_receipt_path(path))
         try:
             try:
                 receipt_fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
@@ -1400,6 +1568,7 @@ class Store:
             "started_at": started_at, "result": "in_progress",
             "diagnostic_category": "migration_in_progress",
         }, sort_keys=True) + "\n", encoding="utf-8")
+        migrated = False
         try:
             source = sqlite3.connect(path, isolation_level=None)
             target_uri = (f"file:{quote(str(backup.resolve()))}?mode=rw")
@@ -1420,6 +1589,7 @@ class Store:
                 integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
                 if integrity != "ok":
                     raise ValueError(f"integrity check failed: {integrity}")
+            migrated = True
             digest = hashlib.sha256(backup.read_bytes()).hexdigest()
             receipt = {
                 "schema_from": int(info.version),
@@ -1429,6 +1599,7 @@ class Store:
                 "finished_at": _iso_now(),
                 "backup_path": str(backup),
                 "backup_sha256": digest,
+                "receipt_path": str(destination),
                 "diagnostic_category": "success",
                 "result": "success",
             }
@@ -1442,6 +1613,13 @@ class Store:
                 # false failure that makes a current store look unmigratable.
                 receipt["diagnostic_category"] = "receipt_pending"
             return receipt
+        except BaseException:
+            if not migrated:
+                destination.unlink(missing_ok=True)
+                current = inspect_schema(path)
+                if current.state == "older":
+                    backup.unlink(missing_ok=True)
+            raise
         finally:
             try:
                 lock.unlink()
@@ -1459,6 +1637,10 @@ class Store:
         here catches or downgrades that.
         """
         self._c.close()
+        snapshot = getattr(self, "_snapshot", None)
+        if snapshot is not None:
+            self._snapshot = None
+            snapshot.cleanup()
 
     def __enter__(self) -> "Store":
         return self

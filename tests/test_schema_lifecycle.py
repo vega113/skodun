@@ -11,13 +11,15 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from skodun.cli import main
 from skodun.store import (SCHEMA_VERSION, SchemaLifecycleError, Store,
-                          inspect_schema)
+                          inspect_schema, migration_blockers,
+                          migration_receipt_path)
 
 
 def _downgrade(path, version=12):
@@ -52,7 +54,7 @@ def test_explicit_migration_creates_backup_and_bounded_receipt(tmp_path):
     assert receipt["schema_to"] == SCHEMA_VERSION
     assert receipt["result"] == "success"
     assert db.with_name(db.name + ".backup-before-v14").stat().st_mode & 0o077 == 0
-    saved = json.loads(db.with_name(db.name + ".migration-receipt.json").read_text())
+    saved = json.loads(migration_receipt_path(db).read_text())
     assert saved["backup_sha256"] == receipt["backup_sha256"]
     assert inspect_schema(db).state == "current"
 
@@ -111,3 +113,119 @@ def test_cli_readiness_refuses_older_store_without_mutation(tmp_path):
     assert result.returncode == 2
     assert db.read_bytes() == before
     assert "migration" in (result.stdout + result.stderr).lower()
+
+
+def test_inspect_schema_refuses_fifo_without_hanging(tmp_path):
+    fifo = tmp_path / "store.db"
+    os.mkfifo(fifo)
+    start = time.monotonic()
+    info = inspect_schema(fifo)
+    assert time.monotonic() - start < 2.0
+    assert info.state == "invalid"
+    assert info.reason_code == "not_a_file"
+
+
+def test_inspect_schema_refuses_symlink(tmp_path):
+    target = tmp_path / "real.db"
+    target.write_bytes(b"not-sqlite")
+    link = tmp_path / "store.db"
+    link.symlink_to(target)
+    info = inspect_schema(link)
+    assert info.state == "invalid"
+    assert info.reason_code == "symlink"
+
+
+def test_cli_wheel_apply_uses_embedded_commit(tmp_path, capsys, monkeypatch):
+    db = _authority_db(tmp_path)
+    with Store.open(db):
+        pass
+    _downgrade(db)
+    monkeypatch.setattr("skodun.provenance.code_provenance",
+                        lambda: {"skodun_commit": "c" * 40})
+    monkeypatch.setattr("skodun.provenance._embedded_identity",
+                        lambda: {"skodun_commit": "c" * 40, "source": "wheel"})
+    assert main(["store", "migrate", "--apply", "--db", str(db)]) == 0
+    assert inspect_schema(db).state == "current"
+    assert "applied v12" in capsys.readouterr().out
+
+
+def test_cli_apply_rejects_mismatched_build_commit(tmp_path, monkeypatch, capsys):
+    db = _authority_db(tmp_path)
+    with Store.open(db):
+        pass
+    _downgrade(db)
+    monkeypatch.setattr("skodun.provenance.code_provenance",
+                        lambda: {"skodun_commit": "c" * 40})
+    assert main(["store", "migrate", "--apply", "--db", str(db),
+                 "--build-commit", "d" * 40]) == 2
+    assert inspect_schema(db).state == "older"
+    assert "build_identity_mismatch" in capsys.readouterr().out
+
+
+def test_dead_capacity_admission_does_not_block_migration(tmp_path):
+    db = _authority_db(tmp_path)
+    with Store.open(db) as store:
+        store.capacity_enqueue(
+            admission_id="ca_dead", resource_class="review-fg",
+            scope=str(tmp_path), pid=2 ** 22)
+    _downgrade(db)
+    assert "active_capacity_admission" not in migration_blockers(db)
+    receipt = Store.migrate_existing(db, build_commit="a" * 40)
+    assert receipt["result"] == "success"
+
+
+def test_legacy_fg_lock_blocks_without_capacity_row(tmp_path):
+    db = _authority_db(tmp_path)
+    common = tmp_path / "repo.git"
+    common.mkdir()
+    lock = common / "grok-reviews-foreground.lock"
+    lock.mkdir()
+    (lock / "owner").write_text(
+        f"pid={os.getpid()}\nstarted={int(time.time())}\nworktree={tmp_path}\n",
+        encoding="utf-8")
+    with Store.open(db) as store:
+        store._c.execute(
+            "INSERT INTO reviews(id, status, worktree_root) VALUES (?,?,?)",
+            ("sk_lock", "clean", str(tmp_path)))
+    # worktree_root may not be a git repo; plant the lock at .git instead.
+    gitdir = tmp_path / ".git"
+    gitdir.mkdir()
+    planted = gitdir / "grok-reviews-foreground.lock"
+    if not planted.exists():
+        os.rename(lock, planted)
+    _downgrade(db)
+    assert "legacy_fg_lock" in migration_blockers(db)
+
+
+def test_failed_apply_is_retryable_when_store_stays_old(tmp_path, monkeypatch):
+    db = _authority_db(tmp_path)
+    with Store.open(db):
+        pass
+    _downgrade(db)
+    original = Path.chmod
+
+    def chmod(self, mode):
+        if str(self).endswith(".backup-before-v" + str(SCHEMA_VERSION)):
+            raise OSError("injected chmod failure")
+        return original(self, mode)
+
+    monkeypatch.setattr(Path, "chmod", chmod)
+    with pytest.raises(OSError):
+        Store.migrate_existing(db, build_commit="a" * 40)
+    monkeypatch.setattr(Path, "chmod", original)
+    assert inspect_schema(db).state == "older"
+    assert not migration_receipt_path(db).exists()
+    receipt = Store.migrate_existing(db, build_commit="a" * 40)
+    assert receipt["result"] == "success"
+
+
+def test_open_readonly_does_not_create_shm_beside_original(tmp_path):
+    db = _authority_db(tmp_path)
+    with Store.open(db) as store:
+        store._c.execute("PRAGMA journal_mode=WAL")
+    shm = Path(str(db) + "-shm")
+    if shm.exists():
+        shm.unlink()
+    with Store.open_readonly(db):
+        pass
+    assert not shm.exists()

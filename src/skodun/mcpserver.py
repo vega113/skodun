@@ -1858,17 +1858,17 @@ class McpServer:
         # before a tool call hits the store. Clients that only read name/version
         # ignore the extra field. Imported lazily so cold `skodun mcp` still
         # avoids paying for sqlite until a tool needs the store.
-        from .provenance import cached_provenance
+        from .provenance import cached_provenance, _embedded_identity
         from .store import SCHEMA_VERSION
         # `commit` beside the version because on an editable install every
-        # commit is still 0.4.0 -- so the version alone cannot tell an operator
-        # whether THIS SERVER is running the code they just merged. It is what
-        # `skodun doctor`'s package line asks them to compare against.
+        # commit is still the same package version -- so the version alone
+        # cannot tell an operator whether THIS SERVER is running the code they
+        # just merged. It is what `skodun doctor`'s package line asks them to
+        # compare against.
         #
-        # BEST EFFORT: read from the cache the constructor started warming, and
-        # never computed here. This is the handshake, and a client that times it
-        # out has lost the session -- so on the rare cold read the field is
-        # absent rather than paid for.
+        # BEST EFFORT for git: read from the cache the constructor started
+        # warming, and never compute git here. Wheel identity is git-free and
+        # may be included even on a cold cache.
         info = {
             "name": SERVER_NAME,
             "version": self._version,
@@ -1877,6 +1877,10 @@ class McpServer:
         warm = cached_provenance()
         if warm is not None:
             info["commit"] = warm.get("skodun_commit")
+        else:
+            embedded = _embedded_identity()
+            if embedded is not None:
+                info["commit"] = embedded.get("skodun_commit")
         return {"protocolVersion": negotiated,
                 "capabilities": {"tools": {}, "prompts": {}},
                 "serverInfo": info}

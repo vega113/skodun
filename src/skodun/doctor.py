@@ -100,7 +100,7 @@ def run_doctor(
         # doctor gives an operator is the CLI's own commit, to compare against
         # the `serverInfo.commit` their client shows.
         commit = code_provenance().get("skodun_commit")
-        running = f" commit={short(commit)}" if commit else ""
+        running = f" commit={short(commit) if commit else 'null'}"
         report.add(
             "package", True,
             f"version={__version__} schema_v={_SCHEMA_V}{running} "

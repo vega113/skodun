@@ -143,6 +143,22 @@ def _read_commit(root: Path) -> str | None:
     return commit if not state.stdout.strip() else f"{commit}-dirty"
 
 
+def _embedded_identity() -> dict | None:
+    """Wheel identity written at build time, or None for a source checkout.
+
+    Instant and git-free. A missing ``_build`` module is the source-checkout
+    case, not an error: provenance then falls back to the git probe.
+    """
+    try:
+        from . import _build
+    except ImportError:
+        return None
+    commit = getattr(_build, "COMMIT", None)
+    if not isinstance(commit, str) or not commit.strip():
+        return None
+    return {"skodun_commit": commit.strip(), "source": "wheel"}
+
+
 def short(commit: str | None, width: int = 12) -> str:
     """A commit abbreviated for a one-line diagnostic, KEEPING its suffix.
 
@@ -166,10 +182,11 @@ def code_provenance() -> dict:
     Re-reading per review would stamp verdicts with a commit that never
     produced them, which is the opposite of what this field is for.
 
-    `skodun_commit` is `None` for an install that is not a checkout. Explicit
-    `None` rather than an absent key, for the reason `requested_reviewer` gives:
-    absence would be indistinguishable from a record written before the field
-    existed.
+    `skodun_commit` is the embedded wheel identity when this process was
+    installed from a release artifact. A source checkout without that file
+    falls back to git. Explicit `None` rather than an absent key, for the
+    reason `requested_reviewer` gives: absence would be indistinguishable from
+    a record written before the field existed.
     """
     global _CACHED
     if _CACHED is None:
@@ -178,9 +195,12 @@ def code_provenance() -> dict:
             # above, and the second must take the first's answer rather than
             # compute its own on the other side of a `git pull`.
             if _CACHED is None:
+                embedded = _embedded_identity()
+                commit = (embedded["skodun_commit"] if embedded is not None
+                          else _read_commit(_package_root()))
                 _CACHED = {
                     "skodun_version": __version__,
-                    "skodun_commit": _read_commit(_package_root()),
+                    "skodun_commit": commit,
                 }
     return dict(_CACHED)
 
