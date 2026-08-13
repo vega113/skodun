@@ -2037,10 +2037,7 @@ class Store:
                     break
             if exhausted:
                 break
-        truncated = len(findings) > limit
-        if (not truncated and len(findings) == limit
-                and not exhausted and examined >= scan_cap):
-            truncated = True
+        truncated = len(findings) > limit or not exhausted
         return findings[:limit], truncated
 
     def lineage_review_candidates(self, repository_id: str) -> list[dict]:

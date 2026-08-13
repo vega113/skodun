@@ -305,6 +305,39 @@ def test_lineage_finding_candidates_skip_invalid_rows_without_underfilling(tmp_p
         assert findings[0]["_lineage_review_id"] == "real"
 
 
+def test_lineage_scan_cap_reports_truncation_instead_of_a_complete_miss(tmp_path):
+    base = {
+        "branch": "main", "head": "h", "base_ref": "origin/main", "base_sha": "b",
+        "diff_hash": "d", "context_hash": "", "mode": "now", "model": "m",
+        "adapter": "a", "status": "clean", "parse_ok": True, "degraded": False,
+        "diff_truncated": False, "trustworthy": True, "stop_reason": "done",
+        "severity": {"high": 0, "medium": 0, "low": 0}, "summary": "ok",
+        "repo_id": "repo", "lineage_repository_id": "canonical",
+        "findings_total": 1,
+    }
+    finding = fingerprint.annotate_findings(
+        [{"file": "src/a.py", "title": "real"}])[0]
+    with Store.open(tmp_path / "s.db") as store:
+        store.save_review({
+            **base, "id": "real", "reviewed_at": "2026-08-12T09:00:00Z",
+            "findings": [finding],
+        })
+        digest = finding["finding_fingerprint_v2"]
+        for index in range(16):
+            store._c.execute(
+                """INSERT INTO finding_lineage
+                (review_id, finding_index, repository_id, fingerprint_version,
+                 fingerprint, scope, scope_reason, predecessor_review_id,
+                 predecessor_finding_index, match_reason, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (f"ghost-{index}", 99, "canonical", "finding_fingerprint_v2",
+                 digest, None, None, None, None, "new",
+                 "2026-08-12T10:00:00Z"))
+        findings, truncated = store.lineage_finding_candidates_with_meta(
+            "canonical", before_reviewed_at="2026-08-12T11:00:00Z", limit=1)
+        assert truncated is True
+
+
 def test_lineage_prompt_context_is_bounded_and_utf8_safe():
     rows = [{
         "finding_fingerprint_v2": "sha256:" + "a" * 64,
