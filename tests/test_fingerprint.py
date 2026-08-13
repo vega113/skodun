@@ -394,3 +394,18 @@ def test_lineage_prompt_path_cannot_spoof_reason_tokens():
     assert truncated is False
     assert f'{digest} path="foo reason=moved" reason=new' in text
     assert "path=foo reason=moved" not in text
+
+
+def test_lineage_prompt_path_quoting_survives_surrogate_filenames():
+    digest = "sha256:" + "b" * 64
+    rows = [{
+        "finding_fingerprint_v2": digest,
+        "file": "src/\udcff.py",
+        "finding_lineage_v2": {"match_reason": "prior"},
+    }]
+    context, truncated = fingerprint.render_prompt_context(rows)
+    assert truncated is False
+    text = context.decode("utf-8")
+    assert digest in text
+    assert "reason=prior" in text
+    assert "\udcff" not in text
