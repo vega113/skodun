@@ -115,6 +115,15 @@ def test_lineage_moved_line_uses_location_outside_digest_and_claim_changes_are_n
     assert changed["finding_lineage_v2"]["match_reason"] == "new"
 
 
+def test_location_uses_line_start_when_line_is_null():
+    old = {"file": "src/a.py", "line_start": 10, "title": "same",
+           "symbol": "run"}
+    new = {**old, "line": None, "line_start": 42}
+    result = fingerprint.annotate_findings([new], [old])[0]
+    assert result["finding_lineage_v2"]["line"] == "42"
+    assert result["finding_lineage_v2"]["match_reason"] == "moved"
+
+
 def test_same_file_line_change_without_anchor_is_ambiguous():
     old = {"file": "src/a.py", "line": 10, "title": "same"}
     moved = {**old, "line": 42}
@@ -172,9 +181,54 @@ def test_terminal_store_write_persists_lineage_without_changing_legacy_fields(tm
         "findings": [finding], "summary": "ok", "repo_id": "repo",
     }
     store = Store.open(tmp_path / "s.db")
-    store.save_review(record)
-    rows = store.list_lineage("r1")
-    assert rows[0]["fingerprint"] == finding["finding_fingerprint_v2"]
-    assert store.get_review("r1")["findings"][0]["finding_fingerprint_v2"]
-    assert [item["id"] for item in store.lineage_review_candidates("unknown")] == ["r1"]
-    assert [item["id"] for item in store.lineage_review_candidates("repo")] == []
+    try:
+        store.save_review(record)
+        rows = store.list_lineage("r1")
+        assert rows[0]["fingerprint"] == finding["finding_fingerprint_v2"]
+        assert store.get_review("r1")["findings"][0]["finding_fingerprint_v2"]
+        assert [item["id"] for item in store.lineage_review_candidates("unknown")] == ["r1"]
+        assert [item["id"] for item in store.lineage_review_candidates("repo")] == []
+    finally:
+        store.close()
+
+
+def test_malformed_lineage_projection_is_skipped_without_rolling_back_review(tmp_path):
+    record = {
+        "id": "malformed", "reviewed_at": "2026-08-12T10:00:00Z", "branch": "main",
+        "head": "h", "base_ref": "origin/main", "base_sha": "b", "diff_hash": "d",
+        "context_hash": "", "mode": "now", "model": "m", "adapter": "a",
+        "status": "clean", "parse_ok": True, "degraded": False, "diff_truncated": False,
+        "trustworthy": True, "stop_reason": "done", "findings_total": 2,
+        "severity": {"high": 0, "medium": 0, "low": 0}, "summary": "ok",
+        "repo_id": "repo", "findings": [
+            {"file": "src/a.py", "title": "bad", "finding_fingerprint_v2": "sha256:" + "a" * 64,
+             "finding_lineage_v2": {"version": "finding_fingerprint_v2", "match_reason": []},
+             "scope_attribution": {"scope": []}},
+            {"file": "src/b.py", "title": "good"},
+        ],
+    }
+    with Store.open(tmp_path / "s.db") as store:
+        store.save_review(record)
+        assert store.get_review("malformed") is not None
+        assert store.list_lineage("malformed") == []
+
+
+def test_lineage_candidates_are_chronological_and_exclude_later_reviews(tmp_path):
+    base = {
+        "branch": "main", "head": "h", "base_ref": "origin/main", "base_sha": "b",
+        "diff_hash": "d", "context_hash": "", "mode": "now", "model": "m", "adapter": "a",
+        "status": "clean", "parse_ok": True, "degraded": False, "diff_truncated": False,
+        "trustworthy": True, "stop_reason": "done", "findings_total": 1,
+        "severity": {"high": 0, "medium": 0, "low": 0}, "summary": "ok", "repo_id": "repo",
+    }
+    def rec(rid, when):
+        finding = fingerprint.annotate_findings([{"file": "src/a.py", "title": rid}])[0]
+        return {**base, "id": rid, "reviewed_at": when, "findings": [finding],
+                "lineage_repository_id": "canonical"}
+    with Store.open(tmp_path / "s.db") as store:
+        store.save_review(rec("older", "2026-08-12T09:00:00Z"))
+        store.save_review(rec("newer", "2026-08-12T11:00:00Z"))
+        candidates, truncated = store.lineage_review_candidates_with_meta(
+            "canonical", before_reviewed_at="2026-08-12T10:00:00Z", limit=10)
+        assert [item["id"] for item in candidates] == ["older"]
+        assert truncated is False

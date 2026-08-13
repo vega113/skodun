@@ -330,7 +330,10 @@ def test_cli_review_status_and_cancel_stdout(tmp_path, monkeypatch, capsys):
 # ==========================================================================
 
 def test_mcp_review_status_and_cancel_parity(tmp_path):
-    rec = _artifact([], id="sk_mcp", status="running", mode="now",
+    finding = {"file": "src/a.py", "title": "same",
+               "finding_fingerprint_v2": "sha256:" + "a" * 64,
+               "finding_lineage_v2": {"match_reason": "moved"}}
+    rec = _artifact([finding], id="sk_mcp", status="running", mode="now",
                     pid=2**30, findings_total=0, repo="/r",
                     reviewed_at=_fresh_ts(), model="m",
                     adapter="grok", worst_runtime_sec=86_400)
@@ -343,6 +346,8 @@ def test_mcp_review_status_and_cancel_parity(tmp_path):
     res = _tool("review_status", db, review_id="sk_mcp")
     assert res.status == 0
     assert "id=sk_mcp" in res.text and "state=running" in res.text
+    assert "fingerprint_version=finding_fingerprint_v2" in res.text
+    assert "lineage_counts=moved:1" in res.text
 
     with Store.open(db) as st:
         code, text = services.svc_review_status(st, review_id="sk_mcp")

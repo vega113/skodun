@@ -1497,13 +1497,16 @@ class Store:
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
-    def save_review(self, rec: dict) -> None:
+    def save_review(self, rec: dict, *, lineage_annotator=None) -> None:
         normalized = _normalize_record(rec, label="save_review")
         # The artifact row and its additive lineage projection are one
         # publication.  Keep both writes in the same transaction so a
         # partially written read model can never be observed after a crash.
         self._c.execute("BEGIN IMMEDIATE")
         try:
+            if lineage_annotator is not None and normalized.get("status") != RUNNING:
+                lineage_annotator(self, normalized)
+                normalized = _normalize_record(normalized, label="save_review")
             self._write_review(normalized)
             self._c.execute("COMMIT")
         except BaseException:
@@ -1513,7 +1516,7 @@ class Store:
                 pass
             raise
 
-    def save_checkpointed_review(self, rec: dict) -> dict:
+    def save_checkpointed_review(self, rec: dict, *, lineage_annotator=None) -> dict:
         """Atomically publish a final review and consume its checkpoints.
 
         No review row can become coverage-bearing while its orchestration is
@@ -1530,6 +1533,10 @@ class Store:
         try:
             self._require_complete_orchestration(
                 orchestration_id, identity_digest)
+            if lineage_annotator is not None:
+                lineage_annotator(self, normalized)
+                normalized = _normalize_record(
+                    normalized, label="save_checkpointed_review")
             self._write_review(normalized)
             persisted = self.get_review(normalized["id"])
             if persisted is None:
@@ -1608,7 +1615,36 @@ class Store:
             lineage = finding.get("finding_lineage_v2")
             if not isinstance(digest, str) or not isinstance(lineage, Mapping):
                 continue
+            match_reason = lineage.get("match_reason")
+            if (not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+                    or lineage.get("version") != "finding_fingerprint_v2"
+                    or not isinstance(match_reason, str)
+                    or match_reason not in {
+                        "new", "repeated", "moved", "scope_changed",
+                        "ambiguous"}):
+                continue
+            predecessor_index = lineage.get("predecessor_index")
+            if (predecessor_index is not None
+                    and (type(predecessor_index) is not int
+                         or predecessor_index < 0)):
+                continue
+            predecessor_review_id = lineage.get("predecessor_review_id")
+            if (predecessor_review_id is not None
+                    and (not isinstance(predecessor_review_id, str)
+                         or not predecessor_review_id
+                         or len(predecessor_review_id) > 256)):
+                continue
             scope = finding.get("scope_attribution")
+            scope_name = scope.get("scope") if isinstance(scope, Mapping) else None
+            scope_reason = (scope.get("reason_code")
+                            if isinstance(scope, Mapping) else None)
+            if scope_name is not None and not isinstance(scope_name, str):
+                scope_name = None
+            if scope_reason is not None and not isinstance(scope_reason, str):
+                scope_reason = None
+            repository_id = rec.get("lineage_repository_id") or "unknown"
+            if not isinstance(repository_id, str):
+                repository_id = "unknown"
             self._c.execute(
                 """INSERT INTO finding_lineage
                 (review_id, finding_index, repository_id, fingerprint_version,
@@ -1616,13 +1652,11 @@ class Store:
                  predecessor_finding_index, match_reason, created_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (rec.get("id"), index,
-                 rec.get("lineage_repository_id") or "unknown",
-                 lineage.get("version", "finding_fingerprint_v2"), digest,
-                 scope.get("scope") if isinstance(scope, Mapping) else None,
-                 scope.get("reason_code") if isinstance(scope, Mapping) else None,
-                 lineage.get("predecessor_review_id"),
-                 lineage.get("predecessor_index"),
-                 lineage.get("match_reason", "new"),
+                 repository_id, lineage["version"], digest,
+                 scope_name[:256] if scope_name is not None else None,
+                 scope_reason[:256] if scope_reason is not None else None,
+                 predecessor_review_id, predecessor_index,
+                 match_reason,
                  rec.get("reviewed_at") or _iso_now()))
 
     def list_lineage(self, review_id: str | None = None) -> list[dict]:
@@ -1635,24 +1669,42 @@ class Store:
                 " ORDER BY finding_index", (review_id,)).fetchall()
         return [dict(row) for row in rows]
 
-    def lineage_review_candidates(self, repository_id: str) -> list[dict]:
+    def lineage_review_candidates_with_meta(
+            self, repository_id: str, *, before_reviewed_at: str | None = None,
+            limit: int = 200) -> tuple[list[dict], bool]:
         """Return terminal artifacts with persisted lineage for one repository.
 
-        Unlike the human-facing host-wide review log, this query is not capped
-        before repository qualification.  It is the conservative predecessor
-        source for cross-restack matching and contains no running rows because
-        lineage is written only at terminal publication.
+        Unlike the human-facing host-wide review log, this query is repository
+        qualified before applying a bounded history limit. It contains no
+        running rows because lineage is written only at terminal publication.
         """
         repository_id = _require_text("repository_id", repository_id)
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("lineage candidate limit must be a positive int")
+        where = "repository_id=?"
+        params: list[object] = [repository_id]
+        if before_reviewed_at is not None:
+            where += " AND created_at < ?"
+            params.append(before_reviewed_at)
+        count = self._c.execute(
+            f"SELECT COUNT(DISTINCT review_id) FROM finding_lineage WHERE {where}",
+            tuple(params)).fetchone()[0]
         rows = self._c.execute(
-            "SELECT DISTINCT review_id FROM finding_lineage "
-            "WHERE repository_id=? ORDER BY review_id", (repository_id,)
-        ).fetchall()
+            f"SELECT review_id, MAX(created_at) AS reviewed_at "
+            f"FROM finding_lineage WHERE {where} GROUP BY review_id "
+            "ORDER BY reviewed_at DESC, review_id DESC LIMIT ?",
+            tuple(params) + (limit,)).fetchall()
         candidates = []
         for row in rows:
             artifact = self.get_review(row["review_id"])
             if isinstance(artifact, dict) and artifact.get("status") != RUNNING:
                 candidates.append(artifact)
+        return candidates, count > limit
+
+    def lineage_review_candidates(self, repository_id: str) -> list[dict]:
+        """Compatibility wrapper for the bounded lineage candidate read."""
+        candidates, _truncated = self.lineage_review_candidates_with_meta(
+            repository_id)
         return candidates
 
     def get_review(self, review_id: str) -> dict | None:
@@ -2392,7 +2444,8 @@ class Store:
             (pid, pid, review_id, RUNNING))
         return cur.rowcount == 1
 
-    def finalize_review(self, record_id: str, rec: dict) -> bool:
+    def finalize_review(self, record_id: str, rec: dict, *,
+                        lineage_annotator=None) -> bool:
         """Apply a worker's completed record to its reservation, CONDITIONALLY.
 
         Returns True when the record was applied, False when the reservation is
@@ -2475,6 +2528,9 @@ class Store:
                             and str(exc) ==
                             "batch orchestration has incomplete checkpoints"):
                         raise
+            if lineage_annotator is not None:
+                lineage_annotator(self, merged)
+                merged = _normalize_record(merged, label="finalize_review")
             cur = self._c.execute(
                 _FINALIZE_REVIEW, _review_values(merged) + (record_id,))
             applied = cur.rowcount == 1

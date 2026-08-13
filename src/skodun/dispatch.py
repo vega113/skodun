@@ -1235,8 +1235,16 @@ def _work(store: "Store", cancel: threading.Event, record_id: str, repo: Path,
         rec = pipeline.cancellation_transform(rec, boundary)
         _note(f"cancelled {boundary}; recording an untrustworthy record")
 
-    pipeline.annotate_lineage(store, rec)
-    applied = store.finalize_review(record_id, rec)
+    try:
+        applied = store.finalize_review(
+            record_id, rec, lineage_annotator=pipeline.annotate_lineage)
+    except TypeError as exc:
+        # Preserve compatibility with narrow test/dry-run stores that expose
+        # the pre-hardening two-argument seam; the shipped Store takes the
+        # callback and serializes enrichment with terminal publication.
+        if "lineage_annotator" not in str(exc):
+            raise
+        applied = store.finalize_review(record_id, rec)
     if not applied:
         # The reservation stopped being `running` while this worker was reviewing:
         # a newer push superseded it, or a stale sweep reclaimed it. Its answer is
@@ -1301,8 +1309,15 @@ def _record_cancellation(store: "Store", record_id: str, exc) -> WorkerOutcome:
     if isinstance(partial, Mapping) and partial.get("id") == record_id:
         rec = pipeline.cancellation_transform(dict(partial), reason)
         try:
-            pipeline.annotate_lineage(store, rec)
-            if store.finalize_review(record_id, rec):
+            try:
+                applied = store.finalize_review(
+                    record_id, rec,
+                    lineage_annotator=pipeline.annotate_lineage)
+            except TypeError as exc:
+                if "lineage_annotator" not in str(exc):
+                    raise
+                applied = store.finalize_review(record_id, rec)
+            if applied:
                 current = store.get_review(record_id) or rec
                 return WorkerOutcome(0, banner(current))
         except BaseException as e:      # pragma: no cover - defensive

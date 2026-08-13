@@ -2075,8 +2075,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     f"repository or checkpoint identity moved before "
                     f"finalization ({mismatch}); no aggregate was published")
             try:
-                annotate_lineage(store, rec)
-                stored = store.save_checkpointed_review(rec)
+                stored = store.save_checkpointed_review(
+                    rec, lineage_annotator=annotate_lineage)
             except Exception as exc:
                 raise PersistenceFailed(
                     f"could not atomically finalize batch checkpoints: "
@@ -2597,9 +2597,20 @@ def _under(root: Path, relative: str) -> Path:
     return p if p.is_absolute() else root / p
 
 
-def _save(store: Store, rec: dict) -> None:
+def _save(store: Store, rec: dict, *, lineage_annotator=None) -> None:
     try:
-        store.save_review(rec)
+        if lineage_annotator is None:
+            store.save_review(rec)
+        else:
+            try:
+                store.save_review(rec, lineage_annotator=lineage_annotator)
+            except TypeError as exc:
+                # Narrow compatibility stores used by shipped seam tests may
+                # still expose the pre-hardening signature. The real Store
+                # accepts the callback and serializes enrichment atomically.
+                if "lineage_annotator" not in str(exc):
+                    raise
+                store.save_review(rec)
     except Exception as e:
         raise PersistenceFailed(f"could not record the review: {e!r}") from e
 
@@ -2618,8 +2629,15 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
         # An unknown canonical remote is deliberately not a lineage scope:
         # linking two unrelated local clones would be worse than a false
         # negative.  Stack manifests and normal remotes provide this value.
+        truncated = False
         if repository_id != "unknown":
-            for prior in store.lineage_review_candidates(repository_id):
+            if hasattr(store, "lineage_review_candidates_with_meta"):
+                candidates, truncated = store.lineage_review_candidates_with_meta(
+                    repository_id,
+                    before_reviewed_at=rec.get("reviewed_at"), limit=200)
+            else:
+                candidates = store.lineage_review_candidates(repository_id)
+            for prior in candidates:
                 if prior.get("id") == rec.get("id"):
                     continue
                 if prior.get("status") == "running":
@@ -2636,6 +2654,9 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
                         previous.append(enriched)
         rec["findings"] = annotate_findings(rec.get("findings") or (), previous)
         rec["fingerprint_status"] = "complete"
+        rec["fingerprint_candidate_limit"] = 200
+        rec["fingerprint_candidate_count"] = len(previous)
+        rec["fingerprint_candidates_truncated"] = bool(truncated)
         rec.pop("fingerprint_error", None)
     except Exception as exc:
         # A read-model enrichment failure must never change review trust or
@@ -2654,8 +2675,7 @@ def _persist(store: Store, rec: dict) -> dict:
     rendered from exactly what the gate will later see. A record that cannot be
     read back was not recorded, whatever the write said.
     """
-    annotate_lineage(store, rec)
-    _save(store, rec)
+    _save(store, rec, lineage_annotator=annotate_lineage)
     stored = store.get_review(rec["id"])
     if stored is None:
         raise PersistenceFailed(

@@ -83,9 +83,12 @@ def _source_and_claim(finding: Mapping[str, Any]) -> tuple[str, str]:
 def _location(finding: Mapping[str, Any]) -> tuple[str, str]:
     """Return bounded location metadata kept outside the digest."""
     path = _path(finding.get("file"))
-    value = finding.get("line", finding.get("line_start", finding.get("line_end")))
-    if value in (None, ""):
-        value = UNKNOWN
+    value: Any = UNKNOWN
+    for name in ("line", "line_start", "line_end"):
+        candidate = finding.get(name)
+        if candidate not in (None, ""):
+            value = candidate
+            break
     return path, _norm(value)
 
 
