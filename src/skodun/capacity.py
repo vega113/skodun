@@ -110,6 +110,7 @@ class Ticket:
     started_at: str | None = None
     ended_at: str | None = None
     wait_ms: int | None = None
+    queue_wait_ms: int | None = None
     expire_reason: str | None = None
     position: int | None = None
     review_id: str | None = None
@@ -333,6 +334,7 @@ def _ticket_from_row(row: Mapping) -> Ticket:
         started_at=row.get("started_at"),
         ended_at=row.get("ended_at"),
         wait_ms=row.get("wait_ms"),
+        queue_wait_ms=row.get("queue_wait_ms"),
         expire_reason=row.get("expire_reason"),
         review_id=row.get("review_id"),
     )
@@ -345,6 +347,7 @@ def _apply_row(ticket: Ticket, row: Mapping) -> Ticket:
     ticket.started_at = updated.started_at
     ticket.ended_at = updated.ended_at
     ticket.wait_ms = updated.wait_ms
+    ticket.queue_wait_ms = updated.queue_wait_ms
     ticket.expire_reason = updated.expire_reason
     ticket.review_id = updated.review_id
     return ticket

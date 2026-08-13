@@ -933,12 +933,25 @@ def _provenance(outcome: _Outcome) -> dict:
     """
     if outcome.accepted is not None:
         a = outcome.accepted
-        return {"provider": a["provider"], "model": a["model"],
-                "effort": a["effort"]}
+        out = {"provider": a["provider"], "model": a["model"],
+               "effort": a["effort"]}
+        timing = a.get("capacity_timing")
+        for row in reversed(outcome.attempts):
+            candidate = row.get("capacity_timing")
+            if isinstance(candidate, dict):
+                timing = candidate
+                break
+        if isinstance(timing, dict):
+            out["capacity_timing"] = dict(timing)
+        return out
     for row in reversed(outcome.attempts):
         if "skipped" not in row:
-            return {"provider": row.get("provider"), "model": row.get("model"),
-                    "effort": row.get("effort")}
+            out = {"provider": row.get("provider"), "model": row.get("model"),
+                   "effort": row.get("effort")}
+            timing = row.get("capacity_timing")
+            if isinstance(timing, dict):
+                out["capacity_timing"] = dict(timing)
+            return out
     return {"provider": None, "model": None, "effort": None,
             "note": outcome.failure_reason or "no attempt started a process"}
 
@@ -3148,12 +3161,14 @@ def _checkpointed_sub(
         sub = _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
                        label, cancel=cancel)
         completed_at = _iso_now()
+        capacity_timing = sub.provenance.get("capacity_timing")
+        checkpoint_timing = (dict(capacity_timing)
+                             if isinstance(capacity_timing, dict) else {})
+        checkpoint_timing.setdefault("started_at", started_at)
+        checkpoint_timing["completed_at"] = completed_at
         sub = replace(sub, provenance={
             **sub.provenance,
-            "checkpoint_timing": {
-                "started_at": started_at,
-                "completed_at": completed_at,
-            },
+            "checkpoint_timing": checkpoint_timing,
             # Empty synthetic sub-results have no process or admission work;
             # preserve unknown rather than manufacturing a timing value that
             # would make checkpoint reuse differ from a fresh deterministic run.
@@ -3188,6 +3203,12 @@ def _checkpoint_lease_seconds(d: Defaults, chain_width: int) -> float:
     """Cover one pass's retries plus its configured provider admission wait."""
     return (budget.worst_runtime(d, chain_width, 0)
             + capacity.admission_wait_from_env(30.0))
+
+
+def _milliseconds_to_seconds(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return round(value / 1000.0, 3)
 
 
 def _escalated(d: Defaults, prompt_bytes: int,
@@ -3682,10 +3703,17 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 attempts=sub.attempts, timeout_sec=effective_d.timeout_sec,
                 run_duration_sec=run_duration_sec,
                 wall_duration_sec=sub.provenance.get("wall_duration_sec"),
+                queued_at=(sub.provenance.get("checkpoint_timing") or {}).get(
+                    "queued_at"),
+                admitted_at=(sub.provenance.get("checkpoint_timing") or {}).get(
+                    "admitted_at"),
                 started_at=(sub.provenance.get("checkpoint_timing") or {}).get(
                     "started_at"),
                 completed_at=(sub.provenance.get("checkpoint_timing") or {}).get(
-                    "completed_at")),
+                    "completed_at"),
+                queue_duration_sec=_milliseconds_to_seconds(
+                    (sub.provenance.get("checkpoint_timing") or {}).get(
+                        "queue_wait_ms"))),
         })
 
     # --- the cross-file pass over the seams the split just cut --------------
@@ -3793,10 +3821,17 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 run_duration_sec=run_duration_sec,
                 wall_duration_sec=integration_sub.provenance.get(
                     "wall_duration_sec"),
+                queued_at=(integration_sub.provenance.get(
+                    "checkpoint_timing") or {}).get("queued_at"),
+                admitted_at=(integration_sub.provenance.get(
+                    "checkpoint_timing") or {}).get("admitted_at"),
                 started_at=(integration_sub.provenance.get(
                     "checkpoint_timing") or {}).get("started_at"),
                 completed_at=(integration_sub.provenance.get(
-                    "checkpoint_timing") or {}).get("completed_at"))
+                    "checkpoint_timing") or {}).get("completed_at"),
+                queue_duration_sec=_milliseconds_to_seconds(
+                    (integration_sub.provenance.get("checkpoint_timing")
+                     or {}).get("queue_wait_ms")))
 
     # --- aggregate ---------------------------------------------------------
     # ORACLE (`grok-prepush-review.sh:3703-3820`): parse_ok is ALL, degraded and

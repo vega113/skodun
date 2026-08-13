@@ -91,6 +91,8 @@ def _extra_pass_state(value: object) -> str:
     if not isinstance(value, Mapping):
         return "not_planned"
     status = value.get("status")
+    if value.get("failed") is True:
+        return "failed"
     if status == "pending":
         return "queued"
     if status in {"failed", "unavailable"}:
@@ -98,7 +100,7 @@ def _extra_pass_state(value: object) -> str:
     if status == "degraded" or value.get("degraded") is True:
         return "degraded"
     if status in {"ran", "complete"}:
-        return "complete" if value.get("parse_ok") is not False else "failed"
+        return "complete" if value.get("parse_ok") is True else "failed"
     if value.get("ran") is True:
         return "complete" if value.get("parse_ok") is True else "failed"
     return _pass_state(status)
@@ -120,11 +122,10 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
     failed_rows = [r for r in checkpoint_rows if r.get("state") == "failed"]
     completed = len(complete_rows)
     failed = len(failed_rows)
-    checkpoint_batches = [payload for row in checkpoint_rows
-                          if row.get("pass_kind") == "batch"
-                          for payload in [_checkpoint_payload(row)]
-                          if payload is not None]
-    evidence_batches = batches or checkpoint_batches
+    checkpoint_payloads = [payload for row in checkpoint_rows
+                           for payload in [_checkpoint_payload(row)]
+                           if payload is not None]
+    evidence_batches = batches or checkpoint_payloads
     parseable = rec.get("usable_output") is True or any(
         isinstance(b, Mapping) and b.get("parse_ok") is True
         for b in evidence_batches)

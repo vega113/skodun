@@ -70,6 +70,13 @@ def attempt_telemetry(attempt: Mapping, *, timeout_sec: int | None) -> dict:
         "resume_decision": attempt.get("resume_decision"),
         "execution_provenance": _provenance(attempt.get("execution_provenance")),
     }
+    capacity_timing = attempt.get("capacity_timing")
+    if isinstance(capacity_timing, Mapping):
+        row["capacity_timing"] = {
+            key: capacity_timing.get(key)
+            for key in ("queued_at", "admitted_at", "started_at", "ended_at",
+                        "wait_ms", "queue_wait_ms")
+        }
     return row
 
 

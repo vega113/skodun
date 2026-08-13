@@ -321,6 +321,8 @@ def test_an_over_budget_diff_is_reviewed_in_batches_and_recorded_once(tmp_path,
     assert all(b["telemetry"]["timing"]["started_at"]
                and b["telemetry"]["timing"]["completed_at"]
                and b["telemetry"]["timing"]["run_duration_sec"] is not None
+               and b["telemetry"]["timing"]["queued_at"]
+               and b["telemetry"]["timing"]["admitted_at"]
                for b in rec["batches"])
     assert rec["integration"]["ran"] is True
     assert rec["integration"]["status"] == "ran"
@@ -329,6 +331,8 @@ def test_an_over_budget_diff_is_reviewed_in_batches_and_recorded_once(tmp_path,
     assert rec["integration"]["telemetry"]["timing"]["started_at"]
     assert rec["integration"]["telemetry"]["timing"]["completed_at"]
     assert rec["integration"]["telemetry"]["timing"]["run_duration_sec"] is not None
+    assert rec["integration"]["telemetry"]["timing"]["queued_at"]
+    assert rec["integration"]["telemetry"]["timing"]["admitted_at"]
 
     # The record persists the budget its own shape implies -- what
     # `recover_stale` reads instead of recomputing from the current config.

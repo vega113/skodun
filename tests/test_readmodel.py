@@ -127,6 +127,39 @@ def test_pending_checkpoint_is_queued_and_extra_pass_shapes_are_decoded():
     assert p.passes["refuter"] == "complete"
 
 
+def test_failed_extra_pass_flag_and_missing_parse_boolean_stay_failed():
+    p = project_review(_record(
+        status="clean", trustworthy=True, usable_output=True,
+        extra_passes={
+            "security": {"ran": False, "failed": True},
+            "skeptic": {"status": "ran"},
+        }))
+    assert p.passes["security"] == "failed"
+    assert p.passes["skeptic"] == "failed"
+    assert p.gate_eligible is False
+    assert p.gate_reason == "required_pass_failed"
+
+
+def test_completed_integration_checkpoint_is_usable_evidence():
+    payload = {
+        "parse_ok": True, "degraded": False, "degraded_reason": "",
+        "stop_reason": "done", "diff_truncated": False,
+        "summary": "integration", "findings": [], "failure_reason": "",
+        "attempts": [], "provenance": {}, "accepted": None,
+    }
+    p = project_review(
+        _record(batches=[], usable_output=False),
+        orchestration={"state": "active", "batch_count": 2},
+        checkpoints=[
+            {"pass_kind": "batch", "pass_index": 1, "state": "failed"},
+            {"pass_kind": "batch", "pass_index": 2, "state": "failed"},
+            {"pass_kind": "integration", "pass_index": 0,
+             "state": "complete", "payload_json": json.dumps(payload)},
+        ])
+    assert p.usable_evidence is True
+    assert p.coverage_state == "partial"
+
+
 def test_unbatched_clean_round_counts_its_finder_and_rejects_string_booleans():
     complete = project_review(_record(status="clean", trustworthy=True,
                                        usable_output=True), checkpoints=[])
