@@ -1,5 +1,7 @@
 """Shipped-path tests for versioned fingerprint and lineage invariants."""
 
+import pytest
+
 from skodun import fingerprint
 from skodun import pipeline
 from skodun.store import Store
@@ -232,6 +234,16 @@ def test_lineage_candidates_are_chronological_and_exclude_later_reviews(tmp_path
             "canonical", before_reviewed_at="2026-08-12T10:00:00Z", limit=10)
         assert [item["id"] for item in candidates] == ["older"]
         assert truncated is False
+
+
+def test_lineage_candidates_reject_a_non_canonical_before_timestamp(tmp_path):
+    with Store.open(tmp_path / "s.db") as store:
+        with pytest.raises(ValueError, match="before_reviewed_at"):
+            store.lineage_finding_candidates_with_meta(
+                "canonical", before_reviewed_at="yesterday")
+        with pytest.raises(ValueError, match="before_reviewed_at"):
+            store.lineage_review_candidates_with_meta(
+                "canonical", before_reviewed_at="2026-8-12T10:00:00Z")
 
 
 def test_lineage_candidates_are_bounded_by_finding_count_not_review_count(tmp_path):

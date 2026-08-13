@@ -1946,6 +1946,8 @@ class Store:
         where = "repository_id=?"
         params: list[object] = [repository_id]
         if before_reviewed_at is not None:
+            before_reviewed_at = _require_ts(
+                "before_reviewed_at", before_reviewed_at)
             where += " AND created_at < ?"
             params.append(before_reviewed_at)
         rows = self._c.execute(
@@ -1974,6 +1976,9 @@ class Store:
         repository_id = _require_text("repository_id", repository_id)
         if type(limit) is not int or limit <= 0:
             raise ValueError("lineage candidate limit must be a positive int")
+        if before_reviewed_at is not None:
+            before_reviewed_at = _require_ts(
+                "before_reviewed_at", before_reviewed_at)
         want = limit + 1
         scan_cap = min(want * 4, 1024)
         findings: list[dict] = []

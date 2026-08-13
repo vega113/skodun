@@ -200,6 +200,17 @@ def test_prompt_records_stack_context_truncation_flag():
     assert p.stack_context_bytes == len(context)
 
 
+def test_prompt_records_lineage_context_truncation_flag():
+    context = (b"----- BEGIN PRIOR FINDINGS -----\ncount=1 truncated=true\n"
+               b"----- END PRIOR FINDINGS -----\n")
+    p = build("feat/x", "origin/main", "a" * 40, "b" * 40, b"d", 400_000,
+              SEL, None, lineage_context=context,
+              lineage_context_truncated=True)
+    assert p.lineage_context_truncated is True
+    assert p.lineage_context_bytes == len(context)
+    assert context in p.text
+
+
 def test_head_may_carry_the_now_mode_working_tree_label():
     head = "c" * 40 + " (working tree)"
     p = build("feat", "origin/main", "a" * 40, head, b"d", 400_000, SEL, None)

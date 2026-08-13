@@ -3274,3 +3274,41 @@ def test_a_deleted_branch_does_not_interfere_and_a_cleanly_finishing_superseded_
     assert "cancelled" not in log_text.lower(), (
         "the worker was signalled -- this drill needs an UNCANCELLED finish "
         "to reach finalize_review's own conditional")
+
+
+def test_record_cancellation_keeps_partial_when_lineage_enrichment_fails(monkeypatch):
+    from skodun import pipeline
+
+    saved = []
+
+    class Fake:
+        def finalize_review(self, record_id, rec, *, lineage_annotator=None):
+            if lineage_annotator is not None:
+                lineage_annotator(self, rec)
+            saved.append(dict(rec))
+            return True
+
+        def get_review(self, record_id):
+            return saved[-1] if saved else None
+
+        def fail_if_running(self, *a, **k):
+            raise AssertionError("partial must be finalized, not failed")
+
+    monkeypatch.setattr(
+        pipeline, "annotate_lineage",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("lineage boom")))
+    rec = {
+        "id": "r1", "parse_ok": True, "degraded": False, "diff_truncated": False,
+        "findings": [{"file": "a.py", "title": "keep me"}], "status": "running",
+        "usable_output": True,
+    }
+
+    class Cancelled(Exception):
+        def __init__(self):
+            super().__init__("the review was cancelled")
+            self.partial = rec
+
+    out = dispatch._record_cancellation(Fake(), "r1", Cancelled())
+    assert saved
+    assert saved[0]["findings"][0]["title"] == "keep me"
+    assert out.code == 0
