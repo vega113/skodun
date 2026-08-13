@@ -345,7 +345,7 @@ def test_lineage_scan_cap_reports_truncation_instead_of_a_complete_miss(tmp_path
                 (f"ghost-{index}", 99, "canonical", "finding_fingerprint_v2",
                  digest, None, None, None, None, "new",
                  "2026-08-12T10:00:00Z"))
-        findings, truncated = store.lineage_finding_candidates_with_meta(
+        _, truncated = store.lineage_finding_candidates_with_meta(
             "canonical", before_reviewed_at="2026-08-12T11:00:00Z", limit=1)
         assert truncated is True
 

@@ -2619,7 +2619,10 @@ def test_prepush_prompt_includes_prior_finding_lineage(tmp_path, monkeypatch):
         })
     rec = _prepush(db, repo)
     prompt = (tmp_path / "bin" / "prompt_1.txt").read_bytes()
+    digest = finding["finding_fingerprint_v2"].encode("ascii")
     assert b"----- BEGIN PRIOR FINDINGS -----" in prompt
+    assert digest in prompt
+    assert b"prior leak" not in prompt
     assert rec["lineage_context_bytes"] > 0
     assert rec["lineage_repository_id"] == "canonical"
 
