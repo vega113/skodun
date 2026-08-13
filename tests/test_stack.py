@@ -96,6 +96,18 @@ def test_service_projection_is_bounded_and_status_specific():
     }) == "SKODUN STACK: status=ignored reason=stale_head"
 
 
+def test_truncated_stack_context_preserves_valid_utf8():
+    snowman = "\u2603"
+    validation = stack.StackValidation(
+        status="ignored", reason_code=snowman * 80, manifest=None)
+
+    context, truncated = stack.render_prompt_context(validation, max_bytes=128)
+
+    assert truncated is True
+    assert len(context) <= 128
+    context.decode("utf-8")
+
+
 def test_prompt_context_is_bounded_and_keeps_full_diff_authoritative():
     validation = stack.StackValidation(
         status="valid", reason_code="ok", manifest=stack.StackManifest(

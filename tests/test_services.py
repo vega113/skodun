@@ -112,6 +112,20 @@ def test_status_line_exposes_fingerprint_version_and_lineage_reason():
     assert "lineage_counts=moved:1" in line
 
 
+def test_status_line_exposes_fingerprint_status_and_candidate_bounds():
+    line = services.format_status_line({
+        "id": "review-1", "status": "clean", "parse_ok": True,
+        "fingerprint_status": "complete",
+        "fingerprint_candidate_count": 12,
+        "fingerprint_candidate_limit": 200,
+        "fingerprint_candidates_truncated": True,
+    })
+    assert "fingerprint_status=complete" in line
+    assert "fingerprint_candidate_count=12" in line
+    assert "fingerprint_candidate_limit=200" in line
+    assert "fingerprint_candidates_truncated=true" in line
+
+
 def test_status_line_exposes_stack_context_and_truncation():
     line = services.format_status_line({
         "id": "review-1", "status": "clean", "parse_ok": True,

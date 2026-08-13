@@ -1846,3 +1846,30 @@ def test_the_dead_pid_helper_refuses_rather_than_returning_a_live_pid(
 
     with pytest.raises(AssertionError, match="still reads as alive"):
         _spawned_pid()
+
+
+def test_save_uses_signature_detection_for_narrow_stores():
+    saved = []
+
+    class Narrow:
+        def save_review(self, rec):
+            saved.append(dict(rec))
+
+    pipeline._save(Narrow(), {"id": "r1", "status": "clean"},
+                   lineage_annotator=lambda *_a, **_k: None)
+    assert saved == [{"id": "r1", "status": "clean"}]
+
+
+def test_save_does_not_swallow_typeerror_from_annotator_capable_store():
+    saved = []
+
+    class Capable:
+        def save_review(self, rec, *, lineage_annotator=None):
+            if lineage_annotator is not None:
+                raise TypeError("lineage_annotator callback rejected the payload")
+            saved.append(dict(rec))
+
+    with pytest.raises(pipeline.PersistenceFailed, match="rejected the payload"):
+        pipeline._save(Capable(), {"id": "r1"},
+                       lineage_annotator=lambda *_a, **_k: None)
+    assert saved == []

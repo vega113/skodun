@@ -852,6 +852,42 @@ def test_checkpoint_preparation_is_deterministic_and_invokes_no_provider(
         [item.identity for item in two.batches]
 
 
+def test_prepared_batch_prompts_include_stack_and_lineage_context(tmp_path):
+    repo = _oversized(tmp_path)
+    cfg = load_config(repo)
+    d = cfg.defaults
+    root = gitio._worktree_root(repo)
+    base = resolve_base(repo)
+    diff = capture_diff(repo, base.sha, d.untracked_max)
+    finder = pipeline._reviewer_for(cfg, "finder")
+    batches = pipeline.batch_plan(diff.data, d, finder)
+    branch = gitio.current_branch(repo)
+    head = gitio.head_sha(repo)
+    stack_context = (
+        b"----- BEGIN STACK CONTEXT -----\n"
+        b"version=1 status=valid\n"
+        b"----- END STACK CONTEXT -----\n")
+    lineage_context = (
+        b"----- BEGIN PRIOR FINDINGS -----\n"
+        b"count=1 truncated=false\n"
+        b"----- END PRIOR FINDINGS -----\n")
+
+    with_context = pipeline._prepare_batch_plan(
+        diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, base_ref=base.ref, base_sha=base.sha,
+        head_label=f"{head} (working tree)",
+        stack_context=stack_context, lineage_context=lineage_context)
+    without = pipeline._prepare_batch_plan(
+        diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
+        branch=branch, base_ref=base.ref, base_sha=base.sha,
+        head_label=f"{head} (working tree)")
+
+    assert stack_context.rstrip(b"\n") in with_context.batches[0].prompt.text
+    assert lineage_context.rstrip(b"\n") in with_context.batches[0].prompt.text
+    assert with_context.batches[0].identity.prompt_hash != \
+        without.batches[0].identity.prompt_hash
+
+
 def test_prepared_prompts_are_the_prompts_the_orchestrator_sends(tmp_path):
     _fake_grok(tmp_path, _emit(CLEAN))
     repo = _oversized(tmp_path)

@@ -54,7 +54,9 @@ def test_explicit_migration_creates_backup_and_bounded_receipt(tmp_path):
     assert receipt["schema_from"] == 12
     assert receipt["schema_to"] == SCHEMA_VERSION
     assert receipt["result"] == "success"
-    assert db.with_name(db.name + ".backup-before-v14").stat().st_mode & 0o077 == 0
+    assert db.with_name(
+        db.name + ".backup-before-v" + str(SCHEMA_VERSION)
+    ).stat().st_mode & 0o077 == 0
     saved = json.loads(migration_receipt_path(db).read_text())
     assert saved["backup_sha256"] == receipt["backup_sha256"]
     assert inspect_schema(db).state == "current"

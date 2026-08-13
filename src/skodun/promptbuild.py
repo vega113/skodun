@@ -172,6 +172,8 @@ class Prompt:
     prompt_bytes: int
     stack_context_bytes: int = 0
     stack_context_truncated: bool = False
+    lineage_context_bytes: int = 0
+    lineage_context_truncated: bool = False
 
 
 def build(
@@ -184,6 +186,9 @@ def build(
     selection: Selection | None,
     pack_body: bytes | None,
     stack_context: bytes | None = None,
+    stack_context_truncated: bool = False,
+    lineage_context: bytes | None = None,
+    lineage_context_truncated: bool = False,
 ) -> Prompt:
     """Render the review prompt.
 
@@ -222,6 +227,8 @@ def build(
     out += f"Head:   {head}\n".encode("utf-8")
     if stack_context:
         out += b"\n" + stack_context.rstrip(b"\n") + b"\n"
+    if lineage_context:
+        out += b"\n" + lineage_context.rstrip(b"\n") + b"\n"
 
     # Oracle: `$(...)` capture strips every trailing newline, `printf '%s\n'`
     # re-adds exactly one, and `[ -n "$_cl_body" ]` tests the stripped value.
@@ -243,4 +250,9 @@ def build(
     text = bytes(out)
     return Prompt(text=text, diff_truncated=diff_truncated,
                   prompt_bytes=len(text),
-                  stack_context_bytes=len(stack_context or b""))
+                  stack_context_bytes=len(stack_context or b""),
+                  stack_context_truncated=bool(stack_context)
+                  and stack_context_truncated is True,
+                  lineage_context_bytes=len(lineage_context or b""),
+                  lineage_context_truncated=bool(lineage_context)
+                  and lineage_context_truncated is True)

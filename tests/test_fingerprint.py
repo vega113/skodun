@@ -232,3 +232,52 @@ def test_lineage_candidates_are_chronological_and_exclude_later_reviews(tmp_path
             "canonical", before_reviewed_at="2026-08-12T10:00:00Z", limit=10)
         assert [item["id"] for item in candidates] == ["older"]
         assert truncated is False
+
+
+def test_lineage_candidates_are_bounded_by_finding_count_not_review_count(tmp_path):
+    base = {
+        "branch": "main", "head": "h", "base_ref": "origin/main", "base_sha": "b",
+        "diff_hash": "d", "context_hash": "", "mode": "now", "model": "m",
+        "adapter": "a", "status": "clean", "parse_ok": True, "degraded": False,
+        "diff_truncated": False, "trustworthy": True, "stop_reason": "done",
+        "findings_total": 3, "severity": {"high": 0, "medium": 0, "low": 0},
+        "summary": "ok", "repo_id": "repo", "lineage_repository_id": "canonical",
+    }
+
+    def rec(rid, when, titles):
+        findings = fingerprint.annotate_findings(
+            [{"file": "src/a.py", "title": title} for title in titles])
+        return {**base, "id": rid, "reviewed_at": when, "findings": findings,
+                "findings_total": len(findings)}
+
+    with Store.open(tmp_path / "s.db") as store:
+        store.save_review(rec("r1", "2026-08-12T09:00:00Z", ["a", "b", "c"]))
+        store.save_review(rec("r2", "2026-08-12T09:01:00Z", ["d", "e", "f"]))
+        findings, truncated = store.lineage_finding_candidates_with_meta(
+            "canonical", before_reviewed_at="2026-08-12T10:00:00Z", limit=4)
+        assert truncated is True
+        assert len(findings) == 4
+        rec_out = {
+            "id": "r3", "lineage_repository_id": "canonical",
+            "reviewed_at": "2026-08-12T10:00:00Z", "status": "clean",
+            "findings": [{"file": "src/a.py", "title": "new"}],
+        }
+        pipeline.annotate_lineage(store, rec_out)
+        assert rec_out["fingerprint_status"] == "complete"
+        assert rec_out["fingerprint_candidate_count"] == 6
+        assert rec_out["fingerprint_candidate_limit"] == fingerprint.CANDIDATE_LIMIT
+        assert rec_out["fingerprint_candidates_truncated"] is False
+
+
+def test_lineage_prompt_context_is_bounded_and_utf8_safe():
+    rows = [{
+        "finding_fingerprint_v2": "sha256:" + "a" * 64,
+        "file": "src/\u2603.py",
+        "finding_lineage_v2": {"match_reason": "repeated"},
+    }] * 40
+    context, truncated = fingerprint.render_prompt_context(rows, max_bytes=128)
+    assert truncated is True
+    assert len(context) <= 128
+    context.decode("utf-8")
+    assert b"PRIOR FINDINGS" in context
+    assert b"full diff remains authoritative" in context

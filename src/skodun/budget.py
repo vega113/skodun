@@ -48,7 +48,7 @@ line.
 
 from __future__ import annotations
 
-from . import checklist, promptbuild
+from . import checklist, fingerprint, promptbuild, stack
 from .config import Defaults, Reviewer
 
 #: Grace added to a computed worst case before anything acts on it. One
@@ -192,6 +192,8 @@ PROMPT_OVERHEAD_BYTES: int = (
     + len(promptbuild.DIFF_TRUNCATED)
     + checklist.BUDGET
     + _IDENTITY_SLACK
+    + stack.MAX_STACK_PROMPT_BYTES
+    + fingerprint.MAX_LINEAGE_PROMPT_BYTES
 )
 
 

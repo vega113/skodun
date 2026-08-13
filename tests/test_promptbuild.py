@@ -186,8 +186,18 @@ def test_stack_context_is_additive_and_reported_without_changing_diff_budget():
     p = build("feat/x", "origin/main", "a" * 40, "b" * 40, b"d", 1,
               SEL, None, stack_context=context)
     assert p.stack_context_bytes == len(context)
+    assert p.stack_context_truncated is False
     assert p.diff_truncated is False
     assert context in p.text
+
+
+def test_prompt_records_stack_context_truncation_flag():
+    context = (b"----- BEGIN STACK CONTEXT -----\nstatus=valid\n"
+               b"----- END STACK CONTEXT -----\n")
+    p = build("feat/x", "origin/main", "a" * 40, "b" * 40, b"d", 400_000,
+              SEL, None, stack_context=context, stack_context_truncated=True)
+    assert p.stack_context_truncated is True
+    assert p.stack_context_bytes == len(context)
 
 
 def test_head_may_carry_the_now_mode_working_tree_label():

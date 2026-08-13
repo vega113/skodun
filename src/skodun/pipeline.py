@@ -156,6 +156,7 @@ elsewhere passes `progress_sink=`; see `_note`.
 from __future__ import annotations
 
 import calendar
+import inspect
 import os
 import shutil
 import sys
@@ -1603,6 +1604,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     gitio.canonical_repository_identity(root) or "unknown")
             except Exception:
                 lineage_repository_id = "unknown"
+        lineage_prompt_context, lineage_prompt_truncated = _lineage_prompt_context(
+            store, lineage_repository_id, before=review_started_at)
         common = dict(
             id=rid, reviewed_at=review_started_at,
             review_started_at=review_started_at,
@@ -1772,7 +1775,11 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 prepared_plan = _prepare_batch_plan(
                     diff, batches=plan, cfg=cfg, d=d, root=root,
                     finder=finder, branch=branch, base_ref=base.ref,
-                    base_sha=base.sha, head_label=f"{head} (working tree)")
+                    base_sha=base.sha, head_label=f"{head} (working tree)",
+                    stack_context=stack_prompt_context,
+                    stack_context_truncated=stack_prompt_truncated,
+                    lineage_context=lineage_prompt_context,
+                    lineage_context_truncated=lineage_prompt_truncated)
                 checkpoint_identity = _orchestration_identity(
                     rec, diff, prepared_plan, cfg=cfg, d=d, root=root,
                     finder=finder, branch=branch, head=head,
@@ -1849,7 +1856,10 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 prompt = promptbuild.build(
                     branch, base.ref, base.sha, f"{head} (working tree)",
                     diff.data, mdb, selection, pack_body,
-                    stack_context=stack_prompt_context)
+                    stack_context=stack_prompt_context,
+                    stack_context_truncated=stack_prompt_truncated,
+                    lineage_context=lineage_prompt_context,
+                    lineage_context_truncated=lineage_prompt_truncated)
 
                 # The first route happens before the diff and prompt exist so
                 # it can participate in preflight. Once the shipped prompt is
@@ -1907,7 +1917,10 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                                 branch, base.ref,
                                 base.sha, f"{head} (working tree)",
                                 diff.data, mdb, selection, pack_body,
-                                stack_context=stack_prompt_context)
+                                stack_context=stack_prompt_context,
+                                stack_context_truncated=stack_prompt_truncated,
+                                lineage_context=lineage_prompt_context,
+                                lineage_context_truncated=lineage_prompt_truncated)
                 if prompt.diff_truncated:
                     # Reachable only for a diff that is over the envelope and
                     # was NOT batched, i.e. one this build refused to split.
@@ -2071,7 +2084,10 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         if checkpoint_run is not None:
             mismatch = _revalidate_foreground_orchestration(
                 checkpoint_run.identity, rec, repo=repo, cfg=cfg, d=d,
-                finder=finder)
+                finder=finder, stack_context=stack_prompt_context,
+                stack_context_truncated=stack_prompt_truncated,
+                lineage_context=lineage_prompt_context,
+                lineage_context_truncated=lineage_prompt_truncated)
             if mismatch is not None:
                 try:
                     store.record_orchestration_mismatch(
@@ -2605,22 +2621,77 @@ def _under(root: Path, relative: str) -> Path:
     return p if p.is_absolute() else root / p
 
 
+def _accepts_keyword(fn, name: str) -> bool:
+    """True when `fn` can take `name` as a keyword argument."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    param = params.get(name)
+    return param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
 def _save(store: Store, rec: dict, *, lineage_annotator=None) -> None:
     try:
-        if lineage_annotator is None:
+        if lineage_annotator is None or not _accepts_keyword(
+                store.save_review, "lineage_annotator"):
             store.save_review(rec)
         else:
-            try:
-                store.save_review(rec, lineage_annotator=lineage_annotator)
-            except TypeError as exc:
-                # Narrow compatibility stores used by shipped seam tests may
-                # still expose the pre-hardening signature. The real Store
-                # accepts the callback and serializes enrichment atomically.
-                if "lineage_annotator" not in str(exc):
-                    raise
-                store.save_review(rec)
+            store.save_review(rec, lineage_annotator=lineage_annotator)
     except Exception as e:
         raise PersistenceFailed(f"could not record the review: {e!r}") from e
+
+
+def _flatten_lineage_candidates(
+        rec: dict, candidates, truncated: bool, limit: int
+        ) -> tuple[list[dict], bool]:
+    """Compatibility flatten of review artifacts into bounded finding rows."""
+    previous: list[dict] = []
+    repository_id = rec.get("lineage_repository_id") or "unknown"
+    overflow = False
+    for prior in candidates:
+        if prior.get("id") == rec.get("id"):
+            continue
+        if prior.get("status") == "running":
+            continue
+        if (prior.get("lineage_repository_id") or "unknown") != repository_id:
+            continue
+        for prior_index, previous_finding in enumerate(prior.get("findings") or ()):
+            if len(previous) >= limit:
+                overflow = True
+                break
+            if isinstance(previous_finding, dict):
+                enriched = dict(previous_finding)
+                enriched["_lineage_review_id"] = prior.get("id")
+                enriched["_lineage_finding_index"] = prior_index
+                enriched["_lineage_reviewed_at"] = prior.get("reviewed_at")
+                previous.append(enriched)
+        if overflow:
+            break
+    return previous, bool(truncated) or overflow
+
+
+def _lineage_prompt_context(
+        store, repository_id: str, *, before: str | None
+        ) -> tuple[bytes, bool]:
+    """Bounded prior-fingerprint bytes for provider prompts. Advisory only."""
+    if not repository_id or repository_id == "unknown" or store is None:
+        return b"", False
+    try:
+        from .fingerprint import CANDIDATE_LIMIT, render_prompt_context
+        if not hasattr(store, "lineage_finding_candidates_with_meta"):
+            return b"", False
+        rows, truncated = store.lineage_finding_candidates_with_meta(
+            repository_id, before_reviewed_at=before, limit=CANDIDATE_LIMIT)
+        text, text_truncated = render_prompt_context(rows)
+        return text, bool(truncated) or text_truncated
+    except Exception:
+        return b"", False
 
 
 def annotate_lineage(store: Store, rec: dict) -> dict:
@@ -2631,7 +2702,7 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
     authoritative trust or gate axes.
     """
     try:
-        from .fingerprint import annotate_findings
+        from .fingerprint import CANDIDATE_LIMIT, annotate_findings
         repository_id = rec.get("lineage_repository_id") or "unknown"
         previous: list[dict] = []
         # An unknown canonical remote is deliberately not a lineage scope:
@@ -2639,30 +2710,29 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
         # negative.  Stack manifests and normal remotes provide this value.
         truncated = False
         if repository_id != "unknown":
-            if hasattr(store, "lineage_review_candidates_with_meta"):
+            if hasattr(store, "lineage_finding_candidates_with_meta"):
+                previous, truncated = store.lineage_finding_candidates_with_meta(
+                    repository_id,
+                    before_reviewed_at=rec.get("reviewed_at"),
+                    limit=CANDIDATE_LIMIT)
+                previous = [
+                    item for item in previous
+                    if item.get("_lineage_review_id") != rec.get("id")
+                ]
+            elif hasattr(store, "lineage_review_candidates_with_meta"):
                 candidates, truncated = store.lineage_review_candidates_with_meta(
                     repository_id,
-                    before_reviewed_at=rec.get("reviewed_at"), limit=200)
+                    before_reviewed_at=rec.get("reviewed_at"),
+                    limit=CANDIDATE_LIMIT)
+                previous, truncated = _flatten_lineage_candidates(
+                    rec, candidates, truncated, CANDIDATE_LIMIT)
             else:
                 candidates = store.lineage_review_candidates(repository_id)
-            for prior in candidates:
-                if prior.get("id") == rec.get("id"):
-                    continue
-                if prior.get("status") == "running":
-                    continue
-                if (prior.get("lineage_repository_id") or "unknown") != repository_id:
-                    continue
-                for prior_index, previous_finding in enumerate(
-                        prior.get("findings") or ()):
-                    if isinstance(previous_finding, dict):
-                        enriched = dict(previous_finding)
-                        enriched["_lineage_review_id"] = prior.get("id")
-                        enriched["_lineage_finding_index"] = prior_index
-                        enriched["_lineage_reviewed_at"] = prior.get("reviewed_at")
-                        previous.append(enriched)
+                previous, truncated = _flatten_lineage_candidates(
+                    rec, candidates, False, CANDIDATE_LIMIT)
         rec["findings"] = annotate_findings(rec.get("findings") or (), previous)
         rec["fingerprint_status"] = "complete"
-        rec["fingerprint_candidate_limit"] = 200
+        rec["fingerprint_candidate_limit"] = CANDIDATE_LIMIT
         rec["fingerprint_candidate_count"] = len(previous)
         rec["fingerprint_candidates_truncated"] = bool(truncated)
         rec.pop("fingerprint_error", None)
@@ -3189,7 +3259,11 @@ def _prepare_batch_plan(
         diff, *, batches: list, cfg: Config, d: Defaults, root: Path,
         finder: Reviewer, branch: str, base_ref: str, base_sha: str,
         head_label: str, context_source: str = "wt",
-        context_oid: str | None = None) -> _PreparedPlan:
+        context_oid: str | None = None,
+        stack_context: bytes | None = None,
+        stack_context_truncated: bool = False,
+        lineage_context: bytes | None = None,
+        lineage_context_truncated: bool = False) -> _PreparedPlan:
     """Freeze deterministic pass inputs before any resumable provider call.
 
     Exact resume cannot learn context/checklist/prompt identity lazily after a
@@ -3231,7 +3305,11 @@ def _prepare_batch_plan(
             branch, head_label, index, count, list(batch.files))
         prompt = promptbuild.build(
             b_branch, base_ref, base_sha, b_head, batch.data, envelope,
-            selection, pack.body if pack is not None else None)
+            selection, pack.body if pack is not None else None,
+            stack_context=stack_context,
+            stack_context_truncated=stack_context_truncated,
+            lineage_context=lineage_context,
+            lineage_context_truncated=lineage_context_truncated)
         boundary = {
             "index": index,
             "diff_hash": gitio.diff_identity(batch.data),
@@ -3340,7 +3418,11 @@ def _orchestration_identity(
 
 def _revalidate_foreground_orchestration(
         expected: checkpoints.OrchestrationIdentity, rec: dict, *,
-        repo: Path, cfg: Config, d: Defaults, finder: Reviewer) -> str | None:
+        repo: Path, cfg: Config, d: Defaults, finder: Reviewer,
+        stack_context: bytes | None = None,
+        stack_context_truncated: bool = False,
+        lineage_context: bytes | None = None,
+        lineage_context_truncated: bool = False) -> str | None:
     """Recompute the exact repository/plan identity before final publication."""
     base = gitio.resolve_base(repo)
     diff = gitio.capture_diff(repo, base.sha, d.untracked_max)
@@ -3353,7 +3435,11 @@ def _revalidate_foreground_orchestration(
     prepared = _prepare_batch_plan(
         diff, batches=plan, cfg=cfg, d=d, root=root, finder=finder,
         branch=branch, base_ref=base.ref, base_sha=base.sha,
-        head_label=f"{head} (working tree)")
+        head_label=f"{head} (working tree)",
+        stack_context=stack_context,
+        stack_context_truncated=stack_context_truncated,
+        lineage_context=lineage_context,
+        lineage_context_truncated=lineage_context_truncated)
     current = _orchestration_identity(
         rec, diff, prepared, cfg=cfg, d=d, root=root, finder=finder,
         branch=branch, head=head, base_ref=base.ref, base_sha=base.sha,
