@@ -183,6 +183,14 @@ def test_string_false_usable_output_is_not_evidence():
     assert p.coverage_state == "none"
 
 
+def test_string_false_usable_output_cannot_make_a_clean_review_eligible():
+    p = project_review(_record(status="clean", trustworthy=True,
+                               usable_output="false", parse_ok=False, batches=[]))
+    assert p.usable_evidence is False
+    assert p.coverage_state != "complete"
+    assert p.gate_eligible is False
+
+
 def test_integration_prompt_bytes_join_batch_totals():
     rec = _record(
         status="clean", trustworthy=True, usable_output=True,

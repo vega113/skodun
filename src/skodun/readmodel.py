@@ -168,7 +168,8 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
                 (not orchestration_state and rec.get("status") in
                  {"clean", "findings"}) or
                 (planned > 0 and completed == planned and not failed))
-    coverage_state = "complete" if complete else ("partial" if parseable else "none")
+    coverage_state = ("complete" if complete and parseable
+                      else "partial" if parseable else "none")
     extras = rec.get("extra_passes")
     extras = extras if isinstance(extras, Mapping) else {}
     passes = {

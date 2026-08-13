@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from skodun import (batching, budget, chain, checklist, contextpack, gitio,
+from skodun import (batching, budget, capacity, chain, checklist, contextpack, gitio,
                     passes, pipeline, promptbuild, runner, services, trust)
 from skodun.adapters import ParseResult
 from skodun.cli import main
@@ -1006,6 +1006,10 @@ def test_checkpoint_claim_lease_includes_configured_admission_wait():
     assert pipeline._checkpoint_claim_lease_seconds(
         defaults, 1, env={"SKODUN_ADMISSION_WAIT_SECONDS": "1.9"}) == (
         budget.worst_runtime(defaults, 1, 0) + 2)
+    assert capacity.admission_wait_from_env(
+        30.0, {"SKODUN_ADMISSION_WAIT_SECONDS": "nan"}) == 30.0
+    assert capacity.admission_wait_from_env(
+        30.0, {"SKODUN_ADMISSION_WAIT_SECONDS": "inf"}) == 30.0
 
 
 def _clean_checkpoint_sub(label: str) -> pipeline._Sub:

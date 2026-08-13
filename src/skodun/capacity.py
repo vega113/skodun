@@ -211,7 +211,7 @@ def admission_wait_from_env(default: float,
         value = float(str(raw).strip())
     except ValueError:
         return float(default)
-    if value < 0:
+    if value < 0 or value != value or value in (float("inf"), float("-inf")):
         return float(default)
     return value
 

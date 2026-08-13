@@ -107,6 +107,8 @@ def test_run_duration_stays_unknown_when_attempts_omit_timing():
     assert run_duration_sec([{"n": 1}]) is None
     assert run_duration_sec([{"duration_sec": 0}]) == 0.0
     assert run_duration_sec([{"duration_sec": 1.25}, {"duration_sec": 0.75}]) == 2.0
+    assert run_duration_sec([{"duration_sec": 10 ** 10000}]) is None
+    assert run_duration_sec([{"duration_sec": float("inf")}]) is None
 
 
 def test_shared_surface_validation_rejects_bool_negative_and_unbounded_targets():

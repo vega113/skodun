@@ -8,6 +8,7 @@ or an invented token count.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Mapping
 
 
@@ -53,9 +54,13 @@ def _token_usage(raw: object) -> dict[str, int | None]:
 def _duration(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if value < 0 or value != value or value in (float("inf"), float("-inf")):
+    try:
+        duration = float(value)
+    except OverflowError:
         return None
-    return float(value)
+    if duration < 0 or not math.isfinite(duration):
+        return None
+    return duration
 
 
 def run_duration_sec(attempts: Iterable[Mapping]) -> float | None:
@@ -69,7 +74,8 @@ def run_duration_sec(attempts: Iterable[Mapping]) -> float | None:
             values.append(parsed)
     if not values:
         return None
-    return round(sum(values), 3)
+    total = sum(values)
+    return round(total, 3) if math.isfinite(total) else None
 
 
 def attempt_telemetry(attempt: Mapping, *, timeout_sec: int | None) -> dict:
