@@ -390,9 +390,18 @@ def test_store_receipt_ingestion_is_idempotent_and_nonce_conflicts(tmp_path):
 
 def test_store_receipt_rows_are_bounded_per_identity(tmp_path):
     with Store.open(tmp_path / "store.db") as store:
+        first = parse_receipt(json.dumps(receipt_mapping()))
+        store.save_evidence_receipt(
+            identity(), policy(), first.canonical_json,
+            "2026-08-13T16:00:03Z")
+        conflict = parse_receipt(json.dumps(receipt_mapping(
+            counters={"checks": 4})))
+        assert store.save_evidence_receipt(
+            identity(), policy(), conflict.canonical_json,
+            "2026-08-13T16:00:03Z")["status"] == "conflict"
         for index in range(40):
             parsed = parse_receipt(json.dumps(receipt_mapping(
-                nonce=f"run-{index}")))
+                nonce=f"run-new-{index}")))
             store.save_evidence_receipt(
                 identity(), policy(), parsed.canonical_json,
                 "2026-08-13T16:00:03Z")

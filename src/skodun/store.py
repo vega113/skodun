@@ -2171,6 +2171,32 @@ class Store:
                                       ELSE 0 END)""",
                     (identity_digest, identity_digest, identity_digest))
 
+            def trim_evidence_receipts() -> None:
+                limit_sql = """CASE WHEN (SELECT COUNT(*)
+                                      FROM evidence_receipts
+                                      WHERE identity_digest=?) > 31
+                                 THEN (SELECT COUNT(*)
+                                       FROM evidence_receipts
+                                       WHERE identity_digest=?) - 31
+                                 ELSE 0 END"""
+                self._c.execute(
+                    f"""DELETE FROM evidence_receipt_conflicts
+                        WHERE identity_digest=?
+                          AND existing_receipt_digest IN (
+                            SELECT receipt_digest FROM evidence_receipts
+                            WHERE identity_digest=?
+                            ORDER BY ingested_at ASC, rowid ASC
+                            LIMIT {limit_sql})""",
+                    (identity_digest, identity_digest,
+                     identity_digest, identity_digest))
+                self._c.execute(
+                    f"""DELETE FROM evidence_receipts WHERE rowid IN (
+                           SELECT rowid FROM evidence_receipts
+                           WHERE identity_digest=?
+                           ORDER BY ingested_at ASC, rowid ASC
+                           LIMIT {limit_sql})""",
+                    (identity_digest, identity_digest, identity_digest))
+
             existing = self._c.execute(
                 """SELECT receipt_digest FROM evidence_receipts
                    WHERE identity_digest=? AND receipt_digest=?""",
@@ -2203,7 +2229,7 @@ class Store:
                 self._c.execute("COMMIT")
                 return {"status": "conflict", "receipt_digest": receipt_digest,
                         "existing_receipt_digest": conflict["receipt_digest"]}
-            trim_receipts("evidence_receipts")
+            trim_evidence_receipts()
             self._c.execute(
                 """INSERT INTO evidence_receipts
                    (identity_digest, receipt_digest, nonce, status, reason_code,
