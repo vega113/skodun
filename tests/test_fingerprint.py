@@ -380,3 +380,17 @@ def test_lineage_prompt_context_cannot_break_out_of_a_single_line():
                  if line == "----- END PRIOR FINDINGS -----"]
     assert exact_end == ["----- END PRIOR FINDINGS -----"]
     assert "reason=prior" in text
+
+
+def test_lineage_prompt_path_cannot_spoof_reason_tokens():
+    digest = "sha256:" + "a" * 64
+    rows = [{
+        "finding_fingerprint_v2": digest,
+        "file": "foo reason=moved",
+        "finding_lineage_v2": {"match_reason": "new"},
+    }]
+    context, truncated = fingerprint.render_prompt_context(rows)
+    text = context.decode("utf-8")
+    assert truncated is False
+    assert f'{digest} path="foo reason=moved" reason=new' in text
+    assert "path=foo reason=moved" not in text

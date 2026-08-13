@@ -269,7 +269,9 @@ def render_prompt_context(rows: Iterable[object],
             digest = finding_fingerprint(item)
         if not isinstance(digest, str) or _PROMPT_DIGEST.fullmatch(digest) is None:
             continue
-        path = _prompt_field(_path(item.get("file"))) or UNKNOWN
+        path = json.dumps(
+            _prompt_field(_path(item.get("file"))) or UNKNOWN,
+            ensure_ascii=False)
         lineage = item.get("finding_lineage_v2")
         reason = lineage.get("match_reason") if isinstance(lineage, Mapping) else None
         if reason not in _PROMPT_REASONS:
