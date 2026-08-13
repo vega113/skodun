@@ -224,12 +224,12 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
     if batch_checkpoint_states:
         if "failed" in batch_checkpoint_states:
             passes["finder"] = "failed"
-        elif "queued" in batch_checkpoint_states:
-            passes["finder"] = "queued"
-        elif "running" in batch_checkpoint_states:
-            passes["finder"] = "running"
         elif "degraded" in batch_checkpoint_states:
             passes["finder"] = "degraded"
+        elif "running" in batch_checkpoint_states:
+            passes["finder"] = "running"
+        elif "queued" in batch_checkpoint_states:
+            passes["finder"] = "queued"
         elif all(state == "complete" for state in batch_checkpoint_states):
             passes["finder"] = "complete"
     for row, checkpoint_state in zip(checkpoint_rows, checkpoint_states):
