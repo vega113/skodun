@@ -2597,6 +2597,36 @@ def test_run_prepush_review_persists_nothing_of_its_own(tmp_path):
     assert rec["status"] == "clean" and rec["id"] == rid
 
 
+def test_prepush_prompt_includes_prior_finding_lineage(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        gitio, "canonical_repository_identity", lambda root: "canonical")
+    repo = _bg_repo(tmp_path)
+    db = tmp_path / "s.db"
+    from skodun import fingerprint
+    finding = fingerprint.annotate_findings(
+        [{"file": "src/a.py", "title": "prior leak"}])[0]
+    with Store.open(db) as st:
+        st.save_review({
+            "id": "prior", "reviewed_at": "2026-08-12T09:00:00Z",
+            "branch": "feat", "head": "h", "base_ref": "origin/main",
+            "base_sha": "b", "diff_hash": "d", "context_hash": "",
+            "mode": "now", "model": "m", "adapter": "a", "status": "clean",
+            "parse_ok": True, "degraded": False, "diff_truncated": False,
+            "trustworthy": True, "stop_reason": "done", "findings_total": 1,
+            "severity": {"high": 0, "medium": 0, "low": 0}, "summary": "ok",
+            "repo_id": "repo", "lineage_repository_id": "canonical",
+            "findings": [finding],
+        })
+    rec = _prepush(db, repo)
+    prompt = (tmp_path / "bin" / "prompt_1.txt").read_bytes()
+    digest = finding["finding_fingerprint_v2"].encode("ascii")
+    assert b"----- BEGIN PRIOR FINDINGS -----" in prompt
+    assert digest in prompt
+    assert b"prior leak" not in prompt
+    assert rec["lineage_context_bytes"] > 0
+    assert rec["lineage_repository_id"] == "canonical"
+
+
 def test_the_background_worker_does_not_auto_route(tmp_path):
     """Phase A scope (epic S5): auto-routing is the FOREGROUND loop's.
 
@@ -2647,6 +2677,48 @@ def test_the_background_prompt_shows_the_PUSHED_OID_not_the_working_tree(tmp_pat
     assert "(working tree)" not in prompt, (
         "the head LABEL is the pushed oid; the foreground's label would claim a "
         "scope this review does not have")
+
+
+def test_the_background_prompt_carries_lineage_context_telemetry(
+        tmp_path, monkeypatch):
+    from skodun import pipeline
+
+    repo = _bg_repo(tmp_path)
+    context = (b"----- BEGIN PRIOR FINDINGS -----\n"
+               b"count=1 truncated=false\n"
+               b"----- END PRIOR FINDINGS -----\n")
+    monkeypatch.setattr(
+        pipeline, "_lineage_prompt_context",
+        lambda *args, **kwargs: (context, True))
+
+    rec = _prepush(tmp_path / "s.db", repo)
+
+    prompt = (tmp_path / "bin" / "prompt_1.txt").read_bytes()
+    assert context.rstrip(b"\n") in prompt
+    assert rec["lineage_context_bytes"] == len(context)
+    assert rec["lineage_context_truncated"] is True
+
+
+def test_the_worker_persists_lineage_context_telemetry(
+        tmp_path, monkeypatch):
+    from skodun import pipeline
+
+    repo = _bg_repo(tmp_path)
+    context = b"----- BEGIN PRIOR FINDINGS -----\ncount=1\n----- END PRIOR FINDINGS -----\n"
+    monkeypatch.setattr(
+        pipeline, "_lineage_prompt_context",
+        lambda *args, **kwargs: (context, False))
+    db = tmp_path / "s.db"
+    rid, ident = _reserve(db, repo)
+
+    out = run_worker(rid, repo, "feat", ident["head"], ident["base_sha"],
+                     ident["base_ref"], db)
+
+    assert out.code == 0
+    with Store.open(db) as store:
+        rec = store.get_review(rid)
+    assert rec["lineage_context_bytes"] == len(context)
+    assert rec["lineage_context_truncated"] is False
 
 
 def test_the_background_context_pack_reads_the_commit_not_the_checkout(tmp_path):
@@ -3274,3 +3346,41 @@ def test_a_deleted_branch_does_not_interfere_and_a_cleanly_finishing_superseded_
     assert "cancelled" not in log_text.lower(), (
         "the worker was signalled -- this drill needs an UNCANCELLED finish "
         "to reach finalize_review's own conditional")
+
+
+def test_record_cancellation_keeps_partial_when_lineage_enrichment_fails(monkeypatch):
+    from skodun import pipeline
+
+    saved = []
+
+    class Fake:
+        def finalize_review(self, record_id, rec, *, lineage_annotator=None):
+            if lineage_annotator is not None:
+                lineage_annotator(self, rec)
+            saved.append(dict(rec))
+            return True
+
+        def get_review(self, record_id):
+            return saved[-1] if saved else None
+
+        def fail_if_running(self, *a, **k):
+            raise AssertionError("partial must be finalized, not failed")
+
+    monkeypatch.setattr(
+        pipeline, "annotate_lineage",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("lineage boom")))
+    rec = {
+        "id": "r1", "parse_ok": True, "degraded": False, "diff_truncated": False,
+        "findings": [{"file": "a.py", "title": "keep me"}], "status": "running",
+        "usable_output": True,
+    }
+
+    class Cancelled(Exception):
+        def __init__(self):
+            super().__init__("the review was cancelled")
+            self.partial = rec
+
+    out = dispatch._record_cancellation(Fake(), "r1", Cancelled())
+    assert saved
+    assert saved[0]["findings"][0]["title"] == "keep me"
+    assert out.code == 0

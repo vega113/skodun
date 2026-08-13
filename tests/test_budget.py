@@ -249,6 +249,42 @@ def test_the_reservation_covers_the_prompt_bytes_the_envelope_does_not():
     assert budget.PROMPT_OVERHEAD_BYTES - (fixed + checklist.BUDGET) >= 256
 
 
+def test_the_reservation_covers_the_maximum_stack_and_lineage_prompt_blocks():
+    from skodun import fingerprint, stack
+
+    assert budget.PROMPT_OVERHEAD_BYTES >= (
+        stack.MAX_STACK_PROMPT_BYTES
+        + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES
+        + fingerprint.MAX_LINEAGE_PROMPT_BYTES
+        + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES)
+    wrapped = promptbuild.advisory_context(
+        b"S" * stack.MAX_STACK_PROMPT_BYTES,
+        b"L" * fingerprint.MAX_LINEAGE_PROMPT_BYTES)
+    assert len(wrapped) <= (
+        stack.MAX_STACK_PROMPT_BYTES
+        + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES
+        + fingerprint.MAX_LINEAGE_PROMPT_BYTES
+        + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES)
+
+
+def test_a_full_prompt_with_max_advisory_context_fits_the_declared_ceiling():
+    """Stack/lineage blocks sit outside the diff envelope; the reservation
+    must still keep argv-bound adapters under their declared ceiling."""
+    from skodun.checklist import BUDGET, Selection
+    from skodun import fingerprint, stack
+
+    d = Defaults(max_diff_bytes=400_000)
+    envelope = budget.prompt_budget(d, AGY)
+    selection = Selection(sections=("core",), bytes_total=BUDGET,
+                          over_budget=False, body="r" * BUDGET)
+    prompt = promptbuild.build(
+        "a-fairly-long-feature-branch-name", "origin/main", "0" * 40,
+        "1" * 40 + " (working tree)", b"d" * envelope, envelope, selection,
+        b"", stack_context=b"S" * stack.MAX_STACK_PROMPT_BYTES,
+        lineage_context=b"L" * fingerprint.MAX_LINEAGE_PROMPT_BYTES)
+    assert prompt.prompt_bytes <= MAX_PROMPT_ARG_BYTES
+
+
 def test_a_full_prompt_at_the_budget_fits_the_declared_ceiling():
     """THE property the reservation exists for, asserted end to end.
 

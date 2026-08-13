@@ -29,6 +29,7 @@ MAX_ID_CHARS = 128
 MAX_PATH_CHARS = 512
 MAX_TRACKING_REF_CHARS = 1_024
 MAX_PROBLEM_DETAIL_CHARS = 240
+MAX_STACK_PROMPT_BYTES = 2048
 
 _OID = re.compile(r"[0-9a-f]{40}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -551,8 +552,36 @@ def render_projection(value: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def clip_utf8(data: bytes, max_bytes: int) -> bytes:
+    """Return a prefix of `data` that is valid UTF-8 and at most `max_bytes`."""
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValueError("UTF-8 clip budget must be a non-negative int")
+    if len(data) <= max_bytes:
+        return data
+    clipped = data[:max_bytes]
+    index = len(clipped)
+    while index > 0 and clipped[index - 1] & 0xC0 == 0x80:
+        index -= 1
+    if index == 0:
+        return b""
+    lead = clipped[index - 1]
+    if lead & 0x80 == 0:
+        return clipped
+    if lead & 0xE0 == 0xC0:
+        needed = 2
+    elif lead & 0xF0 == 0xE0:
+        needed = 3
+    elif lead & 0xF8 == 0xF0:
+        needed = 4
+    else:
+        return clipped[:index - 1]
+    if len(clipped) - (index - 1) >= needed:
+        return clipped
+    return clipped[:index - 1]
+
+
 def render_prompt_context(validation: StackValidation | None,
-                          max_bytes: int = 2048) -> tuple[bytes, bool]:
+                          max_bytes: int = MAX_STACK_PROMPT_BYTES) -> tuple[bytes, bool]:
     """Render a compact, bounded stack hint for provider prompts.
 
     This is advisory context only: the complete certification diff remains the
@@ -591,8 +620,8 @@ def render_prompt_context(validation: StackValidation | None,
     if len(text) <= max_bytes:
         return text, False
     marker = b"\n[stack context truncated; full diff remains authoritative]\n"
-    clipped = text[:max_bytes - len(marker)]
-    return clipped + marker, True
+    budget = max(0, max_bytes - len(marker))
+    return clip_utf8(text, budget) + marker, True
 
 
 def _ignored(request: StackRequest, reason_code: str) -> StackValidation:

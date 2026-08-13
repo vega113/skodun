@@ -172,6 +172,27 @@ class Prompt:
     prompt_bytes: int
     stack_context_bytes: int = 0
     stack_context_truncated: bool = False
+    lineage_context_bytes: int = 0
+    lineage_context_truncated: bool = False
+
+
+def advisory_context(
+        stack_context: bytes | None = None,
+        lineage_context: bytes | None = None) -> bytes:
+    """Encode stack/lineage blocks the same way every prompt builder does."""
+    extra = bytearray()
+    if stack_context:
+        extra += b"\n" + stack_context.rstrip(b"\n") + b"\n"
+    if lineage_context:
+        extra += b"\n" + lineage_context.rstrip(b"\n") + b"\n"
+    return bytes(extra)
+
+
+#: Worst-case wrapper cost of one `advisory_context` block: a leading newline
+#: plus a restored trailing newline when the bounded payload had none. The
+#: MAX_* constants bound the payload itself; this is charged separately so
+#: argv-bound adapters cannot go over their declared ceiling by two bytes.
+ADVISORY_BLOCK_WRAPPER_BYTES = 2
 
 
 def build(
@@ -184,6 +205,9 @@ def build(
     selection: Selection | None,
     pack_body: bytes | None,
     stack_context: bytes | None = None,
+    stack_context_truncated: bool = False,
+    lineage_context: bytes | None = None,
+    lineage_context_truncated: bool = False,
 ) -> Prompt:
     """Render the review prompt.
 
@@ -220,8 +244,7 @@ def build(
     out += f"Branch: {branch}\n".encode("utf-8")
     out += f"Base:   {base_ref} ({base_sha})\n".encode("utf-8")
     out += f"Head:   {head}\n".encode("utf-8")
-    if stack_context:
-        out += b"\n" + stack_context.rstrip(b"\n") + b"\n"
+    out += advisory_context(stack_context, lineage_context)
 
     # Oracle: `$(...)` capture strips every trailing newline, `printf '%s\n'`
     # re-adds exactly one, and `[ -n "$_cl_body" ]` tests the stripped value.
@@ -243,4 +266,9 @@ def build(
     text = bytes(out)
     return Prompt(text=text, diff_truncated=diff_truncated,
                   prompt_bytes=len(text),
-                  stack_context_bytes=len(stack_context or b""))
+                  stack_context_bytes=len(stack_context or b""),
+                  stack_context_truncated=bool(stack_context)
+                  and stack_context_truncated is True,
+                  lineage_context_bytes=len(lineage_context or b""),
+                  lineage_context_truncated=bool(lineage_context)
+                  and lineage_context_truncated is True)

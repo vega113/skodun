@@ -1448,6 +1448,7 @@ def _review_annotation_suffix(rec: dict) -> str:
             if value not in (None, ""):
                 tokens.append(_status_field(f"stack_{key}", value))
     for key in ("stack_context_bytes", "stack_context_truncated",
+                "lineage_context_bytes", "lineage_context_truncated",
                 "fingerprint_status", "fingerprint_candidate_count",
                 "fingerprint_candidate_limit", "fingerprint_candidates_truncated"):
         value = rec.get(key)
@@ -1539,7 +1540,9 @@ def format_status_line(rec: dict, *, now: float | None = None,
                 parts.append(_status_field("lineage_counts", summary))
     parts.extend(_status_field(key, rec.get(key)) for key in (
         "stack_context_bytes", "stack_context_truncated",
-        "fingerprint_candidates_truncated")
+        "lineage_context_bytes", "lineage_context_truncated",
+        "fingerprint_status", "fingerprint_candidate_count",
+        "fingerprint_candidate_limit", "fingerprint_candidates_truncated")
                  if rec.get(key) not in (None, ""))
     stack = rec.get("stack")
     if isinstance(stack, dict):
@@ -1618,6 +1621,13 @@ def svc_review_status(store, review_id=None, repo=None, *, output="text") -> tup
         import json
         payload = {"id": rec.get("id"), "state": report_state(rec),
                    "coverage": projection.to_dict()}
+        for key in ("stack_context_bytes", "stack_context_truncated",
+                    "lineage_context_bytes", "lineage_context_truncated",
+                    "fingerprint_status", "fingerprint_candidate_count",
+                    "fingerprint_candidate_limit",
+                    "fingerprint_candidates_truncated"):
+            if rec.get(key) not in (None, ""):
+                payload[key] = rec[key]
         return 0, json.dumps(payload, sort_keys=True)
     return 0, format_status_line(rec, projection=projection)
 

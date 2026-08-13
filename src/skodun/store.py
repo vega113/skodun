@@ -60,7 +60,7 @@ _REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 class SchemaLifecycleError(ValueError):
@@ -897,6 +897,12 @@ _MIGRATION_V14: tuple[str, ...] = (
   ON finding_lineage(repository_id, fingerprint_version, fingerprint, created_at)""",
 )
 
+# --- v15: bounded lineage candidate lookup by recency ---------------------
+_MIGRATION_V15: tuple[str, ...] = (
+"""CREATE INDEX IF NOT EXISTS ix_finding_lineage_repo_created_review
+  ON finding_lineage(repository_id, created_at, review_id)""",
+)
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -930,6 +936,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (12, _MIGRATION_V12),
     (13, _MIGRATION_V13),
     (14, _MIGRATION_V14),
+    (15, _MIGRATION_V15),
 )
 
 
@@ -1939,22 +1946,104 @@ class Store:
         where = "repository_id=?"
         params: list[object] = [repository_id]
         if before_reviewed_at is not None:
+            before_reviewed_at = _require_ts(
+                "before_reviewed_at", before_reviewed_at)
             where += " AND created_at < ?"
             params.append(before_reviewed_at)
-        count = self._c.execute(
-            f"SELECT COUNT(DISTINCT review_id) FROM finding_lineage WHERE {where}",
-            tuple(params)).fetchone()[0]
         rows = self._c.execute(
             f"SELECT review_id, MAX(created_at) AS reviewed_at "
             f"FROM finding_lineage WHERE {where} GROUP BY review_id "
             "ORDER BY reviewed_at DESC, review_id DESC LIMIT ?",
-            tuple(params) + (limit,)).fetchall()
+            tuple(params) + (limit + 1,)).fetchall()
+        truncated = len(rows) > limit
         candidates = []
-        for row in rows:
+        for row in rows[:limit]:
             artifact = self.get_review(row["review_id"])
             if isinstance(artifact, dict) and artifact.get("status") != RUNNING:
                 candidates.append(artifact)
-        return candidates, count > limit
+        return candidates, truncated
+
+    def lineage_finding_candidates_with_meta(
+            self, repository_id: str, *, before_reviewed_at: str | None = None,
+            limit: int = 200) -> tuple[list[dict], bool]:
+        """Return bounded prior findings for one repository, newest first.
+
+        The limit is a flattened finding count, not a predecessor review count.
+        Pages of `limit + 1` raw rows skip unreadable or invalid indexes so a
+        ghost row cannot starve older valid predecessors. A raw-scan cap keeps
+        the terminal writer transaction bounded.
+        """
+        repository_id = _require_text("repository_id", repository_id)
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("lineage candidate limit must be a positive int")
+        if before_reviewed_at is not None:
+            before_reviewed_at = _require_ts(
+                "before_reviewed_at", before_reviewed_at)
+        want = limit + 1
+        scan_cap = min(want * 4, 1024)
+        findings: list[dict] = []
+        cache: dict[str, dict | None] = {}
+        examined = 0
+        cursor: tuple[str, str, int] | None = None
+        exhausted = False
+        while len(findings) < want and examined < scan_cap:
+            where = "repository_id=?"
+            params: list[object] = [repository_id]
+            if before_reviewed_at is not None:
+                where += " AND created_at < ?"
+                params.append(before_reviewed_at)
+            if cursor is not None:
+                created_at, review_id, finding_index = cursor
+                where += (
+                    " AND (created_at < ? OR (created_at = ? AND review_id < ?)"
+                    " OR (created_at = ? AND review_id = ? AND finding_index < ?))"
+                )
+                params.extend([created_at, created_at, review_id,
+                               created_at, review_id, finding_index])
+            batch = min(want, scan_cap - examined)
+            rows = self._c.execute(
+                f"""SELECT review_id, finding_index, created_at
+                      FROM finding_lineage WHERE {where}
+                     ORDER BY created_at DESC, review_id DESC, finding_index DESC
+                     LIMIT ?""",
+                tuple(params) + (batch,)).fetchall()
+            examined += len(rows)
+            if len(rows) < batch:
+                exhausted = True
+            if not rows:
+                break
+            cursor = (rows[-1]["created_at"], rows[-1]["review_id"],
+                      rows[-1]["finding_index"])
+            for row in rows:
+                review_id = row["review_id"]
+                if review_id not in cache:
+                    artifact = self.get_review(review_id)
+                    if (not isinstance(artifact, dict)
+                            or artifact.get("status") == RUNNING):
+                        cache[review_id] = None
+                    else:
+                        cache[review_id] = artifact
+                artifact = cache[review_id]
+                if artifact is None:
+                    continue
+                index = row["finding_index"]
+                stored = artifact.get("findings") or ()
+                if not isinstance(index, int) or index < 0 or index >= len(stored):
+                    continue
+                previous_finding = stored[index]
+                if not isinstance(previous_finding, dict):
+                    continue
+                enriched = dict(previous_finding)
+                enriched["_lineage_review_id"] = review_id
+                enriched["_lineage_finding_index"] = index
+                enriched["_lineage_reviewed_at"] = artifact.get("reviewed_at")
+                findings.append(enriched)
+                if len(findings) >= want:
+                    break
+            if exhausted:
+                break
+        truncated = len(findings) > limit or not exhausted
+        return findings[:limit], truncated
 
     def lineage_review_candidates(self, repository_id: str) -> list[dict]:
         """Compatibility wrapper for the bounded lineage candidate read."""

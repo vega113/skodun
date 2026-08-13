@@ -412,6 +412,8 @@ def test_stack_request_adds_attribution_without_changing_full_certification(
         return prompt.split(b"----- BEGIN DIFF -----", 1)[1].split(
             b"----- END DIFF -----", 1)[0]
     assert diff_bytes(first_prompt) == diff_bytes(second_prompt)
+    assert with_stack["stack_context_bytes"] > 0
+    assert isinstance(with_stack["lineage_context_bytes"], int)
     assert st.get_review(with_stack["id"]) == with_stack
     _verdict(with_stack, capsys)
 
@@ -1846,3 +1848,30 @@ def test_the_dead_pid_helper_refuses_rather_than_returning_a_live_pid(
 
     with pytest.raises(AssertionError, match="still reads as alive"):
         _spawned_pid()
+
+
+def test_save_uses_signature_detection_for_narrow_stores():
+    saved = []
+
+    class Narrow:
+        def save_review(self, rec):
+            saved.append(dict(rec))
+
+    pipeline._save(Narrow(), {"id": "r1", "status": "clean"},
+                   lineage_annotator=lambda *_a, **_k: None)
+    assert saved == [{"id": "r1", "status": "clean"}]
+
+
+def test_save_does_not_swallow_typeerror_from_annotator_capable_store():
+    saved = []
+
+    class Capable:
+        def save_review(self, rec, *, lineage_annotator=None):
+            if lineage_annotator is not None:
+                raise TypeError("lineage_annotator callback rejected the payload")
+            saved.append(dict(rec))
+
+    with pytest.raises(pipeline.PersistenceFailed, match="rejected the payload"):
+        pipeline._save(Capable(), {"id": "r1"},
+                       lineage_annotator=lambda *_a, **_k: None)
+    assert saved == []

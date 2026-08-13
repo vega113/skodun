@@ -108,6 +108,27 @@ def test_the_prompt_carries_change_headers_and_never_a_hunk_body():
     assert "Changed regions:" in text
 
 
+def test_integration_prompt_carries_stack_and_lineage_context_metadata():
+    stack_context = (b"----- BEGIN STACK CONTEXT -----\n"
+                     b"status=valid\n"
+                     b"----- END STACK CONTEXT -----\n")
+    lineage_context = (b"----- BEGIN PRIOR FINDINGS -----\n"
+                       b"count=2 truncated=true\n"
+                       b"----- END PRIOR FINDINGS -----\n")
+
+    prompt = integration_prompt(
+        TWO, stack_context=stack_context, stack_context_truncated=True,
+        lineage_context=lineage_context, lineage_context_truncated=True)
+
+    text = prompt.text.decode("utf-8")
+    assert stack_context.rstrip(b"\n").decode() in text
+    assert lineage_context.rstrip(b"\n").decode() in text
+    assert prompt.stack_context_bytes == len(stack_context)
+    assert prompt.stack_context_truncated is True
+    assert prompt.lineage_context_bytes == len(lineage_context)
+    assert prompt.lineage_context_truncated is True
+
+
 def test_body_filtering_is_the_builders_job_not_the_callers():
     """A caller hands over the WHOLE batch bytes; the builder keeps the headers.
 
@@ -555,6 +576,46 @@ def test_a_prompt_within_the_cap_is_not_flagged():
     assert got.diff_truncated is False
     assert "TRUNCATED" not in got.text.decode("utf-8")
     assert got.prompt_bytes == len(got.text)
+
+
+def test_integration_prompt_carries_stack_and_lineage_context():
+    stack_context = (
+        b"----- BEGIN STACK CONTEXT -----\n"
+        b"version=1 status=valid\n"
+        b"----- END STACK CONTEXT -----\n")
+    lineage_context = (
+        b"----- BEGIN PRIOR FINDINGS -----\n"
+        b"count=1 truncated=false\n"
+        b"----- END PRIOR FINDINGS -----\n")
+    got = integration_prompt(
+        TWO, stack_context=stack_context, lineage_context=lineage_context)
+    assert stack_context.rstrip(b"\n") in got.text
+    assert lineage_context.rstrip(b"\n") in got.text
+    assert got.text.count(b"----- BEGIN STACK CONTEXT -----") == 1
+    assert got.text.count(b"----- BEGIN PRIOR FINDINGS -----") == 1
+    assert got.stack_context_bytes == len(stack_context)
+    assert got.lineage_context_bytes == len(lineage_context)
+    assert got.diff_truncated is False
+
+
+def test_integration_truncation_reserves_stack_and_lineage_blocks():
+    stack_context = (
+        b"----- BEGIN STACK CONTEXT -----\n"
+        b"version=1 status=valid\n"
+        b"----- END STACK CONTEXT -----\n")
+    lineage_context = (
+        b"----- BEGIN PRIOR FINDINGS -----\n"
+        b"count=1 truncated=true\n"
+        b"----- END PRIOR FINDINGS -----\n")
+    got = integration_prompt(
+        TWO, max_prompt_bytes=400, stack_context=stack_context,
+        stack_context_truncated=True, lineage_context=lineage_context,
+        lineage_context_truncated=True)
+    assert got.diff_truncated is True
+    assert stack_context.rstrip(b"\n") in got.text
+    assert lineage_context.rstrip(b"\n") in got.text
+    assert got.stack_context_truncated is True
+    assert got.lineage_context_truncated is True
 
 
 def test_a_non_positive_cap_raises_like_every_other_prompt_builder():

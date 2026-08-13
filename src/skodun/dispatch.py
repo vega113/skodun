@@ -1235,15 +1235,10 @@ def _work(store: "Store", cancel: threading.Event, record_id: str, repo: Path,
         rec = pipeline.cancellation_transform(rec, boundary)
         _note(f"cancelled {boundary}; recording an untrustworthy record")
 
-    try:
+    if pipeline._accepts_keyword(store.finalize_review, "lineage_annotator"):
         applied = store.finalize_review(
             record_id, rec, lineage_annotator=pipeline.annotate_lineage)
-    except TypeError as exc:
-        # Preserve compatibility with narrow test/dry-run stores that expose
-        # the pre-hardening two-argument seam; the shipped Store takes the
-        # callback and serializes enrichment with terminal publication.
-        if "lineage_annotator" not in str(exc):
-            raise
+    else:
         applied = store.finalize_review(record_id, rec)
     if not applied:
         # The reservation stopped being `running` while this worker was reviewing:
@@ -1309,13 +1304,22 @@ def _record_cancellation(store: "Store", record_id: str, exc) -> WorkerOutcome:
     if isinstance(partial, Mapping) and partial.get("id") == record_id:
         rec = pipeline.cancellation_transform(dict(partial), reason)
         try:
-            try:
-                applied = store.finalize_review(
-                    record_id, rec,
-                    lineage_annotator=pipeline.annotate_lineage)
-            except TypeError as exc:
-                if "lineage_annotator" not in str(exc):
-                    raise
+            if pipeline._accepts_keyword(store.finalize_review, "lineage_annotator"):
+                class _AnnotatorFailed(Exception):
+                    pass
+
+                def _annotator(store, rec):
+                    try:
+                        pipeline.annotate_lineage(store, rec)
+                    except Exception as exc:
+                        raise _AnnotatorFailed from exc
+
+                try:
+                    applied = store.finalize_review(
+                        record_id, rec, lineage_annotator=_annotator)
+                except _AnnotatorFailed:
+                    applied = store.finalize_review(record_id, rec)
+            else:
                 applied = store.finalize_review(record_id, rec)
             if applied:
                 current = store.get_review(record_id) or rec

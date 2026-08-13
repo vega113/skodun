@@ -284,7 +284,7 @@ from typing import TYPE_CHECKING, Any
 from .adapters import REFUTER_VERDICTS
 from .batching import MAX_REGION_LINES, changed_regions
 from .config import SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOTS, Defaults
-from .promptbuild import RULES_BEGIN, RULES_END, Prompt
+from .promptbuild import RULES_BEGIN, RULES_END, Prompt, advisory_context
 from .textnorm import collapse_ws
 from .triage import MIN_REASON_CHARS
 
@@ -982,6 +982,10 @@ def integration_prompt(
     selection: Selection | None = None,
     max_prompt_bytes: int = DEFAULT_MAX_DIFF_BYTES,
     max_region_lines: int = MAX_REGION_LINES,
+    stack_context: bytes | None = None,
+    stack_context_truncated: bool = False,
+    lineage_context: bytes | None = None,
+    lineage_context_truncated: bool = False,
 ) -> Prompt:
     """The cross-file pass over the seams a batched review cut.
 
@@ -1047,16 +1051,30 @@ def integration_prompt(
         lines.append("")
 
     text = ("\n".join(lines) + "\n").encode("utf-8", "replace")
-    truncated = len(text) > max_prompt_bytes
+    extra = advisory_context(stack_context, lineage_context)
+    body_budget = max_prompt_bytes
+    if extra:
+        body_budget = max(1, max_prompt_bytes - len(extra))
+    truncated = len(text) > body_budget
     if truncated:
         # `errors="ignore"` on the way back, because the cut may land inside a
         # multi-byte character; the marker then goes on the end, so the returned
         # bytes are allowed to exceed the cap by its length. The oracle does
         # both, and a prompt that says it was cut is worth those bytes.
-        cut = text[:max_prompt_bytes].decode("utf-8", "ignore")
+        # Stack/lineage are reserved out of the cap so a huge seam body cannot
+        # drop the advisory blocks the batch prompts already carried.
+        cut = text[:body_budget].decode("utf-8", "ignore")
         text = (cut + "\n" + (_INTEGRATION_TRUNCATED % max_prompt_bytes)
                 + "\n").encode("utf-8", "replace")
-    return Prompt(text=text, diff_truncated=truncated, prompt_bytes=len(text))
+    text = text + extra
+    return Prompt(
+        text=text, diff_truncated=truncated, prompt_bytes=len(text),
+        stack_context_bytes=len(stack_context or b""),
+        stack_context_truncated=bool(stack_context)
+        and stack_context_truncated is True,
+        lineage_context_bytes=len(lineage_context or b""),
+        lineage_context_truncated=bool(lineage_context)
+        and lineage_context_truncated is True)
 
 
 # ---------------------------------------------------------------------------
