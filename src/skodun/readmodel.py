@@ -238,7 +238,7 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
                                      strict=True):
         key = "finder" if row.get("pass_kind") == "batch" else "integration"
         if (key == "finder" and row.get("state") == "running"
-                and passes[key] != "failed"):
+                and passes[key] not in {"failed", "degraded"}):
             passes[key] = "running"
         elif key == "integration":
             passes[key] = checkpoint_state

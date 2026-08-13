@@ -322,6 +322,19 @@ def test_degraded_finder_checkpoint_outranks_queued_sibling():
     assert p.passes["finder"] == "degraded"
 
 
+def test_degraded_finder_checkpoint_outranks_running_sibling():
+    degraded = {"parse_ok": True, "degraded": True}
+    p = project_review(
+        _record(status="clean", trustworthy=True, usable_output=False),
+        orchestration={"state": "active", "batch_count": 2},
+        checkpoints=[
+            {"pass_kind": "batch", "pass_index": 1, "state": "complete",
+             "payload_json": json.dumps(degraded)},
+            {"pass_kind": "batch", "pass_index": 2, "state": "running"},
+        ])
+    assert p.passes["finder"] == "degraded"
+
+
 def test_completed_integration_checkpoint_is_usable_evidence():
     payload = {
         "parse_ok": True, "degraded": False, "degraded_reason": "",
