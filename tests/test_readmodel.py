@@ -148,6 +148,42 @@ def test_failed_integration_checkpoint_payload_is_not_projected_complete():
     assert p.coverage_state == "partial"
 
 
+def test_consumed_failed_checkpoint_does_not_override_failed_projection():
+    payload = {
+        "parse_ok": False, "degraded": False, "degraded_reason": "",
+        "stop_reason": "parse_failed", "diff_truncated": False,
+        "summary": "", "findings": [], "failure_reason": "bad output",
+        "attempts": [], "provenance": {}, "accepted": None,
+    }
+    p = project_review(
+        _record(status="clean", trustworthy=True, usable_output=False),
+        orchestration={"state": "consumed", "batch_count": 1},
+        checkpoints=[{"pass_kind": "batch", "pass_index": 1,
+                      "state": "complete", "payload_json": json.dumps(payload)}])
+    assert p.coverage_state == "none"
+    assert p.gate_eligible is False
+
+
+def test_integration_evidence_does_not_complete_finder():
+    payload = {
+        "parse_ok": True, "degraded": False, "degraded_reason": "",
+        "stop_reason": "done", "diff_truncated": False,
+        "summary": "integration", "findings": [], "failure_reason": "",
+        "attempts": [], "provenance": {}, "accepted": None,
+    }
+    p = project_review(
+        _record(status="failed", trustworthy=False, usable_output=False),
+        orchestration={"state": "active", "batch_count": 2},
+        checkpoints=[
+            {"pass_kind": "batch", "pass_index": 1, "state": "failed"},
+            {"pass_kind": "batch", "pass_index": 2, "state": "failed"},
+            {"pass_kind": "integration", "pass_index": 0,
+             "state": "complete", "payload_json": json.dumps(payload)},
+        ])
+    assert p.usable_evidence is True
+    assert p.passes["finder"] == "failed"
+
+
 def test_failed_extra_pass_flag_and_missing_parse_boolean_stay_failed():
     p = project_review(_record(
         status="clean", trustworthy=True, usable_output=True,

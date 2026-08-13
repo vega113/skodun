@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import time
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -216,7 +217,7 @@ def admission_wait_from_env(default: float,
         value = float(str(raw).strip())
     except ValueError:
         return float(default)
-    if value < 0:
+    if value < 0 or not math.isfinite(value):
         return float(default)
     return value
 

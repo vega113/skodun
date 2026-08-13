@@ -142,13 +142,19 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
     failed_rows = [state for state in checkpoint_states if state == "failed"]
     completed = len(complete_rows)
     failed = len(failed_rows)
-    checkpoint_payloads = [payload for row in checkpoint_rows
+    checkpoint_payloads = [(row.get("pass_kind"), payload)
+                           for row in checkpoint_rows
                            for payload in [_checkpoint_payload(row)]
                            if payload is not None]
-    evidence_batches = batches or checkpoint_payloads
+    evidence_batches = batches or [payload for _, payload in checkpoint_payloads]
+    finder_evidence = batches or [payload for kind, payload in checkpoint_payloads
+                                  if kind == "batch"]
     parseable = rec.get("usable_output") is True or any(
         isinstance(b, Mapping) and b.get("parse_ok") is True
         for b in evidence_batches)
+    finder_parseable = rec.get("usable_output") is True or any(
+        isinstance(b, Mapping) and b.get("parse_ok") is True
+        for b in finder_evidence)
     if not checkpoint_rows and isinstance(batches, list):
         completed = sum(1 for b in batches if isinstance(b, Mapping) and
                         b.get("parse_ok") is True)
@@ -157,7 +163,10 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
         if not batches and parseable:
             completed = 1
     orchestration_state = (orchestration or {}).get("state")
-    complete = (orchestration_state == "consumed" or
+    consumed_complete = (orchestration_state == "consumed" and not failed and
+                          (completed == planned or
+                           (not checkpoint_rows and parseable)))
+    complete = (consumed_complete or
                 (not orchestration_state and rec.get("status") in
                  {"clean", "findings"} and parseable) or
                 (planned > 0 and completed == planned and not failed))
@@ -165,7 +174,7 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
     extras = rec.get("extra_passes")
     extras = extras if isinstance(extras, Mapping) else {}
     passes = {
-        "finder": "complete" if parseable else _pass_state(rec.get("status"), "failed"),
+        "finder": "complete" if finder_parseable else _pass_state(rec.get("status"), "failed"),
         "integration": "not_planned",
         "security": _extra_pass_state(extras.get("security")),
         "skeptic": _extra_pass_state(extras.get("skeptic")),

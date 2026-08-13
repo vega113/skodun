@@ -732,6 +732,15 @@ def test_checkpoint_lease_includes_provider_admission_wait(monkeypatch):
     assert pipeline._checkpoint_lease_seconds(d, 2) == expected
 
 
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "1e309"])
+def test_checkpoint_lease_rejects_nonfinite_provider_admission_wait(
+        monkeypatch, raw):
+    d = Defaults(timeout_sec=100, timeout_retries=0, degraded_retries=0)
+    monkeypatch.setenv("SKODUN_ADMISSION_WAIT_SECONDS", raw)
+    assert pipeline._checkpoint_lease_seconds(d, 2) == \
+        pipeline.budget.worst_runtime(d, 2, 0) + 30.0
+
+
 def test_lock_wait_and_poll_read_env_overrides_and_ignore_junk(monkeypatch):
     monkeypatch.setenv("SKODUN_LOCK_WAIT_SECONDS", "7.5")
     assert pipeline._env_seconds("SKODUN_LOCK_WAIT_SECONDS", 99.0) == 7.5
