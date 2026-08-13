@@ -180,6 +180,16 @@ def test_branch_base_head_block_format():
             b"Head:   " + b"b" * 40 + b"\n") in p.text
 
 
+def test_stack_context_is_additive_and_reported_without_changing_diff_budget():
+    context = (b"----- BEGIN STACK CONTEXT -----\nstatus=valid\n"
+               b"----- END STACK CONTEXT -----\n")
+    p = build("feat/x", "origin/main", "a" * 40, "b" * 40, b"d", 1,
+              SEL, None, stack_context=context)
+    assert p.stack_context_bytes == len(context)
+    assert p.diff_truncated is False
+    assert context in p.text
+
+
 def test_head_may_carry_the_now_mode_working_tree_label():
     head = "c" * 40 + " (working tree)"
     p = build("feat", "origin/main", "a" * 40, head, b"d", 400_000, SEL, None)

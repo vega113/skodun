@@ -96,6 +96,34 @@ def test_service_projection_is_bounded_and_status_specific():
     }) == "SKODUN STACK: status=ignored reason=stale_head"
 
 
+def test_prompt_context_is_bounded_and_keeps_full_diff_authoritative():
+    validation = stack.StackValidation(
+        status="valid", reason_code="ok", manifest=stack.StackManifest(
+            schema_version=1, repository_id=REPOSITORY,
+            certification_base=BASE, current_head=HEAD,
+            direct_parent=None, dependencies=(), current_slice=stack.StackSlice(
+                slice_id="pr-14", commit=HEAD,
+                tracking_ref=f"{REPOSITORY}#14", ownership=(stack.OwnershipScope(
+                    kind="file", path="src/current.py", exclusive=True,
+                    line_start=12, line_end=20, symbol=None),)),
+            downstream_owners=(), producer=stack.ManifestProducer(
+                id="test", version="1"),
+            manifest_digest="sha256:" + "a" * 64))
+    context, truncated = stack.render_prompt_context(validation, max_bytes=128)
+    assert truncated is True
+    assert b"full diff remains authoritative" in context
+    assert len(context) <= 128
+
+
+def test_invalid_prompt_context_exposes_status_without_claiming_validity():
+    context, truncated = stack.render_prompt_context(
+        stack.StackValidation(status="ignored", reason_code="stale_head",
+                              manifest=None))
+    assert truncated is False
+    assert b"status=ignored reason=stale_head" in context
+    assert b"status=valid" not in context
+
+
 def test_manifest_digest_is_over_normalized_semantics_not_json_layout(tmp_path):
     document = _manifest()
     document["manifest_digest"] = _digest(document)

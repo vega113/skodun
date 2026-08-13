@@ -905,6 +905,7 @@ def svc_log(store, branch, limit, repo=None) -> tuple[int, str]:
         ctx = round_context_for_review(store, rec)
         if ctx is not None:
             line = f"{line} | {ctx.line()}"
+        line = f"{line}{_review_annotation_suffix(rec)}"
         lines.append(line)
     return 0, "\n".join(lines)
 
@@ -1087,9 +1088,30 @@ def svc_triage_list(store, review_id) -> tuple[int, str]:
         # Only `[{i}]` and `({status})` are ours. Churn marker is ours too.
         marker = churn_marker(f)
         marker_s = f" ({marker})" if marker else ""
-        lines.append(f"[{i}] {shown_field(f.get('severity'))} "
-                     f"{shown_field(f.get('file'))}:{shown_field(f.get('line'))} "
-                     f"{shown_field(f.get('title'))} ({status}){marker_s}")
+        finding_line = (f"[{i}] {shown_field(f.get('severity'))} "
+                        f"{shown_field(f.get('file'))}:{shown_field(f.get('line'))} "
+                        f"{shown_field(f.get('title'))} ({status}){marker_s}")
+        scope = f.get("scope_attribution") if isinstance(f, dict) else None
+        if isinstance(scope, dict):
+            scope_name = shown_field(scope.get("scope"))
+            scope_reason = shown_field(scope.get("reason_code"))
+            if scope_name:
+                finding_line += f" scope={scope_name}"
+            if scope_reason:
+                finding_line += f" scope_reason={scope_reason}"
+        lineage = f.get("finding_lineage_v2") if isinstance(f, dict) else None
+        if isinstance(lineage, dict):
+            match = shown_field(lineage.get("match_reason"))
+            predecessor = shown_field(lineage.get("predecessor_review_id"))
+            if match:
+                finding_line += f" lineage={match}"
+            if predecessor:
+                finding_line += f" predecessor={predecessor}"
+        if isinstance(states.get(fkey), dict) and states[fkey].get("event") == "defer":
+            ref = shown_field(states[fkey].get("tracking_ref"))
+            if ref:
+                finding_line += f" deferred_to={ref}"
+        lines.append(finding_line)
         # One extra line for an annotated finding, and never more than one:
         # `refuter_line` flattens and bounds every field it prints, so arbitrary
         # model text cannot forge a second `[n]` row. An annotation is shown
@@ -1416,6 +1438,36 @@ def _status_field(label: str, val) -> str:
     return f"{label}={json.dumps(text)}"
 
 
+def _review_annotation_suffix(rec: dict) -> str:
+    """Bounded additive stack/lineage tokens shared by log and status."""
+    tokens = []
+    stack = rec.get("stack")
+    if isinstance(stack, dict):
+        for key in ("status", "reason_code", "current_slice_id"):
+            value = stack.get(key)
+            if value not in (None, ""):
+                tokens.append(_status_field(f"stack_{key}", value))
+    for key in ("stack_context_bytes", "stack_context_truncated",
+                "fingerprint_status", "fingerprint_candidate_count",
+                "fingerprint_candidate_limit", "fingerprint_candidates_truncated"):
+        value = rec.get(key)
+        if value not in (None, ""):
+            tokens.append(_status_field(key, value))
+    findings = rec.get("findings")
+    if isinstance(findings, list):
+        reasons = []
+        for item in findings:
+            if isinstance(item, dict) and isinstance(item.get("finding_lineage_v2"), dict):
+                reason = item["finding_lineage_v2"].get("match_reason")
+                if isinstance(reason, str) and reason:
+                    reasons.append(reason)
+        if reasons:
+            counts = {reason: reasons.count(reason) for reason in sorted(set(reasons))}
+            tokens.append(_status_field(
+                "lineage_counts", ",".join(f"{k}:{counts[k]}" for k in counts)))
+    return (" | " + " ".join(tokens)) if tokens else ""
+
+
 def format_status_line(rec: dict, *, now: float | None = None,
                        projection=None) -> str:
     """One machine-readable status line for CLI and MCP.
@@ -1485,6 +1537,15 @@ def format_status_line(rec: dict, *, now: float | None = None,
                                    "scope_changed", "ambiguous")
                     if reason in counts)
                 parts.append(_status_field("lineage_counts", summary))
+    parts.extend(_status_field(key, rec.get(key)) for key in (
+        "stack_context_bytes", "stack_context_truncated",
+        "fingerprint_candidates_truncated")
+                 if rec.get(key) not in (None, ""))
+    stack = rec.get("stack")
+    if isinstance(stack, dict):
+        for key in ("status", "reason_code", "current_slice_id"):
+            if stack.get(key) not in (None, ""):
+                parts.append(_status_field(f"stack_{key}", stack[key]))
     return " ".join(parts)
 
 

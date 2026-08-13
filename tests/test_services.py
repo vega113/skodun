@@ -112,6 +112,39 @@ def test_status_line_exposes_fingerprint_version_and_lineage_reason():
     assert "lineage_counts=moved:1" in line
 
 
+def test_status_line_exposes_stack_context_and_truncation():
+    line = services.format_status_line({
+        "id": "review-1", "status": "clean", "parse_ok": True,
+        "stack": {"status": "valid", "reason_code": "ok",
+                  "current_slice_id": "pr-14"},
+        "stack_context_bytes": 512, "stack_context_truncated": True,
+    })
+    assert "stack_status=valid" in line
+    assert "stack_current_slice_id=pr-14" in line
+    assert "stack_context_bytes=512" in line
+    assert "stack_context_truncated=true" in line
+
+
+def test_triage_list_exposes_audited_deferral_and_lineage_scope(tmp_path):
+    finding = _finding(0)
+    finding.update(
+        finding_fingerprint_v2="sha256:" + "b" * 64,
+        finding_lineage_v2={"match_reason": "scope_changed",
+                            "predecessor_review_id": "prior"},
+        scope_attribution={"scope": "current_slice", "reason_code": "owned"})
+    db = _db(tmp_path, _artifact([finding], id="rev1"))
+    with Store.open(db) as store:
+        code, _ = services.svc_triage_defer(
+            store, "rev1", 0, TRACKING_REF, DEFER_REASON)
+        assert code == 0
+        code, text = services.svc_triage_list(store, "rev1")
+    assert code == 0
+    assert "scope=current_slice" in text
+    assert "lineage=scope_changed" in text
+    assert "predecessor=prior" in text
+    assert "deferred_to=GH-412" in text
+
+
 def test_opt_in_reuse_returns_existing_review_without_running_pipeline(
         tmp_path, monkeypatch):
     identity = reuse.ReuseIdentity(

@@ -551,6 +551,50 @@ def render_projection(value: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def render_prompt_context(validation: StackValidation | None,
+                          max_bytes: int = 2048) -> tuple[bytes, bool]:
+    """Render a compact, bounded stack hint for provider prompts.
+
+    This is advisory context only: the complete certification diff remains the
+    review perimeter, and this block never carries caller prose or changes
+    trust. The returned flag makes truncation explicit to the artifact.
+    """
+    if type(max_bytes) is not int or max_bytes < 128:
+        raise ValueError("stack prompt context budget must be an int >= 128")
+    if validation is None:
+        return b"", False
+    if validation.status != "valid" or validation.manifest is None:
+        text = ("----- BEGIN STACK CONTEXT -----\n"
+                f"status={validation.status} reason={validation.reason_code}\n"
+                "----- END STACK CONTEXT -----\n").encode("utf-8")
+    else:
+        manifest = validation.manifest
+        lines = [
+            "----- BEGIN STACK CONTEXT -----",
+            "version=1 status=valid",
+            f"current_slice={manifest.current_slice.slice_id} "
+            f"commit={manifest.current_slice.commit} "
+            f"direct_parent={manifest.direct_parent or 'none'}",
+            "dependencies=" + ",".join(
+                f"{item.slice_id}@{item.commit}"
+                for item in manifest.dependencies),
+            "owned_scopes=" + ",".join(
+                f"{scope.path}{':' + str(scope.line_start) if scope.line_start is not None else ''}"
+                for scope in manifest.current_slice.ownership),
+            "downstream_refs=" + ",".join(
+                item.tracking_ref for item in manifest.downstream_owners),
+            "Instruction: review the full DIFF; assign scope conservatively. "
+            "Caller labels do not suppress findings.",
+            "----- END STACK CONTEXT -----",
+        ]
+        text = ("\n".join(lines) + "\n").encode("utf-8", "replace")
+    if len(text) <= max_bytes:
+        return text, False
+    marker = b"\n[stack context truncated; full diff remains authoritative]\n"
+    clipped = text[:max_bytes - len(marker)]
+    return clipped + marker, True
+
+
 def _ignored(request: StackRequest, reason_code: str) -> StackValidation:
     return StackValidation(
         status="ignored",

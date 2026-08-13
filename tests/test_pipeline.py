@@ -404,7 +404,14 @@ def test_stack_request_adds_attribution_without_changing_full_certification(
     assert "coverage_scope" not in without_stack
     first_prompt = (tmp_path / "bin" / "prompt_1.txt").read_bytes()
     second_prompt = (tmp_path / "bin" / "prompt_2.txt").read_bytes()
-    assert first_prompt == second_prompt
+    assert first_prompt != second_prompt
+    assert b"----- BEGIN STACK CONTEXT -----" in first_prompt
+    assert b"----- BEGIN STACK CONTEXT -----" not in second_prompt
+    # The stack block is advisory; the authoritative diff bytes remain intact.
+    def diff_bytes(prompt):
+        return prompt.split(b"----- BEGIN DIFF -----", 1)[1].split(
+            b"----- END DIFF -----", 1)[0]
+    assert diff_bytes(first_prompt) == diff_bytes(second_prompt)
     assert st.get_review(with_stack["id"]) == with_stack
     _verdict(with_stack, capsys)
 
