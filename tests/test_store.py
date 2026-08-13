@@ -965,8 +965,11 @@ V15_OBJECTS = {
 }
 V16_OBJECTS = {
     ("table", "evidence_receipts"),
+    ("table", "evidence_receipt_conflicts"),
     ("index", "ix_evidence_receipts_identity_time"),
     ("index", "ix_evidence_receipts_identity_nonce"),
+    ("index", "ux_evidence_receipts_identity_nonce"),
+    ("index", "ix_evidence_receipt_conflicts_identity_time"),
 }
 
 #: One legacy `triage` row, in the shipped single-row-per-ledger-key shape the

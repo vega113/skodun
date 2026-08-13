@@ -58,9 +58,10 @@ identity field and the protected policy/command digests before persistence.
 Add schema v16, never edit the frozen Phase-1 schema. `evidence_receipts` is an
 additive table keyed by `(identity_digest, receipt_digest)` with a unique
 `(identity_digest, nonce)` constraint. Identical retries are idempotent. A
-different digest for an existing identity/nonce is retained as a visible
-`conflict` result and is not stored as accepted evidence. Accepted, rejected,
-and conflict outcomes are bounded read-model rows; none affect trust.
+different digest for an existing identity/nonce is retained in the separate
+bounded `evidence_receipt_conflicts` table as a visible `conflict` result and
+is not stored as accepted evidence. Accepted, rejected, and conflict outcomes
+are bounded read-model rows; none affect trust.
 
 The stored JSON is the validated canonical envelope only. The store exposes a
 bounded summary query by identity digest. It does not store source paths,

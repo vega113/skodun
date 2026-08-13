@@ -926,6 +926,24 @@ _MIGRATION_V16: tuple[str, ...] = (
    ON evidence_receipts(identity_digest, ingested_at DESC, receipt_digest)""",
 """CREATE INDEX IF NOT EXISTS ix_evidence_receipts_identity_nonce
    ON evidence_receipts(identity_digest, nonce)""",
+"""CREATE UNIQUE INDEX IF NOT EXISTS ux_evidence_receipts_identity_nonce
+   ON evidence_receipts(identity_digest, nonce)""",
+"""CREATE TABLE IF NOT EXISTS evidence_receipt_conflicts (
+  identity_digest TEXT NOT NULL,
+  receipt_digest TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  existing_receipt_digest TEXT NOT NULL,
+  reason_code TEXT NOT NULL,
+  evidence_kind TEXT NOT NULL,
+  terminal_state TEXT NOT NULL,
+  receipt_json TEXT NOT NULL,
+  ingested_at TEXT NOT NULL,
+  PRIMARY KEY(identity_digest, receipt_digest),
+  FOREIGN KEY(identity_digest, existing_receipt_digest)
+    REFERENCES evidence_receipts(identity_digest, receipt_digest)
+)""",
+"""CREATE INDEX IF NOT EXISTS ix_evidence_receipt_conflicts_identity_time
+   ON evidence_receipt_conflicts(identity_digest, ingested_at DESC, receipt_digest)""",
 )
 
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
@@ -2095,6 +2113,8 @@ class Store:
         digest for the same identity+nonce is a replay conflict and is refused
         before insertion, so a producer cannot rewrite one run's evidence.
         """
+        from .evidence import EvidenceError, EvidenceIdentity, parse_receipt
+
         identity_digest = _require_text("identity_digest", identity_digest)
         receipt_digest = _require_text("receipt_digest", receipt_digest)
         nonce = _require_text("nonce", nonce)
@@ -2108,6 +2128,24 @@ class Store:
         receipt_json = _require_text("receipt_json", receipt_json)
         if len(receipt_json.encode("utf-8")) > 64 * 1024:
             raise ValueError("evidence receipt JSON exceeds 65536 bytes")
+        try:
+            parsed = parse_receipt(receipt_json)
+        except EvidenceError as exc:
+            raise ValueError(
+                f"evidence receipt is invalid: {exc.reason_code}") from exc
+        expected_identity = EvidenceIdentity(
+            parsed.repository_id, parsed.worktree_root,
+            parsed.certification_base, parsed.current_head,
+            parsed.diff_hash, parsed.stack_slice_id)
+        if (identity_digest != expected_identity.digest
+                or receipt_digest != parsed.receipt_digest
+                or nonce != parsed.nonce
+                or evidence_kind != parsed.evidence_kind
+                or terminal_state != parsed.terminal_state
+                or receipt_json != parsed.canonical_json):
+            raise ValueError("evidence receipt indexed fields do not match payload")
+        if status == "accepted" and parsed.terminal_state != "passed":
+            raise ValueError("failed evidence cannot be stored as accepted")
         self._c.execute("BEGIN IMMEDIATE")
         try:
             existing = self._c.execute(
@@ -2117,11 +2155,27 @@ class Store:
             if existing is not None:
                 self._c.execute("COMMIT")
                 return {"status": "duplicate", "receipt_digest": receipt_digest}
+            existing_conflict = self._c.execute(
+                """SELECT receipt_digest FROM evidence_receipt_conflicts
+                   WHERE identity_digest=? AND receipt_digest=?""",
+                (identity_digest, receipt_digest)).fetchone()
+            if existing_conflict is not None:
+                self._c.execute("COMMIT")
+                return {"status": "duplicate", "receipt_digest": receipt_digest}
             conflict = self._c.execute(
                 """SELECT receipt_digest FROM evidence_receipts
                    WHERE identity_digest=? AND nonce=? LIMIT 1""",
                 (identity_digest, nonce)).fetchone()
             if conflict is not None:
+                self._c.execute(
+                    """INSERT OR IGNORE INTO evidence_receipt_conflicts
+                       (identity_digest, receipt_digest, nonce,
+                        existing_receipt_digest, reason_code, evidence_kind,
+                        terminal_state, receipt_json, ingested_at)
+                       VALUES (?, ?, ?, ?, 'nonce_conflict', ?, ?, ?, ?)""",
+                    (identity_digest, receipt_digest, nonce,
+                     conflict["receipt_digest"], evidence_kind, terminal_state,
+                     receipt_json, ingested_at))
                 self._c.execute("COMMIT")
                 return {"status": "conflict", "receipt_digest": receipt_digest,
                         "existing_receipt_digest": conflict["receipt_digest"]}
@@ -2152,10 +2206,19 @@ class Store:
         rows = self._c.execute(
             """SELECT receipt_digest, nonce, status, reason_code,
                       evidence_kind, terminal_state, ingested_at
-                 FROM evidence_receipts
-                WHERE identity_digest=?
+                 FROM (
+                   SELECT receipt_digest, nonce, status, reason_code,
+                          evidence_kind, terminal_state, ingested_at
+                     FROM evidence_receipts
+                    WHERE identity_digest=?
+                   UNION ALL
+                   SELECT receipt_digest, nonce, 'conflict', reason_code,
+                          evidence_kind, terminal_state, ingested_at
+                     FROM evidence_receipt_conflicts
+                    WHERE identity_digest=?
+                 )
                 ORDER BY ingested_at DESC, receipt_digest DESC
-                LIMIT ?""", (identity_digest, limit)).fetchall()
+                LIMIT ?""", (identity_digest, identity_digest, limit)).fetchall()
         return [{"receipt_digest": row["receipt_digest"],
                  "nonce": row["nonce"], "status": row["status"],
                  "reason_code": row["reason_code"],

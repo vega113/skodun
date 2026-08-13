@@ -15,6 +15,7 @@ import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping
 
 
@@ -53,7 +54,8 @@ def _text(label: str, value: object, *, optional: bool = False,
     if optional and value is None:
         return None
     if (not isinstance(value, str) or not value or len(value) > maximum
-            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+            or any(ord(char) < 32 or ord(char) == 127
+                   or 0xD800 <= ord(char) <= 0xDFFF for char in value)):
         raise EvidenceError("invalid_field", label)
     return value
 
@@ -248,6 +250,11 @@ class EvidenceReceipt:
     redaction: dict[str, bool]
     receipt_digest: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.redaction, MappingProxyType):
+            object.__setattr__(self, "redaction",
+                               MappingProxyType(dict(self.redaction)))
+
     @property
     def canonical_mapping(self) -> dict[str, object]:
         return {
@@ -397,8 +404,11 @@ def parse_receipt(text: str) -> EvidenceReceipt:
 
 
 def _read_regular_file(path: Path) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not nofollow or not nonblock:
+        raise EvidenceError("unsafe_file", "required safe-open flags unavailable")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
     try:
         fd = os.open(path, flags)
     except OSError as exc:

@@ -18,6 +18,7 @@ from skodun.evidence import (
 )
 from skodun import mcpserver, services
 from skodun.cli import main
+from tests.test_mcptools import _HANDSHAKE, _Recorder, _rpc, _serve
 from skodun.store import Store
 
 
@@ -178,15 +179,18 @@ def test_store_receipt_ingestion_is_idempotent_and_nonce_conflicts(tmp_path):
             parsed.terminal_state)
         assert first["status"] == "accepted"
         assert second["status"] == "duplicate"
+        conflicting = parse_receipt(json.dumps(
+            receipt_mapping(counters={"checks": 4})))
         conflict = store.save_evidence_receipt(
-            identity().digest, "sha256:" + "e" * 64, parsed.nonce,
-            "accepted", "ok", parsed.canonical_json,
+            identity().digest, conflicting.receipt_digest, conflicting.nonce,
+            "accepted", "ok", conflicting.canonical_json,
             "2026-08-13T16:00:05Z", parsed.evidence_kind,
             parsed.terminal_state)
         assert conflict["status"] == "conflict"
         rows = store.list_evidence_receipts(identity().digest, 32)
-        assert len(rows) == 1
-        assert rows[0]["receipt_digest"] == parsed.receipt_digest
+        assert len(rows) == 2
+        assert rows[0]["status"] == "conflict"
+        assert rows[1]["receipt_digest"] == parsed.receipt_digest
 
 
 def test_cli_mcp_and_service_json_projections_are_identical(tmp_path, monkeypatch,
@@ -206,10 +210,14 @@ def test_cli_mcp_and_service_json_projections_are_identical(tmp_path, monkeypatc
     assert code == 0
     assert main(["evidence", identity().digest, "--json"]) == 0
     cli_json = capsys.readouterr().out.strip()
-    call = mcpserver.HandlerCall(
-        params={"identity_digest": identity().digest, "output": "json"},
-        store_factory=lambda: Store.open(tmp_path / "store.db"),
-        cancel=__import__("threading").Event())
-    mcp_result = mcpserver._handle_evidence(call)
-    assert mcp_result.status == 0
-    assert cli_json == service_json == mcp_result.text
+    out = _Recorder()
+    assert _serve(
+        tmp_path / "store.db",
+        _HANDSHAKE + _rpc(
+            "tools/call", 1, name="evidence",
+            arguments={"identity_digest": identity().digest, "output": "json"}),
+        out) == 0
+    mcp_body = json.loads(out.data.decode("utf-8").splitlines()[1])
+    assert mcp_body["result"]["isError"] is False
+    mcp_json = mcp_body["result"]["content"][0]["text"]
+    assert cli_json == service_json == mcp_json
