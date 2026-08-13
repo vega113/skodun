@@ -1632,6 +1632,32 @@ def svc_review_status(store, review_id=None, repo=None, *, output="text") -> tup
     return 0, format_status_line(rec, projection=projection)
 
 
+def svc_evidence_summary(store, identity_digest: str, *, output="text") -> tuple[int, str]:
+    """Return the bounded advisory receipt projection for one review identity."""
+    try:
+        digest = str(identity_digest).strip()
+        if not digest:
+            return 2, "skodun evidence: identity digest is required"
+        rows = store.list_evidence_receipts(digest, 32)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:
+        return 2, f"skodun evidence: could not read the store: {e!r}"
+    payload = {"identity_digest": digest, "receipts": rows,
+               "receipt_count": len(rows)}
+    if output == "json":
+        import json
+        return 0, json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":"))
+    if not rows:
+        return 0, f"skodun evidence: identity={digest} receipts=0"
+    return 0, "\n".join(
+        f"skodun evidence: identity={digest} receipt={row['receipt_digest']} "
+        f"kind={row['evidence_kind']} status={row['status']} "
+        f"reason={row['reason_code']} nonce={row['nonce']}"
+        for row in rows)
+
+
 def svc_review_cancel(store, review_id) -> tuple[int, str]:
     """Request cancellation of one in-flight review. `(0, text)` or `(2, why)`.
 

@@ -207,6 +207,14 @@ def build_parser() -> argparse.ArgumentParser:
     rstatus.add_argument("--json", action="store_true", dest="json_output",
                          help="render coverage and pass state as JSON")
 
+    evidence = sub.add_parser(
+        "evidence", help="show bounded advisory evidence receipts")
+    evidence.add_argument(
+        "identity_digest", metavar="IDENTITY-DIGEST",
+        help="canonical review identity digest to inspect")
+    evidence.add_argument("--json", action="store_true", dest="json_output",
+                          help="render the same projection as machine-readable JSON")
+
     rcancel = sub.add_parser(
         "review-cancel",
         help="cancel an in-flight review by id (token, signal, durable terminal)")
@@ -1914,6 +1922,21 @@ def _cmd_review_status(args) -> int:
     return _emit(text, code)
 
 
+def _cmd_evidence(args) -> int:
+    """Print the bounded advisory receipt projection."""
+    from .services import svc_evidence_summary
+    try:
+        from .store import Store
+        store = Store.open(_store_path())
+    except BaseException as e:
+        return _emit(f"skodun evidence: could not read the store: {e!r}", 2)
+    with store:
+        code, text = svc_evidence_summary(
+            store, args.identity_digest,
+            output="json" if getattr(args, "json_output", False) else "text")
+    return _emit(text, code)
+
+
 def _cmd_review_cancel(args) -> int:
     """Request cancel for one review id. Service owns refusals; we own Store."""
     from .services import svc_review_cancel
@@ -2195,6 +2218,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_log(args)
         if args.command == "review-status":
             return _cmd_review_status(args)
+        if args.command == "evidence":
+            return _cmd_evidence(args)
         if args.command == "review-cancel":
             return _cmd_review_cancel(args)
         if args.command == "triage":

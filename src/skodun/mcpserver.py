@@ -957,6 +957,20 @@ def _handle_review_status(call: "HandlerCall") -> "HandlerResult":
     return HandlerResult(status=status, text=text)
 
 
+def _handle_evidence(call: "HandlerCall") -> "HandlerResult":
+    """Read the bounded advisory receipt projection through services.py."""
+    from . import services
+    identity_digest, refusal = _string_arg(
+        call.params, "identity_digest", "evidence")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    with call.store_factory() as store:
+        status, text = services.svc_evidence_summary(
+            store, identity_digest,
+            output="json" if call.params.get("output") == "json" else "text")
+    return HandlerResult(status=status, text=text)
+
+
 def _handle_review_cancel(call: "HandlerCall") -> "HandlerResult":
     """Cancel-by-id. Same service the CLI calls."""
     from . import services
@@ -1225,6 +1239,19 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                         "terminal when the holder is gone. Same words as "
                         "`skodun review-cancel`. Refuses missing ids and "
                         "already-terminal rows."),
+        HandlerSpec(
+            name="evidence", long_running=False,
+            input_schema=_schema({
+                "identity_digest": {
+                    "type": "string",
+                    "description": "canonical review identity digest to inspect"},
+                "output": {"type": "string", "enum": ["text", "json"],
+                           "description": "summary representation (default text)"},
+            }, ("identity_digest",)),
+            handler=_handle_evidence,
+            description="Read bounded advisory repository-evidence receipts. "
+                        "Receipts never alter gate or trust; JSON matches the "
+                        "CLI `skodun evidence --json` projection."),
         # Non-gate feedback: agent/human judgment + product bugs. Appended
         # (not reordered) so the tool-list snapshot only grows at the end.
         HandlerSpec(
