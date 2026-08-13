@@ -2158,6 +2158,19 @@ class Store:
         terminal_state = parsed.terminal_state
         self._c.execute("BEGIN IMMEDIATE")
         try:
+            def trim_receipts(table: str) -> None:
+                self._c.execute(
+                    f"""DELETE FROM {table} WHERE rowid IN (
+                           SELECT rowid FROM {table}
+                           WHERE identity_digest=?
+                           ORDER BY ingested_at ASC, rowid ASC
+                           LIMIT CASE WHEN (SELECT COUNT(*) FROM {table}
+                                            WHERE identity_digest=?) > 31
+                                      THEN (SELECT COUNT(*) FROM {table}
+                                            WHERE identity_digest=?) - 31
+                                      ELSE 0 END)""",
+                    (identity_digest, identity_digest, identity_digest))
+
             existing = self._c.execute(
                 """SELECT receipt_digest FROM evidence_receipts
                    WHERE identity_digest=? AND receipt_digest=?""",
@@ -2177,17 +2190,7 @@ class Store:
                    WHERE identity_digest=? AND nonce=? LIMIT 1""",
                 (identity_digest, nonce)).fetchone()
             if conflict is not None:
-                self._c.execute(
-                    """DELETE FROM evidence_receipt_conflicts
-                       WHERE identity_digest=? AND rowid IN (
-                         SELECT rowid FROM evidence_receipt_conflicts
-                         WHERE identity_digest=?
-                         ORDER BY ingested_at ASC, rowid ASC
-                         LIMIT MAX(0, (SELECT COUNT(*)
-                                      FROM evidence_receipt_conflicts
-                                      WHERE identity_digest=?) - 31)
-                       )""",
-                    (identity_digest, identity_digest, identity_digest))
+                trim_receipts("evidence_receipt_conflicts")
                 self._c.execute(
                     """INSERT OR IGNORE INTO evidence_receipt_conflicts
                        (identity_digest, receipt_digest, nonce,
@@ -2200,6 +2203,7 @@ class Store:
                 self._c.execute("COMMIT")
                 return {"status": "conflict", "receipt_digest": receipt_digest,
                         "existing_receipt_digest": conflict["receipt_digest"]}
+            trim_receipts("evidence_receipts")
             self._c.execute(
                 """INSERT INTO evidence_receipts
                    (identity_digest, receipt_digest, nonce, status, reason_code,

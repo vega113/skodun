@@ -136,6 +136,9 @@ class EvidenceIdentity:
         if not isinstance(self.diff_hash, str) or _DIFF.fullmatch(self.diff_hash) is None:
             raise EvidenceError("invalid_field", "diff_hash")
         _text("stack_slice_id", self.stack_slice_id, optional=True)
+        if (self.stack_slice_id is not None
+                and _IDENTIFIER.fullmatch(self.stack_slice_id) is None):
+            raise EvidenceError("invalid_field", "stack_slice_id")
 
     def to_mapping(self) -> dict[str, object]:
         return {

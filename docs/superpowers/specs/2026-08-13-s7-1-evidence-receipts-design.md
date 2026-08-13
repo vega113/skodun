@@ -35,6 +35,7 @@ receipt cannot substitute a merely equivalent-looking command.
 schema_version, evidence_kind, repository_id, worktree_root,
 certification_base, current_head, diff_hash, stack_slice_id,
 producer_policy_id, producer_policy_digest, command_id, command_digest,
+producer_proof,
 started_at, completed_at, exit_code, terminal_state, duration_ms,
 counters, artifact_digests, tool, runtime, diagnostic_category,
 nonce, redaction, receipt_digest
@@ -48,6 +49,13 @@ match the non-negative second difference. Counters and artifact digests are
 bounded maps/lists; diagnostics are one sanitized category, not free-form
 output. `redaction` is exactly `{applied, secrets_removed, logs_included}` and
 must be `true,true,false`.
+
+`producer_proof` is `sha256:<64 lowercase hex>` over the canonical envelope
+with both `producer_proof` and `receipt_digest` omitted, authenticated with the
+HMAC-SHA256 key held by the protected producer policy. The key is injected only
+through the runner-owned producer channel and is never serialized in the
+receipt. Verification rejects a receipt whose proof does not match before it
+can be reported as accepted.
 
 Identity binding is the canonical digest of repository id, worktree root,
 base, head, diff hash, and optional stack slice. Ingestion receives the

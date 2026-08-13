@@ -275,6 +275,11 @@ def test_receipt_metadata_is_bounded_to_identifiers():
         parse_receipt(json.dumps(raw))
     assert exc.value.reason_code == "invalid_field"
 
+    raw = receipt_mapping(stack_slice_id="API_TOKEN=secret")
+    with pytest.raises(EvidenceError) as exc:
+        parse_receipt(json.dumps(raw))
+    assert exc.value.reason_code == "invalid_field"
+
 
 @pytest.mark.parametrize("cwd", ["..\\outside", "C:\\Windows", "\\\\server\\share"])
 def test_windows_policy_working_directories_are_rejected(cwd):
@@ -381,6 +386,17 @@ def test_store_receipt_ingestion_is_idempotent_and_nonce_conflicts(tmp_path):
         assert len(rows) == 2
         assert rows[0]["status"] == "conflict"
         assert rows[1]["receipt_digest"] == parsed.receipt_digest
+
+
+def test_store_receipt_rows_are_bounded_per_identity(tmp_path):
+    with Store.open(tmp_path / "store.db") as store:
+        for index in range(40):
+            parsed = parse_receipt(json.dumps(receipt_mapping(
+                nonce=f"run-{index}")))
+            store.save_evidence_receipt(
+                identity(), policy(), parsed.canonical_json,
+                "2026-08-13T16:00:03Z")
+        assert len(store.list_evidence_receipts(identity().digest, 32)) == 32
 
 
 def test_store_derives_rejection_and_keeps_identity_mismatches_queryable(tmp_path):
