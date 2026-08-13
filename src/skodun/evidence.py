@@ -157,9 +157,7 @@ _COMMAND_STRING_EXECUTABLES = frozenset({
 
 def _is_shell_command_flag(executable: str, arg: str) -> bool:
     """Reject shell command-string flags, including combined spellings."""
-    name = os.path.basename(executable).lower()
-    name = name.removesuffix(".exe")
-    name = re.sub(r"(python|perl|ruby|node)\d+(?:\.\d+)*$", r"\1", name)
+    name = _normalized_executable(executable)
     if name not in _COMMAND_STRING_EXECUTABLES:
         return False
     lowered = arg.lower()
@@ -168,7 +166,8 @@ def _is_shell_command_flag(executable: str, arg: str) -> bool:
     if name in {"perl", "ruby", "node"}:
         return (lowered == "-e" or lowered.startswith("-e")
                 or lowered.startswith("--eval")
-                or lowered.startswith("--execute"))
+                or lowered.startswith("--execute")
+                or (name == "node" and lowered.startswith(("-p", "--print"))))
     if name in {"powershell", "pwsh"}:
         return (lowered in {"-c", "-command", "-ec", "-encodedcommand"}
                 or lowered.startswith(("-c", "-command", "-ec",
@@ -184,7 +183,7 @@ def _is_shell_command_flag(executable: str, arg: str) -> bool:
 def _contains_shell_command(argv: tuple[str, ...]) -> bool:
     """Reject recognized interpreters and explicitly supported wrappers."""
     executable_positions = [0]
-    wrapper = os.path.basename(argv[0]).lower().removesuffix(".exe")
+    wrapper = _normalized_executable(argv[0])
     if wrapper == "busybox" and len(argv) > 1:
         executable_positions.append(1)
     elif wrapper == "env":
@@ -194,6 +193,9 @@ def _contains_shell_command(argv: tuple[str, ...]) -> bool:
             if (option in {"-S", "--split-string"}
                     or option.startswith(("-S", "--split-string="))):
                 return True
+            if option in {"-", "--"}:
+                index += 1
+                continue
             if "=" in option and not option.startswith("-"):
                 index += 1
                 continue
@@ -212,12 +214,16 @@ def _contains_shell_command(argv: tuple[str, ...]) -> bool:
     for index in executable_positions:
         executable = argv[index]
         flags = argv[index + 1:]
-        if (os.path.basename(executable).lower().removesuffix(".exe")
-                in {"python", "python3", "perl", "ruby", "node"}):
+        if _normalized_executable(executable) != "cmd":
             flags = tuple(_interpreter_option_segment(flags))
         if any(_is_shell_command_flag(executable, flag) for flag in flags):
             return True
     return False
+
+
+def _normalized_executable(executable: str) -> str:
+    name = os.path.basename(executable).lower().removesuffix(".exe")
+    return re.sub(r"(python|perl|ruby|node)\d+(?:\.\d+)*$", r"\1", name)
 
 
 def _interpreter_option_segment(args: tuple[str, ...]):
@@ -231,7 +237,12 @@ def _interpreter_option_segment(args: tuple[str, ...]):
         if not arg.startswith("-") or arg == "-":
             break
         result.append(arg)
-        if arg in {"-m", "--module", "-W", "--warn", "-X", "--execute"}:
+        if arg in {"-m", "--module"}:
+            index += 1
+            if index < len(args):
+                result.append(args[index])
+            break
+        if arg in {"-W", "--warn", "-X"}:
             index += 1
             if index < len(args):
                 result.append(args[index])
