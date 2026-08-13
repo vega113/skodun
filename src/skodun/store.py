@@ -1507,6 +1507,13 @@ class Store:
                 continue
             existed = path.exists()
             if existed:
+                # The lock check and the path existence check are separate
+                # filesystem observations.  A peer may create the database
+                # and its init lock between them; do not inspect that
+                # transient v0 file as an historical store.
+                if init_lock.exists():
+                    _wait_for_init_lock(init_lock, path)
+                    continue
                 break
             path.parent.mkdir(parents=True, exist_ok=True)
             try:
