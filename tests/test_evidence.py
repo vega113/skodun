@@ -121,7 +121,8 @@ def test_duplicate_json_keys_and_nonfinite_numbers_fail_closed():
     assert nonfinite.value.reason_code == "malformed_json"
 
 
-def test_schema_version_bool_and_oversized_integer_fail_as_malformed_input():
+def test_schema_version_bool_and_oversized_integer_fail_as_malformed_input(
+        monkeypatch):
     raw = receipt_mapping(schema_version=True)
     raw["receipt_digest"] = receipt_digest(raw)
     with pytest.raises(EvidenceError) as boolean_version:
@@ -131,6 +132,14 @@ def test_schema_version_bool_and_oversized_integer_fail_as_malformed_input():
     with pytest.raises(EvidenceError) as oversized:
         parse_receipt('{"schema_version":' + "9" * 5000 + "}")
     assert oversized.value.reason_code == "malformed_json"
+
+    def raise_recursion(*_args, **_kwargs):
+        raise RecursionError("too deeply nested")
+
+    monkeypatch.setattr(json, "loads", raise_recursion)
+    with pytest.raises(EvidenceError) as recursive:
+        parse_receipt("{}")
+    assert recursive.value.reason_code == "malformed_json"
 
 
 def test_identity_and_protected_policy_mismatches_never_verify():

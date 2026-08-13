@@ -411,7 +411,7 @@ def parse_receipt(text: str) -> EvidenceReceipt:
                          parse_constant=_no_constant)
     except EvidenceError:
         raise
-    except (TypeError, UnicodeError, ValueError) as exc:
+    except (TypeError, UnicodeError, ValueError, RecursionError) as exc:
         raise EvidenceError("malformed_json", str(exc)) from exc
     if not isinstance(raw, dict):
         raise EvidenceError("invalid_field", "receipt object")
