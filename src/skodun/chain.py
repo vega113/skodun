@@ -109,7 +109,8 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
              first_output_sec: float | None = None,
              classification: dict | None = None,
              skipped: str | None = None,
-             usage: dict | None = None) -> dict:
+             usage: dict | None = None,
+             capacity_timing: dict | None = None) -> dict:
     """One `attempts[]` row, in the ONE shape the artifact schema defines.
 
     Every row carries the identity of the entry it belongs to (`provider`,
@@ -144,6 +145,8 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
         row["skipped"] = skipped
     if usage is not None:
         row["usage"] = usage
+    if capacity_timing is not None:
+        row["capacity_timing"] = capacity_timing
     execution = _CURRENT_EXECUTION.get()
     # A skipped row means no process was started, so executable identity would
     # be misleading even if the adapter was resolved before the skip.
@@ -561,6 +564,7 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
         # Remaining shared admit+bind budget — not a fresh full wait per hop.
         wait_sec = _remaining_admission_sec(admission_deadline)
         provider_ticket: capacity.Ticket | None = None
+        capacity_timing: dict | None = None
         try:
             try:
                 provider_ticket = _acquire_provider_slot(
@@ -572,14 +576,31 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
             except capacity.AdmissionTimeout as e:
                 # Slot contention or effective capacity 0 (quota pressure):
                 # hop to the next chain entry rather than spinning forever.
+                provider_ticket = getattr(e, "ticket", None)
+                if isinstance(provider_ticket, capacity.Ticket):
+                    capacity_timing = {
+                        "queued_at": provider_ticket.queued_at,
+                        "admitted_at": provider_ticket.admitted_at,
+                        "started_at": provider_ticket.started_at,
+                        "ended_at": provider_ticket.ended_at,
+                        "wait_ms": provider_ticket.wait_ms,
+                        "queue_wait_ms": provider_ticket.queue_wait_ms,
+                    }
                 n += 1
                 detail = str(e)
                 _note(f"{entry.name} ({entry.provider}): {detail}")
                 attempts.append(_attempt(
-                    n, entry, skipped=f"provider capacity: {detail}"))
+                    n, entry, skipped=f"provider capacity: {detail}",
+                    capacity_timing=capacity_timing))
                 exhausted.append(
                     f"{entry.name}/{entry.provider}: provider capacity wait")
                 continue
+
+            capacity_timing = {
+                "queued_at": provider_ticket.queued_at,
+                "admitted_at": provider_ticket.admitted_at,
+                "started_at": provider_ticket.started_at,
+            }
 
             timeouts_used = 0
             degraded_used = 0
@@ -621,7 +642,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                     attempts.append(_attempt(
                         n, entry,
                         skipped=f"prompt too large for this provider: {e}",
-                        classification=_classification(verdict)))
+                        classification=_classification(verdict),
+                        capacity_timing=capacity_timing))
                     exhausted.append(f"{entry.name}/{entry.provider}: {e}")
                     break
                 except Exception as e:
@@ -634,7 +656,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                     # same bytes would fail the same way at every other entry.
                     attempts.append(_attempt(
                         n, entry,
-                        skipped=f"could not build the invocation: {e!r}"))
+                        skipped=f"could not build the invocation: {e!r}",
+                        capacity_timing=capacity_timing))
                     return _Outcome(None, attempts,
                                     f"reviewer {entry.name!r} could not be "
                                     f"invoked: {e!r}")
@@ -672,7 +695,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                         raise
                     attempts.append(_attempt(
                         n, entry, skipped=skipped,
-                        classification=_classification(verdict)))
+                        classification=_classification(verdict),
+                        capacity_timing=capacity_timing))
                     exhausted.append(
                         f"{entry.name}/{entry.provider}: {verdict.detail}")
                     break
@@ -683,7 +707,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                         UNAVAILABLE_RC, b"", b"", contract)
                     attempts.append(_attempt(
                         n, entry, skipped=f"binary not found: {cmd[0]}",
-                        classification=_classification(verdict)))
+                        classification=_classification(verdict),
+                        capacity_timing=capacity_timing))
                     exhausted.append(
                         f"{entry.name}/{entry.provider}: {verdict.detail}")
                     break
@@ -696,7 +721,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                         duration_sec=round(result.duration_sec, 3),
                         first_output_sec=_round(result.first_output_sec),
                         classification=_classification(
-                            ClassifyResult("degraded", "", detail))))
+                            ClassifyResult("degraded", "", detail)),
+                        capacity_timing=capacity_timing))
                     return _Outcome(
                         None, attempts,
                         f"reviewer {entry.name!r} left descendant state "
@@ -707,7 +733,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                         n, entry, rc=result.rc, timed_out=True,
                         duration_sec=round(result.duration_sec, 3),
                         first_output_sec=_round(result.first_output_sec),
-                        classification=None))
+                        classification=None,
+                        capacity_timing=capacity_timing))
                     if timeouts_used < d.timeout_retries:
                         timeouts_used += 1
                         _note(f"attempt {entry_n} timed out after "
@@ -736,7 +763,7 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                     duration_sec=round(result.duration_sec, 3),
                     first_output_sec=_round(result.first_output_sec),
                     classification=_classification(verdict),
-                    usage=usage))
+                    usage=usage, capacity_timing=capacity_timing))
 
                 if verdict.kind == "unavailable":
                     # Quota shrinks effective max_in_flight to 0 via
@@ -770,9 +797,20 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                                 "provider": entry.provider,
                                 "model": entry.model,
                                 "effort": entry.effort}
+                    if capacity_timing is not None:
+                        accepted["capacity_timing"] = dict(capacity_timing)
                 return _Outcome(parsed, attempts, "", accepted)
         finally:
             _release_provider_slot(store, provider_ticket)
+            if provider_ticket is not None and capacity_timing is not None:
+                capacity_timing.update({
+                    "queued_at": provider_ticket.queued_at,
+                    "admitted_at": provider_ticket.admitted_at,
+                    "started_at": provider_ticket.started_at,
+                    "ended_at": provider_ticket.ended_at,
+                    "wait_ms": provider_ticket.wait_ms,
+                    "queue_wait_ms": provider_ticket.queue_wait_ms,
+                })
 
     summary = "; ".join(exhausted) or "no chain entry could be attempted"
     return _Outcome(None, attempts, f"all providers unavailable: {summary}")

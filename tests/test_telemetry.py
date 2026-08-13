@@ -72,6 +72,44 @@ def test_telemetry_keeps_missing_usage_unknown_and_excludes_sensitive_fields():
     assert "nested" not in row["execution_provenance"]
 
 
+def test_attempt_telemetry_preserves_bounded_admission_timing():
+    row = attempt_telemetry({
+        "n": 1,
+        "provider": "grok",
+        "model": "mini",
+        "effort": "medium",
+        "classification": {"kind": "ok"},
+        "capacity_timing": {
+            "queued_at": "2026-08-13T10:00:00Z",
+            "admitted_at": "2026-08-13T10:00:02Z",
+            "started_at": "2026-08-13T10:00:03Z",
+            "ended_at": "2026-08-13T10:00:04Z",
+            "wait_ms": 4000,
+            "queue_wait_ms": 2000,
+            "secret": "do not persist",
+        },
+    }, timeout_sec=30)
+
+    assert row["capacity_timing"] == {
+        "queued_at": "2026-08-13T10:00:00Z",
+        "admitted_at": "2026-08-13T10:00:02Z",
+        "started_at": "2026-08-13T10:00:03Z",
+        "ended_at": "2026-08-13T10:00:04Z",
+        "wait_ms": 4000,
+        "queue_wait_ms": 2000,
+    }
+
+
+def test_attempt_telemetry_drops_invalid_admission_timing():
+    base = {"n": 1, "provider": "grok", "model": "mini",
+            "capacity_timing": {"queued_at": "not canonical",
+                                 "wait_ms": 1}}
+    assert "capacity_timing" not in attempt_telemetry(base, timeout_sec=30)
+    base["capacity_timing"] = {
+        "queued_at": "2026-08-13T10:00:00Z", "wait_ms": True}
+    assert "capacity_timing" not in attempt_telemetry(base, timeout_sec=30)
+
+
 def test_batch_telemetry_has_identity_and_byte_dimensions():
     result = batch_telemetry(
         planner_version="skodun-batch-v1",

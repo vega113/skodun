@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import time
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -74,6 +75,7 @@ REASON_STALE_AGE = "stale_age"
 #: pass the lock stale ceiling. Large enough that short unit waits are not
 #: age-reclaimed; dead-pid reclaim does not use this.
 DEFAULT_STALE_SEC = 24 * 3600.0
+MAX_ADMISSION_WAIT_SEC = 24 * 3600.0
 
 
 class AdmissionError(RuntimeError):
@@ -82,6 +84,10 @@ class AdmissionError(RuntimeError):
 
 class AdmissionTimeout(AdmissionError):
     """The waiter exhausted its bounded admission budget."""
+
+    def __init__(self, message: str, *, ticket: object | None = None) -> None:
+        super().__init__(message)
+        self.ticket = ticket
 
 
 class AdmissionCancelled(AdmissionError):
@@ -110,6 +116,7 @@ class Ticket:
     started_at: str | None = None
     ended_at: str | None = None
     wait_ms: int | None = None
+    queue_wait_ms: int | None = None
     expire_reason: str | None = None
     position: int | None = None
     review_id: str | None = None
@@ -211,7 +218,8 @@ def admission_wait_from_env(default: float,
         value = float(str(raw).strip())
     except ValueError:
         return float(default)
-    if value < 0:
+    if (value < 0 or value > MAX_ADMISSION_WAIT_SEC
+            or not math.isfinite(value)):
         return float(default)
     return value
 
@@ -333,6 +341,7 @@ def _ticket_from_row(row: Mapping) -> Ticket:
         started_at=row.get("started_at"),
         ended_at=row.get("ended_at"),
         wait_ms=row.get("wait_ms"),
+        queue_wait_ms=row.get("queue_wait_ms"),
         expire_reason=row.get("expire_reason"),
         review_id=row.get("review_id"),
     )
@@ -345,6 +354,7 @@ def _apply_row(ticket: Ticket, row: Mapping) -> Ticket:
     ticket.started_at = updated.started_at
     ticket.ended_at = updated.ended_at
     ticket.wait_ms = updated.wait_ms
+    ticket.queue_wait_ms = updated.queue_wait_ms
     ticket.expire_reason = updated.expire_reason
     ticket.review_id = updated.review_id
     return ticket
@@ -466,7 +476,7 @@ def acquire(store: "Store", *, scope: str,
                        expire_reason=REASON_ADMISSION_TIMEOUT)
                 raise AdmissionTimeout(
                     f"gave up after {budget:g}s waiting for {resource_class} "
-                    f"capacity (scope={scope})")
+                    f"capacity (scope={scope})", ticket=ticket)
 
             # Drop dead/stale peers before position/admit so FIFO is honest.
             reclaim_stale(
@@ -494,7 +504,7 @@ def acquire(store: "Store", *, scope: str,
                        expire_reason=REASON_ADMISSION_TIMEOUT)
                 raise AdmissionTimeout(
                     f"gave up after {budget:g}s waiting for {resource_class} "
-                    f"capacity (scope={scope})")
+                    f"capacity (scope={scope})", ticket=ticket)
             slice_sleep = min(float(poll_sec), remaining)
             if slice_sleep > 0:
                 pause(slice_sleep)

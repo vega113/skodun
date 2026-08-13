@@ -60,6 +60,8 @@ class CoverageProjection:
 
 def _pass_state(value: object, default: str = "not_planned") -> str:
     state = value if isinstance(value, str) else default
+    if state == "pending":
+        return "queued"
     return state if state in PASS_STATES else "failed"
 
 
@@ -70,63 +72,199 @@ def _nonnegative_int(value: object) -> int | None:
     return value
 
 
+def _checkpoint_payload(row: Mapping) -> Mapping | None:
+    """Decode one bounded completed payload for read-only partial evidence."""
+    if row.get("state") != "complete":
+        return None
+    raw = row.get("payload_json")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, Mapping) else None
+
+
+def _extra_pass_state(value: object, *, refuter: bool = False) -> str:
+    """Normalize legacy optional-pass metadata without treating missing fields as success."""
+    if not isinstance(value, Mapping):
+        return "not_planned"
+    status = value.get("status")
+    if value.get("failed") is True:
+        return "failed"
+    if "parse_ok" in value and value.get("parse_ok") is not True:
+        return "failed"
+    if status == "pending":
+        return "queued"
+    if status in {"failed", "unavailable"}:
+        return status
+    if status == "degraded" or value.get("degraded") is True:
+        return "degraded"
+    if status in {"ran", "complete"}:
+        if refuter and value.get("ran") is True and "parse_ok" not in value:
+            return "complete"
+        return "complete" if value.get("parse_ok") is True else "failed"
+    if value.get("ran") is True:
+        return "complete" if value.get("parse_ok") is True else "failed"
+    return _pass_state(status)
+
+
+def _checkpoint_state(row: Mapping, rec: Mapping) -> str:
+    """Project a terminal checkpoint from its payload when one is present."""
+    state = row.get("state")
+    if state != "complete":
+        return _pass_state(state)
+    payload = _checkpoint_payload(row)
+    if payload is not None:
+        if payload.get("parse_ok") is not True:
+            return "failed"
+        return "degraded" if payload.get("degraded") is True else "complete"
+    if row.get("pass_kind") == "integration":
+        integration = rec.get("integration")
+        if (isinstance(integration, Mapping)
+                and "parse_ok" in integration):
+            if integration.get("parse_ok") is not True:
+                return "failed"
+            return ("degraded" if integration.get("degraded") is True
+                    else "complete")
+    return "failed"
+
+
 def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
                    checkpoints: Sequence[Mapping] = ()) -> CoverageProjection:
     """Derive bounded coverage/pass/gate fields without changing trust."""
     batches = rec.get("batches")
+    batches = batches if isinstance(batches, list) else []
     batch_count = int((orchestration or {}).get("batch_count") or
-                      (len(batches) if isinstance(batches, list) else 0))
+                      len(batches))
     checkpoint_rows = list(checkpoints)
+    integration_record = rec.get("integration")
+    has_checkpoint_integration = any(
+        row.get("pass_kind") == "integration" for row in checkpoint_rows)
     planned = batch_count + (1 if any(
-        row.get("pass_kind") == "integration" for row in checkpoint_rows) else 0)
+        row.get("pass_kind") == "integration" for row in checkpoint_rows) else
+        (1 if isinstance(integration_record, Mapping) else 0))
     if planned == 0:
         planned = 1
-    complete_rows = [r for r in checkpoint_rows if r.get("state") == "complete"]
-    failed_rows = [r for r in checkpoint_rows if r.get("state") == "failed"]
+    checkpoint_states = [_checkpoint_state(row, rec) for row in checkpoint_rows]
+    complete_rows = [state for state in checkpoint_states
+                     if state in {"complete", "degraded"}]
+    failed_rows = [state for state in checkpoint_states if state == "failed"]
     completed = len(complete_rows)
     failed = len(failed_rows)
-    parseable = bool(rec.get("usable_output")) or any(
+    checkpoint_payloads = [(row.get("pass_kind"), payload)
+                           for row in checkpoint_rows
+                           for payload in [_checkpoint_payload(row)]
+                           if payload is not None]
+    integration_evidence = ([integration_record]
+                             if isinstance(integration_record, Mapping) else [])
+    evidence_batches = (batches
+                        + [payload for _, payload in checkpoint_payloads]
+                        + integration_evidence)
+    finder_evidence = (batches
+                       + [payload for kind, payload in checkpoint_payloads
+                          if kind == "batch"])
+    parseable = rec.get("usable_output") is True or any(
         isinstance(b, Mapping) and b.get("parse_ok") is True
-        for b in (batches or []) if isinstance(batches, list))
+        for b in evidence_batches)
+    finder_parseable = ((rec.get("usable_output") is True and not batches)
+                        or any(
+        isinstance(b, Mapping) and b.get("parse_ok") is True
+        for b in finder_evidence))
     if not checkpoint_rows and isinstance(batches, list):
         completed = sum(1 for b in batches if isinstance(b, Mapping) and
                         b.get("parse_ok") is True)
         failed = sum(1 for b in batches if isinstance(b, Mapping) and
                      b.get("parse_ok") is False)
+        if isinstance(integration_record, Mapping) and not has_checkpoint_integration:
+            integration_state = _extra_pass_state(integration_record)
+            if integration_state in {"complete", "degraded"}:
+                completed += 1
+            elif integration_state == "failed":
+                failed += 1
+        if not batches and parseable:
+            completed = 1
     orchestration_state = (orchestration or {}).get("state")
-    complete = (orchestration_state == "consumed" or
+    consumed_complete = (orchestration_state == "consumed" and not failed and
+                          (completed == planned or
+                           (not checkpoint_rows and parseable)))
+    complete = (consumed_complete or
                 (not orchestration_state and rec.get("status") in
-                 {"clean", "findings"}) or
+                 {"clean", "findings"} and parseable) or
                 (planned > 0 and completed == planned and not failed))
     coverage_state = "complete" if complete else ("partial" if parseable else "none")
     extras = rec.get("extra_passes")
     extras = extras if isinstance(extras, Mapping) else {}
     passes = {
-        "finder": "complete" if parseable else _pass_state(rec.get("status"), "failed"),
+        "finder": "complete" if finder_parseable else _pass_state(rec.get("status"), "failed"),
         "integration": "not_planned",
-        "security": _pass_state((extras.get("security") or {}).get("status")),
-        "skeptic": _pass_state((extras.get("skeptic") or {}).get("status")),
-        "refuter": _pass_state((extras.get("refuter") or {}).get("status")),
+        "security": _extra_pass_state(extras.get("security")),
+        "skeptic": _extra_pass_state(extras.get("skeptic")),
+        "refuter": _extra_pass_state(extras.get("refuter"), refuter=True),
     }
-    for row in checkpoint_rows:
+    if (isinstance(integration_record, Mapping)
+            and not has_checkpoint_integration):
+        passes["integration"] = _extra_pass_state(integration_record)
+    if not checkpoint_rows and batches:
+        batch_states = [
+            ("failed" if not isinstance(batch, Mapping)
+             or batch.get("parse_ok") is not True
+             else "degraded" if batch.get("degraded") is True
+             else "complete")
+            for batch in batches]
+        if "failed" in batch_states:
+            passes["finder"] = "failed"
+        elif "degraded" in batch_states:
+            passes["finder"] = "degraded"
+        elif batch_states:
+            passes["finder"] = "complete"
+    batch_checkpoint_states = [checkpoint_state for row, checkpoint_state in
+                               zip(checkpoint_rows, checkpoint_states,
+                                   strict=True)
+                               if row.get("pass_kind") == "batch"]
+    if batch_checkpoint_states:
+        if "failed" in batch_checkpoint_states:
+            passes["finder"] = "failed"
+        elif "degraded" in batch_checkpoint_states:
+            passes["finder"] = "degraded"
+        elif "running" in batch_checkpoint_states:
+            passes["finder"] = "running"
+        elif "queued" in batch_checkpoint_states:
+            passes["finder"] = "queued"
+        elif all(state == "complete" for state in batch_checkpoint_states):
+            passes["finder"] = "complete"
+    for row, checkpoint_state in zip(checkpoint_rows, checkpoint_states,
+                                     strict=True):
         key = "finder" if row.get("pass_kind") == "batch" else "integration"
-        if key == "finder" and row.get("state") == "running":
+        if (key == "finder" and row.get("state") == "running"
+                and passes[key] not in {"failed", "degraded"}):
             passes[key] = "running"
         elif key == "integration":
-            passes[key] = _pass_state(row.get("state"))
-    next_pass = next((i + 1 for i, row in enumerate(checkpoint_rows)
-                      if row.get("state") in {"pending", "failed"}), None)
+            passes[key] = checkpoint_state
+    next_pass = None
+    for row in checkpoint_rows:
+        if row.get("state") in {"pending", "failed"}:
+            next_pass = (row.get("pass_index") if row.get("pass_kind") == "batch"
+                         else batch_count + 1)
+            break
     required_fail = any(passes[k] == "failed" for k in ("integration", "security", "skeptic"))
     eligible = coverage_state == "complete" and rec.get("trustworthy") is True and not required_fail
     reason = "eligible" if eligible else (
         "coverage_incomplete" if coverage_state != "complete" else
+        "required_pass_failed" if required_fail else
         "untrustworthy" if rec.get("trustworthy") is not True else "required_pass_failed")
-    finder_only = (orchestration_state is None and passes["integration"] == "not_planned")
+    finder_only = (orchestration_state is None and
+                   passes["integration"] == "not_planned")
     refuter_available = passes["refuter"] in {"complete", "degraded"}
     cross_provider = passes["integration"] == "complete"
     telemetry_rows = [b.get("telemetry") for b in (batches or [])
                       if isinstance(b, Mapping) and
                       isinstance(b.get("telemetry"), Mapping)]
+    integration = rec.get("integration")
+    if (isinstance(integration, Mapping)
+            and isinstance(integration.get("telemetry"), Mapping)):
+        telemetry_rows.append(integration["telemetry"])
     prompt_values = []
     for row in telemetry_rows:
         dimensions = row.get("bytes")

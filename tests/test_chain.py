@@ -490,9 +490,12 @@ def test_s4_quota_releases_slot_and_hops_to_fallback(tmp_path, monkeypatch):
         assert chain._effective_provider_capacity(store, "xai") == 0
         # Shipped path: _acquire_provider_slot must honor effective 0 via
         # capacity_fn — not a hand-built capacity=0 acquire.
-        with pytest.raises(capacity.AdmissionTimeout):
+        with pytest.raises(capacity.AdmissionTimeout) as exc_info:
             chain._acquire_provider_slot(
                 store, "xai", wait_sec=0.05, cancel=None, on_progress=None)
+        assert exc_info.value.ticket is not None
+        assert exc_info.value.ticket.ended_at
+        assert exc_info.value.ticket.wait_ms is not None
         assert store.capacity_holder_count(
             capacity.provider_resource_class("xai"), "xai") == 0
 
