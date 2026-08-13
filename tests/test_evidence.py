@@ -15,6 +15,7 @@ from skodun.evidence import (
     ProducerCommand,
     ProducerPolicy,
     parse_receipt,
+    producer_proof,
     receipt_digest,
     verify_receipt,
 )
@@ -49,6 +50,7 @@ def policy() -> ProducerPolicy:
             cwd=".",
             env_allowlist=("CI",),
         ),),
+        provenance_key=b"test-provenance-key-1234",
     )
 
 
@@ -66,6 +68,7 @@ def receipt_mapping(**overrides):
         "producer_policy_digest": policy().digest,
         "command_id": "preflight",
         "command_digest": policy().commands[0].digest,
+        "producer_proof": "sha256:" + "0" * 64,
         "started_at": "2026-08-13T16:00:00Z",
         "completed_at": "2026-08-13T16:00:02Z",
         "exit_code": 0,
@@ -82,6 +85,7 @@ def receipt_mapping(**overrides):
         },
     }
     value.update(overrides)
+    value["producer_proof"] = producer_proof(value, policy().provenance_key)
     value["receipt_digest"] = receipt_digest(value)
     return value
 
@@ -156,6 +160,7 @@ def test_identity_and_protected_policy_mismatches_never_verify():
     candidate = ProducerPolicy(
         policy_id="candidate-policy",
         commands=(ProducerCommand("preflight", ("python3", "-m", "candidate"), ".", ()),),
+        provenance_key=b"candidate-provenance-key",
     )
     forged = parse_receipt(json.dumps(receipt_mapping(
         producer_policy_id=candidate.policy_id,
@@ -171,6 +176,15 @@ def test_identity_and_protected_policy_mismatches_never_verify():
     result = verify_receipt(forged_kind, identity(), policy())
     assert result.accepted is False
     assert result.reason_code == "evidence_kind_mismatch"
+
+    forged_proof = parse_receipt(json.dumps(receipt_mapping(
+        counters={"checks": 4})))
+    result = verify_receipt(forged_proof, identity(),
+                            ProducerPolicy(policy().policy_id,
+                                           policy().commands,
+                                           b"different-provenance-key"))
+    assert result.accepted is False
+    assert result.reason_code == "policy_mismatch"
 
 
 @pytest.mark.parametrize("argv", [
@@ -194,6 +208,7 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
     ("ruby", "-eputs(1)"),
     ("node", "-p", "1+1"),
     ("node", "--conditions", "development", "-e", "1+1"),
+    ("node", "--import", "data:text/javascript,console.log(1)", "script.js"),
     ("bash", "-O", "extglob", "-c", "echo unsafe"),
     ("bash", "-o", "pipefail", "-c", "echo unsafe"),
     ("sh", "-o", "errexit", "-c", "echo unsafe"),
@@ -373,6 +388,7 @@ def test_store_derives_rejection_and_keeps_identity_mismatches_queryable(tmp_pat
     candidate = ProducerPolicy(
         policy_id="candidate-policy",
         commands=(ProducerCommand("preflight", ("python3", "-m", "candidate"), ".", ()),),
+        provenance_key=b"candidate-provenance-key",
     )
     forged = parse_receipt(json.dumps(receipt_mapping(
         producer_policy_id=candidate.policy_id,

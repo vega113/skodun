@@ -8,6 +8,7 @@ commands and never contributes to Skodun's trust axes.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -31,6 +32,7 @@ MAX_DIAGNOSTIC_CHARS = 64
 _OID = re.compile(r"[0-9a-f]{40}")
 _DIFF = re.compile(r"[0-9a-f]{40,64}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_PROOF = _DIGEST
 _ENV = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 _TS = "%Y-%m-%dT%H:%M:%SZ"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+:-]{0,127}")
@@ -288,7 +290,12 @@ def _interpreter_option_segment(args: tuple[str, ...], name: str):
         if arg in value_options or arg in {"-W", "--warn", "-X"}:
             index += 1
             if index < len(args):
-                result.append(args[index])
+                value = args[index]
+                if (name == "node" and arg in {"--import", "--loader"}
+                        and value.startswith("data:")):
+                    result.append("-e")
+                else:
+                    result.append(value)
         index += 1
     return result
 
@@ -340,6 +347,7 @@ class ProducerCommand:
 class ProducerPolicy:
     policy_id: str
     commands: tuple[ProducerCommand, ...]
+    provenance_key: bytes = b""
 
     def __post_init__(self) -> None:
         _text("policy_id", self.policy_id)
@@ -350,12 +358,18 @@ class ProducerPolicy:
             raise EvidenceError("invalid_policy", "commands")
         if len({command.command_id for command in self.commands}) != len(self.commands):
             raise EvidenceError("invalid_policy", "duplicate command id")
+        if (not isinstance(self.provenance_key, bytes)
+                or len(self.provenance_key) < 16
+                or len(self.provenance_key) > 64):
+            raise EvidenceError("invalid_policy", "provenance key")
 
     @property
     def digest(self) -> str:
         return _sha256({"policy_id": self.policy_id,
                         "commands": [command.to_mapping()
-                                     for command in self.commands]})
+                                     for command in self.commands],
+                        "provenance_key_digest": hashlib.sha256(
+                            self.provenance_key).hexdigest()})
 
     def command(self, command_id: str) -> ProducerCommand | None:
         return next((command for command in self.commands
@@ -366,7 +380,7 @@ _RECEIPT_FIELDS = frozenset({
     "schema_version", "evidence_kind", "repository_id", "worktree_root",
     "certification_base", "current_head", "diff_hash", "stack_slice_id",
     "producer_policy_id", "producer_policy_digest", "command_id",
-    "command_digest", "started_at", "completed_at", "exit_code",
+    "command_digest", "producer_proof", "started_at", "completed_at", "exit_code",
     "terminal_state", "duration_ms", "counters", "artifact_digests",
     "tool", "runtime", "diagnostic_category", "nonce", "redaction",
     "receipt_digest",
@@ -387,6 +401,7 @@ class EvidenceReceipt:
     producer_policy_digest: str
     command_id: str
     command_digest: str
+    producer_proof: str
     started_at: str
     completed_at: str
     exit_code: int | None
@@ -425,6 +440,7 @@ class EvidenceReceipt:
             "producer_policy_digest": self.producer_policy_digest,
             "command_id": self.command_id,
             "command_digest": self.command_digest,
+            "producer_proof": self.producer_proof,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "exit_code": self.exit_code,
@@ -451,6 +467,15 @@ def receipt_digest(value: Mapping[str, object]) -> str:
     return _sha256(body)
 
 
+def producer_proof(value: Mapping[str, object], key: bytes) -> str:
+    """Return the runner-issued HMAC over the receipt body without claims."""
+    body = dict(value)
+    body.pop("receipt_digest", None)
+    body.pop("producer_proof", None)
+    return "sha256:" + hmac.new(key, _canonical(body).encode("utf-8"),
+                                hashlib.sha256).hexdigest()
+
+
 def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
     unknown = sorted(set(raw) - _RECEIPT_FIELDS)
     missing = sorted(_RECEIPT_FIELDS - set(raw))
@@ -473,6 +498,7 @@ def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
                              "producer_policy_digest")
     command_id = _text("command_id", raw["command_id"])
     command_digest = _digest(raw["command_digest"], "command_digest")
+    producer_claim = _digest(raw["producer_proof"], "producer_proof")
     started = _parse_ts(raw["started_at"], "started_at")
     completed = _parse_ts(raw["completed_at"], "completed_at")
     if completed < started:
@@ -539,6 +565,7 @@ def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
         stack_slice_id=identity.stack_slice_id,
         producer_policy_id=policy_id, producer_policy_digest=policy_digest,
         command_id=command_id, command_digest=command_digest,
+        producer_proof=producer_claim,
         started_at=raw["started_at"], completed_at=raw["completed_at"],
         exit_code=exit_code, terminal_state=terminal, duration_ms=duration,
         counters=normalized_counters, artifact_digests=tuple(artifacts),
@@ -643,6 +670,11 @@ def verify_receipt(receipt: EvidenceReceipt, expected: EvidenceIdentity,
         return EvidenceVerification(False, "command_mismatch")
     if receipt.evidence_kind != command.evidence_kind:
         return EvidenceVerification(False, "evidence_kind_mismatch")
+    if not hmac.compare_digest(
+            receipt.producer_proof,
+            producer_proof(receipt.canonical_mapping,
+                           protected_policy.provenance_key)):
+        return EvidenceVerification(False, "provenance_mismatch")
     if receipt.diagnostic_category != "ok":
         return EvidenceVerification(False, "diagnostic_mismatch")
     if receipt.terminal_state != "passed" or receipt.exit_code != 0:
