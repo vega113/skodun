@@ -23,6 +23,7 @@ break by accident:
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import sys
 import threading
@@ -139,14 +140,25 @@ def test_status_line_exposes_stack_context_and_truncation():
     assert "stack_context_truncated=true" in line
 
 
-def test_status_line_exposes_lineage_context_truncation():
+def test_status_line_exposes_lineage_context_and_truncation():
     line = services.format_status_line({
         "id": "review-1", "status": "clean", "parse_ok": True,
-        "lineage_context_bytes": 1024, "lineage_context_truncated": True,
+        "lineage_context_bytes": 256, "lineage_context_truncated": True,
     })
-    assert "lineage_context_bytes=1024" in line
+    assert "lineage_context_bytes=256" in line
     assert "lineage_context_truncated=true" in line
 
+
+def test_review_status_json_exposes_lineage_context_telemetry(tmp_path):
+    db = _db(tmp_path, _round(
+        lineage_context_bytes=256, lineage_context_truncated=True))
+    with Store.open(db) as store:
+        code, text = services.svc_review_status(store, "sk_1", output="json")
+
+    payload = json.loads(text)
+    assert code == 0
+    assert payload["lineage_context_bytes"] == 256
+    assert payload["lineage_context_truncated"] is True
 
 def test_triage_list_exposes_audited_deferral_and_lineage_scope(tmp_path):
     finding = _finding(0)

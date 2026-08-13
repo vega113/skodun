@@ -1030,6 +1030,11 @@ def integration_prompt(
         lines.extend([RULES_BEGIN.decode("utf-8").rstrip("\n"), rules,
                       RULES_END.decode("utf-8").rstrip("\n"), ""])
 
+    if stack_context:
+        lines.extend([stack_context.decode("utf-8", "replace").rstrip("\n"), ""])
+    if lineage_context:
+        lines.extend([lineage_context.decode("utf-8", "replace").rstrip("\n"), ""])
+
     for position, batch in enumerate(summaries, 1):
         lines.append(_INTEGRATION_BATCH % position)
         files = [collapse_ws(f) for f in (batch.files or ())]
@@ -1067,13 +1072,14 @@ def integration_prompt(
         text = (cut + "\n" + (_INTEGRATION_TRUNCATED % max_prompt_bytes)
                 + "\n").encode("utf-8", "replace")
     text = text + extra
-    return Prompt(text=text, diff_truncated=truncated, prompt_bytes=len(text),
-                  stack_context_bytes=len(stack_context or b""),
-                  stack_context_truncated=bool(stack_context)
-                  and stack_context_truncated is True,
-                  lineage_context_bytes=len(lineage_context or b""),
-                  lineage_context_truncated=bool(lineage_context)
-                  and lineage_context_truncated is True)
+    return Prompt(
+        text=text, diff_truncated=truncated, prompt_bytes=len(text),
+        stack_context_bytes=len(stack_context or b""),
+        stack_context_truncated=bool(stack_context)
+        and stack_context_truncated is True,
+        lineage_context_bytes=len(lineage_context or b""),
+        lineage_context_truncated=bool(lineage_context)
+        and lineage_context_truncated is True)
 
 
 # ---------------------------------------------------------------------------

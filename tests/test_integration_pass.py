@@ -108,6 +108,27 @@ def test_the_prompt_carries_change_headers_and_never_a_hunk_body():
     assert "Changed regions:" in text
 
 
+def test_integration_prompt_carries_stack_and_lineage_context_metadata():
+    stack_context = (b"----- BEGIN STACK CONTEXT -----\n"
+                     b"status=valid\n"
+                     b"----- END STACK CONTEXT -----\n")
+    lineage_context = (b"----- BEGIN PRIOR FINDINGS -----\n"
+                       b"count=2 truncated=true\n"
+                       b"----- END PRIOR FINDINGS -----\n")
+
+    prompt = integration_prompt(
+        TWO, stack_context=stack_context, stack_context_truncated=True,
+        lineage_context=lineage_context, lineage_context_truncated=True)
+
+    text = prompt.text.decode("utf-8")
+    assert stack_context.rstrip(b"\n").decode() in text
+    assert lineage_context.rstrip(b"\n").decode() in text
+    assert prompt.stack_context_bytes == len(stack_context)
+    assert prompt.stack_context_truncated is True
+    assert prompt.lineage_context_bytes == len(lineage_context)
+    assert prompt.lineage_context_truncated is True
+
+
 def test_body_filtering_is_the_builders_job_not_the_callers():
     """A caller hands over the WHOLE batch bytes; the builder keeps the headers.
 

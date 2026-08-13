@@ -1806,6 +1806,10 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     store=store, scratch=scratch, finder=finder, branch=branch,
                     base_ref=base.ref, base_sha=base.sha,
                     head_label=f"{head} (working tree)", cancel=cancel,
+                    stack_context=stack_prompt_context,
+                    stack_context_truncated=stack_prompt_truncated,
+                    lineage_context=lineage_prompt_context,
+                    lineage_context_truncated=lineage_prompt_truncated,
                     prepared_plan=prepared_plan,
                     checkpoint_run=checkpoint_run)
                 answering_provider = _answering_provider(rec, finder)
@@ -2391,10 +2395,10 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
         repo=reserved.get("repo"),
         repo_id=reserved.get("repo_id") or reserved.get("repo"),
         lineage_repository_id=lineage_repository_id,
-        worktree_root=str(root),
-        review_started_at=review_started_at,
         lineage_context_bytes=len(lineage_prompt_context),
         lineage_context_truncated=lineage_prompt_truncated,
+        worktree_root=str(root),
+        review_started_at=review_started_at,
     )
     #: `(threshold, foreground cap)`, or None when the two caps coincide.
     large_prompt = (cfg.dispatch.large_prompt_bytes, cfg.defaults.timeout_sec)
@@ -2467,6 +2471,8 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                     base_ref=base.ref, base_sha=base.sha, head_label=local_oid,
                     context_source="oid", context_oid=local_oid,
                     large_prompt=large_prompt, cancel=cancel,
+                    lineage_context=lineage_prompt_context,
+                    lineage_context_truncated=lineage_prompt_truncated,
                     prepared_plan=prepared_plan,
                     checkpoint_run=checkpoint_run)
             else:
@@ -3369,6 +3375,10 @@ def _prepare_batch_plan(
         "batch_count": count,
         "boundary_digest": boundary_digest,
         "selection_hash": integration_selection_hash,
+        "stack_context_hash": gitio.diff_identity(stack_context or b""),
+        "stack_context_truncated": stack_context_truncated is True,
+        "lineage_context_hash": gitio.diff_identity(lineage_context or b""),
+        "lineage_context_truncated": lineage_context_truncated is True,
     })
     return _PreparedPlan(
         batches=tuple(prepared),
@@ -3481,6 +3491,10 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                  context_oid: str | None = None,
                  large_prompt: tuple[int, int] | None = None,
                  cancel: "threading.Event | None" = None,
+                 stack_context: bytes | None = None,
+                 stack_context_truncated: bool = False,
+                 lineage_context: bytes | None = None,
+                 lineage_context_truncated: bool = False,
                  prepared_plan: _PreparedPlan | None = None,
                  checkpoint_run: _CheckpointRun | None = None) -> dict:
     """Review `batches` as sub-reviews plus one cross-file pass; AGGREGATE.
@@ -3524,7 +3538,10 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             diff, batches=batches, cfg=cfg, d=d, root=root, finder=finder,
             branch=branch, base_ref=base_ref, base_sha=base_sha,
             head_label=head_label, context_source=context_source,
-            context_oid=context_oid)
+            context_oid=context_oid, stack_context=stack_context,
+            stack_context_truncated=stack_context_truncated,
+            lineage_context=lineage_context,
+            lineage_context_truncated=lineage_context_truncated)
     if len(prepared_plan.batches) != count or any(
             item.batch != batch
             for item, batch in zip(prepared_plan.batches, batches)):

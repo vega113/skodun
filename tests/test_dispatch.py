@@ -2679,6 +2679,48 @@ def test_the_background_prompt_shows_the_PUSHED_OID_not_the_working_tree(tmp_pat
         "scope this review does not have")
 
 
+def test_the_background_prompt_carries_lineage_context_telemetry(
+        tmp_path, monkeypatch):
+    from skodun import pipeline
+
+    repo = _bg_repo(tmp_path)
+    context = (b"----- BEGIN PRIOR FINDINGS -----\n"
+               b"count=1 truncated=false\n"
+               b"----- END PRIOR FINDINGS -----\n")
+    monkeypatch.setattr(
+        pipeline, "_lineage_prompt_context",
+        lambda *args, **kwargs: (context, True))
+
+    rec = _prepush(tmp_path / "s.db", repo)
+
+    prompt = (tmp_path / "bin" / "prompt_1.txt").read_bytes()
+    assert context.rstrip(b"\n") in prompt
+    assert rec["lineage_context_bytes"] == len(context)
+    assert rec["lineage_context_truncated"] is True
+
+
+def test_the_worker_persists_lineage_context_telemetry(
+        tmp_path, monkeypatch):
+    from skodun import pipeline
+
+    repo = _bg_repo(tmp_path)
+    context = b"----- BEGIN PRIOR FINDINGS -----\ncount=1\n----- END PRIOR FINDINGS -----\n"
+    monkeypatch.setattr(
+        pipeline, "_lineage_prompt_context",
+        lambda *args, **kwargs: (context, False))
+    db = tmp_path / "s.db"
+    rid, ident = _reserve(db, repo)
+
+    out = run_worker(rid, repo, "feat", ident["head"], ident["base_sha"],
+                     ident["base_ref"], db)
+
+    assert out.code == 0
+    with Store.open(db) as store:
+        rec = store.get_review(rid)
+    assert rec["lineage_context_bytes"] == len(context)
+    assert rec["lineage_context_truncated"] is False
+
+
 def test_the_background_context_pack_reads_the_commit_not_the_checkout(tmp_path):
     """`source="oid"`. The pack is what `context_hash` identifies, and a pack of
     the working tree published under the commit's identity would make dedup

@@ -888,6 +888,8 @@ def test_prepared_batch_prompts_include_stack_and_lineage_context(tmp_path):
         without.batches[0].identity.prompt_hash
     assert with_context.stack_context == stack_context
     assert with_context.lineage_context == lineage_context
+    assert with_context.integration_plan_digest != \
+        without.integration_plan_digest
 
 
 def test_prepared_prompts_are_the_prompts_the_orchestrator_sends(tmp_path):
