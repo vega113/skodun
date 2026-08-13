@@ -190,6 +190,7 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
     ("bash", "-O", "extglob", "-c", "echo unsafe"),
     ("bash", "-o", "pipefail", "-c", "echo unsafe"),
     ("python3", "--check-hash-based-pycs", "always", "-c", "print(1)"),
+    ("ruby", "-C", "/tmp", "-e", "puts 1"),
 ])
 def test_each_interpreter_command_string_flag_is_rejected(argv):
     with pytest.raises(EvidenceError):

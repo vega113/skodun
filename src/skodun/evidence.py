@@ -274,7 +274,7 @@ def _interpreter_option_segment(args: tuple[str, ...], name: str):
                      "--loader", "--import"},
             "python": {"--check-hash-based-pycs"},
             "perl": {"-I", "-M", "--include", "--require"},
-            "ruby": {"-I", "-r", "--require"},
+            "ruby": {"-C", "-I", "-r", "--require"},
         }.get(name, set())
         if arg in value_options or arg in {"-W", "--warn", "-X"}:
             index += 1
