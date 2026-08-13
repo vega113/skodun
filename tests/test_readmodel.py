@@ -113,7 +113,7 @@ def test_pending_checkpoint_is_queued_and_extra_pass_shapes_are_decoded():
                                  "degraded": False},
                     "skeptic": {"ran": True, "parse_ok": False,
                                 "degraded": False},
-                    "refuter": {"ran": True, "parse_ok": True,
+                    "refuter": {"ran": True, "status": "ran",
                                 "degraded": False},
                 }),
         orchestration={"state": "active", "batch_count": 1},
@@ -125,6 +125,27 @@ def test_pending_checkpoint_is_queued_and_extra_pass_shapes_are_decoded():
     assert p.passes["security"] == "complete"
     assert p.passes["skeptic"] == "failed"
     assert p.passes["refuter"] == "complete"
+
+
+def test_failed_integration_checkpoint_payload_is_not_projected_complete():
+    payload = {
+        "parse_ok": False, "degraded": False, "degraded_reason": "",
+        "stop_reason": "parse_failed", "diff_truncated": False,
+        "summary": "", "findings": [], "failure_reason": "bad output",
+        "attempts": [], "provenance": {}, "accepted": None,
+    }
+    p = project_review(
+        _record(status="clean", trustworthy=True, usable_output=True),
+        orchestration={"state": "active", "batch_count": 2},
+        checkpoints=[
+            {"pass_kind": "batch", "pass_index": 1, "state": "complete"},
+            {"pass_kind": "batch", "pass_index": 2, "state": "complete"},
+            {"pass_kind": "integration", "pass_index": 0,
+             "state": "complete", "payload_json": json.dumps(payload)},
+        ])
+    assert p.passes["integration"] == "failed"
+    assert p.cross_provider_complete is False
+    assert p.coverage_state == "partial"
 
 
 def test_failed_extra_pass_flag_and_missing_parse_boolean_stay_failed():

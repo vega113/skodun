@@ -86,7 +86,7 @@ def _checkpoint_payload(row: Mapping) -> Mapping | None:
     return value if isinstance(value, Mapping) else None
 
 
-def _extra_pass_state(value: object) -> str:
+def _extra_pass_state(value: object, *, refuter: bool = False) -> str:
     """Normalize legacy optional-pass metadata without treating missing fields as success."""
     if not isinstance(value, Mapping):
         return "not_planned"
@@ -100,10 +100,29 @@ def _extra_pass_state(value: object) -> str:
     if status == "degraded" or value.get("degraded") is True:
         return "degraded"
     if status in {"ran", "complete"}:
+        if refuter and value.get("ran") is True and "parse_ok" not in value:
+            return "complete"
         return "complete" if value.get("parse_ok") is True else "failed"
     if value.get("ran") is True:
         return "complete" if value.get("parse_ok") is True else "failed"
     return _pass_state(status)
+
+
+def _checkpoint_state(row: Mapping, rec: Mapping) -> str:
+    """Project a terminal checkpoint from its payload when one is present."""
+    state = row.get("state")
+    if state != "complete":
+        return _pass_state(state)
+    payload = _checkpoint_payload(row)
+    if payload is not None:
+        return "complete" if payload.get("parse_ok") is True else "failed"
+    if row.get("pass_kind") == "integration":
+        integration = rec.get("integration")
+        if (isinstance(integration, Mapping)
+                and "parse_ok" in integration):
+            return ("complete" if integration.get("parse_ok") is True
+                    else "failed")
+    return "complete"
 
 
 def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
@@ -118,8 +137,9 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
         row.get("pass_kind") == "integration" for row in checkpoint_rows) else 0)
     if planned == 0:
         planned = 1
-    complete_rows = [r for r in checkpoint_rows if r.get("state") == "complete"]
-    failed_rows = [r for r in checkpoint_rows if r.get("state") == "failed"]
+    checkpoint_states = [_checkpoint_state(row, rec) for row in checkpoint_rows]
+    complete_rows = [state for state in checkpoint_states if state == "complete"]
+    failed_rows = [state for state in checkpoint_states if state == "failed"]
     completed = len(complete_rows)
     failed = len(failed_rows)
     checkpoint_payloads = [payload for row in checkpoint_rows
@@ -149,14 +169,14 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
         "integration": "not_planned",
         "security": _extra_pass_state(extras.get("security")),
         "skeptic": _extra_pass_state(extras.get("skeptic")),
-        "refuter": _extra_pass_state(extras.get("refuter")),
+        "refuter": _extra_pass_state(extras.get("refuter"), refuter=True),
     }
-    for row in checkpoint_rows:
+    for row, checkpoint_state in zip(checkpoint_rows, checkpoint_states):
         key = "finder" if row.get("pass_kind") == "batch" else "integration"
         if key == "finder" and row.get("state") == "running":
             passes[key] = "running"
         elif key == "integration":
-            passes[key] = _pass_state(row.get("state"))
+            passes[key] = checkpoint_state
     next_pass = None
     for row in checkpoint_rows:
         if row.get("state") in {"pending", "failed"}:
