@@ -139,8 +139,12 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
     batch_count = int((orchestration or {}).get("batch_count") or
                       len(batches))
     checkpoint_rows = list(checkpoints)
+    integration_record = rec.get("integration")
+    has_checkpoint_integration = any(
+        row.get("pass_kind") == "integration" for row in checkpoint_rows)
     planned = batch_count + (1 if any(
-        row.get("pass_kind") == "integration" for row in checkpoint_rows) else 0)
+        row.get("pass_kind") == "integration" for row in checkpoint_rows) else
+        (1 if isinstance(integration_record, Mapping) else 0))
     if planned == 0:
         planned = 1
     checkpoint_states = [_checkpoint_state(row, rec) for row in checkpoint_rows]
@@ -153,20 +157,31 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
                            for row in checkpoint_rows
                            for payload in [_checkpoint_payload(row)]
                            if payload is not None]
-    evidence_batches = batches or [payload for _, payload in checkpoint_payloads]
+    integration_evidence = ([integration_record]
+                             if isinstance(integration_record, Mapping) else [])
+    evidence_batches = ((batches + integration_evidence) if batches else
+                        [payload for _, payload in checkpoint_payloads]
+                        + integration_evidence)
     finder_evidence = batches or [payload for kind, payload in checkpoint_payloads
                                   if kind == "batch"]
     parseable = rec.get("usable_output") is True or any(
         isinstance(b, Mapping) and b.get("parse_ok") is True
         for b in evidence_batches)
-    finder_parseable = rec.get("usable_output") is True or any(
+    finder_parseable = ((rec.get("usable_output") is True and not batches)
+                        or any(
         isinstance(b, Mapping) and b.get("parse_ok") is True
-        for b in finder_evidence)
+        for b in finder_evidence))
     if not checkpoint_rows and isinstance(batches, list):
         completed = sum(1 for b in batches if isinstance(b, Mapping) and
                         b.get("parse_ok") is True)
         failed = sum(1 for b in batches if isinstance(b, Mapping) and
                      b.get("parse_ok") is False)
+        if isinstance(integration_record, Mapping) and not has_checkpoint_integration:
+            integration_state = _extra_pass_state(integration_record)
+            if integration_state in {"complete", "degraded"}:
+                completed += 1
+            elif integration_state == "failed":
+                failed += 1
         if not batches and parseable:
             completed = 1
     orchestration_state = (orchestration or {}).get("state")
@@ -187,6 +202,9 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
         "skeptic": _extra_pass_state(extras.get("skeptic")),
         "refuter": _extra_pass_state(extras.get("refuter"), refuter=True),
     }
+    if (isinstance(integration_record, Mapping)
+            and not has_checkpoint_integration):
+        passes["integration"] = _extra_pass_state(integration_record)
     batch_checkpoint_states = [checkpoint_state for row, checkpoint_state in
                                zip(checkpoint_rows, checkpoint_states)
                                if row.get("pass_kind") == "batch"]

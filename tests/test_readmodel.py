@@ -260,6 +260,29 @@ def test_completed_checkpoint_without_valid_payload_fails_closed():
         assert p.gate_eligible is False
 
 
+def test_finalized_integration_metadata_is_projected_without_checkpoints():
+    p = project_review(_record(
+        status="clean", trustworthy=True, usable_output=True,
+        batches=[{"parse_ok": True}],
+        integration={"status": "ran", "ran": True, "parse_ok": True,
+                     "degraded": False}),
+        orchestration=None, checkpoints=[])
+    assert p.passes["integration"] == "complete"
+    assert p.finder_only is False
+    assert p.cross_provider_complete is True
+
+
+def test_finalized_integration_does_not_complete_finder_without_batch_evidence():
+    p = project_review(_record(
+        status="failed", trustworthy=False, usable_output=True,
+        batches=[{"parse_ok": False}],
+        integration={"status": "ran", "ran": True, "parse_ok": True,
+                     "degraded": False}),
+        orchestration=None, checkpoints=[])
+    assert p.usable_evidence is True
+    assert p.passes["finder"] == "failed"
+
+
 def test_completed_integration_checkpoint_is_usable_evidence():
     payload = {
         "parse_ok": True, "degraded": False, "degraded_reason": "",
