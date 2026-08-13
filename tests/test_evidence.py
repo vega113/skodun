@@ -204,6 +204,8 @@ def test_each_interpreter_command_string_flag_is_rejected(argv):
     ("env", "--", "bash", "-c", "echo unsafe"),
     ("env", "-S", "bash -c echo unsafe"),
     ("env", "env", "bash", "-c", "echo unsafe"),
+    ("env", "API_TOKEN=plaintext", "python3", "check.py"),
+    ("env", "LD_PRELOAD=/tmp/candidate.so", "python3", "check.py"),
     ("env", "--default-signal", "TERM", "bash", "-c", "echo unsafe"),
     ("env", "-v", "bash", "-c", "echo unsafe"),
     ("busybox", "sh", "-c", "echo unsafe"),

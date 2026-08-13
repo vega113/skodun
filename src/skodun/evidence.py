@@ -223,8 +223,7 @@ def _env_target_index(argv: tuple[str, ...], start: int) -> int:
             index += 1
             continue
         if "=" in option and not option.startswith("-"):
-            index += 1
-            continue
+            return -1
         if option in {"-u", "--unset", "-C", "--chdir"}:
             index += 2
             continue
