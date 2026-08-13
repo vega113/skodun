@@ -208,6 +208,8 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
     ("node", "-p", "1+1"),
     ("node", "--conditions", "development", "-e", "1+1"),
     ("node", "--import", "data:text/javascript,console.log(1)", "script.js"),
+    ("node", "--import=data:text/javascript,console.log(1)", "script.js"),
+    ("perl", "-ane", "print 1"),
     ("bash", "-O", "extglob", "-c", "echo unsafe"),
     ("bash", "-o", "pipefail", "-c", "echo unsafe"),
     ("sh", "-o", "errexit", "-c", "echo unsafe"),
@@ -279,6 +281,12 @@ def test_receipt_metadata_is_bounded_to_identifiers():
     with pytest.raises(EvidenceError) as exc:
         parse_receipt(json.dumps(raw))
     assert exc.value.reason_code == "invalid_field"
+
+    for field in ("producer_policy_id", "command_id"):
+        raw = receipt_mapping(**{field: "API_TOKEN=secret"})
+        with pytest.raises(EvidenceError) as exc:
+            parse_receipt(json.dumps(raw))
+        assert exc.value.reason_code == "invalid_field"
 
 
 @pytest.mark.parametrize("cwd", ["..\\outside", "C:\\Windows", "\\\\server\\share"])
@@ -356,6 +364,11 @@ def test_receipt_file_rejects_symlink_and_oversize(tmp_path: Path):
     with pytest.raises(EvidenceError) as symlink:
         load_receipt_file(link)
     assert symlink.value.reason_code == "unsafe_file"
+    linked_dir = tmp_path / "linked-dir"
+    linked_dir.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(EvidenceError) as parent_symlink:
+        load_receipt_file(linked_dir / "receipt.json")
+    assert parent_symlink.value.reason_code == "unsafe_file"
     target.write_bytes(b"x" * (MAX_RECEIPT_BYTES + 1))
     with pytest.raises(EvidenceError) as large:
         load_receipt_file(target)

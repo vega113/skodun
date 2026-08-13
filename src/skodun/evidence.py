@@ -171,7 +171,9 @@ def _is_shell_command_flag(executable: str, arg: str) -> bool:
         return lowered.startswith(("/c", "/k"))
     if name in {"perl", "ruby", "node"}:
         eval_flags = ("-e", "-E") if name == "perl" else ("-e",)
-        return (arg in eval_flags or arg.startswith(eval_flags)
+        perl_cluster = (name == "perl"
+                        and re.fullmatch(r"-[anp]*[eE].*", arg) is not None)
+        return (perl_cluster or arg in eval_flags or arg.startswith(eval_flags)
                 or arg.startswith("--eval")
                 or arg.startswith("--execute")
                 or (name == "node" and arg.startswith(("-p", "--print"))))
@@ -274,6 +276,11 @@ def _interpreter_option_segment(args: tuple[str, ...], name: str):
             break
         if not arg.startswith("-") or arg == "-":
             break
+        if (name == "node"
+                and arg.startswith(("--import=data:", "--loader=data:"))):
+            result.append("-e")
+            index += 1
+            continue
         result.append(arg)
         if arg in {"-m", "--module"}:
             index += 1
@@ -497,9 +504,13 @@ def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
         raw["certification_base"], raw["current_head"],
         raw["diff_hash"], raw["stack_slice_id"])
     policy_id = _text("producer_policy_id", raw["producer_policy_id"])
+    if _IDENTIFIER.fullmatch(policy_id) is None:
+        raise EvidenceError("invalid_field", "producer_policy_id")
     policy_digest = _digest(raw["producer_policy_digest"],
                              "producer_policy_digest")
     command_id = _text("command_id", raw["command_id"])
+    if _IDENTIFIER.fullmatch(command_id) is None:
+        raise EvidenceError("invalid_field", "command_id")
     command_digest = _digest(raw["command_digest"], "command_digest")
     producer_claim = _digest(raw["producer_proof"], "producer_proof")
     started = _parse_ts(raw["started_at"], "started_at")
@@ -604,6 +615,12 @@ def _read_regular_file(path: Path) -> bytes:
         raise EvidenceError("unsafe_file", "required safe-open flags unavailable")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
     try:
+        absolute = Path(path).absolute()
+        current = Path(absolute.anchor)
+        for component in absolute.parts[1:-1]:
+            current /= component
+            if stat.S_ISLNK(os.lstat(current).st_mode):
+                raise EvidenceError("unsafe_file", "symlinked receipt directory")
         fd = os.open(path, flags)
     except OSError as exc:
         raise EvidenceError("unsafe_file", type(exc).__name__) from exc
