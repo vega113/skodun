@@ -108,6 +108,14 @@ def test_truncated_stack_context_preserves_valid_utf8():
     context.decode("utf-8")
 
 
+def test_clip_utf8_keeps_a_complete_multibyte_character_at_the_budget():
+    snowman = "\u2603".encode("utf-8")
+    assert len(snowman) == 3
+    assert stack.clip_utf8(b"ab" + snowman, 5) == b"ab" + snowman
+    assert stack.clip_utf8(b"ab" + snowman + b"x", 5) == b"ab" + snowman
+    assert stack.clip_utf8(b"ab" + snowman, 4) == b"ab"
+
+
 def test_prompt_context_is_bounded_and_keeps_full_diff_authoritative():
     validation = stack.StackValidation(
         status="valid", reason_code="ok", manifest=stack.StackManifest(

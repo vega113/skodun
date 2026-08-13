@@ -559,11 +559,25 @@ def clip_utf8(data: bytes, max_bytes: int) -> bytes:
     if len(data) <= max_bytes:
         return data
     clipped = data[:max_bytes]
-    while clipped and clipped[-1] & 0xC0 == 0x80:
-        clipped = clipped[:-1]
-    if clipped and clipped[-1] & 0xC0 == 0xC0:
-        clipped = clipped[:-1]
-    return clipped
+    index = len(clipped)
+    while index > 0 and clipped[index - 1] & 0xC0 == 0x80:
+        index -= 1
+    if index == 0:
+        return b""
+    lead = clipped[index - 1]
+    if lead & 0x80 == 0:
+        return clipped
+    if lead & 0xE0 == 0xC0:
+        needed = 2
+    elif lead & 0xF0 == 0xE0:
+        needed = 3
+    elif lead & 0xF8 == 0xF0:
+        needed = 4
+    else:
+        return clipped[:index - 1]
+    if len(clipped) - (index - 1) >= needed:
+        return clipped
+    return clipped[:index - 1]
 
 
 def render_prompt_context(validation: StackValidation | None,

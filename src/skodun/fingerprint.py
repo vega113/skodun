@@ -276,5 +276,5 @@ def render_prompt_context(rows: Iterable[object],
         f"count={count} truncated=true\n"
     ).encode("utf-8")
     budget = max(0, max_bytes - len(marker) - len(header))
-    body = b"\n".join(text.splitlines(keepends=True)[2:])
+    body = b"".join(text.splitlines(keepends=True)[2:])
     return header + clip_utf8(body, budget) + marker, True

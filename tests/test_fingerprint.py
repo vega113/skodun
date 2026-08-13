@@ -317,3 +317,4 @@ def test_lineage_prompt_context_is_bounded_and_utf8_safe():
     context.decode("utf-8")
     assert b"PRIOR FINDINGS" in context
     assert b"full diff remains authoritative" in context
+    assert b"\n\nsha256:" not in context
