@@ -210,6 +210,8 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
     ("node", "--import", "data:text/javascript,console.log(1)", "script.js"),
     ("node", "--import=data:text/javascript,console.log(1)", "script.js"),
     ("perl", "-ane", "print 1"),
+    ("ruby", "-we", "puts 1"),
+    ("ruby", "-W0e", "puts 1"),
     ("bash", "-O", "extglob", "-c", "echo unsafe"),
     ("bash", "-o", "pipefail", "-c", "echo unsafe"),
     ("sh", "-o", "errexit", "-c", "echo unsafe"),
@@ -293,6 +295,14 @@ def test_receipt_metadata_is_bounded_to_identifiers():
 def test_windows_policy_working_directories_are_rejected(cwd):
     with pytest.raises(EvidenceError):
         ProducerCommand("unsafe", ("python3", "-m", "repo"), cwd, ())
+
+
+def test_policy_and_command_identifiers_match_receipt_syntax():
+    with pytest.raises(EvidenceError):
+        ProducerCommand("bad id", ("python3", "-m", "repo"), ".", ())
+    with pytest.raises(EvidenceError):
+        ProducerPolicy("bad id", (policy().commands[0],),
+                       b"test-provenance-key-1234")
 
 
 @pytest.mark.parametrize("diagnostic", ["failed", "mismatch", "unverifiable"])

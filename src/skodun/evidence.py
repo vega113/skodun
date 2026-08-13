@@ -173,7 +173,10 @@ def _is_shell_command_flag(executable: str, arg: str) -> bool:
         eval_flags = ("-e", "-E") if name == "perl" else ("-e",)
         perl_cluster = (name == "perl"
                         and re.fullmatch(r"-[anp]*[eE].*", arg) is not None)
-        return (perl_cluster or arg in eval_flags or arg.startswith(eval_flags)
+        ruby_cluster = (name == "ruby"
+                        and re.fullmatch(r"-[A-Za-z0-9]*e.*", arg) is not None)
+        return (perl_cluster or ruby_cluster
+                or arg in eval_flags or arg.startswith(eval_flags)
                 or arg.startswith("--eval")
                 or arg.startswith("--execute")
                 or (name == "node" and arg.startswith(("-p", "--print"))))
@@ -319,7 +322,9 @@ class ProducerCommand:
     evidence_kind: str = "preflight"
 
     def __post_init__(self) -> None:
-        _text("command_id", self.command_id)
+        command_id = _text("command_id", self.command_id)
+        if _IDENTIFIER.fullmatch(command_id) is None:
+            raise EvidenceError("invalid_command", "command_id")
         if (not isinstance(self.argv, tuple) or not self.argv
                 or len(self.argv) > MAX_ARGV):
             raise EvidenceError("invalid_command", "argv")
@@ -360,7 +365,9 @@ class ProducerPolicy:
     provenance_key: bytes = b""
 
     def __post_init__(self) -> None:
-        _text("policy_id", self.policy_id)
+        policy_id = _text("policy_id", self.policy_id)
+        if _IDENTIFIER.fullmatch(policy_id) is None:
+            raise EvidenceError("invalid_policy", "policy_id")
         if (not isinstance(self.commands, tuple) or not self.commands
                 or len(self.commands) > MAX_ARGV
                 or any(not isinstance(command, ProducerCommand)
@@ -613,17 +620,28 @@ def _read_regular_file(path: Path) -> bytes:
     nonblock = getattr(os, "O_NONBLOCK", 0)
     if not nofollow or not nonblock:
         raise EvidenceError("unsafe_file", "required safe-open flags unavailable")
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not directory:
+        raise EvidenceError("unsafe_file", "required directory-open flag unavailable")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | directory
+    dir_fd: int | None = None
     try:
         absolute = Path(path).absolute()
-        current = Path(absolute.anchor)
-        for component in absolute.parts[1:-1]:
-            current /= component
-            if stat.S_ISLNK(os.lstat(current).st_mode):
-                raise EvidenceError("unsafe_file", "symlinked receipt directory")
-        fd = os.open(path, flags)
+        parts = absolute.parts
+        if len(parts) < 2 or any(part in {"", ".", ".."} for part in parts[1:]):
+            raise EvidenceError("unsafe_file", "unsafe receipt path")
+        dir_fd = os.open(absolute.anchor, directory_flags)
+        for component in parts[1:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = next_fd
+        fd = os.open(parts[-1], flags, dir_fd=dir_fd)
     except OSError as exc:
         raise EvidenceError("unsafe_file", type(exc).__name__) from exc
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
     try:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -634,10 +652,9 @@ def _read_regular_file(path: Path) -> bytes:
         if len(data) > MAX_RECEIPT_BYTES:
             raise EvidenceError("too_large", "receipt")
         after_fd = os.fstat(fd)
-        after_path = os.stat(path, follow_symlinks=False)
         fields = lambda value: (value.st_dev, value.st_ino, value.st_mode,
                                 value.st_nlink, value.st_size, value.st_mtime_ns)
-        if fields(before) != fields(after_fd) or fields(after_fd) != fields(after_path):
+        if fields(before) != fields(after_fd):
             raise EvidenceError("unsafe_file", "receipt moved during read")
         return data
     except OSError as exc:
