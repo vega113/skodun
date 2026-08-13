@@ -382,6 +382,23 @@ def test_truncated_lineage_prompt_keeps_complete_quoted_path_lines():
             assert line.count('"') == 2
 
 
+def test_truncated_lineage_prompt_skips_an_oversized_first_row():
+    long_digest = "sha256:" + "a" * 64
+    short_digest = "sha256:" + "b" * 64
+    rows = [
+        {"finding_fingerprint_v2": long_digest, "file": "L" * 400,
+         "finding_lineage_v2": {"match_reason": "new"}},
+        {"finding_fingerprint_v2": short_digest, "file": "src/b.py",
+         "finding_lineage_v2": {"match_reason": "repeated"}},
+    ]
+    context, truncated = fingerprint.render_prompt_context(rows, max_bytes=256)
+    assert truncated is True
+    text = context.decode("utf-8")
+    assert short_digest in text
+    assert long_digest not in text
+    assert 'path="src/b.py" reason=repeated' in text
+
+
 def test_lineage_prompt_context_cannot_break_out_of_a_single_line():
     rows = [{
         "finding_fingerprint_v2": "sha256:" + "a" * 64,

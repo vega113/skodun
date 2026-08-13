@@ -255,8 +255,6 @@ def render_prompt_context(rows: Iterable[object],
     Digests and paths only: never claims, transcripts, or raw finding bodies.
     Missing or malformed rows are omitted rather than invented.
     """
-    from .stack import clip_utf8
-
     if type(max_bytes) is not int or max_bytes < 128:
         raise ValueError("lineage prompt context budget must be an int >= 128")
     lines = ["----- BEGIN PRIOR FINDINGS -----"]
@@ -289,8 +287,11 @@ def render_prompt_context(rows: Iterable[object],
         f"count={count} truncated=true\n"
     ).encode("utf-8")
     budget = max(0, max_bytes - len(marker) - len(header))
-    body = b"".join(text.splitlines(keepends=True)[2:])
-    clipped = clip_utf8(body, budget)
-    cut = clipped.rfind(b"\n")
-    clipped = clipped[:cut + 1] if cut >= 0 else b""
-    return header + clipped + marker, True
+    out = bytearray()
+    for line in text.splitlines(keepends=True)[2:]:
+        if len(line) > budget:
+            continue
+        if len(out) + len(line) > budget:
+            break
+        out += line
+    return header + bytes(out) + marker, True
