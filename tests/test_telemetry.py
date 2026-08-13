@@ -100,6 +100,16 @@ def test_attempt_telemetry_preserves_bounded_admission_timing():
     }
 
 
+def test_attempt_telemetry_drops_invalid_admission_timing():
+    base = {"n": 1, "provider": "grok", "model": "mini",
+            "capacity_timing": {"queued_at": "not canonical",
+                                 "wait_ms": 1}}
+    assert "capacity_timing" not in attempt_telemetry(base, timeout_sec=30)
+    base["capacity_timing"] = {
+        "queued_at": "2026-08-13T10:00:00Z", "wait_ms": True}
+    assert "capacity_timing" not in attempt_telemetry(base, timeout_sec=30)
+
+
 def test_batch_telemetry_has_identity_and_byte_dimensions():
     result = batch_telemetry(
         planner_version="skodun-batch-v1",

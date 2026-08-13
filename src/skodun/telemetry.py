@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 
+from .store import _is_canonical_ts
+
 
 EXECUTION_PROVENANCE_KEYS = frozenset({
     "adapter", "resolved", "version", "override_source",
@@ -50,6 +52,22 @@ def _token_usage(raw: object) -> dict[str, int | None]:
     }
 
 
+def _capacity_timing(raw: object) -> dict | None:
+    if not isinstance(raw, Mapping):
+        return None
+    timestamps = ("queued_at", "admitted_at", "started_at", "ended_at")
+    waits = ("wait_ms", "queue_wait_ms")
+    for key in timestamps:
+        if key in raw and raw[key] is not None and not _is_canonical_ts(raw[key]):
+            return None
+    for key in waits:
+        value = raw.get(key)
+        if value is not None and (isinstance(value, bool)
+                                  or not isinstance(value, int) or value < 0):
+            return None
+    return {key: raw.get(key) for key in (*timestamps, *waits)}
+
+
 def attempt_telemetry(attempt: Mapping, *, timeout_sec: int | None) -> dict:
     """Project one attempt into a stable, allowlisted telemetry row."""
     classification = attempt.get("classification")
@@ -70,13 +88,9 @@ def attempt_telemetry(attempt: Mapping, *, timeout_sec: int | None) -> dict:
         "resume_decision": attempt.get("resume_decision"),
         "execution_provenance": _provenance(attempt.get("execution_provenance")),
     }
-    capacity_timing = attempt.get("capacity_timing")
-    if isinstance(capacity_timing, Mapping):
-        row["capacity_timing"] = {
-            key: capacity_timing.get(key)
-            for key in ("queued_at", "admitted_at", "started_at", "ended_at",
-                        "wait_ms", "queue_wait_ms")
-        }
+    capacity_timing = _capacity_timing(attempt.get("capacity_timing"))
+    if capacity_timing is not None:
+        row["capacity_timing"] = capacity_timing
     return row
 
 

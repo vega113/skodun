@@ -19,9 +19,12 @@ def test_partial_finder_evidence_reports_next_pass_and_not_gate_eligible():
                                               {"parse_ok": True}]),
         orchestration={"state": "active", "batch_count": 4},
         checkpoints=[
-            {"pass_kind": "batch", "pass_index": 1, "state": "complete"},
-            {"pass_kind": "batch", "pass_index": 2, "state": "complete"},
-            {"pass_kind": "batch", "pass_index": 3, "state": "complete"},
+            {"pass_kind": "batch", "pass_index": 1, "state": "complete",
+             "payload_json": json.dumps({"parse_ok": True})},
+            {"pass_kind": "batch", "pass_index": 2, "state": "complete",
+             "payload_json": json.dumps({"parse_ok": True})},
+            {"pass_kind": "batch", "pass_index": 3, "state": "complete",
+             "payload_json": json.dumps({"parse_ok": True})},
             {"pass_kind": "batch", "pass_index": 4, "state": "pending"},
         ])
     assert p.coverage_state == "partial"
@@ -244,6 +247,17 @@ def test_degraded_completed_checkpoint_stays_degraded():
         checkpoints=[{"pass_kind": "batch", "pass_index": 1,
                       "state": "complete", "payload_json": json.dumps(payload)}])
     assert p.passes["finder"] == "degraded"
+
+
+def test_completed_checkpoint_without_valid_payload_fails_closed():
+    for payload_json in (None, "not json", json.dumps([])):
+        p = project_review(
+            _record(status="clean", trustworthy=True, usable_output=False),
+            orchestration={"state": "active", "batch_count": 1},
+            checkpoints=[{"pass_kind": "batch", "pass_index": 1,
+                          "state": "complete", "payload_json": payload_json}])
+        assert p.coverage_state == "none"
+        assert p.gate_eligible is False
 
 
 def test_completed_integration_checkpoint_is_usable_evidence():

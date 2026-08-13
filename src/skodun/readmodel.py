@@ -128,7 +128,7 @@ def _checkpoint_state(row: Mapping, rec: Mapping) -> str:
                 return "failed"
             return ("degraded" if integration.get("degraded") is True
                     else "complete")
-    return "complete"
+    return "failed"
 
 
 def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
@@ -144,7 +144,8 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
     if planned == 0:
         planned = 1
     checkpoint_states = [_checkpoint_state(row, rec) for row in checkpoint_rows]
-    complete_rows = [state for state in checkpoint_states if state == "complete"]
+    complete_rows = [state for state in checkpoint_states
+                     if state in {"complete", "degraded"}]
     failed_rows = [state for state in checkpoint_states if state == "failed"]
     completed = len(complete_rows)
     failed = len(failed_rows)

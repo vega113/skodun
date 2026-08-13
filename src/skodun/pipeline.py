@@ -952,8 +952,14 @@ def _provenance(outcome: _Outcome) -> dict:
             if isinstance(timing, dict):
                 out["capacity_timing"] = dict(timing)
             return out
-    return {"provider": None, "model": None, "effort": None,
-            "note": outcome.failure_reason or "no attempt started a process"}
+    out = {"provider": None, "model": None, "effort": None,
+           "note": outcome.failure_reason or "no attempt started a process"}
+    for row in reversed(outcome.attempts):
+        timing = row.get("capacity_timing")
+        if isinstance(timing, dict):
+            out["capacity_timing"] = dict(timing)
+            break
+    return out
 
 
 # ---------------------------------------------------------------------------
