@@ -205,6 +205,19 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
     if (isinstance(integration_record, Mapping)
             and not has_checkpoint_integration):
         passes["integration"] = _extra_pass_state(integration_record)
+    if not checkpoint_rows and batches:
+        batch_states = [
+            ("failed" if not isinstance(batch, Mapping)
+             or batch.get("parse_ok") is not True
+             else "degraded" if batch.get("degraded") is True
+             else "complete")
+            for batch in batches]
+        if "failed" in batch_states:
+            passes["finder"] = "failed"
+        elif "degraded" in batch_states:
+            passes["finder"] = "degraded"
+        elif batch_states:
+            passes["finder"] = "complete"
     batch_checkpoint_states = [checkpoint_state for row, checkpoint_state in
                                zip(checkpoint_rows, checkpoint_states)
                                if row.get("pass_kind") == "batch"]
@@ -221,7 +234,8 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
             passes["finder"] = "complete"
     for row, checkpoint_state in zip(checkpoint_rows, checkpoint_states):
         key = "finder" if row.get("pass_kind") == "batch" else "integration"
-        if key == "finder" and row.get("state") == "running":
+        if (key == "finder" and row.get("state") == "running"
+                and passes[key] != "failed"):
             passes[key] = "running"
         elif key == "integration":
             passes[key] = checkpoint_state

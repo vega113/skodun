@@ -283,6 +283,32 @@ def test_finalized_integration_does_not_complete_finder_without_batch_evidence()
     assert p.passes["finder"] == "failed"
 
 
+def test_legacy_mixed_finder_batches_preserve_failed_and_degraded_state():
+    p = project_review(_record(
+        status="clean", trustworthy=True, usable_output=True,
+        batches=[{"parse_ok": True}, {"parse_ok": False}]), checkpoints=[])
+    assert p.passes["finder"] == "failed"
+
+    p = project_review(_record(
+        status="clean", trustworthy=True, usable_output=True,
+        batches=[{"parse_ok": True, "degraded": True},
+                 {"parse_ok": True}]), checkpoints=[])
+    assert p.passes["finder"] == "degraded"
+
+
+def test_running_finder_sibling_does_not_hide_failed_checkpoint():
+    bad = {"parse_ok": False, "degraded": False}
+    p = project_review(
+        _record(status="failed", trustworthy=False, usable_output=False),
+        orchestration={"state": "active", "batch_count": 2},
+        checkpoints=[
+            {"pass_kind": "batch", "pass_index": 1, "state": "complete",
+             "payload_json": json.dumps(bad)},
+            {"pass_kind": "batch", "pass_index": 2, "state": "running"},
+        ])
+    assert p.passes["finder"] == "failed"
+
+
 def test_completed_integration_checkpoint_is_usable_evidence():
     payload = {
         "parse_ok": True, "degraded": False, "degraded_reason": "",
