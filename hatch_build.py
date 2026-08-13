@@ -66,28 +66,30 @@ def _existing_embedded_commit(root: Path) -> str | None:
 
 
 def _git_commit(root: Path) -> str | None:
-    top = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True, timeout=10)
-    if top.returncode != 0:
+    def _run(*args: str):
+        try:
+            return subprocess.run(
+                ["git", "-C", str(root), *args],
+                capture_output=True, text=True, timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+
+    top = _run("rev-parse", "--show-toplevel")
+    if top is None or top.returncode != 0:
         return None
     try:
         if Path(top.stdout.strip()).resolve() != root.resolve():
             return None
     except OSError:
         return None
-    head = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=10)
-    if head.returncode != 0:
+    head = _run("rev-parse", "HEAD")
+    if head is None or head.returncode != 0:
         return None
     commit = head.stdout.strip()
     if len(commit) != 40 or any(ch not in "0123456789abcdef" for ch in commit):
         return None
-    status = subprocess.run(
-        ["git", "-C", str(root), "status", "--porcelain"],
-        capture_output=True, text=True, timeout=10)
-    if status.returncode != 0:
+    status = _run("status", "--porcelain")
+    if status is None or status.returncode != 0:
         return f"{commit}-unknown"
     if status.stdout.strip():
         return f"{commit}-dirty"

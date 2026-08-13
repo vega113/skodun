@@ -349,12 +349,11 @@ def test_partial_ladder_keeps_pre_migration_backup(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="injected mid-ladder"):
         Store.migrate_existing(db, build_commit="a" * 40)
     monkeypatch.setattr(store_mod, "_migrate", real)
-    assert inspect_schema(db).version == 12
+    assert inspect_schema(db).version == 13
     backup = Path(str(db) + ".backup-before-v" + str(SCHEMA_VERSION))
-    assert not backup.exists()
+    assert backup.exists()
     assert not Path(str(db) + ".migration.lock").exists()
-    receipt = Store.migrate_existing(db, build_commit="a" * 40)
-    assert receipt["result"] == "success"
+    assert not migration_receipt_path(db).exists()
 
 
 def test_failed_apply_is_retryable_when_store_stays_old(tmp_path, monkeypatch):
@@ -375,6 +374,9 @@ def test_failed_apply_is_retryable_when_store_stays_old(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "chmod", original)
     assert inspect_schema(db).state == "older"
     assert not migration_receipt_path(db).exists()
+    leftover = Path(str(db) + ".backup-before-v" + str(SCHEMA_VERSION))
+    assert leftover.exists()
+    leftover.unlink()
     receipt = Store.migrate_existing(db, build_commit="a" * 40)
     assert receipt["result"] == "success"
 

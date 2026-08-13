@@ -246,28 +246,6 @@ def migration_receipt_path(path: Path, target: int | None = None) -> Path:
     return Path(str(path) + f".migration-receipt-v{version}.json")
 
 
-def _restore_from_backup(path: Path, backup: Path) -> bool:
-    """Copy an integrity-ok backup over `path`. False if restore cannot run."""
-    try:
-        if not backup.is_file() or backup.stat().st_size == 0:
-            return False
-    except OSError:
-        return False
-    uri = f"file:{quote(str(backup.resolve()))}?mode=ro"
-    source = sqlite3.connect(uri, uri=True)
-    try:
-        if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            return False
-        dest = sqlite3.connect(path, isolation_level=None)
-        try:
-            source.backup(dest)
-        finally:
-            dest.close()
-    finally:
-        source.close()
-    return True
-
-
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -347,7 +325,8 @@ def _legacy_fg_lock_live(common_dir: Path) -> bool:
         if not lock.is_dir():
             return False
     except OSError:
-        return False
+        # Unreadable lock metadata is not proof of absence.
+        return True
     pid = _owner_pid(lock)
     if pid is not None:
         return _pid_alive(pid)
@@ -410,13 +389,11 @@ def _discovered_lock_scopes(conn: sqlite3.Connection,
                     "SELECT DISTINCT worktree_root FROM reviews "
                     "WHERE worktree_root IS NOT NULL").fetchall():
                 if row[0]:
-                    try:
-                        from . import gitio
-                        scopes.add(str(gitio.git_common_dir(Path(row[0]))))
-                    except Exception:
-                        guessed = _git_common_dir_guess(Path(str(row[0])))
-                        if guessed is not None:
-                            scopes.add(str(guessed))
+                    # File-only resolution: spawning git here can hang
+                    # migrate --plan/--apply on a blocked .git/config.
+                    guessed = _git_common_dir_guess(Path(str(row[0])))
+                    if guessed is not None:
+                        scopes.add(str(guessed))
     return scopes
 
 
@@ -1716,11 +1693,10 @@ class Store:
         except BaseException:
             if not migrated:
                 destination.unlink(missing_ok=True)
-                try:
-                    if _restore_from_backup(path, backup):
-                        backup.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                # Keep the verified backup. Restoring over the live path would
+                # erase writes from connections that already had the store
+                # open before the migration lock. Retry after the operator
+                # restores or removes the leftover backup.
             raise
 
     def close(self) -> None:
