@@ -1622,7 +1622,10 @@ def svc_review_status(store, review_id=None, repo=None, *, output="text") -> tup
         payload = {"id": rec.get("id"), "state": report_state(rec),
                    "coverage": projection.to_dict()}
         for key in ("stack_context_bytes", "stack_context_truncated",
-                    "lineage_context_bytes", "lineage_context_truncated"):
+                    "lineage_context_bytes", "lineage_context_truncated",
+                    "fingerprint_status", "fingerprint_candidate_count",
+                    "fingerprint_candidate_limit",
+                    "fingerprint_candidates_truncated"):
             if rec.get(key) not in (None, ""):
                 payload[key] = rec[key]
         return 0, json.dumps(payload, sort_keys=True)
