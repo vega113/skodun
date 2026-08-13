@@ -732,7 +732,7 @@ def test_checkpoint_lease_includes_provider_admission_wait(monkeypatch):
     assert pipeline._checkpoint_lease_seconds(d, 2) == expected
 
 
-@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "1e309"])
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "1e309", "1e20"])
 def test_checkpoint_lease_rejects_nonfinite_provider_admission_wait(
         monkeypatch, raw):
     d = Defaults(timeout_sec=100, timeout_retries=0, degraded_retries=0)

@@ -75,6 +75,7 @@ REASON_STALE_AGE = "stale_age"
 #: pass the lock stale ceiling. Large enough that short unit waits are not
 #: age-reclaimed; dead-pid reclaim does not use this.
 DEFAULT_STALE_SEC = 24 * 3600.0
+MAX_ADMISSION_WAIT_SEC = 24 * 3600.0
 
 
 class AdmissionError(RuntimeError):
@@ -217,7 +218,8 @@ def admission_wait_from_env(default: float,
         value = float(str(raw).strip())
     except ValueError:
         return float(default)
-    if value < 0 or not math.isfinite(value):
+    if (value < 0 or value > MAX_ADMISSION_WAIT_SEC
+            or not math.isfinite(value)):
         return float(default)
     return value
 
