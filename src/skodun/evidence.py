@@ -165,7 +165,8 @@ def _is_shell_command_flag(executable: str, arg: str) -> bool:
         lowered = arg.lower()
         return lowered.startswith(("/c", "/k"))
     if name in {"perl", "ruby", "node"}:
-        return (arg == "-e" or arg.startswith("-e")
+        eval_flags = ("-e", "-E") if name == "perl" else ("-e",)
+        return (arg in eval_flags or arg.startswith(eval_flags)
                 or arg.startswith("--eval")
                 or arg.startswith("--execute")
                 or (name == "node" and arg.startswith(("-p", "--print"))))
@@ -293,6 +294,7 @@ class ProducerCommand:
     argv: tuple[str, ...]
     cwd: str
     env_allowlist: tuple[str, ...]
+    evidence_kind: str = "preflight"
 
     def __post_init__(self) -> None:
         _text("command_id", self.command_id)
@@ -316,10 +318,13 @@ class ProducerCommand:
                 or any(_ENV.fullmatch(name) is None
                        for name in self.env_allowlist)):
             raise EvidenceError("invalid_command", "environment allowlist")
+        if self.evidence_kind not in _KINDS:
+            raise EvidenceError("invalid_command", "evidence kind")
 
     def to_mapping(self) -> dict[str, object]:
         return {"command_id": self.command_id, "argv": list(self.argv),
-                "cwd": self.cwd, "env_allowlist": list(self.env_allowlist)}
+                "cwd": self.cwd, "env_allowlist": list(self.env_allowlist),
+                "evidence_kind": self.evidence_kind}
 
     @property
     def digest(self) -> str:
@@ -631,6 +636,8 @@ def verify_receipt(receipt: EvidenceReceipt, expected: EvidenceIdentity,
     command = protected_policy.command(receipt.command_id)
     if command is None or command.digest != receipt.command_digest:
         return EvidenceVerification(False, "command_mismatch")
+    if receipt.evidence_kind != command.evidence_kind:
+        return EvidenceVerification(False, "evidence_kind_mismatch")
     if receipt.diagnostic_category != "ok":
         return EvidenceVerification(False, "diagnostic_mismatch")
     if receipt.terminal_state != "passed" or receipt.exit_code != 0:

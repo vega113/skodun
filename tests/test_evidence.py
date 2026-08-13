@@ -166,6 +166,12 @@ def test_identity_and_protected_policy_mismatches_never_verify():
     assert result.accepted is False
     assert result.reason_code == "policy_mismatch"
 
+    forged_kind = parse_receipt(json.dumps(receipt_mapping(
+        evidence_kind="full_gate")))
+    result = verify_receipt(forged_kind, identity(), policy())
+    assert result.accepted is False
+    assert result.reason_code == "evidence_kind_mismatch"
+
 
 @pytest.mark.parametrize("argv", [
     ("bash", "-lc", "echo unsafe"),
@@ -184,6 +190,7 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
     ("perl", "-e", "print unsafe"),
     ("powershell", "-EncodedCommand", "unsafe"),
     ("perl", "-eprint(1)"),
+    ("perl", "-E", "say 1"),
     ("ruby", "-eputs(1)"),
     ("node", "-p", "1+1"),
     ("node", "--conditions", "development", "-e", "1+1"),
