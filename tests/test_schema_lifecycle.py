@@ -299,6 +299,43 @@ def test_legacy_fg_lock_blocks_for_worktree_git_file(tmp_path, monkeypatch):
     assert "legacy_fg_lock" in migration_blockers(db)
 
 
+def test_legacy_fg_lock_blocks_from_pre_v9_repo_column(tmp_path):
+    db = _authority_db(tmp_path)
+    common = tmp_path / "common.git"
+    common.mkdir()
+    lock = common / "grok-reviews-foreground.lock"
+    lock.mkdir()
+    (lock / "owner").write_text(
+        f"pid={os.getpid()}\nstarted={int(time.time())}\nworktree={tmp_path}\n",
+        encoding="utf-8")
+    with Store.open(db) as store:
+        store._c.execute(
+            "INSERT INTO reviews(id, status, repo) VALUES (?,?,?)",
+            ("sk_repo", "clean", str(common)))
+    _downgrade(db)
+    assert "legacy_fg_lock" in migration_blockers(db)
+
+
+def test_partial_ladder_keeps_pre_migration_backup(tmp_path, monkeypatch):
+    db = _authority_db(tmp_path)
+    with Store.open(db):
+        pass
+    _downgrade(db, version=12)
+    import skodun.store as store_mod
+
+    def wrap(conn):
+        conn.execute("PRAGMA user_version = 13")
+        raise ValueError("injected mid-ladder")
+
+    monkeypatch.setattr(store_mod, "_migrate", wrap)
+    with pytest.raises(ValueError, match="injected mid-ladder"):
+        Store.migrate_existing(db, build_commit="a" * 40)
+    assert inspect_schema(db).version == 13
+    backup = Path(str(db) + ".backup-before-v" + str(SCHEMA_VERSION))
+    assert backup.exists()
+    assert not Path(str(db) + ".migration.lock").exists()
+
+
 def test_failed_apply_is_retryable_when_store_stays_old(tmp_path, monkeypatch):
     db = _authority_db(tmp_path)
     with Store.open(db):

@@ -42,6 +42,16 @@ class CustomBuildHook(BuildHookInterface):
 
 
 def _git_commit(root: Path) -> str | None:
+    top = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, timeout=10)
+    if top.returncode != 0:
+        return None
+    try:
+        if Path(top.stdout.strip()).resolve() != root.resolve():
+            return None
+    except OSError:
+        return None
     head = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
         capture_output=True, text=True, timeout=10)

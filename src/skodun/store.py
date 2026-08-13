@@ -126,10 +126,12 @@ def schema_too_new_message(store_version: int) -> str:
 
 def _open_regular_file(path: Path) -> tuple[int | None, SchemaInfo | None]:
     """Open `path` without following links or blocking on FIFOs."""
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not nofollow or not nonblock:
+        return None, SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
+                                reason_code="unsafe_open")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
@@ -374,6 +376,13 @@ def _discovered_lock_scopes(conn: sqlite3.Connection,
                 scopes.add(str(row[0]))
     if "reviews" in tables:
         columns = _table_columns(conn, "reviews")
+        if "repo" in columns:
+            for row in conn.execute(
+                    "SELECT DISTINCT repo FROM reviews "
+                    "WHERE repo IS NOT NULL").fetchall():
+                if row[0]:
+                    # `reviews.repo` is already a git common dir (v5+).
+                    scopes.add(str(row[0]))
         if "worktree_root" in columns:
             for row in conn.execute(
                     "SELECT DISTINCT worktree_root FROM reviews "
@@ -403,9 +412,10 @@ def migration_blockers(path: Path) -> tuple[str, ...]:
         return ("blockers_unreadable",)
     assert snapshot is not None and db_path is not None
     uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=0)
-    conn.row_factory = sqlite3.Row
+    conn = None
     try:
+        conn = sqlite3.connect(uri, uri=True, timeout=0)
+        conn.row_factory = sqlite3.Row
         tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         blockers: list[str] = []
@@ -470,8 +480,11 @@ def migration_blockers(path: Path) -> tuple[str, ...]:
                 blockers.append("legacy_fg_lock")
                 break
         return tuple(blockers)
+    except sqlite3.Error:
+        return ("blockers_unreadable",)
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
         snapshot.cleanup()
 
 #: Set to anything other than "0", unset, or blank to ignore `provider_state`
@@ -1590,18 +1603,23 @@ class Store:
                     version=int(info.version)) from exc
         os.write(fd, str(os.getpid()).encode("ascii"))
         os.close(fd)
-        # Refresh the schema and blockers after taking the exclusive
-        # maintenance fence. A concurrent migrator may have completed after
-        # the optimistic inspection above; it must not be backed up again.
+        try:
+            return cls._apply_locked_migration(
+                path, build_commit=build_commit, receipt_path=receipt_path)
+        finally:
+            lock.unlink(missing_ok=True)
+
+    @classmethod
+    def _apply_locked_migration(cls, path: Path, *, build_commit: str,
+                                 receipt_path: Path | None) -> dict:
+        """Apply migration while the caller holds the exclusive lock."""
         info = inspect_schema(path)
         if info.state != "older":
-            lock.unlink(missing_ok=True)
             raise SchemaLifecycleError(
                 "not_migratable", "migration requires an older existing store",
                 version=info.version)
         blockers = migration_blockers(path)
         if blockers:
-            lock.unlink(missing_ok=True)
             raise SchemaLifecycleError(
                 "active_work", "migration blocked by: " + ", ".join(blockers),
                 version=int(info.version))
@@ -1609,32 +1627,29 @@ class Store:
         destination = (Path(receipt_path) if receipt_path is not None
                        else migration_receipt_path(path))
         try:
-            try:
-                receipt_fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                                     0o600)
-                os.close(receipt_fd)
-            except FileExistsError as exc:
-                raise SchemaLifecycleError(
-                    "receipt_exists", f"migration receipt already exists: {destination}",
-                    version=int(info.version)) from exc
-            try:
-                backup_fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                                    0o600)
-                os.close(backup_fd)
-            except FileExistsError as exc:
-                destination.unlink(missing_ok=True)
-                raise SchemaLifecycleError(
-                    "backup_exists", f"migration backup already exists: {backup}",
-                    version=int(info.version)) from exc
-        except BaseException:
-            lock.unlink(missing_ok=True)
-            raise
+            receipt_fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                                 0o600)
+            os.close(receipt_fd)
+        except FileExistsError as exc:
+            raise SchemaLifecycleError(
+                "receipt_exists", f"migration receipt already exists: {destination}",
+                version=int(info.version)) from exc
+        try:
+            backup_fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                                0o600)
+            os.close(backup_fd)
+        except FileExistsError as exc:
+            destination.unlink(missing_ok=True)
+            raise SchemaLifecycleError(
+                "backup_exists", f"migration backup already exists: {backup}",
+                version=int(info.version)) from exc
         started_at = _iso_now()
         destination.write_text(json.dumps({
             "schema_from": int(info.version), "schema_to": SCHEMA_VERSION,
             "started_at": started_at, "result": "in_progress",
             "diagnostic_category": "migration_in_progress",
         }, sort_keys=True) + "\n", encoding="utf-8")
+        original_version = int(info.version)
         migrated = False
         try:
             source = sqlite3.connect(path, isolation_level=None)
@@ -1659,7 +1674,7 @@ class Store:
             migrated = True
             digest = hashlib.sha256(backup.read_bytes()).hexdigest()
             receipt = {
-                "schema_from": int(info.version),
+                "schema_from": original_version,
                 "schema_to": SCHEMA_VERSION,
                 "build_commit": build_commit,
                 "started_at": started_at,
@@ -1674,24 +1689,19 @@ class Store:
                 destination.write_text(json.dumps(receipt, sort_keys=True) + "\n",
                                        encoding="utf-8")
             except OSError:
-                # The schema is already committed and verified. Keep the
-                # pre-created bounded receipt as a recovery marker and return
-                # the successful migration outcome instead of reporting a
-                # false failure that makes a current store look unmigratable.
                 receipt["diagnostic_category"] = "receipt_pending"
             return receipt
         except BaseException:
             if not migrated:
                 destination.unlink(missing_ok=True)
                 current = inspect_schema(path)
-                if current.state == "older":
+                # Keep the verified pre-migration backup whenever the store
+                # advanced off the original version; deleting it would leave
+                # a partial ladder with no restore image.
+                if (current.state == "older"
+                        and current.version == original_version):
                     backup.unlink(missing_ok=True)
             raise
-        finally:
-            try:
-                lock.unlink()
-            except FileNotFoundError:
-                pass
 
     def close(self) -> None:
         """Close the underlying connection. Idempotent.

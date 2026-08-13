@@ -967,9 +967,10 @@ MCP `review` and `review_readiness` responses expose the same identity in
 `structuredContent.skodun_version` and `structuredContent.skodun_commit`, so a
 client does not need to parse human text or issue a separate shell command.
 
-`skodun_commit` is `null` for an install that is not a checkout — a wheel has
-no commit, and the version still identifies the code. On a checkout it carries
-a suffix when the hash does **not** describe what ran:
+`skodun_commit` is the embedded wheel identity for a release install, or
+`null` only when that identity is missing (an anonymous/old wheel). A source
+checkout records the git HEAD, with a suffix when the hash does **not**
+describe what ran:
 
 | Value | Meaning |
 |---|---|
