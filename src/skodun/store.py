@@ -331,6 +331,39 @@ def _legacy_fg_lock_live(common_dir: Path) -> bool:
     return age < float(LOCK_WRITE_GRACE_SEC)
 
 
+def _git_common_dir_guess(worktree_root: Path) -> Path | None:
+    """Resolve a git common dir from `.git` without spawning git.
+
+    Used only when `gitio.git_common_dir` cannot answer. Ordinary repos keep
+    `.git` as a directory; linked worktrees keep a `gitdir:` file and a
+    `commondir` pointer to the shared git dir where the FG lock lives.
+    """
+    git = worktree_root / ".git"
+    try:
+        if git.is_file():
+            gitdir = None
+            for line in git.read_text(encoding="utf-8").splitlines():
+                if line.lower().startswith("gitdir:"):
+                    raw = line.split(":", 1)[1].strip()
+                    gitdir = Path(raw) if Path(raw).is_absolute() else (
+                        worktree_root / raw)
+                    break
+            if gitdir is None:
+                return None
+            git = gitdir
+        if not git.is_dir():
+            return None
+        common = git / "commondir"
+        if common.is_file():
+            rel = common.read_text(encoding="utf-8").splitlines()[0].strip()
+            resolved = (git / rel).resolve()
+            if resolved.is_dir():
+                return resolved
+        return git.resolve()
+    except OSError:
+        return None
+
+
 def _discovered_lock_scopes(conn: sqlite3.Connection,
                             tables: set[str]) -> set[str]:
     scopes: set[str] = set()
@@ -350,9 +383,9 @@ def _discovered_lock_scopes(conn: sqlite3.Connection,
                         from . import gitio
                         scopes.add(str(gitio.git_common_dir(Path(row[0]))))
                     except Exception:
-                        guess = Path(str(row[0])) / ".git"
-                        if guess.is_dir():
-                            scopes.add(str(guess.resolve()))
+                        guessed = _git_common_dir_guess(Path(str(row[0])))
+                        if guessed is not None:
+                            scopes.add(str(guessed))
     return scopes
 
 

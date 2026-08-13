@@ -274,6 +274,31 @@ def test_legacy_fg_lock_blocks_without_capacity_row(tmp_path):
     assert "legacy_fg_lock" in migration_blockers(db)
 
 
+def test_legacy_fg_lock_blocks_for_worktree_git_file(tmp_path, monkeypatch):
+    db = _authority_db(tmp_path)
+    common = tmp_path / "main.git"
+    wt_git = common / "worktrees" / "wt"
+    wt_git.mkdir(parents=True)
+    (wt_git / "commondir").write_text("../..\n", encoding="utf-8")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {wt_git}\n", encoding="utf-8")
+    lock = common / "grok-reviews-foreground.lock"
+    lock.mkdir()
+    (lock / "owner").write_text(
+        f"pid={os.getpid()}\nstarted={int(time.time())}\nworktree={worktree}\n",
+        encoding="utf-8")
+    with Store.open(db) as store:
+        store._c.execute(
+            "INSERT INTO reviews(id, status, worktree_root) VALUES (?,?,?)",
+            ("sk_wt", "clean", str(worktree)))
+    def _boom(_repo):
+        raise RuntimeError("no git")
+    monkeypatch.setattr("skodun.gitio.git_common_dir", _boom)
+    _downgrade(db)
+    assert "legacy_fg_lock" in migration_blockers(db)
+
+
 def test_failed_apply_is_retryable_when_store_stays_old(tmp_path, monkeypatch):
     db = _authority_db(tmp_path)
     with Store.open(db):
