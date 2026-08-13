@@ -183,39 +183,25 @@ def _is_shell_command_flag(executable: str, arg: str) -> bool:
 def _contains_shell_command(argv: tuple[str, ...]) -> bool:
     """Reject recognized interpreters and explicitly supported wrappers."""
     executable_positions = [0]
-    wrapper = _normalized_executable(argv[0])
-    if wrapper == "busybox" and len(argv) > 1:
-        executable_positions.append(1)
-    elif wrapper == "env":
-        index = 1
-        while index < len(argv):
-            option = argv[index]
-            if (option in {"-S", "--split-string"}
-                    or option.startswith(("-S", "--split-string="))):
+    cursor = 0
+    while cursor < len(executable_positions):
+        index = executable_positions[cursor]
+        wrapper = _normalized_executable(argv[index])
+        if wrapper == "busybox" and index + 1 < len(argv):
+            executable_positions.append(index + 1)
+        elif wrapper == "env":
+            target = _env_target_index(argv, index + 1)
+            if target == -1:
                 return True
-            if option in {"-", "--"}:
-                index += 1
-                continue
-            if "=" in option and not option.startswith("-"):
-                index += 1
-                continue
-            if option in {"-u", "--unset", "-C", "--chdir"}:
-                index += 2
-                continue
-            if option.startswith(("--unset=", "--chdir=")):
-                index += 1
-                continue
-            if option in {"-i", "--ignore-environment"}:
-                index += 1
-                continue
-            break
-        if index < len(argv):
-            executable_positions.append(index)
+            if target < len(argv):
+                executable_positions.append(target)
+        cursor += 1
     for index in executable_positions:
         executable = argv[index]
         flags = argv[index + 1:]
-        if _normalized_executable(executable) != "cmd":
-            flags = tuple(_interpreter_option_segment(flags))
+        name = _normalized_executable(executable)
+        if name != "cmd":
+            flags = tuple(_interpreter_option_segment(flags, name))
         if any(_is_shell_command_flag(executable, flag) for flag in flags):
             return True
     return False
@@ -226,7 +212,33 @@ def _normalized_executable(executable: str) -> str:
     return re.sub(r"(python|perl|ruby|node)\d+(?:\.\d+)*$", r"\1", name)
 
 
-def _interpreter_option_segment(args: tuple[str, ...]):
+def _env_target_index(argv: tuple[str, ...], start: int) -> int:
+    index = start
+    while index < len(argv):
+        option = argv[index]
+        if (option in {"-S", "--split-string"}
+                or option.startswith(("-S", "--split-string="))):
+            return -1
+        if option in {"-", "--"}:
+            index += 1
+            continue
+        if "=" in option and not option.startswith("-"):
+            index += 1
+            continue
+        if option in {"-u", "--unset", "-C", "--chdir"}:
+            index += 2
+            continue
+        if option.startswith(("--unset=", "--chdir=")):
+            index += 1
+            continue
+        if option in {"-i", "--ignore-environment"}:
+            index += 1
+            continue
+        break
+    return index
+
+
+def _interpreter_option_segment(args: tuple[str, ...], name: str):
     """Return only interpreter options before a script/module operand."""
     result: list[str] = []
     index = 0
@@ -242,7 +254,13 @@ def _interpreter_option_segment(args: tuple[str, ...]):
             if index < len(args):
                 result.append(args[index])
             break
-        if arg in {"-W", "--warn", "-X"}:
+        value_options = {
+            "node": {"-C", "--conditions", "-r", "--require",
+                     "--loader", "--import"},
+            "perl": {"-I", "-M", "--include", "--require"},
+            "ruby": {"-I", "-r", "--require"},
+        }.get(name, set())
+        if arg in value_options or arg in {"-W", "--warn", "-X"}:
             index += 1
             if index < len(args):
                 result.append(args[index])
@@ -358,12 +376,10 @@ class EvidenceReceipt:
         if not isinstance(self.artifact_digests, tuple):
             object.__setattr__(self, "artifact_digests",
                                tuple(self.artifact_digests))
-        if not isinstance(self.counters, MappingProxyType):
-            object.__setattr__(self, "counters",
-                               MappingProxyType(dict(self.counters)))
-        if not isinstance(self.redaction, MappingProxyType):
-            object.__setattr__(self, "redaction",
-                               MappingProxyType(dict(self.redaction)))
+        object.__setattr__(self, "counters",
+                           MappingProxyType(dict(self.counters)))
+        object.__setattr__(self, "redaction",
+                           MappingProxyType(dict(self.redaction)))
 
     @property
     def canonical_mapping(self) -> dict[str, object]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -185,6 +186,7 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
     ("perl", "-eprint(1)"),
     ("ruby", "-eputs(1)"),
     ("node", "-p", "1+1"),
+    ("node", "--conditions", "development", "-e", "1+1"),
 ])
 def test_each_interpreter_command_string_flag_is_rejected(argv):
     with pytest.raises(EvidenceError):
@@ -197,6 +199,7 @@ def test_each_interpreter_command_string_flag_is_rejected(argv):
     ("env", "-", "bash", "-c", "echo unsafe"),
     ("env", "--", "bash", "-c", "echo unsafe"),
     ("env", "-S", "bash -c echo unsafe"),
+    ("env", "env", "bash", "-c", "echo unsafe"),
     ("busybox", "sh", "-c", "echo unsafe"),
     ("bash.exe", "-c", "echo unsafe"),
     ("cmd.exe", "/c", "echo unsafe"),
@@ -262,6 +265,19 @@ def test_receipt_nested_counters_are_immutable_and_invalid_constructed_receipts_
     result = verify_receipt(forged, identity(), policy())
     assert result.accepted is False
     assert result.reason_code == "invalid_field"
+
+
+def test_mapping_proxy_inputs_are_copied_before_freezing():
+    parsed = parse_receipt(json.dumps(receipt_mapping()))
+    counters = {"checks": 3}
+    redaction = {"applied": True, "secrets_removed": True,
+                 "logs_included": False}
+    forged = replace(parsed, counters=MappingProxyType(counters),
+                     redaction=MappingProxyType(redaction))
+    counters["checks"] = 99
+    redaction["applied"] = False
+    assert dict(forged.counters) == {"checks": 3}
+    assert dict(forged.redaction)["applied"] is True
 
 
 def test_directly_constructed_artifact_digests_are_immutable():
