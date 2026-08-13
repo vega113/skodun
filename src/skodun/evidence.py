@@ -193,6 +193,8 @@ def _contains_shell_command(argv: tuple[str, ...]) -> bool:
     while cursor < len(executable_positions):
         index = executable_positions[cursor]
         wrapper = _normalized_executable(argv[index])
+        if wrapper == "timeout":
+            return True
         if wrapper == "busybox" and index + 1 < len(argv):
             executable_positions.append(index + 1)
         elif wrapper == "env":
@@ -279,7 +281,7 @@ def _interpreter_option_segment(args: tuple[str, ...], name: str):
                      "--loader", "--import"},
             "python": {"--check-hash-based-pycs"},
             "perl": {"-I", "-M", "--include", "--require"},
-            "ruby": {"-C", "-I", "-r", "--require"},
+            "ruby": {"-C", "-E", "-I", "-r", "--require"},
         }.get(name, set())
         if name in {"csh", "dash", "fish", "ksh", "sh", "tcsh", "zsh"}:
             value_options = value_options | {"-o"}

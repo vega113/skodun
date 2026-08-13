@@ -202,6 +202,7 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
     ("fish", "--init-command=echo unsafe"),
     ("python3", "--check-hash-based-pycs", "always", "-c", "print(1)"),
     ("ruby", "-C", "/tmp", "-e", "puts 1"),
+    ("ruby", "-E", "UTF-8", "-e", "puts 1"),
 ])
 def test_each_interpreter_command_string_flag_is_rejected(argv):
     with pytest.raises(EvidenceError):
@@ -220,6 +221,7 @@ def test_each_interpreter_command_string_flag_is_rejected(argv):
     ("env", "--default-signal", "TERM", "bash", "-c", "echo unsafe"),
     ("env", "-v", "bash", "-c", "echo unsafe"),
     ("busybox", "sh", "-c", "echo unsafe"),
+    ("timeout", "10", "bash", "-c", "echo unsafe"),
     ("bash.exe", "-c", "echo unsafe"),
     ("cmd.exe", "/c", "echo unsafe"),
 ])
