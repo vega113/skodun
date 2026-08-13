@@ -290,4 +290,7 @@ def render_prompt_context(rows: Iterable[object],
     ).encode("utf-8")
     budget = max(0, max_bytes - len(marker) - len(header))
     body = b"".join(text.splitlines(keepends=True)[2:])
-    return header + clip_utf8(body, budget) + marker, True
+    clipped = clip_utf8(body, budget)
+    cut = clipped.rfind(b"\n")
+    clipped = clipped[:cut + 1] if cut >= 0 else b""
+    return header + clipped + marker, True

@@ -365,6 +365,23 @@ def test_lineage_prompt_context_is_bounded_and_utf8_safe():
     assert b"\n\nsha256:" not in context
 
 
+def test_truncated_lineage_prompt_keeps_complete_quoted_path_lines():
+    digest = "sha256:" + "a" * 64
+    rows = [{
+        "finding_fingerprint_v2": digest,
+        "file": "x" * 200,
+        "finding_lineage_v2": {"match_reason": "repeated"},
+    }] * 8
+    context, truncated = fingerprint.render_prompt_context(rows, max_bytes=400)
+    assert truncated is True
+    text = context.decode("utf-8")
+    for line in text.splitlines():
+        if line.startswith("sha256:"):
+            assert ' path="' in line
+            assert line.endswith('" reason=repeated')
+            assert line.count('"') == 2
+
+
 def test_lineage_prompt_context_cannot_break_out_of_a_single_line():
     rows = [{
         "finding_fingerprint_v2": "sha256:" + "a" * 64,
