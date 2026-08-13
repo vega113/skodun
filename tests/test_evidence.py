@@ -189,6 +189,8 @@ def test_producer_policy_rejects_combined_command_string_flags(argv):
     ("node", "--conditions", "development", "-e", "1+1"),
     ("bash", "-O", "extglob", "-c", "echo unsafe"),
     ("bash", "-o", "pipefail", "-c", "echo unsafe"),
+    ("sh", "-o", "errexit", "-c", "echo unsafe"),
+    ("dash", "-o", "errexit", "-c", "echo unsafe"),
     ("python3", "--check-hash-based-pycs", "always", "-c", "print(1)"),
     ("ruby", "-C", "/tmp", "-e", "puts 1"),
 ])
@@ -242,6 +244,11 @@ def test_receipt_metadata_is_bounded_to_identifiers():
         with pytest.raises(EvidenceError) as exc:
             parse_receipt(json.dumps(raw))
         assert exc.value.reason_code == "invalid_field"
+
+    raw = receipt_mapping(counters={"API_TOKEN=secret": 1})
+    with pytest.raises(EvidenceError) as exc:
+        parse_receipt(json.dumps(raw))
+    assert exc.value.reason_code == "invalid_field"
 
 
 @pytest.mark.parametrize("cwd", ["..\\outside", "C:\\Windows", "\\\\server\\share"])

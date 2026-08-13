@@ -277,6 +277,8 @@ def _interpreter_option_segment(args: tuple[str, ...], name: str):
             "perl": {"-I", "-M", "--include", "--require"},
             "ruby": {"-C", "-I", "-r", "--require"},
         }.get(name, set())
+        if name in {"csh", "dash", "fish", "ksh", "sh", "tcsh", "zsh"}:
+            value_options = value_options | {"-o"}
         if arg in value_options or arg in {"-W", "--warn", "-X"}:
             index += 1
             if index < len(args):
@@ -486,6 +488,8 @@ def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
     normalized_counters: dict[str, int] = {}
     for key, value in counters.items():
         if not isinstance(key, str) or _text("counter", key, maximum=64) is None:
+            raise EvidenceError("invalid_field", "counter")
+        if _IDENTIFIER.fullmatch(key) is None:
             raise EvidenceError("invalid_field", "counter")
         normalized_counters[key] = _plain_int(value, "counter")
     artifacts = raw["artifact_digests"]
