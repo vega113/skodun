@@ -363,16 +363,17 @@ def migration_blockers(path: Path) -> tuple[str, ...]:
         blockers: list[str] = []
         if "reviews" in tables:
             columns = _table_columns(conn, "reviews")
+            # Pre-v3 stores have no pid column, and a current row may have a
+            # NULL pid. Neither can prove a live process; treating them as
+            # blockers would strand migrate --apply on a crashed historical
+            # review. Live work is still fenced by the FG lock and capacity
+            # admissions below.
             if "pid" in columns:
                 running = conn.execute(
-                    "SELECT pid FROM reviews WHERE status='running'").fetchall()
-                if any(row[0] is None or _pid_alive(int(row[0]))
-                       for row in running):
+                    "SELECT pid FROM reviews WHERE status='running' "
+                    "AND pid IS NOT NULL").fetchall()
+                if any(_pid_alive(int(row[0])) for row in running):
                     blockers.append("active_review")
-            elif conn.execute(
-                    "SELECT 1 FROM reviews WHERE status='running' LIMIT 1"
-            ).fetchone():
-                blockers.append("active_review")
         if "review_checkpoints" in tables:
             now = _iso_now()
             columns = _table_columns(conn, "review_checkpoints")

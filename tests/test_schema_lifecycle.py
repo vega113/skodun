@@ -162,6 +162,59 @@ def test_cli_apply_rejects_mismatched_build_commit(tmp_path, monkeypatch, capsys
     assert "build_identity_mismatch" in capsys.readouterr().out
 
 
+def test_stale_running_review_without_pid_does_not_block_forever(tmp_path):
+    db = tmp_path / "v1-stale-running.db"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE reviews (
+          id TEXT PRIMARY KEY, reviewed_at TEXT, branch TEXT, head TEXT,
+          base_ref TEXT, base_sha TEXT, diff_hash TEXT, context_hash TEXT,
+          mode TEXT, model TEXT, adapter TEXT, status TEXT,
+          parse_ok INTEGER, degraded INTEGER, diff_truncated INTEGER,
+          trustworthy INTEGER, stop_reason TEXT, findings_total INTEGER,
+          sev_high INTEGER, sev_medium INTEGER, sev_low INTEGER, summary TEXT,
+          source TEXT DEFAULT 'skodun', artifact_json TEXT
+        );
+        CREATE TABLE triage (
+          ledger_key TEXT PRIMARY KEY, finding_key TEXT, review_id TEXT,
+          branch TEXT, base_sha TEXT, file TEXT, line INTEGER, severity TEXT,
+          title TEXT, dismissed_reason TEXT, dismissed_at TEXT
+        );
+        CREATE TABLE gate_events (
+          at TEXT, repo TEXT, branch TEXT, diff_hash TEXT, outcome TEXT,
+          code INTEGER, note TEXT
+        );
+    """)
+    conn.execute("INSERT INTO reviews(id, status) VALUES ('sk_stale', 'running')")
+    conn.execute("PRAGMA user_version = 1")
+    conn.close()
+    assert "active_review" not in migration_blockers(db)
+    receipt = Store.migrate_existing(db, build_commit="a" * 40)
+    assert receipt["result"] == "success"
+
+
+def test_live_pid_running_review_blocks_migration(tmp_path):
+    db = _authority_db(tmp_path)
+    with Store.open(db) as store:
+        store._c.execute(
+            "INSERT INTO reviews(id, status, pid) VALUES (?,?,?)",
+            ("sk_live", "running", os.getpid()))
+    _downgrade(db)
+    assert "active_review" in migration_blockers(db)
+
+
+def test_dead_pid_running_review_does_not_block_migration(tmp_path):
+    db = _authority_db(tmp_path)
+    with Store.open(db) as store:
+        store._c.execute(
+            "INSERT INTO reviews(id, status, pid) VALUES (?,?,?)",
+            ("sk_dead", "running", 2 ** 22))
+    _downgrade(db)
+    assert "active_review" not in migration_blockers(db)
+    receipt = Store.migrate_existing(db, build_commit="a" * 40)
+    assert receipt["result"] == "success"
+
+
 def test_dead_capacity_admission_does_not_block_migration(tmp_path):
     db = _authority_db(tmp_path)
     with Store.open(db) as store:
