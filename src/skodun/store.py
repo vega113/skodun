@@ -165,8 +165,6 @@ def _copy_fd_to(fd: int, destination: Path) -> None:
 
 def _copy_sidecar(src: Path, destination: Path) -> SchemaInfo | None:
     """Copy a WAL/SHM sidecar with the same descriptor rules as the database."""
-    if not src.exists():
-        return None
     fd, error = _open_regular_file(src)
     if error is not None:
         if error.state == "missing":
@@ -1505,9 +1503,13 @@ class Store:
                 f"store cannot be opened read-only: {path}", version=None)
         assert snapshot is not None and db_path is not None
         uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            conn = sqlite3.connect(uri, uri=True)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            snapshot.cleanup()
+            raise
         return cls(conn, Path(path), _snapshot=snapshot)
 
     @classmethod

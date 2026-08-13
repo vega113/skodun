@@ -11,6 +11,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -293,6 +294,40 @@ def test_failed_apply_is_retryable_when_store_stays_old(tmp_path, monkeypatch):
     assert not migration_receipt_path(db).exists()
     receipt = Store.migrate_existing(db, build_commit="a" * 40)
     assert receipt["result"] == "success"
+
+
+def test_inspect_schema_refuses_dangling_wal_symlink(tmp_path):
+    db = _authority_db(tmp_path)
+    with Store.open(db):
+        pass
+    Path(str(db) + "-wal").symlink_to(tmp_path / "missing-wal")
+    info = inspect_schema(db)
+    assert info.state == "invalid"
+    assert info.reason_code == "symlink"
+
+
+def test_open_readonly_cleans_snapshot_if_connect_fails(tmp_path, monkeypatch):
+    db = _authority_db(tmp_path)
+    with Store.open(db):
+        pass
+    import skodun.store as store_mod
+    real = store_mod.sqlite3.connect
+    calls = {"ro": 0}
+
+    def wrap(*args, **kwargs):
+        target = args[0] if args else ""
+        if isinstance(target, str) and "mode=ro" in target:
+            calls["ro"] += 1
+            if calls["ro"] >= 2:
+                raise sqlite3.OperationalError("injected readonly connect")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(store_mod.sqlite3, "connect", wrap)
+    before = set(Path(tempfile.gettempdir()).glob("skodun-inspect-*"))
+    with pytest.raises(sqlite3.OperationalError, match="injected readonly"):
+        Store.open_readonly(db)
+    after = set(Path(tempfile.gettempdir()).glob("skodun-inspect-*"))
+    assert after <= before
 
 
 def test_unreadable_blocker_snapshot_refuses_migration(tmp_path, monkeypatch):
