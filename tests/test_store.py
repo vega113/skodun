@@ -1,3 +1,5 @@
+"""Store lifecycle and persistence invariants, including warning-free closure."""
+
 import itertools
 import json
 import os
@@ -2451,6 +2453,7 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_provenance.py",
     "tests/test_stats.py",
     "tests/test_evidence.py",
+    "tests/test_mutation.py",
     "tests/test_reuse.py",
     "tests/test_readiness.py",
     "tests/test_schema_lifecycle.py",
@@ -3755,3 +3758,4 @@ def test_routing_counts_refuses_a_timestamp_it_cannot_order_by(tmp_path):
     with Store.open(tmp_path / "s.db") as st:
         with pytest.raises(ValueError, match="since_iso"):
             st.routing_counts(since_iso="last tuesday")
+"""Store lifecycle and persistence invariants, including warning-free closure."""

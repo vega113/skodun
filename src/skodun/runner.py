@@ -190,6 +190,7 @@ def run_with_watchdog(
     stdin_path: Path | None = None,
     cancel: "threading.Event | None" = None,
     max_output_bytes: int | None = None,
+    env: dict[str, str] | None = None,
 ) -> RunResult:
     """Run `cmd` with a hard wall-clock timeout, streaming output to files.
 
@@ -269,6 +270,7 @@ def run_with_watchdog(
                     stderr=err,
                     stdin=subprocess.DEVNULL if stdin_file is None else stdin_file,
                     start_new_session=True,
+                    env=env,
                 )
             except OSError as e:
                 raise SpawnError(e, cmd=cmd, cwd=cwd) from e
