@@ -235,6 +235,8 @@ def _tree_digest(root: Path) -> str:
                 encoded = relative.encode("utf-8")
                 digest.update(len(encoded).to_bytes(8, "big"))
                 digest.update(encoded)
+                mode = stat.S_IMODE(_stat_result.st_mode)
+                digest.update(mode.to_bytes(4, "big"))
                 digest.update(_stat_result.st_size.to_bytes(8, "big"))
                 while True:
                     chunk = os.read(fd, 1024 * 1024)
@@ -451,7 +453,10 @@ def parse_mutation_proof(raw: Mapping[str, object]) -> MutationProof:
                 or not compile_result["run"]["passed"]
                 or not (result["baseline_result"]["executed"]
                         and not result["baseline_result"]["passed"]
-                        and result["baseline_result"]["marker_seen"])
+                        and result["baseline_result"]["marker_seen"]
+                        and not result["baseline_result"]["timed_out"]
+                        and not result["baseline_result"]["output_limit_exceeded"]
+                        and result["baseline_result"]["descendants_clean"])
                 or not all(run["passed"] and run["marker_seen"]
                            for run in (result["controls"]["positive"],
                                        result["controls"]["negative"],
@@ -488,8 +493,10 @@ def _run_command(
                          else shutil.which(executable))
         if not resolved_text or not Path(resolved_text).exists():
             raise MutationError("command_missing", command_id)
+        argv = list(command.argv)
+        argv[0] = resolved_text
         result: RunResult = run_with_watchdog(
-            command.argv, cwd=cwd, stdout_path=stdout, stderr_path=stderr,
+            argv, cwd=cwd, stdout_path=stdout, stderr_path=stderr,
             timeout_sec=timeout_sec, cancel=cancel,
             max_output_bytes=_MAX_OUTPUT,
             env={name: os.environ[name] for name in command.env_allowlist
@@ -723,6 +730,8 @@ def run_mutation(spec: MutationSpec, *, root: Path,
                     if not _same_file(restore_stat, target_stat):
                         raise MutationError("target_changed")
                     _write_fd(restore_fd, original)
+                    os.fchmod(restore_fd, stat.S_IMODE(target_stat.st_mode))
+                    os.fsync(restore_fd)
                 finally:
                     os.close(restore_fd)
                 restore_status = "restored"
