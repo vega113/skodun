@@ -1,8 +1,10 @@
-trait Base
+trait Base:
+  val marker = 1
 class Child extends Base
 object Namespace:
-  val marker = 1
+  val imported = 2
 object Use:
   import Namespace.*
   val item = new Child
-  val inherited = marker
+  val inherited = item.marker
+  val wildcard = imported
