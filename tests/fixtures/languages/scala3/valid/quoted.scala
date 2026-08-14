@@ -1,3 +1,5 @@
+import scala.quoted.*
+
 object Quoted:
   val character = '\u03bb'
-  val expression = '{ 1 + 2 }
+  def expression(using Quotes): Expr[Int] = '{ 1 + 2 }

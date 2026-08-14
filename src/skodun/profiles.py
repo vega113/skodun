@@ -8,6 +8,7 @@ never parse source, certify coverage, or contribute to gate/trust.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -157,6 +158,8 @@ class LanguageCapabilityProfile:
             field, command_id = required[capability]
             if command_id is None:
                 raise ProfileError("invalid_profile", field)
+        if "version_discovery" not in self.capabilities:
+            raise ProfileError("invalid_profile", "version_discovery required")
         if (not isinstance(self.fixtures, tuple)
                 or len(self.fixtures) > MAX_PROFILE_FIXTURES
                 or any(not isinstance(item, FixtureExpectation)
@@ -167,7 +170,8 @@ class LanguageCapabilityProfile:
         if self.fixtures and (self.compile_command_id is None
                               or self.harness_command_id is None):
             raise ProfileError("invalid_profile", "fixture compile/harness command")
-        if (set(self.capabilities) & {"symbol_query", "mutation_locator"}
+        if (set(self.capabilities) & {"symbol_query", "mutation_locator",
+                                      "mutation_execution"}
                 and not self.fixtures):
             raise ProfileError("invalid_profile", "optional capability fixtures")
         if self.version_prefix is not None:
@@ -240,19 +244,24 @@ def _root(root: Path) -> Path:
 
 
 def _safe_fixture(root: Path, relative: str) -> bytes:
-    path = root / relative
-    current = root
-    for part in Path(relative).parts:
-        current = current / part
-        if current.is_symlink():
-            raise ProfileError("unsafe_fixture", relative)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     nonblock = getattr(os, "O_NONBLOCK", 0)
-    if not nofollow or not nonblock:
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not nonblock or not directory:
         raise ProfileError("unsafe_fixture", "safe-open flags unavailable")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | nofollow | directory
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | nofollow | nonblock
+    parent_fd: int | None = None
     fd: int | None = None
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | nofollow | nonblock)
+        parts = Path(relative).parts
+        parent_fd = os.open(str(root), directory_flags)
+        for part in parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        fd = os.open(parts[-1], file_flags, dir_fd=parent_fd)
+        os.set_blocking(fd, True)
         stat_result = os.fstat(fd)
         if not stat.S_ISREG(stat_result.st_mode) or stat_result.st_nlink != 1:
             raise ProfileError("unsafe_fixture", relative)
@@ -264,9 +273,15 @@ def _safe_fixture(root: Path, relative: str) -> bytes:
             raise ProfileError("unsafe_fixture", "fixture changed during read")
     except ProfileError:
         raise
-    except OSError as exc:
-        raise ProfileError("fixture_missing", relative) from exc
+    except (OSError, ValueError) as exc:
+        reason = ("unsafe_fixture"
+                  if isinstance(exc, OSError)
+                  and exc.errno in {errno.ELOOP, errno.ENOTDIR}
+                  else "fixture_missing")
+        raise ProfileError(reason, relative) from exc
     finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
         if fd is not None:
             os.close(fd)
     if len(data) > MAX_PROFILE_OUTPUT_BYTES:
@@ -468,6 +483,8 @@ def run_profile(profile: LanguageCapabilityProfile, policy: ProducerPolicy,
                                "mutation_execution"):
                 if capability not in profile.capabilities:
                     continue
+                if fixture.expected_status != "accepted":
+                    continue
                 command = commands[command_for_capability[capability]]
                 try:
                     optional_check, _ = _run_command(
@@ -654,6 +671,11 @@ def compact_stored_receipt_context(
         if "receipt_digest" not in safe:
             raise ProfileError("invalid_context", "receipt_digest")
         safe_rows.append(safe)
+    prefix = b"----- BEGIN REPOSITORY EVIDENCE -----\n"
+    suffix = b"\n----- END REPOSITORY EVIDENCE -----\n"
+    body_budget = max_bytes - len(prefix) - len(suffix)
+    if body_budget < 1:
+        raise ProfileError("invalid_context", "max_bytes too small")
     selected = []
     truncated = len(safe_rows) > max_items
     for row in safe_rows[:max_items]:
@@ -661,7 +683,7 @@ def compact_stored_receipt_context(
                      "receipts": [*selected, row], "truncated": truncated}
         encoded = json.dumps(candidate, ensure_ascii=False, sort_keys=True,
                               separators=(",", ":")).encode("utf-8")
-        if len(encoded) > max_bytes:
+        if len(encoded) > body_budget:
             truncated = True
             break
         selected.append(row)
@@ -669,8 +691,7 @@ def compact_stored_receipt_context(
                        "receipts": selected, "truncated": truncated},
                       ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"))
-    rendered = ("----- BEGIN REPOSITORY EVIDENCE -----\n" + body
-                + "\n----- END REPOSITORY EVIDENCE -----\n").encode("utf-8")
+    rendered = prefix + body.encode("utf-8") + suffix
     if len(rendered) > max_bytes:
         raise ProfileError("invalid_context", "max_bytes too small")
     return rendered

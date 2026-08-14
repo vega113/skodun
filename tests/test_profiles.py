@@ -126,6 +126,13 @@ def test_profile_validation_requires_capability_command_mapping():
             harness_command_id=None, capabilities=("version_discovery",),
             fixtures=(FixtureExpectation("fixture.scala", "accepted", "OK"),),
         )
+    with pytest.raises(ProfileError, match="version_discovery required"):
+        LanguageCapabilityProfile(
+            profile_id="no-version", language="scala", version="3",
+            version_command_id="version", compile_command_id="compile",
+            harness_command_id=None, capabilities=("syntax_compile",),
+            fixtures=(),
+        )
 
 
 def test_scala_pilot_advertises_capabilities_without_parser_claim():
@@ -155,6 +162,25 @@ def test_invalid_fixture_is_rejected_before_profile_is_available(tmp_path):
     result = run_profile(_profile(), _policy(tool), tmp_path)
     assert result.accepted is False
     assert result.reason_code == "invalid_fixture"
+
+
+def test_optional_capabilities_skip_fixtures_expected_to_be_rejected(tmp_path):
+    tool = _tool(tmp_path)
+    (tmp_path / "fixture.scala").write_text("object Valid {}\n", encoding="utf-8")
+    (tmp_path / "invalid.scala").write_text(
+        "// SKODUN_INVALID_FIXTURE\n", encoding="utf-8")
+    profile = replace(
+        _profile(),
+        fixtures=(FixtureExpectation("fixture.scala", "accepted", "COMPILE_OK"),
+                  FixtureExpectation("invalid.scala", "rejected",
+                                     "COMPILE_REJECTED",
+                                     "HARNESS_REJECTED")),
+    )
+    result = run_profile(profile, _policy(tool), tmp_path)
+    assert result.accepted is True
+    assert result.reason_code == "ok"
+    assert sum(check["command_id"] == "scala_symbols"
+               for check in result.checks) == 1
 
 
 def test_missing_command_and_version_mismatch_are_stable_unavailable_reasons(tmp_path):
@@ -282,6 +308,19 @@ def test_stored_receipt_context_is_redacted_and_ready_for_the_review_prompt():
     assert b"BEGIN REPOSITORY EVIDENCE" in rendered
     assert b"logs" not in rendered
     assert len(rendered) < 127_000
+
+
+def test_stored_receipt_context_reserves_its_wrappers():
+    rows = [{
+        "receipt_digest": "sha256:" + "d" * 64,
+        "nonce": "n" * 512, "status": "accepted", "reason_code": "ok",
+        "evidence_kind": "preflight", "terminal_state": "passed",
+        "ingested_at": "2026-08-14T00:00:00Z",
+    } for _ in range(32)]
+    rendered = compact_stored_receipt_context(
+        rows, "sha256:" + "e" * 64, max_bytes=4096)
+    assert len(rendered) <= 4096
+    assert b'"truncated":true' in rendered
 
 
 def test_shared_review_pipeline_includes_exact_identity_receipt_context(monkeypatch):
