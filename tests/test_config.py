@@ -1548,3 +1548,91 @@ model = "m"
     with pytest.raises(ValueError,
                        match=r"\[routing\] weights: 'xai' is too large"):
         load_config(None, global_path=g)
+
+
+# ---------------------------------------------------------------------------
+# Shipped Grok finder defaults (model + effort + pin/fallback graph)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_MULTI_PROVIDER_EXAMPLE = _REPO_ROOT / "examples" / "multi-provider.toml"
+
+
+def _load_shipped_toml(tmp_path: Path, src: Path):
+    """Load a committed TOML as a project file, with no global layer.
+
+    The operator's `~/.config/skodun/config.toml` must not leak into these
+    assertions: they pin what the repository ships, not what this machine
+    happens to have merged on top.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".skodun.toml").write_text(src.read_text(encoding="utf-8"),
+                                       encoding="utf-8")
+    return load_config(repo, global_path=tmp_path / "absent.toml")
+
+
+def _finder_named(cfg, name: str):
+    for entry in cfg.reviewers:
+        if entry.name == name:
+            return entry
+    raise AssertionError(f"no reviewer named {name!r} in { [r.name for r in cfg.reviewers] }")
+
+
+def test_example_grok_finder_defaults_to_grok_46_medium(tmp_path):
+    """The published multi-provider example is the operator-facing default."""
+    cfg = _load_shipped_toml(tmp_path, _MULTI_PROVIDER_EXAMPLE)
+    finder = _finder_named(cfg, "finder")
+    assert finder.provider == "xai"
+    assert finder.model == "grok-4.6"
+    assert finder.effort == "medium"
+
+
+def test_dogfood_grok_finder_defaults_to_grok_46_medium(tmp_path):
+    """This repository's own `.skodun.toml` must match the shipped Grok default."""
+    cfg = load_config(_REPO_ROOT, global_path=tmp_path / "absent.toml")
+    finder = _finder_named(cfg, "finder")
+    assert finder.provider == "xai"
+    assert finder.model == "grok-4.6"
+    assert finder.effort == "medium"
+
+
+def test_example_pin_and_fallback_graph_are_unchanged(tmp_path):
+    """Model/effort is the only intended default change.
+
+    A pin still resolves by name, the finder's chain is still
+    finder → finder-openai, and auto-routing still scores the same pool.
+    """
+    from skodun.pipeline import _chain_for, _requested_head
+
+    cfg = _load_shipped_toml(tmp_path, _MULTI_PROVIDER_EXAMPLE)
+    finder = _finder_named(cfg, "finder")
+    openai = _requested_head(cfg, "finder-openai")
+
+    assert finder.fallbacks == ("finder-openai",)
+    assert [r.name for r in _chain_for(cfg, finder)] == ["finder", "finder-openai"]
+    assert openai.provider == "openai"
+    assert openai.model == "gpt-5.4-mini"
+    assert openai.effort == "medium"
+    assert openai.fallbacks == ("finder-gemini",)
+    assert cfg.routing.mode == "auto"
+    assert cfg.routing.pool == ("finder", "finder-openai")
+    assert cfg.routing.cross_model is True
+
+
+def test_dogfood_pin_and_fallback_graph_are_unchanged(tmp_path):
+    from skodun.pipeline import _chain_for, _requested_head
+
+    cfg = load_config(_REPO_ROOT, global_path=tmp_path / "absent.toml")
+    finder = _finder_named(cfg, "finder")
+    gemini = _requested_head(cfg, "finder-gemini")
+    openai = _requested_head(cfg, "finder-openai")
+
+    assert finder.fallbacks == ("finder-gemini", "finder-openai")
+    assert [r.name for r in _chain_for(cfg, finder)] == [
+        "finder", "finder-gemini", "finder-openai"]
+    assert gemini.provider == "google"
+    assert gemini.model == "gemini-3.6-flash-high"
+    assert openai.provider == "openai"
+    assert openai.model == "gpt-5.4"
+    assert openai.effort == "medium"

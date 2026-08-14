@@ -161,8 +161,8 @@ wins per key, reviewers merge by `name`). The store lives at
 [[reviewers]]
 name     = "finder"
 provider = "xai"        # xai | openai | openai-api | google | junie — run `skodun providers`
-model    = "grok-4.5"   # must be an id your CLI offers -- run `grok models`
-effort   = "high"
+model    = "grok-4.6"   # must be an id your CLI offers -- run `grok models`
+effort   = "medium"
 role     = "finder"     # finder | refuter | security | triager | integrator
 ```
 
@@ -306,8 +306,8 @@ model, or a cached provider-wide quota outage):
 [[reviewers]]
 name      = "finder"
 provider  = "xai"
-model     = "grok-4.5"
-effort    = "high"
+model     = "grok-4.6"
+effort    = "medium"
 role      = "finder"
 fallbacks = ["finder-openai"]   # tried, in order, only when "finder"'s own attempt is unavailable
 

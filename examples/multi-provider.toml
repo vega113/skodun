@@ -143,8 +143,8 @@ cross_model = true
 [[reviewers]]
 name      = "finder"
 provider  = "xai"
-model     = "grok-4.5"        # verify with `grok models` -- ids are retired without notice
-effort    = "high"
+model     = "grok-4.6"        # verify with `grok models` -- ids are retired without notice
+effort    = "medium"
 role      = "finder"
 fallbacks = ["finder-openai"]  # up to 3 names; each must exist, be enabled, and not cycle
 
