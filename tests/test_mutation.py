@@ -20,8 +20,9 @@ HEAD = "b" * 40
 DIFF = "c" * 40
 
 
-def identity() -> EvidenceIdentity:
-    return EvidenceIdentity("github.com/acme/project", "/tmp/project",
+def identity(root: Path | None = None) -> EvidenceIdentity:
+    return EvidenceIdentity("github.com/acme/project",
+                            str(root or Path("/tmp/project")),
                             BASE, HEAD, DIFF)
 
 
@@ -71,7 +72,7 @@ def spec() -> MutationSpec:
 def test_valid_mutation_proves_old_fail_new_pass_and_restores_tree(tmp_path):
     make_fixture(tmp_path)
     before = (tmp_path / "target.py").read_bytes()
-    execution = run_mutation(spec(), root=tmp_path, identity=identity(),
+    execution = run_mutation(spec(), root=tmp_path, identity=identity(tmp_path),
                              policy=make_policy(tmp_path))
 
     assert execution.accepted is True
@@ -87,32 +88,32 @@ def test_valid_mutation_proves_old_fail_new_pass_and_restores_tree(tmp_path):
     assert (tmp_path / "target.py").read_bytes() == before
 
     receipt = parse_receipt(json.dumps(execution.receipt_mapping))
-    assert verify_receipt(receipt, identity(), make_policy(tmp_path)).accepted
+    assert verify_receipt(receipt, identity(tmp_path), make_policy(tmp_path)).accepted
     assert receipt.evidence_kind == "mutation"
     with Store.open(tmp_path / "store.db") as store:
         stored = store.save_evidence_receipt(
-            identity(), make_policy(tmp_path),
+            identity(tmp_path), make_policy(tmp_path),
             json.dumps(execution.receipt_mapping, sort_keys=True,
                        separators=(",", ":")),
             "2026-08-14T00:00:00Z")
         assert stored["status"] == "accepted"
-        assert store.list_evidence_receipts(identity().digest)[0][
+        assert store.list_evidence_receipts(identity(tmp_path).digest)[0][
             "evidence_kind"] == "mutation"
 
 
-@pytest.mark.parametrize("change", [
-    {"old_bytes": b"not present"},
-    {"old_bytes": b"print", "expected_match_count": 2},
-    {"old_bytes": b"raise SystemExit(0)", "new_bytes": b"raise SystemExit(0)"},
+@pytest.mark.parametrize(("change", "expected_reason"), [
+    ({"old_bytes": b"not present"}, "target_missing"),
+    ({"old_bytes": b"print", "expected_match_count": 2}, "target_cardinality"),
+    ({"old_bytes": b"raise SystemExit(1)",
+      "new_bytes": b"raise SystemExit(1)"}, "no_op"),
 ])
-def test_vacuous_target_selection_is_rejected(tmp_path, change):
+def test_vacuous_target_selection_is_rejected(tmp_path, change, expected_reason):
     make_fixture(tmp_path)
     values = {**spec().__dict__, **change}
     with pytest.raises(MutationError) as exc:
         run_mutation(MutationSpec(**values), root=tmp_path,
-                     identity=identity(), policy=make_policy(tmp_path))
-    assert exc.value.reason_code in {"target_missing", "target_cardinality",
-                                     "no_op"}
+                     identity=identity(tmp_path), policy=make_policy(tmp_path))
+    assert exc.value.reason_code == expected_reason
     assert (tmp_path / "target.py").read_text(encoding="utf-8").endswith(
         "raise SystemExit(1)\n")
 
@@ -120,7 +121,7 @@ def test_vacuous_target_selection_is_rejected(tmp_path, change):
 def test_invalid_mutant_is_rejected_as_compiler_invalid_and_restored(tmp_path):
     make_fixture(tmp_path)
     invalid = MutationSpec(**{**spec().__dict__, "new_bytes": b"raise ("})
-    execution = run_mutation(invalid, root=tmp_path, identity=identity(),
+    execution = run_mutation(invalid, root=tmp_path, identity=identity(tmp_path),
                              policy=make_policy(tmp_path))
     assert execution.accepted is False
     assert execution.reason_code == "compiler_invalid"
@@ -134,12 +135,12 @@ def test_compiler_timeout_is_incomplete_and_restores_owned_mutation(tmp_path):
     base_policy = make_policy(tmp_path)
     commands = list(base_policy.commands)
     commands[0] = replace(commands[0],
-                          argv=("python3", "slow_compile.py"))
+                          argv=("python3", "slow_compile.py", "target.py"))
     policy = ProducerPolicy(base_policy.policy_id, tuple(commands),
                             base_policy.provenance_key)
     execution = run_mutation(
         replace(spec(), timeout_sec=0.1), root=tmp_path,
-        identity=identity(), policy=policy)
+        identity=identity(tmp_path), policy=policy)
     assert execution.accepted is False
     assert execution.reason_code == "timeout"
     proof = parse_mutation_proof(execution.proof)
@@ -152,24 +153,45 @@ def test_missing_fixture_and_undeclared_command_fail_closed(tmp_path):
     missing_fixture = MutationSpec(**{**spec().__dict__,
                                       "fixture_file": "missing.py"})
     with pytest.raises(MutationError) as fixture:
-        run_mutation(missing_fixture, root=tmp_path, identity=identity(),
+        run_mutation(missing_fixture, root=tmp_path, identity=identity(tmp_path),
                      policy=make_policy(tmp_path))
     assert fixture.value.reason_code == "fixture_missing"
 
     missing_command = MutationSpec(**{**spec().__dict__,
                                       "compiler_command_id": "not-declared"})
     with pytest.raises(MutationError) as command:
-        run_mutation(missing_command, root=tmp_path, identity=identity(),
+        run_mutation(missing_command, root=tmp_path, identity=identity(tmp_path),
                      policy=make_policy(tmp_path))
     assert command.value.reason_code == "command_undeclared"
 
 
 def test_mutation_proof_rejects_unknown_fields_and_changed_tree(tmp_path):
     make_fixture(tmp_path)
-    execution = run_mutation(spec(), root=tmp_path, identity=identity(),
+    execution = run_mutation(spec(), root=tmp_path, identity=identity(tmp_path),
                              policy=make_policy(tmp_path))
     forged = dict(execution.proof)
     forged["unknown"] = True
     with pytest.raises(MutationError) as unknown:
         parse_mutation_proof(forged)
     assert unknown.value.reason_code == "unknown_field"
+
+
+def test_changed_final_tree_is_rejected(tmp_path):
+    make_fixture(tmp_path)
+    (tmp_path / "positive.py").write_text(
+        "from pathlib import Path\n"
+        "Path('unrelated.txt').write_text('changed')\n"
+        "print('MUTATION_SENTINEL positive')\n", encoding="utf-8")
+    execution = run_mutation(spec(), root=tmp_path,
+                             identity=identity(tmp_path),
+                             policy=make_policy(tmp_path))
+    assert execution.accepted is False
+    assert execution.reason_code == "final_tree_changed"
+
+
+def test_worktree_identity_must_match_root(tmp_path):
+    make_fixture(tmp_path)
+    with pytest.raises(MutationError) as exc:
+        run_mutation(spec(), root=tmp_path, identity=identity(),
+                     policy=make_policy(tmp_path))
+    assert exc.value.reason_code == "worktree_mismatch"

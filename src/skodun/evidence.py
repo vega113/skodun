@@ -515,14 +515,17 @@ def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
     kind = raw["evidence_kind"]
     if not isinstance(kind, str) or kind not in _KINDS:
         raise EvidenceError("invalid_field", "evidence_kind")
-    if kind == "mutation" and "mutation_proof" not in raw:
-        raise EvidenceError("missing_field", "mutation_proof")
     mutation_proof = raw.get("mutation_proof")
+    if kind == "mutation":
+        if mutation_proof is None:
+            raise EvidenceError("missing_field", "mutation_proof")
+    elif "mutation_proof" in raw:
+        raise EvidenceError("invalid_field", "mutation_proof")
     if mutation_proof is not None:
         try:
             from .mutation import parse_mutation_proof
             mutation_proof = parse_mutation_proof(mutation_proof).canonical_mapping
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             reason_code = getattr(exc, "reason_code", "invalid_field")
             raise EvidenceError(reason_code, "mutation_proof") from exc
     identity = EvidenceIdentity(

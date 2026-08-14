@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ from .runner import ReviewCancelled, RunResult, run_with_watchdog
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+:-]{0,127}")
+_NONCE = re.compile(r"[A-Za-z0-9._-]{1,111}")
 _PATH_PART = re.compile(r"[A-Za-z0-9._+-]{1,128}")
 _MUTATION_TYPES = frozenset({
     "value_boundary", "symbol_shadowing", "deletion_omission",
@@ -47,7 +49,8 @@ _PROOF_FIELDS = frozenset({
 })
 _RUN_FIELDS = frozenset({
     "run_id", "exit_code", "expected_exit_code", "passed", "marker_seen",
-    "executed", "timed_out", "output_digest", "error_digest",
+    "executed", "timed_out", "output_limit_exceeded", "descendants_clean",
+    "output_digest", "error_digest",
 })
 _MAX_OUTPUT = 64 * 1024
 _MAX_TREE_BYTES = 256 * 1024 * 1024
@@ -119,39 +122,98 @@ def _sha256_bytes(value: bytes) -> str:
 
 def _read_bounded(path: Path) -> bytes:
     try:
-        data = path.read_bytes()
+        with path.open("rb") as handle:
+            data = handle.read(_MAX_OUTPUT + 1)
+    except FileNotFoundError:
+        raise
     except OSError as exc:
         raise MutationError("artifact_unreadable", type(exc).__name__) from exc
     return data[:_MAX_OUTPUT]
 
 
-def _safe_path(root: Path, relative: str, *, must_exist: bool = True) -> Path:
-    root = root.absolute()
-    path = root / relative
-    current = root
+def _open_regular(root: Path, relative: str, *, write: bool = False):
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory:
+        raise MutationError("unsafe_path", "required safe-open flags unavailable")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | nofollow | directory
+    file_flags = (os.O_RDWR if write else os.O_RDONLY) | os.O_CLOEXEC | nofollow
+    parts = Path(relative).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise MutationError("unsafe_path", relative)
+    parent_fd = None
     try:
-        parts = Path(relative).parts
+        parent_fd = os.open(str(root), directory_flags)
         for part in parts[:-1]:
-            current = current / part
-            os.lstat(current)
-            if not os.path.isdir(current) or os.path.islink(current):
-                raise MutationError("unsafe_path", relative)
-        stat_result = os.lstat(path)
-        if os.path.islink(path) or not os.path.isfile(path):
+            next_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        fd = os.open(parts[-1], file_flags, dir_fd=parent_fd)
+        stat_result = os.fstat(fd)
+        if not stat.S_ISREG(stat_result.st_mode) or stat_result.st_nlink != 1:
+            os.close(fd)
             raise MutationError("unsafe_path", relative)
-        if stat_result.st_nlink != 1:
-            raise MutationError("unsafe_path", relative)
+        return fd, stat_result
+    except MutationError:
+        raise
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise MutationError("unsafe_path", type(exc).__name__) from exc
+    finally:
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+
+
+def _read_fd(fd: int, limit: int | None = None) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if limit is not None and total > limit:
+            raise MutationError("tree_too_large", "file exceeds bound")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _write_fd(fd: int, data: bytes) -> None:
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    offset = 0
+    while offset < len(data):
+        offset += os.write(fd, data[offset:])
+    os.fsync(fd)
+
+
+def _same_file(left, right) -> bool:
+    return (left.st_dev == right.st_dev and left.st_ino == right.st_ino
+            and left.st_nlink == right.st_nlink)
+
+
+def _mentions_path(command, relative: str) -> bool:
+    return relative in command.argv or ("./" + relative) in command.argv
+
+
+def _safe_path(root: Path, relative: str, *, must_exist: bool = True) -> Path:
+    try:
+        fd, _stat_result = _open_regular(root, relative)
+        os.close(fd)
     except FileNotFoundError:
         if must_exist:
             raise MutationError("target_missing", relative)
-    except OSError as exc:
-        raise MutationError("unsafe_path", type(exc).__name__) from exc
-    return path
+        return root / relative
+    return root / relative
 
 
 def _tree_digest(root: Path) -> str:
-    entries: list[tuple[str, bytes]] = []
     total = 0
+    digest = hashlib.sha256()
     for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
         kept_dirs: list[str] = []
         for name in sorted(dirs):
@@ -167,26 +229,27 @@ def _tree_digest(root: Path) -> str:
             if name.endswith(".pyc"):
                 continue
             path = Path(current) / name
+            relative = str(path.relative_to(root)).replace(os.sep, "/")
+            fd, _stat_result = _open_regular(root, relative)
             try:
-                stat_result = os.lstat(path)
-                if os.path.islink(path) or not os.path.isfile(path):
-                    raise MutationError("unsafe_path", str(path.relative_to(root)))
-                if stat_result.st_nlink != 1:
-                    raise MutationError("unsafe_path", str(path.relative_to(root)))
-                data = path.read_bytes()
-            except OSError as exc:
-                raise MutationError("tree_unreadable", type(exc).__name__) from exc
-            total += len(data)
-            if total > _MAX_TREE_BYTES:
-                raise MutationError("tree_too_large")
-            entries.append((str(path.relative_to(root)).replace(os.sep, "/"), data))
-    digest = hashlib.sha256()
-    for name, data in entries:
-        encoded = name.encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "big"))
-        digest.update(encoded)
-        digest.update(len(data).to_bytes(8, "big"))
-        digest.update(data)
+                encoded = relative.encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+                digest.update(_stat_result.st_size.to_bytes(8, "big"))
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _MAX_TREE_BYTES:
+                        raise MutationError("tree_too_large")
+                    digest.update(chunk)
+                after = os.fstat(fd)
+                if (not _same_file(after, _stat_result)
+                        or after.st_size != _stat_result.st_size):
+                    raise MutationError("tree_changed", relative)
+            finally:
+                os.close(fd)
     return "sha256:" + digest.hexdigest()
 
 
@@ -210,6 +273,8 @@ class MutationSpec:
 
     def __post_init__(self) -> None:
         _identifier(self.mutation_id, "mutation_id")
+        if _NONCE.fullmatch(self.mutation_id) is None:
+            raise MutationError("invalid_field", "mutation_id")
         if self.mutation_type not in _MUTATION_TYPES:
             raise MutationError("invalid_field", "mutation_type")
         _relative_path(self.target_file, "target_file")
@@ -290,6 +355,8 @@ def _validate_run(raw: object, label: str) -> dict[str, object]:
             raise MutationError("invalid_field", f"{label}.{key}")
     for key in ("passed", "marker_seen", "executed", "timed_out"):
         _boolean(result[key], f"{label}.{key}")
+    for key in ("output_limit_exceeded", "descendants_clean"):
+        _boolean(result[key], f"{label}.{key}")
     _digest(result["output_digest"], f"{label}.output_digest")
     _digest(result["error_digest"], f"{label}.error_digest")
     return result
@@ -310,6 +377,8 @@ def parse_mutation_proof(raw: Mapping[str, object]) -> MutationProof:
             or result["schema_version"] != 1):
         raise MutationError("schema_version")
     _identifier(result["mutation_id"], "mutation_id")
+    if _NONCE.fullmatch(result["mutation_id"]) is None:
+        raise MutationError("invalid_field", "mutation_id")
     if result["mutation_type"] not in _MUTATION_TYPES:
         raise MutationError("invalid_field", "mutation_type")
     _relative_path(result["target_file"], "target_file")
@@ -366,7 +435,8 @@ def parse_mutation_proof(raw: Mapping[str, object]) -> MutationProof:
         raise MutationError("invalid_field", "restore_status")
     artifacts = result["artifact_digests"]
     if (not isinstance(artifacts, list) or len(artifacts) > 32
-            or any(_DIGEST.fullmatch(item or "") is None for item in artifacts)):
+            or any(not isinstance(item, str) or _DIGEST.fullmatch(item) is None
+                   for item in artifacts)):
         raise MutationError("invalid_field", "artifact_digests")
     _identifier(result["diagnostic"], "diagnostic")
     _identifier(result["reason_code"], "reason_code")
@@ -420,7 +490,10 @@ def _run_command(
             raise MutationError("command_missing", command_id)
         result: RunResult = run_with_watchdog(
             command.argv, cwd=cwd, stdout_path=stdout, stderr_path=stderr,
-            timeout_sec=timeout_sec, cancel=cancel)
+            timeout_sec=timeout_sec, cancel=cancel,
+            max_output_bytes=_MAX_OUTPUT,
+            env={name: os.environ[name] for name in command.env_allowlist
+                 if name in os.environ})
         executed = True
         timed_out = result.timed_out
         out = _read_bounded(stdout)
@@ -429,10 +502,17 @@ def _run_command(
             "run_id": run_id,
             "exit_code": result.rc,
             "expected_exit_code": expected_exit_code,
-            "passed": result.rc == expected_exit_code and not result.timed_out,
+            "passed": (result.rc == expected_exit_code
+                       and not result.timed_out
+                       and not result.output_limit_exceeded
+                       and not result.descendants_killed
+                       and result.descendant_state == "none"),
             "marker_seen": sentinel.encode("utf-8") in out,
             "executed": executed,
             "timed_out": timed_out,
+            "output_limit_exceeded": result.output_limit_exceeded,
+            "descendants_clean": (not result.descendants_killed
+                                   and result.descendant_state == "none"),
             "output_digest": _sha256_bytes(out),
             "error_digest": _sha256_bytes(err),
         }
@@ -511,15 +591,31 @@ def run_mutation(spec: MutationSpec, *, root: Path,
     if any(command.evidence_kind != "mutation" for command in commands
            if command is not None):
         raise MutationError("command_kind_mismatch")
+    if Path(identity.worktree_root).absolute() != root.absolute():
+        raise MutationError("worktree_mismatch")
     target = _safe_path(root, spec.target_file)
-    fixture = _safe_path(root, spec.fixture_file, must_exist=False)
-    if not fixture.exists():
-        raise MutationError("fixture_missing")
-    original = target.read_bytes()
+    try:
+        fixture = _safe_path(root, spec.fixture_file)
+    except MutationError as exc:
+        if exc.reason_code == "target_missing":
+            raise MutationError("fixture_missing") from exc
+        raise
+    if not all(_mentions_path(policy.command(item), spec.fixture_file)
+               for item in (spec.baseline_command_id,
+                            spec.compiler_command_id,
+                            spec.mutant_command_id)):
+        raise MutationError("fixture_unbound")
+    target_fd, target_stat = _open_regular(root, spec.target_file)
+    try:
+        original = _read_fd(target_fd, _MAX_OUTPUT)
+    finally:
+        os.close(target_fd)
     count = original.count(spec.old_bytes)
     if count == 0:
         raise MutationError("target_missing")
     if count != spec.expected_match_count:
+        raise MutationError("target_cardinality")
+    if count != 1:
         raise MutationError("target_cardinality")
     anchor_count = original.count(spec.anchor.encode("utf-8"))
     if anchor_count == 0:
@@ -539,6 +635,7 @@ def run_mutation(spec: MutationSpec, *, root: Path,
             "run_id": run_id, "exit_code": -1,
             "expected_exit_code": expected_exit_code, "passed": False,
             "marker_seen": False, "executed": False, "timed_out": False,
+            "output_limit_exceeded": False, "descendants_clean": True,
             "output_digest": _sha256_bytes(b""),
             "error_digest": _sha256_bytes(b""),
         }
@@ -549,7 +646,7 @@ def run_mutation(spec: MutationSpec, *, root: Path,
         "positive": blank(f"{spec.mutation_id}-positive-not-run"),
         "negative": blank(f"{spec.mutation_id}-negative-not-run", 1),
     }
-    mutant = blank(f"{spec.mutation_id}-mutant-not-run", 1)
+    mutant = blank(f"{spec.mutation_id}-mutant-not-run", 0)
     artifacts: list[str] = []
     reason = "incomplete"
     diagnostic = "incomplete"
@@ -564,8 +661,17 @@ def run_mutation(spec: MutationSpec, *, root: Path,
             reason = "baseline_failed"
             diagnostic = "control_failed"
         else:
-            target.write_bytes(mutant_bytes)
-            mutated = True
+            mutate_fd, mutate_stat = _open_regular(root, spec.target_file, write=True)
+            try:
+                if not _same_file(mutate_stat, target_stat):
+                    raise MutationError("target_changed")
+                current = _read_fd(mutate_fd, _MAX_OUTPUT)
+                if current != original:
+                    raise MutationError("target_changed")
+                _write_fd(mutate_fd, mutant_bytes)
+                mutated = True
+            finally:
+                os.close(mutate_fd)
             compile_run = _run_command(
                 spec.compiler_command_id, policy, root,
                 f"{spec.mutation_id}-compile", 0, spec.sentinel,
@@ -611,23 +717,38 @@ def run_mutation(spec: MutationSpec, *, root: Path,
     finally:
         if mutated:
             try:
-                target.write_bytes(original)
+                restore_fd, restore_stat = _open_regular(root, spec.target_file,
+                                                         write=True)
+                try:
+                    if not _same_file(restore_stat, target_stat):
+                        raise MutationError("target_changed")
+                    _write_fd(restore_fd, original)
+                finally:
+                    os.close(restore_fd)
                 restore_status = "restored"
-            except OSError:
+            except (OSError, MutationError):
                 restore_status = "failed"
         try:
             final_tree = _tree_digest(root)
         except MutationError:
             final_tree = _sha256_bytes(b"")
-        shutil.rmtree(scratch_path, ignore_errors=True)
-        cleanup_status = "clean"
+        try:
+            shutil.rmtree(scratch_path)
+        except OSError:
+            cleanup_status = "incomplete"
+        else:
+            cleanup_status = "clean" if not scratch_path.exists() else "incomplete"
     if restore_status == "failed":
         reason = "restore_failed"
         diagnostic = "incomplete"
     if final_tree != initial_tree:
         reason = "final_tree_changed"
         diagnostic = "incomplete"
-    accepted = reason == "ok" and restore_status == "restored" and final_tree == initial_tree
+    if cleanup_status != "clean" and reason == "ok":
+        reason = "cleanup_incomplete"
+        diagnostic = "incomplete"
+    accepted = (reason == "ok" and restore_status == "restored"
+                and cleanup_status == "clean" and final_tree == initial_tree)
     completed = datetime.now(timezone.utc).replace(microsecond=0)
     proof = _proof_mapping(
         spec, preimage_hash=preimage, mutant_content_digest=mutant_digest,

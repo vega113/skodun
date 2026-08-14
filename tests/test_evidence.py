@@ -98,6 +98,31 @@ def test_canonical_receipt_digest_is_stable_and_excludes_claim():
         raw["receipt_digest"]
 
 
+def test_mutation_proof_shape_is_required_and_nonmutation_receipts_reject_it():
+    raw = receipt_mapping(evidence_kind="mutation")
+    with pytest.raises(EvidenceError) as missing:
+        parse_receipt(json.dumps(raw))
+    assert missing.value.reason_code == "missing_field"
+
+    raw = receipt_mapping(mutation_proof=None)
+    raw["receipt_digest"] = receipt_digest(raw)
+    with pytest.raises(EvidenceError) as null:
+        parse_receipt(json.dumps(raw))
+    assert null.value.reason_code == "invalid_field"
+
+    raw = receipt_mapping(mutation_proof={})
+    raw["receipt_digest"] = receipt_digest(raw)
+    with pytest.raises(EvidenceError) as nonmutation:
+        parse_receipt(json.dumps(raw))
+    assert nonmutation.value.reason_code == "invalid_field"
+
+    raw = receipt_mapping(evidence_kind="mutation", mutation_proof={})
+    raw["receipt_digest"] = receipt_digest(raw)
+    with pytest.raises(EvidenceError) as malformed:
+        parse_receipt(json.dumps(raw))
+    assert malformed.value.reason_code == "missing_field"
+
+
 @pytest.mark.parametrize("mutator,reason", [
     (lambda r: r.update({"unknown": 1}), "unknown_field"),
     (lambda r: r.update({"duration_ms": 1}), "duration_mismatch"),
