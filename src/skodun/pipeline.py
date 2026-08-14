@@ -1625,6 +1625,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 lineage_repository_id = "unknown"
         lineage_prompt_context, lineage_prompt_truncated = _lineage_prompt_context(
             store, lineage_repository_id, before=review_started_at)
+        evidence_prompt_context = _evidence_prompt_context(
+            store, root, base.sha, head, diff_hash)
         common = dict(
             id=rid, reviewed_at=review_started_at,
             review_started_at=review_started_at,
@@ -1800,7 +1802,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     stack_context=stack_prompt_context,
                     stack_context_truncated=stack_prompt_truncated,
                     lineage_context=lineage_prompt_context,
-                    lineage_context_truncated=lineage_prompt_truncated)
+                    lineage_context_truncated=lineage_prompt_truncated,
+                    evidence_context=evidence_prompt_context)
                 checkpoint_identity = _orchestration_identity(
                     rec, diff, prepared_plan, cfg=cfg, d=d, root=root,
                     finder=finder, branch=branch, head=head,
@@ -1829,6 +1832,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     stack_context_truncated=stack_prompt_truncated,
                     lineage_context=lineage_prompt_context,
                     lineage_context_truncated=lineage_prompt_truncated,
+                    evidence_context=evidence_prompt_context,
                     prepared_plan=prepared_plan,
                     checkpoint_run=checkpoint_run)
                 answering_provider = _answering_provider(rec, finder)
@@ -1884,7 +1888,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     stack_context=stack_prompt_context,
                     stack_context_truncated=stack_prompt_truncated,
                     lineage_context=lineage_prompt_context,
-                    lineage_context_truncated=lineage_prompt_truncated)
+                    lineage_context_truncated=lineage_prompt_truncated,
+                    evidence_context=evidence_prompt_context)
 
                 # The first route happens before the diff and prompt exist so
                 # it can participate in preflight. Once the shipped prompt is
@@ -1945,7 +1950,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                                 stack_context=stack_prompt_context,
                                 stack_context_truncated=stack_prompt_truncated,
                                 lineage_context=lineage_prompt_context,
-                                lineage_context_truncated=lineage_prompt_truncated)
+                                lineage_context_truncated=lineage_prompt_truncated,
+                                evidence_context=evidence_prompt_context)
                 if prompt.diff_truncated:
                     # Reachable only for a diff that is over the envelope and
                     # was NOT batched, i.e. one this build refused to split.
@@ -2392,6 +2398,8 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
     lineage_prompt_context, lineage_prompt_truncated = _lineage_prompt_context(
         store, lineage_repository_id, before=review_started_at)
     diff_hash = gitio.diff_identity(diff.data)
+    evidence_prompt_context = _evidence_prompt_context(
+        store, root, base.sha, local_oid, diff_hash)
     common = dict(
         id=record_id, reviewed_at=reserved.get("reviewed_at") or _iso_now(),
         source="skodun", branch=branch, head=local_oid, base_ref=base.ref,
@@ -2471,7 +2479,8 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                     base_sha=base.sha, head_label=local_oid,
                     context_source="oid", context_oid=local_oid,
                     lineage_context=lineage_prompt_context,
-                    lineage_context_truncated=lineage_prompt_truncated)
+                    lineage_context_truncated=lineage_prompt_truncated,
+                    evidence_context=evidence_prompt_context)
                 checkpoint_identity = _orchestration_identity(
                     rec, diff, prepared_plan, cfg=cfg, d=d, root=root,
                     finder=finder, branch=branch, head=local_oid,
@@ -2492,6 +2501,7 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                     large_prompt=large_prompt, cancel=cancel,
                     lineage_context=lineage_prompt_context,
                     lineage_context_truncated=lineage_prompt_truncated,
+                    evidence_context=evidence_prompt_context,
                     prepared_plan=prepared_plan,
                     checkpoint_run=checkpoint_run)
             else:
@@ -2501,7 +2511,8 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                     local_oid=local_oid, large_prompt=large_prompt,
                     cancel=cancel, record_id=record_id,
                     lineage_context=lineage_prompt_context,
-                    lineage_context_truncated=lineage_prompt_truncated)
+                    lineage_context_truncated=lineage_prompt_truncated,
+                    evidence_context=evidence_prompt_context)
 
         rec["trustworthy"] = is_trustworthy(
             rec["parse_ok"], rec["degraded"], rec["diff_truncated"])
@@ -2568,7 +2579,8 @@ def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
                  stack_context: bytes | None = None,
                  stack_context_truncated: bool = False,
                  lineage_context: bytes | None = None,
-                 lineage_context_truncated: bool = False) -> dict:
+                 lineage_context_truncated: bool = False,
+                 evidence_context: bytes | None = None) -> dict:
     """One prompt, one chain, one record: the UNBATCHED background review.
 
     Deliberately mirrors `run_review`'s 6b branch, with the two differences a
@@ -2626,7 +2638,8 @@ def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
                               stack_context=stack_context,
                               stack_context_truncated=stack_context_truncated,
                               lineage_context=lineage_context,
-                              lineage_context_truncated=lineage_context_truncated)
+                              lineage_context_truncated=lineage_context_truncated,
+                              evidence_context=evidence_context)
     if prompt.diff_truncated:
         _note(f"diff is {len(diff.data)} bytes (> {mdb}); the "
               f"prompt is truncated and this review cannot be trustworthy")
@@ -2736,6 +2749,29 @@ def _lineage_prompt_context(
         return text, bool(truncated) or text_truncated
     except Exception:
         return b"", False
+
+
+def _evidence_prompt_context(store, root: Path, certification_base: str,
+                             current_head: str, diff_hash: str) -> bytes:
+    """Return exact-identity receipt summaries for the next model prompt."""
+    try:
+        repository_id = gitio.canonical_repository_identity(root)
+        if not repository_id or "/" not in repository_id:
+            return b""
+        from .evidence import EvidenceIdentity
+        from .profiles import compact_stored_receipt_context
+        identity = EvidenceIdentity(
+            repository_id=repository_id, worktree_root=str(root),
+            certification_base=certification_base, current_head=current_head,
+            diff_hash=diff_hash)
+        rows = store.list_evidence_receipts(identity.digest, 32)
+        if not rows:
+            return b""
+        return compact_stored_receipt_context(rows, identity.digest)
+    except Exception:
+        # Repository receipts are advisory context. An unreadable optional
+        # projection must not spend a model call or alter fail-closed trust.
+        return b""
 
 
 def annotate_lineage(store: Store, rec: dict) -> dict:
@@ -3335,7 +3371,8 @@ def _prepare_batch_plan(
         stack_context: bytes | None = None,
         stack_context_truncated: bool = False,
         lineage_context: bytes | None = None,
-        lineage_context_truncated: bool = False) -> _PreparedPlan:
+        lineage_context_truncated: bool = False,
+        evidence_context: bytes | None = None) -> _PreparedPlan:
     """Freeze deterministic pass inputs before any resumable provider call.
 
     Exact resume cannot learn context/checklist/prompt identity lazily after a
@@ -3381,7 +3418,8 @@ def _prepare_batch_plan(
             stack_context=stack_context,
             stack_context_truncated=stack_context_truncated,
             lineage_context=lineage_context,
-            lineage_context_truncated=lineage_context_truncated)
+            lineage_context_truncated=lineage_context_truncated,
+            evidence_context=evidence_context)
         boundary = {
             "index": index,
             "diff_hash": gitio.diff_identity(batch.data),
@@ -3538,6 +3576,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                  stack_context_truncated: bool = False,
                  lineage_context: bytes | None = None,
                  lineage_context_truncated: bool = False,
+                 evidence_context: bytes | None = None,
                  prepared_plan: _PreparedPlan | None = None,
                  checkpoint_run: _CheckpointRun | None = None) -> dict:
     """Review `batches` as sub-reviews plus one cross-file pass; AGGREGATE.
@@ -3584,7 +3623,8 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             context_oid=context_oid, stack_context=stack_context,
             stack_context_truncated=stack_context_truncated,
             lineage_context=lineage_context,
-            lineage_context_truncated=lineage_context_truncated)
+            lineage_context_truncated=lineage_context_truncated,
+            evidence_context=evidence_context)
     if len(prepared_plan.batches) != count or any(
             item.batch != batch
             for item, batch in zip(prepared_plan.batches, batches)):

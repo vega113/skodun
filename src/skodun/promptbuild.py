@@ -174,17 +174,21 @@ class Prompt:
     stack_context_truncated: bool = False
     lineage_context_bytes: int = 0
     lineage_context_truncated: bool = False
+    evidence_context_bytes: int = 0
 
 
 def advisory_context(
         stack_context: bytes | None = None,
-        lineage_context: bytes | None = None) -> bytes:
-    """Encode stack/lineage blocks the same way every prompt builder does."""
+        lineage_context: bytes | None = None,
+        evidence_context: bytes | None = None) -> bytes:
+    """Encode bounded advisory blocks the same way every prompt builder does."""
     extra = bytearray()
     if stack_context:
         extra += b"\n" + stack_context.rstrip(b"\n") + b"\n"
     if lineage_context:
         extra += b"\n" + lineage_context.rstrip(b"\n") + b"\n"
+    if evidence_context:
+        extra += b"\n" + evidence_context.rstrip(b"\n") + b"\n"
     return bytes(extra)
 
 
@@ -193,6 +197,10 @@ def advisory_context(
 #: MAX_* constants bound the payload itself; this is charged separately so
 #: argv-bound adapters cannot go over their declared ceiling by two bytes.
 ADVISORY_BLOCK_WRAPPER_BYTES = 2
+# Receipt context contains only a small, redacted JSON projection.  Keep its
+# hard ceiling modest so reserving the full block does not turn ordinary
+# provider-specific batches into irreducible truncated hunks.
+EVIDENCE_CONTEXT_MAX_BYTES = 4 * 1024
 
 
 def build(
@@ -208,6 +216,7 @@ def build(
     stack_context_truncated: bool = False,
     lineage_context: bytes | None = None,
     lineage_context_truncated: bool = False,
+    evidence_context: bytes | None = None,
 ) -> Prompt:
     """Render the review prompt.
 
@@ -244,7 +253,7 @@ def build(
     out += f"Branch: {branch}\n".encode("utf-8")
     out += f"Base:   {base_ref} ({base_sha})\n".encode("utf-8")
     out += f"Head:   {head}\n".encode("utf-8")
-    out += advisory_context(stack_context, lineage_context)
+    out += advisory_context(stack_context, lineage_context, evidence_context)
 
     # Oracle: `$(...)` capture strips every trailing newline, `printf '%s\n'`
     # re-adds exactly one, and `[ -n "$_cl_body" ]` tests the stripped value.
@@ -271,4 +280,5 @@ def build(
                   and stack_context_truncated is True,
                   lineage_context_bytes=len(lineage_context or b""),
                   lineage_context_truncated=bool(lineage_context)
-                  and lineage_context_truncated is True)
+                  and lineage_context_truncated is True,
+                  evidence_context_bytes=len(evidence_context or b""))
