@@ -161,6 +161,9 @@ class LanguageCapabilityProfile:
             raise ProfileError("invalid_profile", "fixtures")
         if len({item.path for item in self.fixtures}) != len(self.fixtures):
             raise ProfileError("invalid_profile", "duplicate fixture path")
+        if self.fixtures and (self.compile_command_id is None
+                              or self.harness_command_id is None):
+            raise ProfileError("invalid_profile", "fixture compile/harness command")
         if self.version_prefix is not None:
             _text(self.version_prefix, "version_prefix", 128)
         _plain_int(self.timeout_sec, "timeout_sec", 1, MAX_PROFILE_TIMEOUT_SEC)
@@ -290,9 +293,15 @@ def _command_cwd(root: Path, relative: str) -> Path:
     return path
 
 
-def _resolve_executable(command) -> str:
+def _resolve_executable_for_cwd(command, cwd: Path) -> str:
+    """Resolve an argv path with the same cwd semantics as Popen."""
     executable = command.argv[0]
-    resolved = executable if "/" in executable else shutil.which(executable)
+    if "/" not in executable:
+        resolved = shutil.which(executable)
+    elif Path(executable).is_absolute():
+        resolved = executable
+    else:
+        resolved = str(cwd / executable)
     if not resolved or not Path(resolved).is_file():
         raise ProfileError("command_missing", command.command_id)
     for argument in command.argv[1:]:
@@ -312,8 +321,8 @@ def _read_output(path: Path, limit: int) -> bytes:
 def _run_command(command, root: Path, scratch: Path, run_id: str,
                  timeout_sec: int, output_limit: int,
                  fixture: Path | None = None) -> tuple[dict[str, object], bytes]:
-    resolved = _resolve_executable(command)
     cwd = _command_cwd(root, command.cwd)
+    resolved = _resolve_executable_for_cwd(command, cwd)
     argv = [resolved if index == 0 else argument for index, argument
             in enumerate(command.argv)]
     for index, argument in enumerate(argv):
@@ -388,7 +397,9 @@ def run_profile(profile: LanguageCapabilityProfile, policy: ProducerPolicy,
             commands[command_id] = _command(
                 policy, command_id,
                 mutation=command_id == profile.mutation_command_id)
-            _resolve_executable(commands[command_id])
+            command = commands[command_id]
+            _resolve_executable_for_cwd(
+                command, _command_cwd(root, command.cwd))
     except ProfileError as exc:
         return _failed(profile, exc.reason_code)
 
@@ -528,6 +539,9 @@ def adapt_local_receipt(raw: Mapping[str, object] | str, expected: EvidenceIdent
     head = _head(expected, raw.get("current_head"))
     terminal = raw.get("terminal_state")
     exit_code = raw.get("exit_code")
+    if exit_code is not None and (
+            isinstance(exit_code, bool) or not isinstance(exit_code, int)):
+        raise ProfileError("invalid_receipt", "exit_code")
     passed = terminal == "passed" and exit_code == 0
     digest = raw.get("receipt_digest")
     if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
@@ -586,6 +600,50 @@ def adapt_review_threads(raw: Mapping[str, object] | str, expected: EvidenceIden
                     "passed" if unresolved == 0 else "failed",
                     "ok" if unresolved == 0 else "unresolved_threads",
                     {"snapshot_id": snapshot, "unresolved": unresolved})
+
+
+def compact_stored_receipt_context(
+        rows: Sequence[Mapping[str, object]], identity_digest: str, *,
+        max_items: int = MAX_RECEIPT_CONTEXT_ITEMS,
+        max_bytes: int = MAX_RECEIPT_CONTEXT_BYTES) -> bytes:
+    """Render store projections as bounded, redacted prompt context."""
+    if _DIGEST.fullmatch(identity_digest) is None:
+        raise ProfileError("invalid_context", "identity_digest")
+    if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items < 1:
+        raise ProfileError("invalid_context", "max_items")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 128:
+        raise ProfileError("invalid_context", "max_bytes")
+    safe_rows = []
+    allowed = ("receipt_digest", "nonce", "status", "reason_code",
+               "evidence_kind", "terminal_state", "ingested_at")
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ProfileError("invalid_context", "receipt row")
+        safe = {key: _text(row[key], key, 512) for key in allowed
+                if key in row and row[key] is not None}
+        if "receipt_digest" not in safe:
+            raise ProfileError("invalid_context", "receipt_digest")
+        safe_rows.append(safe)
+    selected = []
+    truncated = len(safe_rows) > max_items
+    for row in safe_rows[:max_items]:
+        candidate = {"identity_digest": identity_digest,
+                     "receipts": [*selected, row], "truncated": truncated}
+        encoded = json.dumps(candidate, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":")).encode("utf-8")
+        if len(encoded) > max_bytes:
+            truncated = True
+            break
+        selected.append(row)
+    body = json.dumps({"identity_digest": identity_digest,
+                       "receipts": selected, "truncated": truncated},
+                      ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+    rendered = ("----- BEGIN REPOSITORY EVIDENCE -----\n" + body
+                + "\n----- END REPOSITORY EVIDENCE -----\n").encode("utf-8")
+    if len(rendered) > max_bytes:
+        raise ProfileError("invalid_context", "max_bytes too small")
+    return rendered
 
 
 def compact_receipt_context(receipts: Sequence[RepositoryReceipt], *,

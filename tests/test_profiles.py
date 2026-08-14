@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from skodun.evidence import EvidenceIdentity, ProducerCommand, ProducerPolicy
+from skodun import pipeline
 from skodun.profiles import (
     FixtureExpectation,
     LanguageCapabilityProfile,
@@ -20,6 +21,7 @@ from skodun.profiles import (
     adapt_mutation_log,
     adapt_review_threads,
     compact_receipt_context,
+    compact_stored_receipt_context,
     run_profile,
     scala3_profile,
 )
@@ -115,6 +117,13 @@ def test_profile_validation_requires_capability_command_mapping():
 
     with pytest.raises(ProfileError, match="fixture path"):
         FixtureExpectation("../secret.scala", "accepted", "OK")
+    with pytest.raises(ProfileError, match="compile/harness"):
+        LanguageCapabilityProfile(
+            profile_id="version-only", language="scala", version="3",
+            version_command_id="version", compile_command_id=None,
+            harness_command_id=None, capabilities=("version_discovery",),
+            fixtures=(FixtureExpectation("fixture.scala", "accepted", "OK"),),
+        )
 
 
 def test_scala_pilot_advertises_capabilities_without_parser_claim():
@@ -233,6 +242,9 @@ def test_repository_receipt_adapters_fail_closed_on_stale_or_invalid_lifecycle()
     failed = adapt_ci_receipt({"run_id": "run", "conclusion": "failure",
                                "head_sha": HEAD}, identity())
     assert failed.status == "failed"
+    with pytest.raises(ProfileError, match="exit_code"):
+        adapt_local_receipt({**_local_payload(), "exit_code": False},
+                            identity(), "preflight")
 
 
 def test_compact_receipt_context_is_deterministic_and_materially_bounded():
@@ -248,3 +260,36 @@ def test_compact_receipt_context_is_deterministic_and_materially_bounded():
     payload = json.loads(compact)
     assert payload["receipts"]
     assert payload["truncated"] is True
+
+
+def test_stored_receipt_context_is_redacted_and_ready_for_the_review_prompt():
+    rows = [{
+        "receipt_digest": "sha256:" + "d" * 64,
+        "nonce": "run-1", "status": "accepted", "reason_code": "ok",
+        "evidence_kind": "preflight", "terminal_state": "passed",
+        "ingested_at": "2026-08-14T00:00:00Z", "logs": "secret",
+    }]
+    rendered = compact_stored_receipt_context(rows, "sha256:" + "e" * 64)
+    assert b"BEGIN REPOSITORY EVIDENCE" in rendered
+    assert b"logs" not in rendered
+    assert len(rendered) < 127_000
+
+
+def test_shared_review_pipeline_includes_exact_identity_receipt_context(monkeypatch):
+    class StoreProjection:
+        def list_evidence_receipts(self, identity_digest, limit):
+            assert identity_digest.startswith("sha256:")
+            assert limit == 32
+            return [{
+                "receipt_digest": "sha256:" + "d" * 64,
+                "nonce": "run-1", "status": "accepted", "reason_code": "ok",
+                "evidence_kind": "preflight", "terminal_state": "passed",
+                "ingested_at": "2026-08-14T00:00:00Z",
+            }]
+
+    monkeypatch.setattr(pipeline.gitio, "canonical_repository_identity",
+                        lambda _root: "github.com/acme/project")
+    context = pipeline._evidence_prompt_context(
+        StoreProjection(), Path("/tmp/project"), BASE, HEAD, DIFF)
+    assert b"BEGIN REPOSITORY EVIDENCE" in context
+    assert b"sha256:" + b"d" * 64 in context
