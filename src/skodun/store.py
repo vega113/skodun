@@ -60,7 +60,7 @@ _REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 class SchemaLifecycleError(ValueError):
@@ -903,6 +903,49 @@ _MIGRATION_V15: tuple[str, ...] = (
   ON finding_lineage(repository_id, created_at, review_id)""",
 )
 
+# --- v16: advisory trusted repository-evidence receipts --------------------
+#
+# Receipt rows are a bounded read model, never a review artifact or trust axis.
+# The composite primary key makes an identical retry idempotent.  Nonce
+# conflicts are checked by Store.save_evidence_receipt so the conflicting
+# payload is refused rather than silently replacing the first run.
+_MIGRATION_V16: tuple[str, ...] = (
+"""CREATE TABLE IF NOT EXISTS evidence_receipts (
+  identity_digest TEXT NOT NULL,
+  receipt_digest TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('accepted','rejected')),
+  reason_code TEXT NOT NULL,
+  evidence_kind TEXT NOT NULL,
+  terminal_state TEXT NOT NULL,
+  receipt_json TEXT NOT NULL,
+  ingested_at TEXT NOT NULL,
+  PRIMARY KEY(identity_digest, receipt_digest)
+)""",
+"""CREATE INDEX IF NOT EXISTS ix_evidence_receipts_identity_time
+   ON evidence_receipts(identity_digest, ingested_at DESC, receipt_digest)""",
+"""CREATE INDEX IF NOT EXISTS ix_evidence_receipts_identity_nonce
+   ON evidence_receipts(identity_digest, nonce)""",
+"""CREATE UNIQUE INDEX IF NOT EXISTS ux_evidence_receipts_identity_nonce
+   ON evidence_receipts(identity_digest, nonce)""",
+"""CREATE TABLE IF NOT EXISTS evidence_receipt_conflicts (
+  identity_digest TEXT NOT NULL,
+  receipt_digest TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  existing_receipt_digest TEXT NOT NULL,
+  reason_code TEXT NOT NULL,
+  evidence_kind TEXT NOT NULL,
+  terminal_state TEXT NOT NULL,
+  receipt_json TEXT NOT NULL,
+  ingested_at TEXT NOT NULL,
+  PRIMARY KEY(identity_digest, receipt_digest),
+  FOREIGN KEY(identity_digest, existing_receipt_digest)
+    REFERENCES evidence_receipts(identity_digest, receipt_digest)
+)""",
+"""CREATE INDEX IF NOT EXISTS ix_evidence_receipt_conflicts_identity_time
+   ON evidence_receipt_conflicts(identity_digest, ingested_at DESC, receipt_digest)""",
+)
+
 # `(target_version, delta)`, applied in order. Keep it sorted ascending and keep
 # the last target equal to SCHEMA_VERSION -- both are pinned by a test.
 #
@@ -937,6 +980,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (13, _MIGRATION_V13),
     (14, _MIGRATION_V14),
     (15, _MIGRATION_V15),
+    (16, _MIGRATION_V16),
 )
 
 
@@ -1463,6 +1507,13 @@ class Store:
                 continue
             existed = path.exists()
             if existed:
+                # The lock check and the path existence check are separate
+                # filesystem observations.  A peer may create the database
+                # and its init lock between them; do not inspect that
+                # transient v0 file as an historical store.
+                if init_lock.exists():
+                    _wait_for_init_lock(init_lock, path)
+                    continue
                 break
             path.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -2055,6 +2106,176 @@ class Store:
         row = self._c.execute("SELECT artifact_json FROM reviews WHERE id=?",
                               (review_id,)).fetchone()
         return json.loads(row["artifact_json"]) if row else None
+
+    # --- v16: advisory evidence receipts ----------------------------------
+
+    def save_evidence_receipt(
+            self, expected_identity, protected_policy, receipt_json: str,
+            ingested_at: str) -> dict:
+        """Persist one bounded receipt without touching review trust.
+
+        The expected identity and producer policy are protected inputs.  The
+        store reparses the envelope, verifies it against those inputs, and
+        derives the persisted status and reason code; callers cannot label a
+        candidate-policy receipt as accepted.  A rejected identity mismatch
+        remains queryable under the identity being inspected.
+
+        The identity+digest key makes exact retries harmless.  A different
+        digest for the same identity+nonce is a replay conflict and is refused
+        before insertion, so a producer cannot rewrite one run's evidence.
+        """
+        from .evidence import (EvidenceError, EvidenceIdentity, ProducerPolicy,
+                                parse_receipt, verify_receipt)
+
+        if not isinstance(expected_identity, EvidenceIdentity):
+            raise TypeError("expected_identity must be EvidenceIdentity")
+        if not isinstance(protected_policy, ProducerPolicy):
+            raise TypeError("protected_policy must be ProducerPolicy")
+        ingested_at = _require_ts("ingested_at", ingested_at)
+        if not isinstance(receipt_json, str):
+            raise ValueError("evidence receipt JSON must be text")
+        try:
+            encoded_size = len(receipt_json.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError("evidence receipt JSON is not UTF-8") from exc
+        if encoded_size > 64 * 1024:
+            raise ValueError("evidence receipt JSON exceeds 65536 bytes")
+        try:
+            parsed = parse_receipt(receipt_json)
+        except EvidenceError as exc:
+            raise ValueError(
+                f"evidence receipt is invalid: {exc.reason_code}") from exc
+        if receipt_json != parsed.canonical_json:
+            raise ValueError("evidence receipt JSON is not canonical")
+        verification = verify_receipt(parsed, expected_identity,
+                                       protected_policy)
+        identity_digest = expected_identity.digest
+        receipt_digest = parsed.receipt_digest
+        nonce = parsed.nonce
+        status = verification.status
+        reason_code = verification.reason_code
+        evidence_kind = parsed.evidence_kind
+        terminal_state = parsed.terminal_state
+        self._c.execute("BEGIN IMMEDIATE")
+        try:
+            def trim_receipts(table: str) -> None:
+                self._c.execute(
+                    f"""DELETE FROM {table} WHERE rowid IN (
+                           SELECT rowid FROM {table}
+                           WHERE identity_digest=?
+                           ORDER BY ingested_at ASC, rowid ASC
+                           LIMIT CASE WHEN (SELECT COUNT(*) FROM {table}
+                                            WHERE identity_digest=?) > 31
+                                      THEN (SELECT COUNT(*) FROM {table}
+                                            WHERE identity_digest=?) - 31
+                                      ELSE 0 END)""",
+                    (identity_digest, identity_digest, identity_digest))
+
+            def trim_evidence_receipts() -> None:
+                limit_sql = """CASE WHEN (SELECT COUNT(*)
+                                      FROM evidence_receipts
+                                      WHERE identity_digest=?) > 31
+                                 THEN (SELECT COUNT(*)
+                                       FROM evidence_receipts
+                                       WHERE identity_digest=?) - 31
+                                 ELSE 0 END"""
+                self._c.execute(
+                    f"""DELETE FROM evidence_receipt_conflicts
+                        WHERE identity_digest=?
+                          AND existing_receipt_digest IN (
+                            SELECT receipt_digest FROM evidence_receipts
+                            WHERE identity_digest=?
+                            ORDER BY ingested_at ASC, rowid ASC
+                            LIMIT {limit_sql})""",
+                    (identity_digest, identity_digest,
+                     identity_digest, identity_digest))
+                self._c.execute(
+                    f"""DELETE FROM evidence_receipts WHERE rowid IN (
+                           SELECT rowid FROM evidence_receipts
+                           WHERE identity_digest=?
+                           ORDER BY ingested_at ASC, rowid ASC
+                           LIMIT {limit_sql})""",
+                    (identity_digest, identity_digest, identity_digest))
+
+            existing = self._c.execute(
+                """SELECT receipt_digest FROM evidence_receipts
+                   WHERE identity_digest=? AND receipt_digest=?""",
+                (identity_digest, receipt_digest)).fetchone()
+            if existing is not None:
+                self._c.execute("COMMIT")
+                return {"status": "duplicate", "receipt_digest": receipt_digest}
+            existing_conflict = self._c.execute(
+                """SELECT receipt_digest FROM evidence_receipt_conflicts
+                   WHERE identity_digest=? AND receipt_digest=?""",
+                (identity_digest, receipt_digest)).fetchone()
+            if existing_conflict is not None:
+                self._c.execute("COMMIT")
+                return {"status": "duplicate", "receipt_digest": receipt_digest}
+            conflict = self._c.execute(
+                """SELECT receipt_digest FROM evidence_receipts
+                   WHERE identity_digest=? AND nonce=? LIMIT 1""",
+                (identity_digest, nonce)).fetchone()
+            if conflict is not None:
+                trim_receipts("evidence_receipt_conflicts")
+                self._c.execute(
+                    """INSERT OR IGNORE INTO evidence_receipt_conflicts
+                       (identity_digest, receipt_digest, nonce,
+                        existing_receipt_digest, reason_code, evidence_kind,
+                        terminal_state, receipt_json, ingested_at)
+                       VALUES (?, ?, ?, ?, 'nonce_conflict', ?, ?, ?, ?)""",
+                    (identity_digest, receipt_digest, nonce,
+                     conflict["receipt_digest"], evidence_kind, terminal_state,
+                     receipt_json, ingested_at))
+                self._c.execute("COMMIT")
+                return {"status": "conflict", "receipt_digest": receipt_digest,
+                        "existing_receipt_digest": conflict["receipt_digest"]}
+            trim_evidence_receipts()
+            self._c.execute(
+                """INSERT INTO evidence_receipts
+                   (identity_digest, receipt_digest, nonce, status, reason_code,
+                    evidence_kind, terminal_state, receipt_json, ingested_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (identity_digest, receipt_digest, nonce, status, reason_code,
+                 evidence_kind, terminal_state, receipt_json, ingested_at))
+            self._c.execute("COMMIT")
+            return {"status": status, "receipt_digest": receipt_digest,
+                    "reason_code": reason_code}
+        except BaseException:
+            try:
+                self._c.execute("ROLLBACK")
+            except BaseException:
+                pass
+            raise
+
+    def list_evidence_receipts(self, identity_digest: str,
+                               limit: int = 32) -> list[dict]:
+        """Return a compact, bounded evidence projection for one identity."""
+        identity_digest = _require_text("identity_digest", identity_digest)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("evidence receipt limit must be a positive integer")
+        limit = min(limit, 32)
+        rows = self._c.execute(
+            """SELECT receipt_digest, nonce, status, reason_code,
+                      evidence_kind, terminal_state, ingested_at
+                 FROM (
+                   SELECT receipt_digest, nonce, status, reason_code,
+                          evidence_kind, terminal_state, ingested_at
+                     FROM evidence_receipts
+                    WHERE identity_digest=?
+                   UNION ALL
+                   SELECT receipt_digest, nonce, 'conflict', reason_code,
+                          evidence_kind, terminal_state, ingested_at
+                     FROM evidence_receipt_conflicts
+                    WHERE identity_digest=?
+                 )
+                ORDER BY ingested_at DESC, receipt_digest DESC
+                LIMIT ?""", (identity_digest, identity_digest, limit)).fetchall()
+        return [{"receipt_digest": row["receipt_digest"],
+                 "nonce": row["nonce"], "status": row["status"],
+                 "reason_code": row["reason_code"],
+                 "evidence_kind": row["evidence_kind"],
+                 "terminal_state": row["terminal_state"],
+                 "ingested_at": row["ingested_at"]} for row in rows]
 
     # --- v13: resumable batch orchestration -------------------------------
     #

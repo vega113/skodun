@@ -54,13 +54,12 @@ from tests.test_gitio import _git, _mkrepo
 _SRC = str(Path(skodun.__file__).resolve().parents[1])
 
 #: The tools `skodun mcp` serves, in `tools/list` order. THE SNAPSHOT.
-#: `triage_defer` is APPENDED rather than slotted beside `triage_dismiss`: the
-#: order is the order tools were added, a client's tool picker renders it, and
-#: reordering the shipped eight would move every one of them for no reason.
+#: New tools are appended in registry order: a client's tool picker renders
+#: this sequence, so reordering an existing entry would move every later tool.
 EXPECTED_TOOLS = ["gate", "review_readiness", "review", "log", "surface", "triage_list",
                   "triage_dismiss", "adopt_refuter", "triage_reopen",
                   "triage_defer", "review_status", "review_cancel",
-                  "feedback_add", "feedback_list"]
+                  "feedback_add", "feedback_list", "evidence"]
 
 TRACKING_REF = "GH-412"
 DEFER_REASON = "in-bounds for this surface; the hot path is the batcher upstream"
