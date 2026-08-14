@@ -401,7 +401,7 @@ _RECEIPT_FIELDS = frozenset({
     "command_digest", "producer_proof", "started_at", "completed_at", "exit_code",
     "terminal_state", "duration_ms", "counters", "artifact_digests",
     "tool", "runtime", "diagnostic_category", "nonce", "redaction",
-    "receipt_digest",
+    "mutation_proof", "receipt_digest",
 })
 
 
@@ -433,6 +433,7 @@ class EvidenceReceipt:
     nonce: str
     redaction: dict[str, bool]
     receipt_digest: str
+    mutation_proof: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.artifact_digests, tuple):
@@ -442,10 +443,13 @@ class EvidenceReceipt:
                            MappingProxyType(dict(self.counters)))
         object.__setattr__(self, "redaction",
                            MappingProxyType(dict(self.redaction)))
+        if self.mutation_proof is not None:
+            object.__setattr__(self, "mutation_proof",
+                               MappingProxyType(dict(self.mutation_proof)))
 
     @property
     def canonical_mapping(self) -> dict[str, object]:
-        return {
+        mapping = {
             "schema_version": self.schema_version,
             "evidence_kind": self.evidence_kind,
             "repository_id": self.repository_id,
@@ -473,6 +477,9 @@ class EvidenceReceipt:
             "redaction": dict(self.redaction),
             "receipt_digest": self.receipt_digest,
         }
+        if self.mutation_proof is not None:
+            mapping["mutation_proof"] = dict(self.mutation_proof)
+        return mapping
 
     @property
     def canonical_json(self) -> str:
@@ -496,7 +503,8 @@ def producer_proof(value: Mapping[str, object], key: bytes) -> str:
 
 def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
     unknown = sorted(set(raw) - _RECEIPT_FIELDS)
-    missing = sorted(_RECEIPT_FIELDS - set(raw))
+    required_fields = _RECEIPT_FIELDS - {"mutation_proof"}
+    missing = sorted(required_fields - set(raw))
     if unknown:
         raise EvidenceError("unknown_field", unknown[0])
     if missing:
@@ -507,6 +515,16 @@ def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
     kind = raw["evidence_kind"]
     if not isinstance(kind, str) or kind not in _KINDS:
         raise EvidenceError("invalid_field", "evidence_kind")
+    if kind == "mutation" and "mutation_proof" not in raw:
+        raise EvidenceError("missing_field", "mutation_proof")
+    mutation_proof = raw.get("mutation_proof")
+    if mutation_proof is not None:
+        try:
+            from .mutation import parse_mutation_proof
+            mutation_proof = parse_mutation_proof(mutation_proof).canonical_mapping
+        except ValueError as exc:
+            reason_code = getattr(exc, "reason_code", "invalid_field")
+            raise EvidenceError(reason_code, "mutation_proof") from exc
     identity = EvidenceIdentity(
         raw["repository_id"], raw["worktree_root"],
         raw["certification_base"], raw["current_head"],
@@ -592,7 +610,8 @@ def _validate_mapping(raw: Mapping[str, object]) -> EvidenceReceipt:
         exit_code=exit_code, terminal_state=terminal, duration_ms=duration,
         counters=normalized_counters, artifact_digests=tuple(artifacts),
         tool=tool, runtime=runtime, diagnostic_category=diagnostic, nonce=nonce,
-        redaction=dict(redaction), receipt_digest=claimed)
+        redaction=dict(redaction), receipt_digest=claimed,
+        mutation_proof=mutation_proof)
 
 
 def parse_receipt(text: str) -> EvidenceReceipt:
