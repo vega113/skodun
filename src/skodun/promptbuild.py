@@ -197,7 +197,10 @@ def advisory_context(
 #: MAX_* constants bound the payload itself; this is charged separately so
 #: argv-bound adapters cannot go over their declared ceiling by two bytes.
 ADVISORY_BLOCK_WRAPPER_BYTES = 2
-EVIDENCE_CONTEXT_MAX_BYTES = 16 * 1024
+# Receipt context contains only a small, redacted JSON projection.  Keep its
+# hard ceiling modest so reserving the full block does not turn ordinary
+# provider-specific batches into irreducible truncated hunks.
+EVIDENCE_CONTEXT_MAX_BYTES = 4 * 1024
 
 
 def build(

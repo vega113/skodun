@@ -29,6 +29,8 @@ MAX_PROFILE_OUTPUT_BYTES = 64 * 1024
 MAX_PROFILE_TIMEOUT_SEC = 600
 MAX_PROFILE_FIXTURES = 64
 MAX_RECEIPT_CONTEXT_ITEMS = 32
+# Keep the profile-facing name as the contract for receipt adapters while the
+# prompt builder owns the shared byte ceiling and budget reservation.
 MAX_RECEIPT_CONTEXT_BYTES = EVIDENCE_CONTEXT_MAX_BYTES
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
