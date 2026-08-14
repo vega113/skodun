@@ -48,6 +48,9 @@ def _tool(tmp_path: Path) -> Path:
         """import pathlib, sys, os
 mode = sys.argv[1]
 if mode == 'version':
+    if os.environ.get('PROFILE_MODE') == 'bad_version':
+        print('Scala 3.3.1 hermetic-fixture-tool')
+        raise SystemExit(3)
     if os.environ.get('PROFILE_MODE') == 'slow':
         import time
         time.sleep(2)
@@ -96,9 +99,8 @@ def _profile(*, fixture: str = "fixture.scala", version_prefix: str = "Scala 3.3
         harness_command_id="scala_harness",
         symbol_query_command_id="scala_symbols",
         locator_command_id="scala_locator",
-        mutation_command_id="scala_mutation",
         capabilities=("version_discovery", "syntax_compile", "fixture_harness",
-                      "symbol_query", "mutation_locator", "mutation_execution"),
+                      "symbol_query", "mutation_locator"),
         fixtures=(FixtureExpectation(fixture, "accepted", "COMPILE_OK"),),
         version_prefix=version_prefix,
         timeout_sec=5,
@@ -165,6 +167,13 @@ def test_missing_command_and_version_mismatch_are_stable_unavailable_reasons(tmp
     mismatch = run_profile(_profile(version_prefix="Scala 4"), _policy(tool), tmp_path)
     assert mismatch.accepted is False
     assert mismatch.reason_code == "version_mismatch"
+    os.environ["PROFILE_MODE"] = "bad_version"
+    try:
+        failed = run_profile(_profile(), _policy(tool), tmp_path)
+    finally:
+        os.environ.pop("PROFILE_MODE", None)
+    assert failed.accepted is False
+    assert failed.reason_code == "version_failed"
 
 
 def test_profile_rejects_unsafe_fixture_and_timeout_without_acceptance(tmp_path):

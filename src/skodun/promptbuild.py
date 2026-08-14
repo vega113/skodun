@@ -197,6 +197,7 @@ def advisory_context(
 #: MAX_* constants bound the payload itself; this is charged separately so
 #: argv-bound adapters cannot go over their declared ceiling by two bytes.
 ADVISORY_BLOCK_WRAPPER_BYTES = 2
+EVIDENCE_CONTEXT_MAX_BYTES = 16 * 1024
 
 
 def build(

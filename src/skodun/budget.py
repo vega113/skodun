@@ -196,6 +196,8 @@ PROMPT_OVERHEAD_BYTES: int = (
     + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES
     + fingerprint.MAX_LINEAGE_PROMPT_BYTES
     + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES
+    + promptbuild.EVIDENCE_CONTEXT_MAX_BYTES
+    + promptbuild.ADVISORY_BLOCK_WRAPPER_BYTES
 )
 
 

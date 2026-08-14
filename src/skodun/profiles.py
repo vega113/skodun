@@ -21,6 +21,7 @@ from types import MappingProxyType
 from typing import Mapping, Sequence
 
 from .evidence import EvidenceIdentity, ProducerPolicy
+from .promptbuild import EVIDENCE_CONTEXT_MAX_BYTES
 from .runner import RunResult, SpawnError, run_with_watchdog
 
 
@@ -28,7 +29,7 @@ MAX_PROFILE_OUTPUT_BYTES = 64 * 1024
 MAX_PROFILE_TIMEOUT_SEC = 600
 MAX_PROFILE_FIXTURES = 64
 MAX_RECEIPT_CONTEXT_ITEMS = 32
-MAX_RECEIPT_CONTEXT_BYTES = 16 * 1024
+MAX_RECEIPT_CONTEXT_BYTES = EVIDENCE_CONTEXT_MAX_BYTES
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _OID = re.compile(r"[0-9a-f]{40}")
@@ -164,6 +165,9 @@ class LanguageCapabilityProfile:
         if self.fixtures and (self.compile_command_id is None
                               or self.harness_command_id is None):
             raise ProfileError("invalid_profile", "fixture compile/harness command")
+        if (set(self.capabilities) & {"symbol_query", "mutation_locator"}
+                and not self.fixtures):
+            raise ProfileError("invalid_profile", "optional capability fixtures")
         if self.version_prefix is not None:
             _text(self.version_prefix, "version_prefix", 128)
         _plain_int(self.timeout_sec, "timeout_sec", 1, MAX_PROFILE_TIMEOUT_SEC)
@@ -386,11 +390,16 @@ def run_profile(profile: LanguageCapabilityProfile, policy: ProducerPolicy,
         root = _root(root)
     except ProfileError as exc:
         return _failed(profile, exc.reason_code)
-    selected = [profile.version_command_id]
-    selected.extend(command_id for command_id in (
-        profile.compile_command_id, profile.harness_command_id,
-        profile.symbol_query_command_id, profile.locator_command_id,
-        profile.mutation_command_id) if command_id is not None)
+    command_for_capability = {
+        "version_discovery": profile.version_command_id,
+        "syntax_compile": profile.compile_command_id,
+        "fixture_harness": profile.harness_command_id,
+        "symbol_query": profile.symbol_query_command_id,
+        "mutation_locator": profile.locator_command_id,
+        "mutation_execution": profile.mutation_command_id,
+    }
+    selected = [command_for_capability[capability]
+               for capability in profile.capabilities]
     commands = {}
     try:
         for command_id in selected:
@@ -413,6 +422,8 @@ def run_profile(profile: LanguageCapabilityProfile, policy: ProducerPolicy,
         except ProfileError as exc:
             return _failed(profile, exc.reason_code, checks)
         checks.append(version_check)
+        if not version_check["passed"]:
+            return _failed(profile, "version_failed", checks)
         version_text = version_bytes.decode("utf-8", "replace").splitlines()
         discovered = version_text[0][:128] if version_text else ""
         if (profile.version_prefix is not None
@@ -451,6 +462,23 @@ def run_profile(profile: LanguageCapabilityProfile, policy: ProducerPolicy,
             if not (compile_ok and harness_ok and markers_ok):
                 return _failed(profile, "invalid_fixture", checks,
                                discovered or None)
+            for capability in ("symbol_query", "mutation_locator",
+                               "mutation_execution"):
+                if capability not in profile.capabilities:
+                    continue
+                command = commands[command_for_capability[capability]]
+                try:
+                    optional_check, _ = _run_command(
+                        command, root, scratch, f"{capability}-{index}",
+                        profile.timeout_sec, profile.max_output_bytes,
+                        fixture_copy)
+                except ProfileError as exc:
+                    return _failed(profile, exc.reason_code, checks,
+                                   discovered or None)
+                checks.append(optional_check)
+                if not optional_check["passed"]:
+                    return _failed(profile, "capability_failed", checks,
+                                   discovered or None)
     return ProfileRun(True, "ok", profile.profile_id, profile.language,
                       discovered or None, profile.capabilities, tuple(checks))
 
@@ -473,9 +501,9 @@ def scala3_profile() -> LanguageCapabilityProfile:
         version_command_id="scala_version", compile_command_id="scala_compile",
         harness_command_id="scala_harness",
         symbol_query_command_id="scala_symbols",
-        locator_command_id="scala_locator", mutation_command_id="scala_mutation",
+        locator_command_id="scala_locator",
         capabilities=("version_discovery", "syntax_compile", "fixture_harness",
-                      "symbol_query", "mutation_locator", "mutation_execution"),
+                      "symbol_query", "mutation_locator"),
         fixtures=fixtures, version_prefix="Scala 3.", timeout_sec=60,
         max_output_bytes=MAX_PROFILE_OUTPUT_BYTES)
 
