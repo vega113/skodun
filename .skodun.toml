@@ -35,12 +35,12 @@ fallbacks = ["finder-gemini", "finder-openai"]
 [[reviewers]]
 name     = "finder-gemini"
 provider = "google"
-model    = "gemini-3.6-flash-high"
+model    = "gemini-3.7-flash-high"
 role     = "finder"
 
 [[reviewers]]
 name     = "finder-openai"
 provider = "openai"
-model    = "gpt-5.4"
-effort   = "medium"
+model    = "gpt-5.6-luna"
+effort   = "high"
 role     = "finder"

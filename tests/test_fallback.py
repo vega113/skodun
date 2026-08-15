@@ -50,7 +50,7 @@ from skodun.pipeline import PreflightRefused, lock_stale_ceiling_sec, run_review
 from skodun.store import Store
 from tests.test_gitio import _git, _mkrepo
 from tests.test_pipeline import (CANCELLED, CLEAN, DIRTY, _emit, _emit_then_hang,
-                                 _per_call, _verdict)
+                                 _hang_silent, _per_call, _verdict)
 
 # --------------------------------------------------------------------------
 # configs under test
@@ -543,10 +543,13 @@ def test_a_codex_stream_degradation_consumes_the_same_retry_budget(
 
 
 def test_a_first_entry_timeout_stops_the_chain(tmp_path, monkeypatch, capsys):
-    """A timeout is not an availability verdict: the provider answered, slowly.
+    """A timeout that already printed is not an availability verdict.
 
-    Hopping on it would spend a second provider's quota on what is most likely
-    an oversized prompt or a wedged harness, and would do it silently.
+    The provider answered, then hung. Hopping on that would spend a second
+    provider's quota on what is most likely an oversized prompt or a wedged
+    harness, and would do it silently. A *silent* hang (no first output) is
+    the opposite case: see
+    `test_a_no_output_timeout_hops_to_the_next_provider`.
     """
     _fake_cli(tmp_path, "grok", _emit_then_hang(CLEAN))
     _fake_cli(tmp_path, "codex", _emit(CODEX_CLEAN))
@@ -565,6 +568,50 @@ def test_a_first_entry_timeout_stops_the_chain(tmp_path, monkeypatch, capsys):
     only = rec["attempts"][0]
     assert only["classification"] is None
     assert only["timed_out"] is True and only["duration_sec"] >= 1.0
+
+
+def test_a_no_output_timeout_hops_to_the_next_provider(tmp_path, monkeypatch,
+                                                       capsys):
+    """A silent hang is "this provider did not serve", not a slow answer.
+
+    Retrying the same hung CLI would hold exclusive review-fg for another
+    full `timeout_sec` and still produce no evidence. The configured
+    fallback is what the chain already uses for unavailability.
+    """
+    _fake_cli(tmp_path, "grok", _hang_silent())
+    _fake_cli(tmp_path, "codex", _emit(CODEX_CLEAN))
+    repo = _repo(tmp_path, CFG_XAI_THEN_OPENAI,
+                 "\n[defaults]\ntimeout_sec = 1\ntimeout_retries = 1\n"
+                 "degraded_retries = 0\n")
+
+    rec = _run(repo, _store(tmp_path))
+
+    assert _calls(tmp_path) == ["grok", "codex"]
+    first, second = rec["attempts"][0], rec["attempts"][1]
+    assert first["provider"] == "xai"
+    assert first["timed_out"] is True
+    assert first["first_output_sec"] is None
+    assert second["provider"] == "openai"
+    assert rec.get("failure_reason") != "timed out after 2 attempts"
+    assert rec["trustworthy"] is True
+    assert rec["adapter"] == "codex"
+
+
+def test_a_no_output_timeout_does_not_retry_the_same_cli_when_alone(
+        tmp_path, monkeypatch, capsys):
+    """No fallback: fail closed after the first silent wait, not a second."""
+    _fake_cli(tmp_path, "grok", _hang_silent())
+    repo = _repo(tmp_path, CFG_XAI_ONLY,
+                 "\n[defaults]\ntimeout_sec = 1\ntimeout_retries = 1\n"
+                 "degraded_retries = 0\n")
+
+    rec = _run(repo, _store(tmp_path))
+
+    assert _calls(tmp_path) == ["grok"]
+    assert rec["failure_reason"] == "timed out after 1 attempts"
+    assert rec["status"] == "failed" and rec["trustworthy"] is False
+    assert rec["attempts"][0]["timed_out"] is True
+    assert rec["attempts"][0]["first_output_sec"] is None
 
 
 def test_a_build_cmd_failure_stops_the_chain_and_never_starts_a_process(

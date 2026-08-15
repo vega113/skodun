@@ -151,15 +151,15 @@ fallbacks = ["finder-openai"]  # up to 3 names; each must exist, be enabled, and
 [[reviewers]]
 name     = "finder-openai"
 provider = "openai"
-model    = "gpt-5.4-mini"     # the codex CLI has no `list models` subcommand -- see README
-effort   = "medium"
+model    = "gpt-5.6-luna"     # the codex CLI has no `list models` subcommand -- see README
+effort   = "high"
 role     = "finder"
 fallbacks = ["finder-gemini"]
 
 [[reviewers]]
 name     = "finder-gemini"
 provider = "google"
-model    = "gemini-3.1-pro-high"
+model    = "gemini-3.7-flash-high"
 role     = "finder"
 
 # --- the refuter: a DIFFERENT provider re-examines the finder's findings ---
@@ -189,7 +189,8 @@ role     = "finder"
 [[reviewers]]
 name      = "refuter"
 provider  = "openai"
-model     = "gpt-5.4"
+model     = "gpt-5.6-luna"
+effort    = "high"
 role      = "refuter"
 fallbacks = ["finder"]
 
@@ -227,7 +228,7 @@ fallbacks = ["finder"]
 #
 # 1. Effort is entangled with the model id, and `agy models` (the command a
 #    config author actually runs) prints ONLY effort-suffixed ids such as
-#    "gemini-3.6-flash-high" -- never the bare "gemini-3.6-flash" a base id
+#    "gemini-3.7-flash-high" -- never the bare "gemini-3.7-flash" a base id
 #    would need. Only two shapes work:
 #      (a) a SUFFIXED id (one `agy models` actually lists), with `effort`
 #          left unset or set to "none" -- the suffix already says the level;
@@ -261,7 +262,7 @@ fallbacks = ["finder"]
 #        [[reviewers]]
 #        name           = "finder-openai"
 #        provider       = "openai"
-#        model          = "gpt-5.4"
+#        model          = "gpt-5.6-luna"
 #        max_diff_bytes = 600000       # this entry only
 #
 #    It replaces the global for that entry, in either direction, and is still
@@ -271,11 +272,11 @@ fallbacks = ["finder"]
 # [[reviewers]]
 # name     = "finder-google"
 # provider = "google"
-# model    = "gemini-3.6-flash-high"   # shape (a): suffixed id, no `effort` line
+# model    = "gemini-3.7-flash-high"   # shape (a): suffixed id, no `effort` line
 # role     = "finder"
 #
 # # shape (b) instead of the above:
-# # model  = "gemini-3.6-flash"        # base id -- NOT in `agy models`' own listing
+# # model  = "gemini-3.7-flash"        # base id -- NOT in `agy models`' own listing
 # # effort = "high"                    # required, and must match
 
 # --- junie (JetBrains CLI): macOS only, empty-capsule confinement ----------

@@ -1608,13 +1608,20 @@ def test_example_pin_and_fallback_graph_are_unchanged(tmp_path):
     cfg = _load_shipped_toml(tmp_path, _MULTI_PROVIDER_EXAMPLE)
     finder = _finder_named(cfg, "finder")
     openai = _requested_head(cfg, "finder-openai")
+    gemini = _requested_head(cfg, "finder-gemini")
+    refuter = _finder_named(cfg, "refuter")
 
     assert finder.fallbacks == ("finder-openai",)
     assert [r.name for r in _chain_for(cfg, finder)] == ["finder", "finder-openai"]
     assert openai.provider == "openai"
-    assert openai.model == "gpt-5.4-mini"
-    assert openai.effort == "medium"
+    assert openai.model == "gpt-5.6-luna"
+    assert openai.effort == "high"
     assert openai.fallbacks == ("finder-gemini",)
+    assert gemini.provider == "google"
+    assert gemini.model == "gemini-3.7-flash-high"
+    assert gemini.effort is None
+    assert refuter.model == "gpt-5.6-luna"
+    assert refuter.effort == "high"
     assert cfg.routing.mode == "auto"
     assert cfg.routing.pool == ("finder", "finder-openai")
     assert cfg.routing.cross_model is True
@@ -1632,7 +1639,7 @@ def test_dogfood_pin_and_fallback_graph_are_unchanged(tmp_path):
     assert [r.name for r in _chain_for(cfg, finder)] == [
         "finder", "finder-gemini", "finder-openai"]
     assert gemini.provider == "google"
-    assert gemini.model == "gemini-3.6-flash-high"
+    assert gemini.model == "gemini-3.7-flash-high"
     assert openai.provider == "openai"
-    assert openai.model == "gpt-5.4"
-    assert openai.effort == "medium"
+    assert openai.model == "gpt-5.6-luna"
+    assert openai.effort == "high"

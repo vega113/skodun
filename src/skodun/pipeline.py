@@ -4148,10 +4148,14 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
         reason = f"extra pass {name} failed: {e!r}"
         return _failed_pass(rec, name, reason, reason)
     if outcome.parsed is None:
+        reason = outcome.failure_reason or passes.failed_pass_reason(name)
+        # Name the pass so a later timeout is not read as "the finder never
+        # produced usable evidence". merge_failed_extra_pass already keeps
+        # the finder's summary/findings and fail-closes the record.
+        if not str(reason).startswith("extra pass"):
+            reason = f"extra pass {name}: {reason}"
         return _with_provenance(
-            passes.merge_failed_extra_pass(
-                rec, name,
-                outcome.failure_reason or passes.failed_pass_reason(name)),
+            passes.merge_failed_extra_pass(rec, name, reason),
             name, _provenance(outcome))
     p = outcome.parsed
     extra = {
