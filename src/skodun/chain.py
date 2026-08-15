@@ -443,12 +443,17 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
        stderr is `ok` and worth nothing. Accepting on `kind` alone would be a
        silent false all-clear.
 
-    Advancing the chain is reserved for `unavailable`. An entry that answered
-    BADLY — degraded, unparseable, timed out — STOPS the chain and returns its
-    failure: that is a harness or config problem, and hopping providers on it
-    would spend someone else's quota to hide a bug. An exhausted chain is an
-    explicit failure with `parsed=None`, which the record machinery turns into
-    an untrustworthy `failed` record. It is never a pass.
+    Advancing the chain is reserved for `unavailable` and for a timeout that
+    produced **no first output**. An entry that answered BADLY — degraded,
+    unparseable, or timed out *after printing* — STOPS the chain and returns
+    its failure: that is a harness or config problem, and hopping providers
+    on it would spend someone else's quota to hide a bug. A silent hang
+    (`first_output_sec is None`) is the opposite: the provider never served,
+    so a second `timeout_sec` on the same CLI only occupies exclusive
+    review-fg. Hop to the next configured entry; if none remain, fail closed
+    after that one wait. An exhausted chain is an explicit failure with
+    `parsed=None`, which the record machinery turns into an untrustworthy
+    `failed` record. It is never a pass.
 
     An invocation that could not be BUILT splits along exactly that line, and
     the split is the whole safety argument of the per-provider budgets (#15):
@@ -735,15 +740,30 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                         first_output_sec=_round(result.first_output_sec),
                         classification=None,
                         capacity_timing=capacity_timing))
+                    # NEVER parsed, and never classified: the runner truncated
+                    # stdout precisely so that a hung run's complete-looking
+                    # envelope cannot become a review.
+                    if result.first_output_sec is None:
+                        # Silent hang: this provider did not serve. Do not
+                        # spend another timeout_sec on the same CLI; hop if
+                        # another entry exists, otherwise fail closed now.
+                        next_step = ("trying the next entry" if i + 1 < len(chain)
+                                     else "no entries remain")
+                        _note(f"attempt {entry_n} timed out after "
+                              f"{d.timeout_sec}s with no output; {next_step}")
+                        if i + 1 < len(chain):
+                            exhausted.append(
+                                f"{entry.name}/{entry.provider}: "
+                                "timed out with no output")
+                            break
+                        return _Outcome(None, attempts,
+                                        f"timed out after {entry_n} attempts")
                     if timeouts_used < d.timeout_retries:
                         timeouts_used += 1
                         _note(f"attempt {entry_n} timed out after "
                               f"{d.timeout_sec}s; retrying in a fresh session "
                               f"({timeouts_used}/{d.timeout_retries})")
                         continue
-                    # NEVER parsed, and never classified: the runner truncated
-                    # stdout precisely so that a hung run's complete-looking
-                    # envelope cannot become a review.
                     return _Outcome(None, attempts,
                                     f"timed out after {entry_n} attempts")
 

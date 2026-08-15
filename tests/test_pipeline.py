@@ -136,6 +136,15 @@ def _emit_then_hang(envelope: str) -> str:
     return _emit(envelope) + "\nsleep 30"
 
 
+def _hang_silent() -> str:
+    """Produce no stdout and hang past the timeout.
+
+    The incident shape: a silent CLI that never served, as opposed to
+    `_emit_then_hang`, which already answered and then wedged.
+    """
+    return "sleep 30"
+
+
 def _per_call(*bodies: str) -> str:
     """Dispatch on `$CALL`; the last body serves every later call."""
     if len(bodies) == 1:
@@ -1189,6 +1198,33 @@ def test_a_bad_extra_pass_provider_is_a_preflight_refusal(tmp_path, monkeypatch,
     assert "no-such-provider" in str(e.value)
     assert _calls(tmp_path) == 0        # not one model call was spent on it
     assert not (git_common_dir(repo) / "grok-reviews-foreground.lock").exists()
+
+
+def test_extra_pass_timeout_keeps_finder_evidence_and_does_not_retry(
+        tmp_path, capsys, monkeypatch):
+    """A parseable finder is not wiped because the skeptic later hung.
+
+    The extra pass is recorded as failed (fail closed). The hung CLI must
+    not get a second full same-provider timeout-retry cycle after the
+    finder already answered.
+    """
+    monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    _fake_grok(tmp_path, _per_call(_emit(CLEAN), _hang_silent()))
+    repo = _repo(tmp_path, "\n[defaults]\ntimeout_sec = 1\n"
+                           "timeout_retries = 1\ndegraded_retries = 0\n")
+
+    rec = _run(repo, _store(tmp_path))
+
+    assert rec["summary"] == "ok"
+    assert rec["findings"] == []
+    assert rec["findings_total"] == 0
+    extra = rec["extra_passes"]["skeptic"]
+    assert extra["failed"] is True
+    # Finder + one silent skeptic wait, not finder + timeout_retries+1.
+    assert _calls(tmp_path) == 2
+    reason = rec.get("failure_reason") or ""
+    assert "timed out after 2 attempts" not in reason
+    assert "skeptic" in reason
 
 
 def test_a_broken_extra_pass_demotes_the_review_instead_of_destroying_it(

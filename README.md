@@ -314,8 +314,8 @@ fallbacks = ["finder-openai"]   # tried, in order, only when "finder"'s own atte
 [[reviewers]]
 name     = "finder-openai"
 provider = "openai"
-model    = "gpt-5.4-mini"
-effort   = "medium"
+model    = "gpt-5.6-luna"
+effort   = "high"
 role     = "finder"
 ```
 
