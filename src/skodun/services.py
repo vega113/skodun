@@ -917,6 +917,18 @@ def svc_stats(store, since_days=7, fmt="text") -> tuple[int, str]:
     try:
         lower = stats.since_iso(since_days)
         data = store.telemetry_stats(since_iso=lower)
+        from . import capacity as capmod
+        from .config import load_config
+        live = {
+            "machine_cap": capmod.resolved_machine_capacity(load_config(None)),
+            "machine_holders": store.capacity_holder_count(
+                capmod.RESOURCE_REVIEW_MACHINE, capmod.MACHINE_SCOPE),
+            "by_repo": store.capacity_live_holders(capmod.RESOURCE_REVIEW_FG),
+            "by_provider": store.capacity_live_holders_prefix(
+                capmod.PROVIDER_CLASS_PREFIX),
+        }
+        data = dict(data)
+        data["live_capacity"] = live
         return 0, stats.render(data, fmt=fmt)
     except KeyboardInterrupt:
         raise

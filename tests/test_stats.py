@@ -128,6 +128,23 @@ def test_stats_does_not_count_reuse_bypasses_or_errors_as_misses(tmp_path):
     assert data["reuse"] == {"hits": 0, "misses": 0}
 
 
+def test_stats_machine_cap_follows_toml_when_env_is_unset(tmp_path, monkeypatch):
+    from skodun.capacity import resolved_machine_capacity
+    from skodun.config import load_config
+    from skodun.services import svc_stats
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text("[capacity]\nmachine = 2\n", encoding="utf-8")
+    monkeypatch.delenv("SKODUN_REVIEW_MACHINE_CAPACITY", raising=False)
+    monkeypatch.setenv("SKODUN_CONFIG", str(cfg_path))
+    expected = resolved_machine_capacity(load_config(None, global_path=cfg_path))
+    with Store.open(tmp_path / "stats.db") as st:
+        code, text = svc_stats(st, since_days=7, fmt="text")
+    assert code == 0
+    assert f"machine_cap={expected}" in text
+    assert expected == 2
+
+
 def test_stats_rejects_bool_days_and_parser_exposes_json(tmp_path):
     assert since_iso(0, now=0) == "1970-01-01T00:00:00Z"
     try:

@@ -549,10 +549,10 @@ def test_s4_dual_hold_off_two_concurrent_store_only_holders(store):
     """T1: dual-hold off path (try_lock=None) admits N concurrent holders."""
     t1 = acquire_for_fg(
         store, scope="/repo", capacity=2, wait_sec=0.5, poll_sec=0.01,
-        try_lock=None)
+        try_lock=None, machine_capacity=2)
     t2 = acquire_for_fg(
         store, scope="/repo", capacity=2, wait_sec=0.5, poll_sec=0.01,
-        try_lock=None)
+        try_lock=None, machine_capacity=2)
     assert t1.status == STATUS_RUNNING
     assert t2.status == STATUS_RUNNING
     assert t1.id != t2.id
@@ -572,7 +572,7 @@ def test_s4_dual_hold_on_try_lock_still_required(store):
 
     t1 = acquire_for_fg(
         store, scope="/repo", capacity=2, wait_sec=1, poll_sec=0.01,
-        try_lock=try_lock_hold)
+        try_lock=try_lock_hold, machine_capacity=2)
     assert t1.status == STATUS_RUNNING
     assert held == ["a"]
 
@@ -737,3 +737,53 @@ def test_s4_progress_eta_from_terminal_samples(store):
         on_progress=on_progress)
     assert any("eta≈" in n for n in notes)
     finish(store, ticket, status=STATUS_RELEASED)
+
+
+# ---------------------------------------------------------------------------
+# Machine-wide outer cap (shared store, inner review-fg stays per-repo)
+# ---------------------------------------------------------------------------
+
+
+def test_machine_capacity_from_env_defaults_and_rejects_junk():
+    assert capacity.machine_capacity_from_env({}) == 1
+    assert capacity.machine_capacity_from_env(
+        {"SKODUN_REVIEW_MACHINE_CAPACITY": "2"}) == 2
+    assert capacity.machine_capacity_from_env(
+        {"SKODUN_REVIEW_MACHINE_CAPACITY": "0"}) == 1
+    assert capacity.machine_capacity_from_env(
+        {"SKODUN_REVIEW_MACHINE_CAPACITY": "nope"}) == 1
+
+
+def test_effective_fg_capacity_is_min_of_machine_and_repo():
+    assert capacity.effective_fg_capacity(8, 1) == 1
+    assert capacity.effective_fg_capacity(1, 2) == 1
+    assert capacity.effective_fg_capacity(3, 3) == 3
+
+
+def test_two_repo_scopes_cannot_both_run_when_machine_cap_is_one(store):
+    first = acquire_for_fg(
+        store, scope="/repo-a/.git", capacity=1, wait_sec=0.2, poll_sec=0.01,
+        try_lock=None, machine_capacity=1)
+    assert first.status == STATUS_RUNNING
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(
+            store, scope="/repo-b/.git", capacity=1, wait_sec=0.08,
+            poll_sec=0.02, try_lock=None, machine_capacity=1)
+    finish(store, first, status=STATUS_RELEASED)
+    second = acquire_for_fg(
+        store, scope="/repo-b/.git", capacity=1, wait_sec=0.2, poll_sec=0.01,
+        try_lock=None, machine_capacity=1)
+    assert second.status == STATUS_RUNNING
+    finish(store, second, status=STATUS_RELEASED)
+
+
+def test_repo_fg_env_cannot_exceed_machine_cap(store):
+    first = acquire_for_fg(
+        store, scope="/repo-a/.git", capacity=8, wait_sec=0.2, poll_sec=0.01,
+        try_lock=None, machine_capacity=1)
+    assert first.status == STATUS_RUNNING
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(
+            store, scope="/repo-a/.git", capacity=8, wait_sec=0.08,
+            poll_sec=0.02, try_lock=None, machine_capacity=1)
+    finish(store, first, status=STATUS_RELEASED)

@@ -440,6 +440,18 @@ ROUTING_MODE_ENV = "SKODUN_ROUTING_MODE"
 
 
 @dataclass(frozen=True)
+class CapacitySettings:
+    """Optional `[capacity]` table: machine outer cap and inner review-fg.
+
+    ``None`` means "no file opinion" so env / capacity.py defaults apply.
+    A repo layer may only lower ``machine`` relative to the global file.
+    """
+
+    machine: int | None = None
+    review_fg: int | None = None
+
+
+@dataclass(frozen=True)
 class Routing:
     """The `[routing]` table: who heads a review nobody pinned.
 
@@ -710,6 +722,9 @@ class Config:
     routing: Routing = Routing()
     #: The `[schedule]` table (launchd job specs). Empty by default.
     schedule_jobs: tuple = ()
+    #: Optional `[capacity]` table. Missing means env/defaults. A repo file
+    #: may only tighten the machine ceiling, never raise it.
+    capacity: CapacitySettings = CapacitySettings()
 
 def _read(path: Path | None) -> dict:
     if path is None or not path.exists():
@@ -994,11 +1009,62 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     from .schedule import parse_schedule_table
     schedule_cfg = parse_schedule_table(schedule_raw if schedule_raw else None)
 
+    cap_global: dict = {}
+    cap_repo: dict = {}
+    if layers:
+        raw_g = layers[0].get("capacity", {})
+        if raw_g:
+            if not isinstance(raw_g, dict):
+                raise ValueError("[capacity] must be a table")
+            cap_global = dict(raw_g)
+        if len(layers) > 1:
+            raw_r = layers[1].get("capacity", {})
+            if raw_r:
+                if not isinstance(raw_r, dict):
+                    raise ValueError("[capacity] must be a table")
+                cap_repo = dict(raw_r)
+    known_cap = {f.name for f in fields(CapacitySettings)}
+    bad = (set(cap_global) | set(cap_repo)) - known_cap
+    if bad:
+        raise ValueError(f"unknown [capacity] keys: {sorted(bad)}")
+
+    def _cap_int(table: str, key: str, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"[capacity] {key}: expected an integer, got "
+                f"{type(value).__name__}")
+        if value < 1:
+            raise ValueError(f"[capacity] {key}: must be >= 1, got {value}")
+        return value
+
+    g_machine = (_cap_int("[capacity]", "machine", cap_global["machine"])
+                 if "machine" in cap_global else None)
+    r_machine = (_cap_int("[capacity]", "machine", cap_repo["machine"])
+                 if "machine" in cap_repo else None)
+    # Repo may only tighten. With no global machine key the ceiling is the
+    # shipped default (1), not "whatever the repo asked for".
+    from .capacity import DEFAULT_MACHINE_CAPACITY
+    ceiling = (g_machine if g_machine is not None
+               else DEFAULT_MACHINE_CAPACITY)
+    if r_machine is not None:
+        machine = min(r_machine, ceiling)
+    else:
+        machine = g_machine
+    g_fg = (_cap_int("[capacity]", "review_fg", cap_global["review_fg"])
+            if "review_fg" in cap_global else None)
+    r_fg = (_cap_int("[capacity]", "review_fg", cap_repo["review_fg"])
+            if "review_fg" in cap_repo else None)
+    review_fg = r_fg if r_fg is not None else g_fg
+    if review_fg is not None:
+        fg_ceiling = machine if machine is not None else DEFAULT_MACHINE_CAPACITY
+        review_fg = min(review_fg, fg_ceiling)
+
     return Config(defaults=Defaults(**dvals), reviewers=reviewers,
                   dispatch=Dispatch(**pvals),
                   retention=Retention(**retvals),
                   routing=routing,
-                  schedule_jobs=schedule_cfg.jobs)
+                  schedule_jobs=schedule_cfg.jobs,
+                  capacity=CapacitySettings(machine=machine, review_fg=review_fg))
 
 
 def _bounded_retention_int(key: str, value: object, minimum: int) -> int:
