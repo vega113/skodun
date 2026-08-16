@@ -102,6 +102,24 @@ quota_pool = "   "
         load_config(None, global_path=bad)
 
 
+def test_repo_capacity_can_only_tighten_machine_cap(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[capacity]
+machine = 2
+review_fg = 2
+""")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write(repo / ".skodun.toml", """
+[capacity]
+machine = 8
+review_fg = 1
+""")
+    cfg = load_config(repo, global_path=g)
+    assert cfg.capacity.machine == 2
+    assert cfg.capacity.review_fg == 1
+
+
 def test_unknown_defaults_key_rejected(tmp_path):
     g = _write(tmp_path / "g.toml", """
 [defaults]

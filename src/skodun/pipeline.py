@@ -1466,7 +1466,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     # Shared admit+bind wall-clock deadline: review-fg wait + provider waits
     # and hops consume the same budget (S4). Not reset per hop or phase.
     admission_deadline = time.monotonic() + float(admission_wait)
-    cap_n = capacity.capacity_from_env()
+    machine_n = capacity.resolved_machine_capacity(cfg)
+    cap_n = capacity.resolved_fg_capacity(cfg)
     dual_hold = capacity.legacy_fg_lock_from_env()
     lock_cell: dict = {"lock": None}
     capacity_ticket: capacity.Ticket | None = None
@@ -1504,14 +1505,16 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 store, scope=scope, capacity=cap_n,
                 wait_sec=admission_wait, poll_sec=poll,
                 stale_sec=stale,
-                cancel=cancel, on_progress=_note, try_lock=_try_fg_lock)
+                cancel=cancel, on_progress=_note, try_lock=_try_fg_lock,
+                machine_capacity=machine_n)
         else:
             # Multi-slot path: store capacity only (S4 dual-hold off).
             capacity_ticket = capacity.acquire_for_fg(
                 store, scope=scope, capacity=cap_n,
                 wait_sec=admission_wait, poll_sec=poll,
                 stale_sec=stale,
-                cancel=cancel, on_progress=_note, try_lock=None)
+                cancel=cancel, on_progress=_note, try_lock=None,
+                machine_capacity=machine_n)
     except capacity.AdmissionTimeout as e:
         if lock_cell["lock"] is not None:
             _release_fg_lock(lock_cell["lock"])

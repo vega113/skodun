@@ -42,6 +42,10 @@ if TYPE_CHECKING:
 
 #: Foreground review capacity class (S3/S4).
 RESOURCE_REVIEW_FG = "review-fg"
+#: Machine-wide outer bound across every repo that shares this store.
+RESOURCE_REVIEW_MACHINE = "review-machine"
+#: Scope for the outer ticket; one row universe per store file.
+MACHINE_SCOPE = "*"
 #: Optional name reserved for later; not wired.
 RESOURCE_REVIEW_BG = "review-bg"
 #: Prefix for per-provider slots: ``provider:xai``, ``provider:openai``, …
@@ -49,6 +53,8 @@ PROVIDER_CLASS_PREFIX = "provider:"
 
 DEFAULT_CAPACITY = 1
 CAPACITY_ENV = "SKODUN_REVIEW_FG_CAPACITY"
+DEFAULT_MACHINE_CAPACITY = 1
+MACHINE_CAPACITY_ENV = "SKODUN_REVIEW_MACHINE_CAPACITY"
 ADMISSION_WAIT_ENV = "SKODUN_ADMISSION_WAIT_SECONDS"
 LEGACY_FG_LOCK_ENV = "SKODUN_LEGACY_FG_LOCK"
 PROVIDER_MAX_IN_FLIGHT_ENV = "SKODUN_PROVIDER_MAX_IN_FLIGHT"
@@ -120,6 +126,8 @@ class Ticket:
     expire_reason: str | None = None
     position: int | None = None
     review_id: str | None = None
+    #: Outer machine ticket when this is a per-repo ``review-fg`` holder.
+    parent: "Ticket | None" = None
 
 
 def capacity_from_env(env: Mapping[str, str] | None = None) -> int:
@@ -135,6 +143,57 @@ def capacity_from_env(env: Mapping[str, str] | None = None) -> int:
     if value < 1:
         return DEFAULT_CAPACITY
     return value
+
+
+def machine_capacity_from_env(env: Mapping[str, str] | None = None) -> int:
+    """``SKODUN_REVIEW_MACHINE_CAPACITY`` ≥ 1; junk / missing → default 1."""
+    env = os.environ if env is None else env
+    raw = env.get(MACHINE_CAPACITY_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_MACHINE_CAPACITY
+    try:
+        value = int(str(raw).strip(), 10)
+    except ValueError:
+        return DEFAULT_MACHINE_CAPACITY
+    if value < 1:
+        return DEFAULT_MACHINE_CAPACITY
+    return value
+
+
+def resolved_machine_capacity(cfg: object | None = None,
+                              env: Mapping[str, str] | None = None) -> int:
+    """Env wins when set; otherwise optional ``cfg.capacity.machine``; else 1."""
+    env = os.environ if env is None else env
+    if str(env.get(MACHINE_CAPACITY_ENV) or "").strip():
+        return machine_capacity_from_env(env)
+    machine = getattr(getattr(cfg, "capacity", None), "machine", None)
+    if isinstance(machine, int) and not isinstance(machine, bool) and machine >= 1:
+        return machine
+    return machine_capacity_from_env(env)
+
+
+def resolved_fg_capacity(cfg: object | None = None,
+                         env: Mapping[str, str] | None = None) -> int:
+    """Inner FG cap: env if set, else file, then clipped by the machine cap."""
+    env = os.environ if env is None else env
+    if str(env.get(CAPACITY_ENV) or "").strip():
+        repo = capacity_from_env(env)
+    else:
+        review_fg = getattr(getattr(cfg, "capacity", None), "review_fg", None)
+        if (isinstance(review_fg, int) and not isinstance(review_fg, bool)
+                and review_fg >= 1):
+            repo = review_fg
+        else:
+            repo = capacity_from_env(env)
+    return effective_fg_capacity(repo, resolved_machine_capacity(cfg, env))
+
+
+def effective_fg_capacity(repo_capacity: int, machine_capacity: int) -> int:
+    """Inner FG slots cannot exceed the machine-wide outer cap."""
+    repo = DEFAULT_CAPACITY if int(repo_capacity) < 1 else int(repo_capacity)
+    machine = (DEFAULT_MACHINE_CAPACITY if int(machine_capacity) < 1
+               else int(machine_capacity))
+    return min(repo, machine)
 
 
 def legacy_fg_lock_from_env(env: Mapping[str, str] | None = None) -> bool:
@@ -396,10 +455,20 @@ def mark_started(store: "Store", ticket: Ticket,
 
 def finish(store: "Store", ticket: Ticket, *, status: str = STATUS_RELEASED,
            expire_reason: str | None = None) -> Ticket:
-    """Terminal transition: released / expired / rejected."""
-    row = store.capacity_finish(
-        ticket.id, status=status, expire_reason=expire_reason)
-    _apply_row(ticket, row)
+    """Terminal transition: released / expired / rejected.
+
+    If this ticket holds a machine-wide parent, the parent is finished with
+    the same status so two repos cannot leak the outer slot.
+    """
+    parent = ticket.parent
+    try:
+        row = store.capacity_finish(
+            ticket.id, status=status, expire_reason=expire_reason)
+        _apply_row(ticket, row)
+    finally:
+        if parent is not None:
+            ticket.parent = None
+            finish(store, parent, status=status, expire_reason=expire_reason)
     return ticket
 
 
@@ -540,15 +609,65 @@ def acquire_for_fg(
         try_lock: Callable[[float], bool] | None = None,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
-        pid_alive_fn: Callable[[int], bool] | None = None) -> Ticket:
-    """FG admission: store FIFO, optionally dual-hold via ``try_lock``.
+        pid_alive_fn: Callable[[int], bool] | None = None,
+        machine_capacity: int | None = None) -> Ticket:
+    """FG admission: machine outer cap, then per-repo FIFO, optional dual-hold.
 
     When ``try_lock`` is ``None``, this is store-only multi-slot admit (S4
     dual-hold off): same as :func:`acquire` for ``review-fg``.
 
     When ``try_lock`` is set, only the FIFO head may call it; success force-
     admits and marks running (S3 dual-hold).
+
+    The machine ticket is always acquired first (scope ``*``, class
+    ``review-machine``) so two MCP/CLI processes sharing the store cannot
+    both run when the outer cap is 1. The inner ``review-fg`` capacity is
+    ``min(repo, machine)``.
     """
+    now = time.monotonic if clock is None else clock
+    machine_cap = (machine_capacity_from_env() if machine_capacity is None
+                   else int(machine_capacity))
+    if machine_cap < 1:
+        machine_cap = DEFAULT_MACHINE_CAPACITY
+    repo_cap = DEFAULT_CAPACITY if capacity is None else int(capacity)
+    if repo_cap < 1:
+        repo_cap = DEFAULT_CAPACITY
+    inner_cap = effective_fg_capacity(repo_cap, machine_cap)
+    deadline = now() + float(wait_sec)
+    machine_ticket = acquire(
+        store, scope=MACHINE_SCOPE, resource_class=RESOURCE_REVIEW_MACHINE,
+        capacity=machine_cap, wait_sec=wait_sec, poll_sec=poll_sec,
+        stale_sec=stale_sec, cancel=cancel, on_progress=on_progress,
+        clock=clock, sleep=sleep, pid_alive_fn=pid_alive_fn)
+    remaining = deadline - now()
+    try:
+        ticket = _acquire_repo_fg(
+            store, scope=scope, capacity=inner_cap,
+            wait_sec=max(remaining, 0.0), poll_sec=poll_sec,
+            stale_sec=stale_sec, cancel=cancel, on_progress=on_progress,
+            try_lock=try_lock, clock=clock, sleep=sleep,
+            pid_alive_fn=pid_alive_fn)
+    except BaseException:
+        finish(store, machine_ticket, status=STATUS_REJECTED,
+               expire_reason="inner_admit_failed")
+        raise
+    ticket.parent = machine_ticket
+    return ticket
+
+
+def _acquire_repo_fg(
+        store: "Store", *, scope: str,
+        capacity: int,
+        wait_sec: float,
+        poll_sec: float,
+        stale_sec: float,
+        cancel: "threading.Event | None",
+        on_progress: Callable[[str], None] | None,
+        try_lock: Callable[[float], bool] | None,
+        clock: Callable[[], float] | None,
+        sleep: Callable[[float], None] | None,
+        pid_alive_fn: Callable[[int], bool] | None) -> Ticket:
+    """Inner per-repo ``review-fg`` admit (legacy dual-hold unchanged)."""
     if try_lock is None:
         return acquire(
             store, scope=scope, resource_class=RESOURCE_REVIEW_FG,

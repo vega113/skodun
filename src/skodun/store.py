@@ -36,6 +36,8 @@ import re
 import shutil
 import sqlite3
 import stat
+import subprocess
+import sys
 import tempfile
 import time
 from urllib.parse import quote
@@ -82,6 +84,10 @@ class SchemaInfo:
     target: int
     reason_code: str | None = None
     detail: str | None = None
+    journal_mode: str | None = None
+    wal_bytes: int | None = None
+    shm_bytes: int | None = None
+    integrity_check: str | None = None
 
     def __post_init__(self) -> None:
         if self.state not in {"missing", "invalid", "current", "older", "newer"}:
@@ -217,24 +223,171 @@ def _snapshot_database(path: Path) -> tuple[tempfile.TemporaryDirectory | None,
     return snapshot, db_path, None
 
 
+def _header_write_version(path: Path) -> int | None:
+    """SQLite header byte 18: 1 = rollback journal, 2 = WAL.
+
+    Uses the same nofollow/nonblock open as inspection so a FIFO or
+    symlink beside the store cannot hang doctor.
+    """
+    fd, error = _open_regular_file(path)
+    if error is not None or fd is None:
+        return None
+    try:
+        header = os.read(fd, 20)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(header) < 20 or not header.startswith(b"SQLite format 3\x00"):
+        return None
+    return int(header[18])
+
+
+def _sidecar_size(path: Path) -> int | None:
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return int(st.st_size)
+
+
+def _journal_mode_from_header(path: Path) -> str | None:
+    write_ver = _header_write_version(path)
+    if write_ver == 2:
+        return "wal"
+    if write_ver == 1:
+        return "delete"
+    return None
+
+
+def _torn_wal_signature(path: Path) -> bool:
+    """WAL header plus a missing or empty ``-wal`` sidecar.
+
+    A healthy checkpointed WAL store can look like this too; callers must
+    still confirm ``integrity_check`` or a corrupt-open before treating it
+    as torn. The signature is the incident shape, not the verdict.
+    """
+    if _header_write_version(path) != 2:
+        return False
+    wal_bytes = _sidecar_size(Path(str(path) + "-wal"))
+    return wal_bytes is None or wal_bytes == 0
+
+
+def _is_busy_error(exc: BaseException) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    busy_codes = {getattr(sqlite3, "SQLITE_BUSY", 5),
+                  getattr(sqlite3, "SQLITE_LOCKED", 6)}
+    if code in busy_codes:
+        return True
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database is busy" in msg
+
+
+def _is_corrupt_error(exc: BaseException) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code == getattr(sqlite3, "SQLITE_CORRUPT", 11):
+        return True
+    return "malformed" in str(exc).lower() or "corrupt" in str(exc).lower()
+
+
+def _durability_fields(path: Path, *, journal_mode: str | None = None,
+                       integrity: str | None = None) -> dict:
+    return {
+        "journal_mode": journal_mode or _journal_mode_from_header(path),
+        "wal_bytes": _sidecar_size(Path(str(path) + "-wal")),
+        "shm_bytes": _sidecar_size(Path(str(path) + "-shm")),
+        "integrity_check": integrity,
+    }
+
+
 def inspect_schema(path: Path) -> SchemaInfo:
     """Inspect a database without creating or mutating filesystem state."""
     path = Path(path)
     snapshot, db_path, error = _snapshot_database(path)
     if error is not None:
+        extra = _durability_fields(path) if path.exists() else {}
+        if extra:
+            return SchemaInfo(
+                error.state, error.path, error.version, error.target,
+                reason_code=error.reason_code, detail=error.detail, **extra)
         return error
     assert snapshot is not None and db_path is not None
     uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
     conn = None
+    last_exc: BaseException | None = None
     try:
-        conn = sqlite3.connect(uri, uri=True, timeout=0)
-        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        state = ("current" if version == SCHEMA_VERSION else
-                 "older" if version < SCHEMA_VERSION else "newer")
-        return SchemaInfo(state, str(path), version, SCHEMA_VERSION)
-    except sqlite3.DatabaseError as exc:
+        for attempt in range(5):
+            try:
+                conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                row = conn.execute("PRAGMA journal_mode").fetchone()
+                journal_mode = (row[0] if row else None) or _journal_mode_from_header(path)
+                integrity_row = conn.execute("PRAGMA integrity_check").fetchone()
+                integrity = str(integrity_row[0]) if integrity_row else "unknown"
+                extra = _durability_fields(
+                    path, journal_mode=str(journal_mode).lower(),
+                    integrity=integrity)
+                # A file-copy snapshot of a live non-empty WAL can look
+                # torn. Only an empty/missing -wal plus a bad check is the
+                # incident shape; that is safe to fail closed on.
+                if integrity != "ok" and _torn_wal_signature(path):
+                    return SchemaInfo(
+                        "invalid", str(path), None, SCHEMA_VERSION,
+                        reason_code="torn_wal",
+                        detail=f"integrity_check={integrity}; repairable "
+                               f"(do not replace with an empty store)",
+                        **extra)
+                state = ("current" if version == SCHEMA_VERSION else
+                         "older" if version < SCHEMA_VERSION else "newer")
+                return SchemaInfo(state, str(path), version, SCHEMA_VERSION,
+                                  **extra)
+            except sqlite3.OperationalError as exc:
+                last_exc = exc
+                if conn is not None:
+                    conn.close()
+                    conn = None
+                if _is_busy_error(exc) and attempt < 4:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                extra = _durability_fields(path)
+                if _is_busy_error(exc):
+                    return SchemaInfo(
+                        "invalid", str(path), None, SCHEMA_VERSION,
+                        reason_code="busy", detail=repr(exc), **extra)
+                if _is_corrupt_error(exc) and _torn_wal_signature(path):
+                    return SchemaInfo(
+                        "invalid", str(path), None, SCHEMA_VERSION,
+                        reason_code="torn_wal",
+                        detail=f"{exc!r}; repairable "
+                               "(do not replace with an empty store)",
+                        **extra)
+                return SchemaInfo(
+                    "invalid", str(path), None, SCHEMA_VERSION,
+                    reason_code="invalid_sqlite", detail=repr(exc), **extra)
+            except sqlite3.DatabaseError as exc:
+                extra = _durability_fields(path)
+                if _is_busy_error(exc):
+                    return SchemaInfo(
+                        "invalid", str(path), None, SCHEMA_VERSION,
+                        reason_code="busy", detail=repr(exc), **extra)
+                if _is_corrupt_error(exc) and _torn_wal_signature(path):
+                    return SchemaInfo(
+                        "invalid", str(path), None, SCHEMA_VERSION,
+                        reason_code="torn_wal",
+                        detail=f"{exc!r}; repairable "
+                               "(do not replace with an empty store)",
+                        **extra)
+                return SchemaInfo(
+                    "invalid", str(path), None, SCHEMA_VERSION,
+                    reason_code="invalid_sqlite", detail=repr(exc), **extra)
+        extra = _durability_fields(path)
+        detail = repr(last_exc) if last_exc is not None else "inspect failed"
         return SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
-                          reason_code="invalid_sqlite", detail=repr(exc))
+                          reason_code="invalid_sqlite", detail=detail, **extra)
     finally:
         if conn is not None:
             conn.close()
@@ -1213,6 +1366,7 @@ def _enable_wal(conn: sqlite3.Connection, attempts: int = 20) -> str:
             row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
             mode = (row[0] if row else "") or ""
             if mode.lower() == "wal":
+                _apply_wal_durability(conn)
                 return mode
         except sqlite3.OperationalError:
             pass        # another opener holds a lock; it is converting it too
@@ -1220,10 +1374,149 @@ def _enable_wal(conn: sqlite3.Connection, attempts: int = 20) -> str:
         try:
             row = conn.execute("PRAGMA journal_mode").fetchone()
             if row and (row[0] or "").lower() == "wal":
+                _apply_wal_durability(conn)
                 return row[0]       # a peer finished the conversion for us
         except sqlite3.OperationalError:     # pragma: no cover - defensive
             pass
     return mode
+
+
+def _apply_wal_durability(conn: sqlite3.Connection) -> None:
+    """Prefer a slower intact WAL over a fast unreadable one.
+
+    ``synchronous`` and ``wal_autocheckpoint`` are per-connection. WAL's
+    compiled default is ``NORMAL``, which can lose the last frames (and a
+    torn checkpoint) when an MCP is killed. FULL plus, on macOS, checkpoint
+    fullfsync is the documented "slower but intact" posture. This does not
+    persist, and it does not flip a DELETE-mode store back to WAL.
+    """
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
+    if sys.platform == "darwin":
+        conn.execute("PRAGMA checkpoint_fullfsync=ON")
+
+
+def _apply_open_durability(conn: sqlite3.Connection) -> None:
+    """Durability PRAGMAs for an already-current store. Never enables WAL."""
+    row = conn.execute("PRAGMA journal_mode").fetchone()
+    mode = (row[0] if row else "") or ""
+    if mode.lower() == "wal":
+        _apply_wal_durability(conn)
+    else:
+        conn.execute("PRAGMA synchronous=FULL")
+
+
+def _quarantine_path(path: Path) -> Path:
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    dest = Path(str(path) + f".malformed-{stamp}")
+    n = 0
+    while dest.exists() or Path(str(dest) + "-wal").exists():
+        n += 1
+        dest = Path(str(path) + f".malformed-{stamp}-{n}")
+    return dest
+
+
+def _copy_store_image(src: Path, dest: Path) -> None:
+    shutil.copy2(src, dest)
+    for suffix in ("-wal", "-shm"):
+        side = Path(str(src) + suffix)
+        size = _sidecar_size(side)
+        if size is None:
+            continue
+        shutil.copy2(side, Path(str(dest) + suffix))
+
+
+def _recover_sqlite_image(src: Path, dest: Path) -> bool:
+    """Replay ``sqlite3 .recover`` into ``dest``. False if unusable."""
+    try:
+        proc = subprocess.run(
+            ["sqlite3", str(src), ".recover"],
+            capture_output=True, text=True, timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return False
+    # ``.recover`` prefixes CLI-only dot commands (``.dbconfig``). Those are
+    # not SQL and would abort ``executescript`` before any INSERT landed.
+    sql = "\n".join(
+        line for line in proc.stdout.splitlines()
+        if line and not line.startswith(".")
+    )
+    if not sql.strip():
+        return False
+    if dest.exists():
+        dest.unlink()
+    conn = sqlite3.connect(dest)
+    try:
+        conn.executescript(sql)
+        check = conn.execute("PRAGMA integrity_check").fetchone()
+        integrity = str(check[0]) if check else "unknown"
+        tables = {
+            str(r[0]) for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        n_reviews = 0
+        if "reviews" in tables:
+            n_reviews = int(conn.execute(
+                "SELECT COUNT(*) FROM reviews").fetchone()[0])
+    except sqlite3.DatabaseError:
+        conn.close()
+        dest.unlink(missing_ok=True)
+        return False
+    conn.close()
+    if integrity != "ok" or "reviews" not in tables or n_reviews < 1:
+        dest.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def _live_image_is_corrupt(path: Path) -> bool:
+    """True only when the live file (not a snapshot) is proven unreadable."""
+    conn = None
+    try:
+        conn = sqlite3.connect(path, timeout=30)
+        conn.execute("PRAGMA user_version")
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+        return (row[0] if row else "") != "ok"
+    except sqlite3.DatabaseError as exc:
+        if _is_busy_error(exc):
+            return False
+        return True
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _repair_malformed_store(path: Path, info: SchemaInfo) -> None:
+    """Copy the torn image aside and replace it only with a verified recover.
+
+    Never deletes the broken bytes. Never creates a silent empty store: if
+    ``.recover`` cannot produce a reviews-bearing, integrity-ok image, the
+    original path is left untouched and the opener fails closed.
+    """
+    quarantine = _quarantine_path(path)
+    _copy_store_image(path, quarantine)
+    recovered = Path(str(path) + f".recovered-{quarantine.name.rsplit('malformed-', 1)[-1]}")
+    try:
+        if _recover_sqlite_image(quarantine, recovered):
+            os.replace(recovered, path)
+            for suffix in ("-wal", "-shm"):
+                leftover = Path(str(path) + suffix)
+                if leftover.exists() and leftover.is_file():
+                    leftover.unlink()
+            return
+    finally:
+        recovered.unlink(missing_ok=True)
+        for suffix in ("-wal", "-shm"):
+            Path(str(recovered) + suffix).unlink(missing_ok=True)
+    raise SchemaLifecycleError(
+        info.reason_code or "torn_wal",
+        f"store cannot be opened: {path}; quarantined copy at {quarantine}; "
+        "not replaced with an empty store — restore from backup or inspect "
+        "the quarantine",
+        version=None,
+    )
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -1534,6 +1827,11 @@ class Store:
                 version=None)
         if existed:
             info = inspect_schema(path)
+            if (info.state == "invalid"
+                    and info.reason_code in {"torn_wal", "invalid_sqlite"}
+                    and _live_image_is_corrupt(path)):
+                _repair_malformed_store(path, info)
+                info = inspect_schema(path)
             if info.state == "newer":
                 raise SchemaLifecycleError(
                     "schema_too_new", schema_too_new_message(int(info.version)),
@@ -1567,6 +1865,7 @@ class Store:
                 # Connection-local; unlike WAL/DDL this does not alter the
                 # store bytes and is safe for an already-current authority.
                 conn.execute("PRAGMA foreign_keys=ON")
+                _apply_open_durability(conn)
             return cls(conn, path)
         except BaseException:
             if conn is not None:
@@ -3521,6 +3820,29 @@ class Store:
                WHERE resource_class=? AND scope=? AND status IN (?,?)""",
             (resource_class, scope, "admitted", "running")).fetchone()
         return int(row["n"]) if row is not None else 0
+
+    def capacity_live_holders(self, resource_class: str) -> list[dict]:
+        """Admitted+running holder counts grouped by scope for one class."""
+        resource_class = _require_text("resource_class", resource_class)
+        rows = self._c.execute(
+            """SELECT scope, COUNT(*) AS n FROM capacity_admissions
+               WHERE resource_class=? AND status IN (?,?)
+               GROUP BY scope ORDER BY scope""",
+            (resource_class, "admitted", "running")).fetchall()
+        return [{"scope": str(r["scope"]), "n": int(r["n"])} for r in rows]
+
+    def capacity_live_holders_prefix(self, prefix: str) -> list[dict]:
+        """Admitted+running holder counts for every class starting with prefix."""
+        prefix = _require_text("prefix", prefix)
+        rows = self._c.execute(
+            """SELECT resource_class, scope, COUNT(*) AS n
+                 FROM capacity_admissions
+                WHERE resource_class LIKE ? AND status IN (?,?)
+                GROUP BY resource_class, scope
+                ORDER BY resource_class, scope""",
+            (prefix + "%", "admitted", "running")).fetchall()
+        return [{"resource_class": str(r["resource_class"]),
+                 "scope": str(r["scope"]), "n": int(r["n"])} for r in rows]
 
     def capacity_reclaim_stale(
             self, resource_class: str, scope: str, *, stale_sec: float,

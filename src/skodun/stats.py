@@ -51,4 +51,18 @@ def render(data: Mapping, *, fmt: str = "text") -> str:
          f"never_trustworthy={data['identities']['never_trustworthy']} "
          f"reuse_hits={data['reuse']['hits']} reuse_misses={data['reuse']['misses']}"),
     ]
+    live = data.get("live_capacity")
+    if isinstance(live, Mapping):
+        repo_bit = ",".join(
+            f"{h.get('scope')}={h.get('n')}"
+            for h in (live.get("by_repo") or []) if isinstance(h, Mapping)
+        ) or "none"
+        prov_bit = ",".join(
+            f"{h.get('resource_class')}@{h.get('scope')}={h.get('n')}"
+            for h in (live.get("by_provider") or []) if isinstance(h, Mapping)
+        ) or "none"
+        lines.append(
+            f"machine_cap={live.get('machine_cap')} "
+            f"machine_holders={live.get('machine_holders')} "
+            f"by_repo={repo_bit} by_provider={prov_bit}")
     return "\n".join(lines)
