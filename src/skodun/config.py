@@ -1041,16 +1041,23 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
                  if "machine" in cap_global else None)
     r_machine = (_cap_int("[capacity]", "machine", cap_repo["machine"])
                  if "machine" in cap_repo else None)
-    machine = g_machine
+    # Repo may only tighten. With no global machine key the ceiling is the
+    # shipped default (1), not "whatever the repo asked for".
+    from .capacity import DEFAULT_MACHINE_CAPACITY
+    ceiling = (g_machine if g_machine is not None
+               else DEFAULT_MACHINE_CAPACITY)
     if r_machine is not None:
-        machine = r_machine if machine is None else min(machine, r_machine)
+        machine = min(r_machine, ceiling)
+    else:
+        machine = g_machine
     g_fg = (_cap_int("[capacity]", "review_fg", cap_global["review_fg"])
             if "review_fg" in cap_global else None)
     r_fg = (_cap_int("[capacity]", "review_fg", cap_repo["review_fg"])
             if "review_fg" in cap_repo else None)
     review_fg = r_fg if r_fg is not None else g_fg
-    if review_fg is not None and machine is not None:
-        review_fg = min(review_fg, machine)
+    if review_fg is not None:
+        fg_ceiling = machine if machine is not None else DEFAULT_MACHINE_CAPACITY
+        review_fg = min(review_fg, fg_ceiling)
 
     return Config(defaults=Defaults(**dvals), reviewers=reviewers,
                   dispatch=Dispatch(**pvals),

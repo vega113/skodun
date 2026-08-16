@@ -51,9 +51,9 @@ def _format_sidecar(nbytes: int | None) -> str:
     return f"{int(nbytes)}B"
 
 
-def _capacity_env_clause() -> str:
+def _capacity_env_clause(cfg: Any = None) -> str:
     from . import capacity as capmod
-    return (f"machine_cap={capmod.machine_capacity_from_env()} "
+    return (f"machine_cap={capmod.resolved_machine_capacity(cfg)} "
             f"machine_holders=unknown by_repo=unknown by_provider=unknown")
 
 
@@ -172,7 +172,7 @@ def run_doctor(
         if info.state == "missing":
             report.add("store", True,
                        f"missing path={store_path}; no store bytes inspected")
-            report.add("capacity", True, _capacity_env_clause())
+            report.add("capacity", True, _capacity_env_clause(cfg))
             report.add("worker_logs", True,
                        f"not created for missing store {store_path}")
         elif info.state == "older":
@@ -180,7 +180,7 @@ def run_doctor(
                        f"schema state=older path={store_path} version={info.version} "
                        f"(build expects v{SCHEMA_VERSION}); explicit migration "
                        f"required {durability}")
-            report.add("capacity", True, _capacity_env_clause())
+            report.add("capacity", True, _capacity_env_clause(cfg))
             report.add("worker_logs", True, "not inspected by read-only doctor")
         elif info.state == "newer":
             report.add("store", False,
@@ -188,7 +188,7 @@ def run_doctor(
                        f"(build expects v{SCHEMA_VERSION}); upgrade this process "
                        "because the store is newer than this skodun, then restart "
                        f"every MCP client {durability}")
-            report.add("capacity", True, _capacity_env_clause())
+            report.add("capacity", True, _capacity_env_clause(cfg))
             report.add("worker_logs", True, "not inspected by read-only doctor")
         elif info.state == "invalid":
             repair = ""
@@ -202,7 +202,7 @@ def run_doctor(
                        f"schema state=invalid path={store_path} "
                        f"reason_code={info.reason_code or 'invalid_schema'}; "
                        f"{durability}{repair}")
-            report.add("capacity", True, _capacity_env_clause())
+            report.add("capacity", True, _capacity_env_clause(cfg))
             report.add("worker_logs", True, "not inspected by read-only doctor")
         else:
             from . import capacity as capmod
@@ -224,7 +224,7 @@ def run_doctor(
                 for h in by_provider) or "none"
             report.add(
                 "capacity", True,
-                f"machine_cap={capmod.machine_capacity_from_env()} "
+                f"machine_cap={capmod.resolved_machine_capacity(cfg)} "
                 f"machine_holders={machine_holders} "
                 f"by_repo={repo_bit} by_provider={prov_bit}")
             report.add("worker_logs", True, "not created by read-only doctor")

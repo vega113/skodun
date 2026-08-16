@@ -120,6 +120,24 @@ review_fg = 1
     assert cfg.capacity.review_fg == 1
 
 
+def test_repo_capacity_machine_cannot_raise_the_default_ceiling(tmp_path):
+    """A repo file with no global [capacity] machine may only tighten default 1."""
+    from skodun.capacity import resolved_fg_capacity, resolved_machine_capacity
+
+    g = _write(tmp_path / "g.toml", "")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write(repo / ".skodun.toml", """
+[capacity]
+machine = 8
+review_fg = 8
+""")
+    cfg = load_config(repo, global_path=g)
+    assert cfg.capacity.machine == 1
+    assert resolved_machine_capacity(cfg, env={}) == 1
+    assert resolved_fg_capacity(cfg, env={}) == 1
+
+
 def test_unknown_defaults_key_rejected(tmp_path):
     g = _write(tmp_path / "g.toml", """
 [defaults]

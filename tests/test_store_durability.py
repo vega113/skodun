@@ -224,3 +224,24 @@ def test_doctor_store_line_includes_journal_wal_and_integrity(tmp_path, monkeypa
     assert "machine_holders=" in cap_check.detail
     assert "by_repo=" in cap_check.detail
     assert "by_provider=" in cap_check.detail
+
+
+def test_doctor_machine_cap_follows_toml_when_env_is_unset(tmp_path, monkeypatch):
+    """Doctor must print the same effective cap pipeline resolves from config."""
+    from skodun.capacity import resolved_machine_capacity
+    from skodun.config import load_config
+
+    db = tmp_path / "s.db"
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text("[capacity]\nmachine = 2\n", encoding="utf-8")
+    monkeypatch.delenv("SKODUN_REVIEW_MACHINE_CAPACITY", raising=False)
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    monkeypatch.setenv("SKODUN_CONFIG", str(cfg_path))
+    _write_review(db, "doc")
+    cfg = load_config(tmp_path, global_path=cfg_path)
+    expected = resolved_machine_capacity(cfg)
+    report = run_doctor(repo=tmp_path, store_path=db, config_path=cfg_path)
+    cap_check = next(c for c in report.checks if c.name == "capacity")
+    assert cap_check.ok
+    assert f"machine_cap={expected}" in cap_check.detail
+    assert expected == 2

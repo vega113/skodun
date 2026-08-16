@@ -56,7 +56,10 @@ review_fg = 1
 ```
 
 A repo value **above** the machine cap is clipped. A repo cannot raise the
-machine cap.
+machine cap — including when the global file has no `[capacity] machine`
+key: the ceiling is then the shipped default of 1, not the repo's number.
+`skodun doctor` / `skodun stats` print `resolved_machine_capacity` (env,
+then file, then default), the same value `run_review` uses.
 
 ## Admit
 
