@@ -698,15 +698,17 @@ def test_every_attempt_row_carries_the_complete_schema(tmp_path, monkeypatch,
                  "degraded_retries = 0\n")
 
     # 1. a cache skip, then a completed `ok` attempt.
-    st_a = Store.open(tmp_path / "a.db")
-    st_a.mark_provider_unavailable("openai", "rate limited", "quota", _iso(3600))
-    skip_row, ok_row = _run(repo, st_a)["attempts"]
+    with Store.open(tmp_path / "a.db") as st_a:
+        st_a.mark_provider_unavailable("openai", "rate limited", "quota", _iso(3600))
+        skip_row, ok_row = _run(repo, st_a)["attempts"]
 
     # 2. a missing binary, then a completed `degraded` attempt.
-    binary_row, degraded_row = _run(repo, Store.open(tmp_path / "b.db"))["attempts"]
+    with Store.open(tmp_path / "b.db") as st_b:
+        binary_row, degraded_row = _run(repo, st_b)["attempts"]
 
     # 3. a missing binary, then a timeout.
-    _, timeout_row = _run(repo, Store.open(tmp_path / "c.db"))["attempts"]
+    with Store.open(tmp_path / "c.db") as st_c:
+        _, timeout_row = _run(repo, st_c)["attempts"]
 
     assert len({row["attempt_id"] for row in (skip_row, ok_row, binary_row, degraded_row, timeout_row)}) == 5
     for row in (skip_row, ok_row, binary_row, degraded_row, timeout_row):
