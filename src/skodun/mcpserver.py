@@ -667,6 +667,9 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
     if refusal:
         return _review_result(2, refusal)
     from .control import client_actor
+    continue_compatible, refusal = _bool_arg(call.params, "continue_compatible", "review")
+    if refusal:
+        return _review_result(2, refusal)
     request_key, refusal = _opt_string_arg(call.params, "request_key", "review")
     if refusal:
         return _review_result(2, refusal)
@@ -684,6 +687,7 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
             reuse_trusted=reuse_trusted, fresh=fresh,
             batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest,
             request_key=request_key, request_source="mcp", request_actor=client_actor(call.client_name),
+            continue_compatible=continue_compatible,
             reuse_client_family=(
                 family if call.params.get("client_family") is not None else None))
     return _review_result(status, text, metadata)
@@ -1087,6 +1091,10 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                     "type": "integer", "minimum": 1, "maximum": 8,
                     "description": "maximum recovery attempts including the "
                                    "first (default 3)"},
+                "continue_compatible": {
+                    "type": "boolean",
+                    "description": "Continue usable exact batch checkpoints and retry failed/dependent work.",
+                },
                 "request_key": {
                     "type": "string",
                     "description": "Idempotency key for this exact worktree request.",

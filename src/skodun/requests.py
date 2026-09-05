@@ -39,6 +39,7 @@ class RequestContext:
     config: object = None
     execution_seq: int | None = None
     budget: object = None
+    continue_compatible: bool = False
 
 
 def _config_hash(cfg):
@@ -185,18 +186,20 @@ def tracked_review(fn):
             candidate = None
             resume_family = (kwargs.get('client_family')
                              if family_intent is _REUSE_INTENT_UNSET else family_intent)
-            if (request_key is None and not identity['capture_error']
-                    and not kwargs.get('recover') and not kwargs.get('fresh')
-                    and kwargs.get('reviewer') is None and resume_family is None):
+            compatible = kwargs.get('continue_compatible', False)
+            if (request_key is None and not identity['capture_error'] and
+                    (compatible or (not kwargs.get('recover') and not kwargs.get('fresh')
+                     and kwargs.get('reviewer') is None and resume_family is None))):
                 candidate = store.find_resume_candidate(
-                    identity['repo_id'], identity['worktree_root'], identity['branch'])
+                    identity['repo_id'], identity['worktree_root'], identity['branch'],
+                    include_consumed=compatible)
                 if candidate is not None:
                     continuation_id = store.request_for_orchestration(candidate['id'], identity)
             decision, row = store.begin_request(
                 request_id=rid, scope=identity['worktree_root'],
                 request_key=request_key, identity=identity, intent=intent,
                 owner_token=owner, pid=os.getpid(), source=request_source, now=now(),
-                actor=request_actor,
+                actor=request_actor, allow_consumed=compatible,
                 continuation_id=continuation_id,
                 continuation_orchestration_id=(candidate['id'] if candidate is not None else None),
                 expires_at=(datetime.now(timezone.utc) + timedelta(days=1)).strftime(
@@ -254,7 +257,8 @@ def tracked_review(fn):
                 'request ended without a complete result; use a new request key'), {
                     'request': {**metadata, 'reason_code': reason}}
         context = RequestContext(rid, store, identity, owner, stack_request,
-                                 config_sink.get('config'), metadata['execution_seq'])
+                                 config_sink.get('config'), metadata['execution_seq'],
+                                 continue_compatible=compatible)
         token = _CURRENT.set(context)
         from .request_cancel import RequestCancel
         cancel = RequestCancel(store, context, kwargs.get('cancel'))

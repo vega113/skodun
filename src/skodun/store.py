@@ -2383,41 +2383,16 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
                     """SELECT * FROM review_orchestrations
                         WHERE identity_digest=?
                           AND state IN ('active','cancelled','failed','complete')
+                          AND id NOT IN (SELECT json_extract(identity_json,'$.continuation_source')
+                            FROM review_orchestrations WHERE state<>'expired'
+                              AND json_extract(identity_json,'$.continuation_source') IS NOT NULL)
                         ORDER BY created_at DESC, id DESC LIMIT 1""",
                     (identity.digest(),)).fetchone()
             if existing is not None:
                 self._c.execute("COMMIT")
                 return dict(existing)
-            self._c.execute(
-                """INSERT INTO review_orchestrations (
-                     id, state, requested_mode, created_at, updated_at,
-                     expires_at, repo_id, worktree_root, branch, head,
-                     base_ref, base_sha, diff_hash, tree_fingerprint,
-                     context_hash, checklist_hash, reviewer_hash, config_hash,
-                     policy_hash, planner_version, batch_budget, batch_count,
-                     boundary_digest, integration_plan_digest,
-                     identity_digest, identity_json)
-                   VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (orchestration_id, requested_mode, created_at, created_at,
-                 expires_at, identity.repo_id, identity.worktree_root,
-                 identity.branch, identity.head, identity.base_ref,
-                 identity.base_sha, identity.diff_hash,
-                 identity.tree_fingerprint, identity.context_hash,
-                 identity.checklist_hash, identity.reviewer_hash,
-                 identity.config_hash, identity.policy_hash,
-                 identity.planner_version, identity.batch_budget,
-                 identity.batch_count, identity.boundary_digest,
-                 identity.integration_plan_digest, identity.digest(),
-                 identity.canonical_json()))
-            self._c.executemany(
-                """INSERT INTO review_checkpoints (
-                     orchestration_id, pass_kind, pass_index, state,
-                     prompt_hash, diff_hash, boundary_hash)
-                   VALUES (?, ?, ?, 'pending', ?, ?, ?)""",
-                [(orchestration_id, item.kind, item.index, item.prompt_hash,
-                  item.diff_hash, item.boundary_hash)
-                 for item in identity.pass_identities])
+            self._insert_orchestration(orchestration_id, identity, requested_mode,
+                                       created_at, expires_at)
             self._c.execute("COMMIT")
         except BaseException:
             try:
@@ -2429,6 +2404,40 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
         assert row is not None
         return row
 
+    def _insert_orchestration(self, orchestration_id, identity, requested_mode,
+                              created_at, expires_at):
+        """Insert already-validated plan rows inside the caller's transaction."""
+        self._c.execute(
+            """INSERT INTO review_orchestrations (
+                 id, state, requested_mode, created_at, updated_at,
+                 expires_at, repo_id, worktree_root, branch, head,
+                 base_ref, base_sha, diff_hash, tree_fingerprint,
+                 context_hash, checklist_hash, reviewer_hash, config_hash,
+                 policy_hash, planner_version, batch_budget, batch_count,
+                 boundary_digest, integration_plan_digest,
+                 identity_digest, identity_json)
+               VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (orchestration_id, requested_mode, created_at, created_at,
+             expires_at, identity.repo_id, identity.worktree_root,
+             identity.branch, identity.head, identity.base_ref,
+             identity.base_sha, identity.diff_hash,
+             identity.tree_fingerprint, identity.context_hash,
+             identity.checklist_hash, identity.reviewer_hash,
+             identity.config_hash, identity.policy_hash,
+             identity.planner_version, identity.batch_budget,
+             identity.batch_count, identity.boundary_digest,
+             identity.integration_plan_digest, identity.digest(),
+             identity.canonical_json()))
+        self._c.executemany(
+            """INSERT INTO review_checkpoints (
+                 orchestration_id, pass_kind, pass_index, state,
+                 prompt_hash, diff_hash, boundary_hash)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?)""",
+            [(orchestration_id, item.kind, item.index, item.prompt_hash,
+              item.diff_hash, item.boundary_hash)
+             for item in identity.pass_identities])
+
     def get_orchestration(self, orchestration_id: str) -> dict | None:
         orchestration_id = _require_text("orchestration_id", orchestration_id)
         row = self._c.execute(
@@ -2437,19 +2446,135 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
         return dict(row) if row is not None else None
 
     def find_resume_candidate(self, repo_id: str, worktree_root: str,
-                              branch: str) -> dict | None:
-        """Newest incomplete candidate in one exact repository/worktree lane."""
-        values = (
-            _require_text("repo_id", repo_id),
-            _require_text("worktree_root", worktree_root),
-            _require_text("branch", branch),
-        )
-        row = self._c.execute(
-            """SELECT * FROM review_orchestrations
-                WHERE repo_id=? AND worktree_root=? AND branch=?
-                  AND state IN ('active','cancelled','failed','complete')
-                ORDER BY created_at DESC, id DESC LIMIT 1""", values).fetchone()
+                              branch: str, *, include_consumed=False) -> dict | None:
+        """Newest candidate; explicit continuation may select failed consumed work."""
+        values = tuple(_require_text(name, value) for name, value in (
+            ('repo_id', repo_id), ('worktree_root', worktree_root), ('branch', branch)))
+        if type(include_consumed) is not bool:
+            raise ValueError('include_consumed must be bool')
+        if include_consumed:
+            row = self._c.execute(
+                """SELECT o.* FROM review_orchestrations o
+                   LEFT JOIN reviews r ON r.id=o.final_review_id
+                   WHERE o.repo_id=? AND o.worktree_root=? AND o.branch=?
+                     AND (o.state IN ('active','cancelled','failed','complete')
+                          OR (o.state='consumed' AND r.trustworthy=0 AND r.status<>'running'))
+                     AND o.id NOT IN (SELECT json_extract(identity_json,'$.continuation_source')
+                       FROM review_orchestrations WHERE state<>'expired'
+                         AND json_extract(identity_json,'$.continuation_source') IS NOT NULL)
+                   ORDER BY o.created_at DESC,o.id DESC LIMIT 1""", values).fetchone()
+        else:
+            row = self._c.execute(
+                """SELECT * FROM review_orchestrations
+                    WHERE repo_id=? AND worktree_root=? AND branch=?
+                      AND state IN ('active','cancelled','failed','complete')
+                      AND id NOT IN (SELECT json_extract(identity_json,'$.continuation_source')
+                        FROM review_orchestrations WHERE state<>'expired'
+                          AND json_extract(identity_json,'$.continuation_source') IS NOT NULL)
+                    ORDER BY created_at DESC,id DESC LIMIT 1""", values).fetchone()
         return dict(row) if row is not None else None
+
+    def continuation_lineage_cutoff(self, request_id, source_id):
+        """Rebuild the source's advisory context without feeding it its own output."""
+        request_id = _require_text('request_id', request_id)
+        source_id = _require_text('source_id', source_id)
+        row = self._c.execute(
+            """SELECT r.artifact_json FROM request_links l JOIN reviews r ON r.id=l.target_id
+               WHERE l.request_id=? AND l.kind='review'
+                 AND json_extract(r.artifact_json,'$.batch_orchestration_id')=?
+               ORDER BY r.reviewed_at,r.id LIMIT 1""", (request_id, source_id)).fetchone()
+        if row is None:
+            return None
+        rec = json.loads(row['artifact_json'])
+        cutoff = rec.get('lineage_context_cutoff') or rec.get('review_started_at') or rec.get('reviewed_at')
+        return _require_ts('lineage_context_cutoff', cutoff)
+
+    def fork_continuation(self, source_id, identity, *, request_id, owner_token,
+                          created_at, expires_at):
+        """Atomically seed one owned generation; never rearm consumed source rows."""
+        from dataclasses import replace
+        from .continuation import ContinuationRefused
+        from .checkpoints import OrchestrationIdentity, CheckpointPayload, first_mismatch, usable_payload
+        source_id = _require_text('source_id', source_id)
+        request_id = _require_text('request_id', request_id)
+        owner_token = _require_text('owner_token', owner_token)
+        created_at = _require_ts('created_at', created_at)
+        expires_at = _require_ts('expires_at', expires_at)
+        if expires_at <= created_at or not isinstance(identity, OrchestrationIdentity):
+            raise ValueError('invalid continuation identity or expiry')
+        child_identity = replace(identity, continuation_source=source_id)
+        self._c.execute('BEGIN IMMEDIATE')
+        try:
+            request = self._c.execute(
+                "SELECT state,owner_token FROM review_requests WHERE id=?", (request_id,)).fetchone()
+            linked = self._c.execute(
+                "SELECT 1 FROM request_links WHERE request_id=? AND kind='batch_orchestration' AND target_id=?",
+                (request_id, source_id)).fetchone()
+            if (request is None or request['owner_token'] != owner_token or
+                    request['state'] not in ('accepted','queued','running') or linked is None):
+                raise ContinuationRefused('continuation_request_ownership')
+            source = self.get_orchestration(source_id)
+            if source is None or source['expires_at'] <= created_at:
+                raise ContinuationRefused('continuation_source_expired')
+            source_identity = OrchestrationIdentity.from_json(source['identity_json'])
+            if source_identity.digest() != source['identity_digest']:
+                raise ContinuationRefused('continuation_source_corrupt')
+            if first_mismatch(source_identity, identity):
+                raise ContinuationRefused('continuation_identity_mismatch')
+            if source['state'] == 'consumed':
+                review = self._c.execute('SELECT trustworthy,status FROM reviews WHERE id=?',
+                                         (source['final_review_id'],)).fetchone()
+                if review is None or review['trustworthy'] != 0 or review['status'] == RUNNING:
+                    raise ContinuationRefused('continuation_source_trustworthy')
+            elif source['state'] not in ('active','cancelled','failed','complete'):
+                raise ContinuationRefused('continuation_source_unavailable')
+            rows = self.list_checkpoints(source_id)
+            planned = {(item.kind, item.index): item for item in identity.pass_identities}
+            if {(row['pass_kind'], row['pass_index']) for row in rows} != set(planned):
+                raise ContinuationRefused('continuation_source_plan_mismatch')
+            for row in rows:
+                expected = planned[(row['pass_kind'], row['pass_index'])]
+                if (row['diff_hash'] != expected.diff_hash or row['boundary_hash'] != expected.boundary_hash
+                        or (expected.prompt_hash is not None and row['prompt_hash'] != expected.prompt_hash)):
+                    raise ContinuationRefused('continuation_source_pass_mismatch')
+            if any(row['state'] == 'running' and (not _is_canonical_ts(row['lease_expires_at'])
+                   or row['lease_expires_at'] > created_at) for row in rows):
+                raise ContinuationRefused('continuation_source_in_flight')
+            existing = self._c.execute(
+                "SELECT * FROM review_orchestrations WHERE identity_digest=? AND state<>'expired' ORDER BY created_at DESC,id DESC LIMIT 1",
+                (child_identity.digest(),)).fetchone()
+            if existing is not None:
+                self._c.execute('COMMIT')
+                return dict(existing)
+            child_id = ids.new_review_id('sk_batch_')
+            self._insert_orchestration(child_id, child_identity, source['requested_mode'], created_at, expires_at)
+            usable = []
+            for row in rows:
+                if row['state'] == 'complete' and row['payload_json'] is not None:
+                    payload = CheckpointPayload(row['payload_json'])
+                    if usable_payload(payload):
+                        usable.append((row, payload))
+            batches_complete = sum(row['pass_kind'] == 'batch' for row, _ in usable) == identity.batch_count
+            for row, payload in usable:
+                if row['pass_kind'] == 'integration' and not batches_complete:
+                    continue
+                value = payload.as_dict()
+                value['provenance'] = {**value['provenance'], 'continuation_source': source_id,
+                                       'continuation_action': 'reused'}
+                payload = CheckpointPayload.from_mapping(value)
+                self._c.execute(
+                    """UPDATE review_checkpoints SET state='complete',payload_json=?,completed_at=?,prompt_hash=?
+                       WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",
+                    (payload.json_text,row['completed_at'],row['prompt_hash'],child_id,row['pass_kind'],row['pass_index']))
+            self.link_request(request_id, 'batch_orchestration', child_id)
+            self._c.execute('COMMIT')
+            return self.get_orchestration(child_id)
+        except BaseException:
+            try:
+                self._c.execute('ROLLBACK')
+            except BaseException:
+                pass
+            raise
 
     def record_orchestration_mismatch(self, orchestration_id: str,
                                       field_name: str, *, at: str) -> bool:

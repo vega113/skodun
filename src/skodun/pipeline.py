@@ -1601,6 +1601,13 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         # lowered: the only thing riding on that number is a peer not reclaiming
         # a lock whose holder is still running.
         plan = batch_plan(diff.data, d, finder)
+        from .requests import current
+        request_context = current()
+        if (request_context is not None and request_context.store is store and
+                request_context.continue_compatible and plan is None):
+            from .continuation import refuse
+            refuse('continuation_plan_mismatch', 'Compatible continuation requires the existing batch plan.',
+                   first_mismatch='batch_plan')
         planned = 0 if plan is None else len(plan)
         # Republished UNCONDITIONALLY from the authoritative plan, and
         # `_grow_budget` is what makes that safe: it never lowers the value. Not
@@ -1628,9 +1635,15 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     gitio.canonical_repository_identity(root) or "unknown")
             except Exception:
                 lineage_repository_id = "unknown"
+        lineage_context_cutoff = review_started_at
+        if request_context is not None and request_context.store is store and request_context.continue_compatible:
+            source = store.find_resume_candidate(scope, str(root), branch, include_consumed=True)
+            if source is not None:
+                lineage_context_cutoff = (store.continuation_lineage_cutoff(request_context.id, source['id'])
+                                          or review_started_at)
         lineage_context_diagnostics: dict = {}
         lineage_prompt_context, lineage_prompt_truncated = _lineage_prompt_context(
-            store, lineage_repository_id, before=review_started_at,
+            store, lineage_repository_id, before=lineage_context_cutoff,
             changed_paths=diff.files, owner_ids=_lineage_owner_ids(stack_validation),
             diagnostics=lineage_context_diagnostics)
         evidence_prompt_context = _evidence_prompt_context(
@@ -1638,6 +1651,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         common = dict(
             id=rid, reviewed_at=review_started_at,
             review_started_at=review_started_at,
+            lineage_context_cutoff=lineage_context_cutoff,
             source="skodun",
             branch=branch, head=head, base_ref=base.ref, base_sha=base.sha,
             diff_hash=diff_hash, mode=mode, model=finder.model,
@@ -1824,7 +1838,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     resume=resume_checkpoints)
                 rec["batch_orchestration_id"] = \
                     checkpoint_run.orchestration_id
-                rec["batch_identity_digest"] = checkpoint_identity.digest()
+                rec["batch_identity_digest"] = checkpoint_run.identity.digest()
                 # Persisted `running` BEFORE the first model call and already
                 # carrying its BATCHED `worst_runtime_sec`: that is the only
                 # moment at which `recover_stale` can learn not to sweep this row
@@ -2501,7 +2515,7 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                     store, checkpoint_identity, rec, resume=True)
                 rec["batch_orchestration_id"] = \
                     checkpoint_run.orchestration_id
-                rec["batch_identity_digest"] = checkpoint_identity.digest()
+                rec["batch_identity_digest"] = checkpoint_run.identity.digest()
                 _note(f"reviewing {len(diff.files)} file(s) vs {base.ref} as "
                       f"{record_id} in {planned} batch(es) ...")
                 rec = _orchestrate(
@@ -3229,6 +3243,36 @@ def _begin_checkpoint_run(store: Store, identity: checkpoints.OrchestrationIdent
     except Exception as exc:
         raise PersistenceFailed(
             f"could not expire batch checkpoints: {exc!r}") from exc
+    from .requests import current
+    from .continuation import refuse
+    ctx = current()
+    if ctx is not None and ctx.store is store and ctx.continue_compatible:
+        candidate = store.find_resume_candidate(
+            identity.repo_id, identity.worktree_root, identity.branch, include_consumed=True)
+        if candidate is None:
+            refuse('continuation_not_found', 'No incomplete compatible batch work exists; request a fresh review explicitly.')
+        try:
+            stored = checkpoints.OrchestrationIdentity.from_json(candidate['identity_json'])
+        except ValueError:
+            refuse('continuation_identity_mismatch', 'Stored continuation identity is invalid.',
+                   first_mismatch='identity_json')
+        mismatch = checkpoints.first_mismatch(stored, identity)
+        if mismatch is not None:
+            refuse('continuation_identity_mismatch',
+                   f'Continuation identity differs: {mismatch}; no checkpoint reused.', first_mismatch=mismatch)
+        try:
+            child = store.fork_continuation(
+                candidate['id'], identity, request_id=ctx.id, owner_token=ctx.owner_token,
+                created_at=now, expires_at=_iso_after(CHECKPOINT_RETENTION_SEC))
+        except ValueError as exc:
+            code = getattr(exc, 'reason_code', 'continuation_source_invalid')
+            refuse(code, 'Continuation source could not be safely claimed; no checkpoint reused.',
+                   first_mismatch='request_identity' if code == 'continuation_request_ownership' else None)
+        child_identity = checkpoints.OrchestrationIdentity.from_json(child['identity_json'])
+        rec['continuation'] = {'policy': 'compatible', 'status': 'continued',
+                               'source_orchestration_id': candidate['id'],
+                               'orchestration_id': child['id'], 'first_mismatch': None}
+        return _CheckpointRun(child['id'], ids.new_review_id('sk_owner_'), child_identity)
     candidate = None
     if resume:
         candidate = store.find_resume_candidate(
@@ -3244,7 +3288,7 @@ def _begin_checkpoint_run(store: Store, identity: checkpoints.OrchestrationIdent
             orchestration_id = candidate["id"]
             _note(f"resuming exact batch orchestration {orchestration_id}")
             return _CheckpointRun(
-                orchestration_id, ids.new_review_id("sk_owner_"), identity)
+                orchestration_id, ids.new_review_id("sk_owner_"), stored)
         try:
             store.record_orchestration_mismatch(
                 candidate["id"], mismatch, at=now)
@@ -3302,6 +3346,8 @@ def _checkpointed_sub(
             payload = checkpoints.CheckpointPayload(claim["payload_json"])
             fields = checkpoints.sub_fields_from_payload(payload)
             sub = _Sub(**fields)
+            if checkpoint_run.identity.continuation_source is not None:
+                sub = replace(sub, provenance={**sub.provenance, 'continuation_action': 'reused'})
         except Exception as exc:
             raise PersistenceFailed(
                 f"stored checkpoint for {label} is invalid: {exc!r}") from exc
@@ -3337,6 +3383,10 @@ def _checkpointed_sub(
                 if sub.attempts else None),
         })
         payload = checkpoints.payload_from_sub(sub)
+        if checkpoint_run.identity.continuation_source is not None:
+            action = 'executed' if checkpoints.usable_payload(payload) else 'failed'
+            sub = replace(sub, provenance={**sub.provenance, 'continuation_action': action})
+            payload = checkpoints.payload_from_sub(sub)
         applied = store.complete_checkpoint(
             checkpoint_run.orchestration_id, pass_identity.kind,
             pass_identity.index, owner=checkpoint_run.owner,

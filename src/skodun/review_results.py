@@ -43,6 +43,8 @@ def attempt_reason(row):
 
 def observation(rec):
     """Compact exact-artifact facts, safe to retain in a request result."""
+    from .continuation import receipt
+    continuation = receipt(rec)
     rows, causes = [], set()
     candidate_count = launched_count = 0
     missing_scopes = []
@@ -93,6 +95,7 @@ def observation(rec):
                 'admission_expired' if 'admission_expired' in causes else
                 'review_partial' if partial else 'review_untrustworthy')
     return {
+        'continuation': continuation,
         'review_id': string(rec.get('id')),
         'request_id': string(rec.get('request_id')),
         'batch_orchestration_id': string(rec.get('batch_orchestration_id')),
@@ -206,6 +209,7 @@ def project(status, metadata=None, *, reason_code=None):
                                       'request_in_flight', 'request_identity_mismatch') else None)
     return {
         'schema_version': SCHEMA_VERSION,
+        'continuation': metadata.get('continuation') or observed.get('continuation'),
         'ids': {'request_id': string(request.get('id')),
                 'review_id': string(observed.get('review_id')),
                 'observed_request_id': string(observed.get('request_id')),
@@ -336,10 +340,15 @@ def valid_replay(value):
     reuse = metadata.get('reuse', {})
     if 'hit' in reuse and type(reuse['hit']) is not bool:
         return False
+    from .continuation import valid_receipt
+    if not valid_receipt(metadata.get('continuation')):
+        return False
     facts = metadata.get('observation')
     if facts is None:
         return True  # Old result receipts have no coverage observation.
     if not isinstance(facts, dict) or not isinstance(facts.get('identity'), dict):
+        return False
+    if not valid_receipt(facts.get('continuation')):
         return False
     if not all(maybe_string(v) for v in facts['identity'].values()):
         return False

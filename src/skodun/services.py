@@ -299,6 +299,8 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
                          stack_request=stack_request)
     except PreflightRefused as e:
         failure(getattr(e, "reason_code", "preflight_refused"))
+        if result_metadata is not None and hasattr(e, "continuation"):
+            result_metadata["continuation"] = e.continuation
         return 2, banner_failure(str(e))
     except LockTimeout as e:
         failure("admission_expired")
@@ -319,6 +321,8 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
             facts = cancelled_observation(store, prior_reviews)
             if facts is not None:
                 result_metadata['observation'] = facts
+                if facts.get('continuation') is not None:
+                    result_metadata['continuation'] = facts['continuation']
         # BEFORE the general `BaseException` below, and it has to be: a
         # cancellation is not "the review failed" with a stack trace worth
         # quoting, and `run_review`'s own `finally` has already downgraded
@@ -345,6 +349,8 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
     if result_metadata is not None:
         from .review_results import observation
         result_metadata["observation"] = observation(rec)
+        if result_metadata["observation"].get("continuation") is not None:
+            result_metadata["continuation"] = result_metadata["observation"]["continuation"]
     text = banner(rec)
     if rec.get("trustworthy") is not True:
         return 4, text
@@ -596,7 +602,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         reuse_trusted=False, fresh=False,
                         reuse_client_family=_REUSE_INTENT_UNSET,
                         batch_target_bytes=None, stack_manifest=None,
-                        request_key=None, request_source="service", request_actor=None
+                        request_key=None, request_source="service", request_actor=None, continue_compatible=False
                         ) -> tuple[int, str, dict]:
     """Durably identify an accepted request before readiness or admission."""
     from .review_results import attach
@@ -609,12 +615,20 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         from .trust import banner_failure
         return attach(2, banner_failure(str(exc)), {
             "termination": {"reason_code": "invalid_input"}})
+    from .continuation import validation_error
+    error = validation_error(continue_compatible, fresh=fresh,
+                             reuse_trusted=reuse_trusted, request_key=request_key)
+    if error:
+        from .trust import banner_failure
+        return attach(2, banner_failure(error), {'termination': {'reason_code': 'invalid_input'}})
+
     kwargs = dict(progress_sink=progress_sink, cancel=cancel, reviewer=reviewer,
                   client_family=client_family, recover=recover,
                   max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
                   reuse_trusted=reuse_trusted, fresh=fresh,
                   reuse_client_family=reuse_client_family,
-                  batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest)
+                  batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest,
+                  continue_compatible=continue_compatible)
     # Syntactically invalid options are not accepted execution requests. Keep
     # their no-store validation contract, including overflow/bool refusals.
     if (_validate_batch_target(batch_target_bytes)[1]
@@ -631,7 +645,7 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
                         max_attempts=None, max_wall_seconds=None,
                         reuse_trusted=False, fresh=False,
                         reuse_client_family=_REUSE_INTENT_UNSET,
-                        batch_target_bytes=None, stack_manifest=None
+                        batch_target_bytes=None, stack_manifest=None, continue_compatible=False
                         ) -> tuple[int, str, dict]:
     """Shared review surface plus recovery metadata for MCP structured output."""
     import threading
@@ -687,8 +701,8 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
         status, text = _svc_review_once(
             store, repo, progress_sink=progress_sink, cancel=cancel,
             reviewer=reviewer, client_family=client_family,
-            resume_checkpoints=(not fresh and reviewer is None
-                                and intent_family is None),
+            resume_checkpoints=(continue_compatible or (not fresh and reviewer is None
+                                and intent_family is None)),
             batch_target_bytes=batch_target_bytes,
             stack_request=stack_request, result_metadata=result_metadata)
         if "stack" in result_metadata:
@@ -819,13 +833,13 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
             store, repo, progress_sink=progress_sink, cancel=request_cancel,
             reviewer=reviewer, client_family=client_family,
             avoid_providers=(set(terminal_providers)
-                             if reviewer is None else set()),
+                             if reviewer is None and not continue_compatible else set()),
             # Recovery attempts are deliberately independent second looks.
             # The caller may opt into checkpoint resume for an ordinary review,
             # but the bounded recovery contract has always promised fresh
             # records and provider diversity; reusing a partial batch here
             # would silently turn a retry into the same interrupted run.
-            resume_checkpoints=False, batch_target_bytes=batch_target_bytes,
+            resume_checkpoints=continue_compatible, batch_target_bytes=batch_target_bytes,
             stack_request=stack_request,
             result_metadata=attempt_metadata)
         result_metadata = attempt_metadata
@@ -974,7 +988,7 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
                reuse_trusted=False, fresh=False,
                reuse_client_family=_REUSE_INTENT_UNSET,
                batch_target_bytes=None, stack_manifest=None,
-               request_key=None, request_source="service") -> tuple[int, str]:
+               request_key=None, request_source="service", continue_compatible=False) -> tuple[int, str]:
     status, text, _ = svc_review_detailed(
         store, repo, progress_sink=progress_sink, cancel=cancel,
         reviewer=reviewer, client_family=client_family, recover=recover,
@@ -984,7 +998,8 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
         reuse_trusted=reuse_trusted, fresh=fresh,
         reuse_client_family=reuse_client_family,
         batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest,
-        request_key=request_key, request_source=request_source)
+        request_key=request_key, request_source=request_source,
+        continue_compatible=continue_compatible)
     return status, text
 
 
