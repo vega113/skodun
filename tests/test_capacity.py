@@ -740,3 +740,37 @@ def test_s4_progress_eta_from_terminal_samples(store):
         on_progress=on_progress)
     assert any("historical median wait=" in n and "samples=3" in n for n in notes)
     finish(store, ticket, status=STATUS_RELEASED)
+
+
+def test_same_second_fifo_uses_committed_enqueue_order(tmp_path, monkeypatch):
+    from skodun import store as store_module
+    monkeypatch.setattr(store_module, '_iso_now', lambda: '2026-09-05T00:00:00Z')
+    with Store.open(tmp_path / 'db') as store:
+        store.capacity_enqueue(admission_id='z-first', resource_class='provider:xai', scope='xai')
+        store.capacity_enqueue(admission_id='a-second', resource_class='provider:xai', scope='xai')
+        assert store.capacity_position('z-first') == 1
+        assert store.capacity_try_admit('a-second', capacity=1) is None
+        assert store.capacity_try_admit('z-first', capacity=1)['status'] == 'admitted'
+
+
+def test_enqueue_order_survives_new_process_and_terminal_rows(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    import sys
+    from skodun import store as store_module
+    monkeypatch.setattr(store_module, '_iso_now', lambda: '2026-09-05T00:00:00Z')
+    db = tmp_path / 'db'
+    with Store.open(db) as store:
+        store.capacity_enqueue(admission_id='z-first', resource_class='provider:xai', scope='xai')
+        store.capacity_enqueue(admission_id='a-second', resource_class='provider:xai', scope='xai')
+    script = "from skodun.store import Store; import sys; s=Store.open(sys.argv[1]); print(s.capacity_position('z-first')); print(s.capacity_try_admit('a-second',capacity=1)); s.close()"
+    result = subprocess.run([sys.executable, '-c', script, str(db)], capture_output=True, text=True,
+        env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')}, check=True)
+    assert result.stdout.splitlines() == ['1', 'None']
+    with Store.open(db) as store:
+        store.capacity_try_admit('z-first', capacity=1)
+        store.capacity_finish('z-first', status='released')
+        store.capacity_enqueue(admission_id='0-third', resource_class='provider:xai', scope='xai')
+        assert store.capacity_position('z-first') is None
+        assert store.capacity_position('a-second') == 1
+        assert store.capacity_try_admit('0-third', capacity=1) is None

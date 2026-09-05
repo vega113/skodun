@@ -510,3 +510,15 @@ def test_zero_based_batch_reuse_is_an_unknown_identity():
         'batches': [{'index': 0, 'continuation_action': 'reused'}]}])
     assert value['reused_passes'] is None
     assert value['reported_reused_passes'] == 0 and value['reuse_identity_missing'] == 1
+
+
+def test_bounded_queue_inspection_uses_the_same_front_as_admission(tmp_path, monkeypatch):
+    from skodun import queueview, store as store_module
+    monkeypatch.setattr(store_module, '_iso_now', lambda: '2026-09-05T00:00:00Z')
+    monkeypatch.setattr(queueview, 'MAX_PEERS', 1)
+    with Store.open(tmp_path / 'db') as store:
+        first = store.capacity_enqueue(admission_id='z-first', resource_class='provider:xai', scope='xai')
+        store.capacity_enqueue(admission_id='a-second', resource_class='provider:xai', scope='xai')
+        row = queueview._admission(store, first, '2026-09-05T00:00:01Z', [], {})
+        assert row['position'] == store.capacity_position('z-first') == 1
+        assert row['holders_truncated'] is True
