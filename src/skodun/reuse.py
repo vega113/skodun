@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from . import (batching, budget, checklist, contextpack, gitio, passes, planning_policy,
@@ -290,7 +290,8 @@ def probe(store, repo, *, cfg, reviewer: str | None = None,
         candidate_identity = _identity_for(
             root, cfg, base, diff, branch=branch,
             reviewer_name=current_reviewer, candidate=loaded)
-        planning_reason = planning_policy.mismatch(loaded.get('planning_policy'), candidate_identity.planning_policy)
+        if planning_reason is None and _candidate_matches(loaded, replace(candidate_identity, planning_policy=None)):
+            planning_reason = planning_policy.mismatch(loaded.get('planning_policy'), candidate_identity.planning_policy)
         if _candidate_matches(loaded, candidate_identity):
             identity = candidate_identity
             candidate = loaded

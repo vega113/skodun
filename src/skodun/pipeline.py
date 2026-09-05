@@ -1135,6 +1135,9 @@ def resolve_review_head(cfg: Config, store: Store, *,
     through the store, and a policy that lived in one of them would be a policy
     the others do not have.
 
+    Read-only readiness and review-plan also use this foreground selection
+    policy to explain the same current route without launching a provider.
+
     Three paths, in priority order:
 
     * **Pinned.** A `reviewer` name is absolute in every mode. It is not scored,

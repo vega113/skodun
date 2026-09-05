@@ -934,6 +934,7 @@ def _handle_feedback_list(call: "HandlerCall") -> "HandlerResult":
 
 def _handle_review_plan(call: "HandlerCall") -> "HandlerResult":
     from contextlib import ExitStack
+    import sqlite3
     from . import services
     from .store import Store, SchemaLifecycleError
     from .cli import _store_path
@@ -953,6 +954,8 @@ def _handle_review_plan(call: "HandlerCall") -> "HandlerResult":
             store = stack.enter_context(factory())
         except SchemaLifecycleError as exc:
             reason = exc.reason_code
+        except (OSError, sqlite3.Error) as exc:
+            reason = type(exc).__name__
         status, text = services.svc_review_plan(store, repo, **options,
             output=call.params.get("output", "text"), history_unavailable_reason=reason)
     return HandlerResult(status=status, text=text)

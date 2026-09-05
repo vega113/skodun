@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from itertools import islice
 
 from .store import _is_canonical_ts
-from .planning_policy import VERSION, capability
+from .planning_policy import VERSION, capability, validate
 from .telemetry import attempt_launched
 
 WINDOW_DAYS = 30
@@ -45,40 +45,72 @@ def _sources(record):
         yield 'primary', record
 
 
+def _attempt_matches(item, reviewer):
+    """False means known unrelated; None means attribution is incomplete."""
+    if not isinstance(item, dict):
+        return None
+    for key, expected in (('provider', reviewer.provider), ('model', reviewer.model), ('effort', reviewer.effort)):
+        value = item.get(key)
+        if isinstance(value, str) and value and value != expected:
+            return False
+    if (not isinstance(item.get('provider'), str) or not item['provider']
+            or not isinstance(item.get('model'), str) or not item['model']
+            or 'effort' not in item or (item['effort'] is not None and not isinstance(item['effort'], str))):
+        return None
+    return (item['provider'], item['model'], item['effort']) == (reviewer.provider, reviewer.model, reviewer.effort)
+
+
 def evidence(records, *, reviewer, mode, context_pack=False, now=None):
     now = now or datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     if not _is_canonical_ts(now):
         raise ValueError('now must be canonical UTC')
     since = (datetime.strptime(now, '%Y-%m-%dT%H:%M:%SZ') - timedelta(days=WINDOW_DAYS)).strftime('%Y-%m-%dT%H:%M:%SZ')
     rows = list(islice(records, RECORD_LIMIT + 1))
-    groups, seen = {}, {}
+    groups, seen, request_parents = {}, {}, {}
+    def request_root(request_id):
+        request_parents.setdefault(request_id, request_id)
+        while request_parents[request_id] != request_id:
+            request_id = request_parents[request_id]
+        return request_id
+    def join_requests(left, right):
+        left, right = request_root(left), request_root(right)
+        request_parents[max(left, right)] = min(left, right)
+    unsupported = 0
     invalid = skipped = duplicates = conflicts = scanned = unfinished = 0
     for record in rows[:RECORD_LIMIT]:
         if not isinstance(record, dict):
             invalid += 1
             continue
+        if record.get('mode') != mode:
+            continue
         at = record.get('review_started_at') or record.get('reviewed_at')
-        if not _is_canonical_ts(at):
+        if _is_canonical_ts(at) and not since <= at <= now:
+            continue
+        policy = record.get('planning_policy')
+        if isinstance(policy, dict) and isinstance(policy.get('version'), str) and policy['version'] != VERSION:
+            unsupported += 1
+            continue
+        try:
+            validate(policy)
+            if policy is None or policy['capability'] is None:
+                raise ValueError('missing current planning capability')
+        except ValueError:
             invalid += 1
             continue
-        if not since <= at <= now or record.get('mode') != mode:
+        if policy['capability'] != capability(reviewer) or policy['context_pack'] != context_pack:
             continue
-        if record.get('status') == 'running':
-            unfinished += 1
+        if not _is_canonical_ts(at):
+            invalid += 1
             continue
         if (record.get('batched') or record.get('batches')) and (not isinstance(record.get('batches'), list) or any(not isinstance(batch, dict) for batch in record['batches'])):
             invalid += 1
             continue
         if record.get('batched') and type(record.get('batch_count')) is int and record['batch_count'] > len(record.get('batches') or ()):
             invalid += 1
-        policy = record.get('planning_policy')
-        if not isinstance(policy, dict) or policy.get('version') != VERSION or type(policy.get('context_pack')) is not bool:
-            invalid += 1
-            continue
-        if 'capability' not in policy:
-            invalid += 1
-            continue
-        if policy['capability'] != capability(reviewer) or policy['context_pack'] != context_pack:
+        if record.get('status') == 'running':
+            rows_for_scope = [item for _, source in _sources(record) for item in (source.get('attempts') or ())]
+            if not rows_for_scope or any(_attempt_matches(item, reviewer) is not False for item in rows_for_scope):
+                unfinished += 1
             continue
         for kind, source in _sources(record):
             attempts = source.get('attempts')
@@ -90,8 +122,11 @@ def evidence(records, *, reviewer, mode, context_pack=False, now=None):
                 scanned += 1
                 if scanned > ATTEMPT_LIMIT:
                     break
-                if not isinstance(item, dict) or (item.get('provider'), item.get('model'), item.get('effort')) != (
-                        reviewer.provider, reviewer.model, reviewer.effort):
+                attribution = _attempt_matches(item, reviewer)
+                if attribution is False:
+                    continue
+                if attribution is None:
+                    invalid += 1
                     continue
                 if attempt_launched(item) is False:
                     skipped += 1
@@ -135,12 +170,14 @@ def evidence(records, *, reviewer, mode, context_pack=False, now=None):
                           'executable_version': (item.get('execution_provenance') or {}).get('version')
                               if isinstance(item.get('execution_provenance'), dict) else None}
                 # Copied checkpoint observations are one actual model call.
-                signature = {key: value for key, value in sample.items() if key not in ('review_id', 'at')}
+                signature = {key: value for key, value in sample.items() if key not in ('review_id', 'at', 'request_id', 'skodun_commit')}
                 if aid in seen:
                     duplicates += 1
-                    conflicts += int(seen[aid] != signature)
+                    conflicts += int(seen[aid][0] != signature)
+                    join_requests(seen[aid][1], request_id)
                     continue
-                seen[aid] = signature
+                seen[aid] = (signature, request_id)
+                request_root(request_id)
                 bucket = 1 << (input_bytes - 1).bit_length()
                 groups.setdefault((kind, bucket), []).append(sample)
             if scanned > ATTEMPT_LIMIT:
@@ -153,6 +190,8 @@ def evidence(records, *, reviewer, mode, context_pack=False, now=None):
         failures = sum(item['failure'] for item in samples)
         censored = sum(item['censored'] for item in samples)
         incomplete = sum(not item['outcome_known'] for item in samples)
+        for item in samples:
+            item['request_id'] = request_root(item['request_id'])
         request_count = len({item['request_id'] for item in samples})
         reasons = []
         if len(samples) < MIN_CALLS:
@@ -194,6 +233,7 @@ def evidence(records, *, reviewer, mode, context_pack=False, now=None):
         'context_pack': context_pack, 'planning_version': VERSION, 'capability': capability(reviewer),
         'records_scanned': min(len(rows), RECORD_LIMIT), 'attempts_scanned': min(scanned, ATTEMPT_LIMIT),
         'truncated': truncated, 'incomplete_rows': invalid, 'duplicate_rows': duplicates,
+        'unsupported_policy_records': unsupported,
         'conflicting_attempt_ids': conflicts, 'candidate_skips': skipped, 'unfinished_records_excluded': unfinished, 'cohorts': cohorts,
         'note': 'Advisory observations; thresholds are not confidence guarantees and ranges are not forecasts.'}
 

@@ -401,3 +401,157 @@ def test_zero_target_uses_shipped_configured_target_semantics(tmp_path, monkeypa
     assert code == 0
     assert json.loads(text)['selection']['target_source'] == 'configured'
     assert json.loads(text)['selection']['application'] == ['--batch-target-bytes', '4000']
+
+
+def test_evidence_scopes_running_and_unsupported_rows_before_qualification():
+    from copy import deepcopy
+    from skodun import operational_targets as targets, planning_policy
+    reviewer = Reviewer(name='finder', provider='xai', model='test', role='finder')
+    kwargs = dict(reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
+    unrelated = deepcopy(history_records()[0])
+    unrelated['status'] = 'running'
+    unrelated['planning_policy'] = planning_policy.describe(Defaults(context_pack=False),
+        Reviewer(name='other', provider='google', model='other', role='finder'))
+    good = targets.evidence(history_records() + [unrelated], **kwargs)
+    assert good['cohorts'][0]['qualified']
+    matching = deepcopy(history_records()[0])
+    matching['status'] = 'running'
+    bad = targets.evidence(history_records() + [matching], **kwargs)
+    assert not bad['cohorts'][0]['qualified']
+    legacy = deepcopy(history_records()[0])
+    legacy['planning_policy']['version'] = 'review-planning/v0'
+    old = targets.evidence(history_records() + [legacy], **kwargs)
+    assert old['cohorts'][0]['qualified']
+    assert old['unsupported_policy_records'] == 1
+
+
+def test_missing_attempt_attribution_is_incomplete_but_known_other_provider_is_not():
+    from skodun.operational_targets import evidence
+    reviewer = Reviewer(name='finder', provider='xai', model='test', role='finder')
+    kwargs = dict(reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
+    for malformed in (None, {}, {'provider': 'xai'}, {'provider': 'xai', 'model': 'test'}):
+        records = history_records()
+        records[0]['batches'][0]['attempts'].append(malformed)
+        result = evidence(records, **kwargs)
+        assert result['incomplete_rows'] >= 1
+        assert not any(c['qualified'] for c in result['cohorts'])
+    records = history_records()
+    records[0]['batches'][0]['attempts'].append({'provider': 'google'})
+    assert evidence(records, **kwargs)['cohorts'][0]['qualified']
+
+
+def test_checkpoint_copy_request_ids_do_not_inflate_or_conflict():
+    from copy import deepcopy
+    from skodun.operational_targets import evidence
+    records = history_records()
+    copies = deepcopy(records)
+    for item in copies:
+        item['request_id'] += '-copy'
+        item['skodun_commit'] = 'copying-build'
+    result = evidence(copies + records, reviewer=Reviewer(name='finder', provider='xai', model='test', role='finder'),
+        mode='now', now='2026-09-05T12:00:00Z')
+    assert result['conflicting_attempt_ids'] == 0
+    assert result['cohorts'][0]['sample_count'] == 20
+    assert result['cohorts'][0]['request_count'] == 5
+    assert result['cohorts'][0]['qualified']
+
+
+def test_checkpoint_rejects_malformed_planning_policy():
+    import pytest
+    from skodun import checkpoints, planning_policy
+    from tests.test_checkpoints import _identity
+    policy = planning_policy.describe(Defaults())
+    for bad in (True, [], {'version': 'review-planning/v1'}, {**policy, 'target_bytes': True},
+                {**policy, 'context_pack': 1}, {**policy, 'digest': 'f' * 64}):
+        with pytest.raises(ValueError, match='planning'):
+            replace(_identity(), planning_policy=bad)
+        assert planning_policy.mismatch(bad, policy) == 'planning_identity_missing'
+
+
+def test_readonly_open_errors_keep_cli_mcp_preview_available(tmp_path, monkeypatch, capsys):
+    import sqlite3
+    import threading
+    from skodun import cli, mcpserver
+    repo = _ready_repo(tmp_path, monkeypatch)
+    def unavailable(*args, **kwargs):
+        raise sqlite3.OperationalError('unreadable fixture')
+    monkeypatch.setattr(Store, 'open_readonly', unavailable)
+    assert cli.main(['review-plan', '--repo', str(repo), '--json']) == 0
+    left = json.loads(capsys.readouterr().out)
+    handler = next(s.handler for s in mcpserver.default_registry() if s.name == 'review_plan')
+    result = handler(mcpserver.HandlerCall(params={'repo': str(repo), 'output': 'json'},
+        store_factory=mcpserver.default_store_factory, cancel=threading.Event()))
+    assert result.status == 0
+    right = json.loads(result.text)
+    assert left['measurements']['unavailable_reason'] == right['measurements']['unavailable_reason'] == 'OperationalError'
+
+
+def test_fitting_fallback_limit_without_validator_is_reported(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from skodun import plan_preview, pipeline
+    reviewer = Reviewer(name='finder', provider='xai', model='test', role='finder')
+    cfg = Config(defaults=Defaults(), reviewers=(reviewer,))
+    monkeypatch.setattr(pipeline, '_adapter_for', lambda _entry: SimpleNamespace(prompt_limit=lambda: 1000))
+    paths = plan_preview._paths(cfg, reviewer, cfg.defaults, SimpleNamespace(text=b'a', prompt_bytes=1))
+    assert paths[0]['status'] == 'admissible'
+
+
+def test_measured_timeout_and_advisory_security_truncation(tmp_path, monkeypatch):
+    from skodun import config
+    from tests.test_cli import _round
+    repo = _ready_repo(tmp_path, monkeypatch)
+    for i in range(30):
+        (repo / f'diff-{i}.txt').write_text('content\n' * 100)
+    finder = Reviewer(name='finder', provider='xai', model='test', role='finder')
+    cfg = Config(defaults=Defaults(context_pack=False, max_diff_bytes=100000, timeout_sec=1), reviewers=(finder,))
+    monkeypatch.setattr(config, 'load_config', lambda _root: cfg)
+    with Store.open(tmp_path / 's.db') as store:
+        for item in history_records():
+            store.save_review(_round(**item))
+        code, text = services.svc_review_plan(store, repo, reviewer='finder', target_source='measured',
+            target_latency_seconds=6, now='2026-09-05T12:00:00Z', output='json')
+        assert code == 0
+        assert json.loads(text)['selection']['reason'] == 'historical_timeout_incompatible'
+    (repo / 'auth').mkdir()
+    (repo / 'auth' / 'login.py').write_text('check\n' * 100)
+    monkeypatch.setenv('SKODUN_SECURITY_PASS', '1')
+    security = Reviewer(name='security', provider='xai', model='test', role='security', max_diff_bytes=100)
+    cfg = replace(cfg, defaults=replace(cfg.defaults, timeout_sec=60), reviewers=(finder, security))
+    code, text = services.svc_review_plan(None, repo, reviewer='finder', batch_target_bytes=8000, output='json')
+    plan = json.loads(text)
+    assert code == 0
+    call = next(c for c in plan['calls'] if c['kind'] == 'security')
+    assert call['prompt_truncated'] and call['partial_coverage']
+
+
+def test_reuse_reason_preserves_only_an_otherwise_matching_candidate(tmp_path, monkeypatch):
+    from skodun import config, gitio, reuse, planning_policy
+    from tests.test_reuse import _record
+    repo = _ready_repo(tmp_path, monkeypatch)
+    cfg = config.load_config(repo)
+    base = gitio.resolve_base(repo)
+    diff = gitio.capture_diff(repo, base.sha, cfg.defaults.untracked_max)
+    identity = reuse._identity_for(repo, cfg, base, diff, branch=gitio.current_branch(repo), reviewer_name=cfg.reviewers[0].name)
+    changed = planning_policy.describe(replace(cfg.defaults, batch_target_bytes=1000), cfg.reviewers[0])
+    target_only = _record(identity, planning_policy=changed, trustworthy=True)
+    unrelated = _record(identity, branch='other', trustworthy=True)
+    with Store.open(tmp_path / 's.db') as store:
+        monkeypatch.setattr(store, 'reuse_candidates', lambda *args: [target_only, unrelated])
+        assert reuse.probe(store, repo, cfg=cfg).reason == 'operational_target_changed'
+        unrelated['planning_policy'] = changed
+        monkeypatch.setattr(store, 'reuse_candidates', lambda *args: [unrelated])
+        assert reuse.probe(store, repo, cfg=cfg).reason == 'no exact trustworthy review matched'
+
+
+def test_mcp_preview_rejects_boolean_and_invalid_enum_inputs(tmp_path, monkeypatch):
+    import threading
+    from skodun import mcpserver
+    repo = _ready_repo(tmp_path, monkeypatch)
+    handler = next(s.handler for s in mcpserver.default_registry() if s.name == 'review_plan')
+    with Store.open(tmp_path / 's.db') as store:
+        from contextlib import nullcontext
+        for invalid in ({'mode': False}, {'mode': ''}, {'batch_target_bytes': True},
+                        {'target_latency_seconds': True}, {'target_source': 'unknown'}, {'output': 'unknown'}):
+            result = handler(mcpserver.HandlerCall(params={'repo': str(repo), **invalid},
+                store_factory=lambda: nullcontext(store), cancel=threading.Event()))
+            assert result.status == 2

@@ -137,6 +137,8 @@ class OrchestrationIdentity:
                 "config_hash", "policy_hash", "planner_version",
                 "boundary_digest", "integration_plan_digest"):
             _text(name, getattr(self, name))
+        from .planning_policy import validate as validate_planning_policy
+        validate_planning_policy(self.planning_policy)
         _text("continuation_source", self.continuation_source, optional=True)
         _text("context_hash", self.context_hash, optional=True)
         _text("checklist_hash", self.checklist_hash, optional=True)

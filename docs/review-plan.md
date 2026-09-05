@@ -33,7 +33,9 @@ For example, an 18-batch aggregate can exceed six megabytes while each batch is
 under 500,000 bytes. Byte envelopes and transport limits are not model context
 or latency guarantees. Each configured fallback is checked against the actual
 input using its adapter capability, independently of the head's sizing envelope.
-The preview does not probe quota, binaries, or provider health.
+The preview does not probe quota, binaries, or provider health. Size-capped
+security/skeptic inputs retain the execution contract: explicit partial advisory
+coverage, rather than a primary-coverage failure.
 
 Integration includes every planned batch. Its structural preview uses empty
 result slots to expose known size problems, but final summaries/findings do not
@@ -50,7 +52,12 @@ cohort only with at least 20 unique launched attempts from at least five request
 inside the named 30-day window, complete matched input/outcome data, and zero
 observed failures or censored timeouts. These are conservative policy thresholds,
 not statistical confidence guarantees. Candidate skips are not launches; copied
-checkpoint attempts are deduplicated; conflicting identities, missing sizes or
+checkpoint attempts are deduplicated independently of enclosing request IDs.
+Requests linked by copied attempts count as one request group, so copies cannot
+inflate the minimum request count. Unsupported policy versions are labeled
+separately; known unrelated running reviews do not invalidate a matching cohort.
+Unattributable outcomes in matching policy sources remain incomplete.
+Conflicting identities, missing sizes or
 planning provenance, and bounded-query truncation prevent qualification.
 
 Cohorts preserve provider/model/effort, foreground versus prepush mode,
@@ -64,7 +71,8 @@ The largest qualifying observed diff target meeting the historical p90 objective
 is considered below the configured sizing ceiling. The shipped planner checks
 the entire candidate, including integration's structural floor and every required
 input. Its largest primary/batch prompt and context size must fit the observed
-ranges. Smaller remainder batches outside those ranges retain unknown timings.
+ranges, and observed timeout caps must not exceed the applicable execution cap.
+Smaller remainder batches outside those ranges retain unknown timings.
 Insufficient, stale, mismatched, missing, censored or failed evidence retains the
 configured target with a reason. A positive explicit `--batch-target-bytes` always wins; zero retains the shipped
 meaning of using the configured/default planner.

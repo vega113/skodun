@@ -929,6 +929,7 @@ def _cmd_review(args) -> int:
 
 def _cmd_review_plan(args) -> int:
     from contextlib import ExitStack
+    import sqlite3
     from .services import svc_review_plan
     from .store import Store, SchemaLifecycleError
     options = {key: getattr(args, key) for key in (
@@ -941,6 +942,8 @@ def _cmd_review_plan(args) -> int:
             store = stack.enter_context(Store.open_readonly(_store_path()))
         except SchemaLifecycleError as exc:
             reason = exc.reason_code
+        except (OSError, sqlite3.Error) as exc:
+            reason = type(exc).__name__
         code, text = svc_review_plan(store, args.repo, **options,
             history_unavailable_reason=reason, output="json" if args.json_output else "text")
     return _emit(text, code)

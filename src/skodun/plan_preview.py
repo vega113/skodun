@@ -39,9 +39,12 @@ def _paths(cfg, reviewer, defaults, prompt=None, *, future=False):
                     validate(prompt.text, entry)
                     if not future:
                         row['status'] = 'admissible'
-                elif type(limit) is int and prompt.prompt_bytes > limit:
-                    row['status'] = 'ineligible'
-                    row['reason_code'] = 'prompt_too_large'
+                elif type(limit) is int:
+                    if prompt.prompt_bytes > limit:
+                        row['status'] = 'ineligible'
+                        row['reason_code'] = 'prompt_too_large'
+                    elif not future:
+                        row['status'] = 'admissible'
             except PromptTooLarge as exc:
                 row.update(status='ineligible', reason_code='prompt_too_large',
                            actual_bytes=exc.size, transport_limit_bytes=exc.limit)
@@ -56,6 +59,7 @@ def _call(kind, index, reviewer, cfg, defaults, prompt, *, condition='required',
         'prompt_bytes': None if future or prompt is None else prompt.prompt_bytes,
         'prompt_hash': None if future or prompt is None else gitio.diff_identity(prompt.text),
         'prompt_truncated': None if future or prompt is None else prompt.diff_truncated,
+        'partial_coverage': kind in ('security', 'skeptic') and prompt is not None and prompt.diff_truncated,
         'input_status': 'pending_results' if future else 'exact',
         'paths': _paths(cfg, reviewer, defaults, prompt, future=future), **extra}
 
@@ -118,10 +122,19 @@ def _prepare(diff, *, root, cfg, defaults, finder, branch, base, head, mode, adv
     return calls, batches, prepared
 
 
+def _timeout(call, defaults, cfg, mode):
+    timeout = defaults.timeout_sec
+    if mode == 'prepush' and call['prompt_bytes'] is not None and call['prompt_bytes'] > cfg.dispatch.large_prompt_bytes:
+        timeout = max(timeout, cfg.defaults.timeout_sec)
+    return timeout
+
+
 def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_target_bytes=None,
             target_source='configured', target_latency_seconds=None, stack_manifest=None,
             local_ref=None, local_oid=None, remote_ref=None, remote_oid=None, review_id=None, now=None):
     from .services import _validate_batch_target
+    if mode is not None and mode not in ('now', 'prepush'):
+        raise ValueError('mode must be now or prepush')
     target, refusal = _validate_batch_target(batch_target_bytes)
     if refusal:
         raise ValueError(refusal)
@@ -228,7 +241,7 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
                 proposed = replace(defaults, batch_target_bytes=cohort['target_bytes'])
                 trial, _, _ = _prepare(diff, root=root, cfg=cfg, defaults=proposed, finder=finder,
                     branch=branch, base=base, head=head, mode=mode, advisory=advisory)
-                if any(call.get('prompt_truncated') or call.get('structural_floor_truncated')
+                if any((call.get('prompt_truncated') and not call.get('partial_coverage')) or call.get('structural_floor_truncated')
                        or all(path['status'] in ('ineligible', 'invalid_configuration') for path in call['paths']) for call in trial
                        if call['condition'] == 'required'):
                     reason = 'required_coverage_floor_unfit'
@@ -238,6 +251,9 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
                         cohort['input_min_bytes'] <= max(call['prompt_bytes'] for call in measured_calls) <= cohort['input_max_bytes']
                         and cohort['context_min_bytes'] <= max(call['context_bytes'] for call in measured_calls) <= cohort['context_max_bytes']):
                     reason = 'candidate_inputs_outside_observed_range'
+                    continue
+                if any(max(cohort['timeout_seconds']) > _timeout(call, proposed, cfg, mode) for call in measured_calls):
+                    reason = 'historical_timeout_incompatible'
                     continue
                 selected, defaults, reason = cohort, proposed, 'qualified_measured_target'
                 break
@@ -254,10 +270,7 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
             calls, batches, prepared = _prepare(diff, root=root, cfg=cfg, defaults=defaults, finder=finder,
                 branch=branch, base=base, head=head, mode=mode, advisory=advisory)
     for call in calls:
-        timeout = defaults.timeout_sec
-        if mode == 'prepush' and call['prompt_bytes'] is not None and call['prompt_bytes'] > cfg.dispatch.large_prompt_bytes:
-            timeout = max(timeout, cfg.defaults.timeout_sec)
-        call['configured_timeout_seconds'] = timeout
+        call['configured_timeout_seconds'] = _timeout(call, defaults, cfg, mode)
         call['timeout_may_escalate_after_results'] = mode == 'prepush' and call['input_status'] == 'pending_results'
         call['attempt_budget_per_entry'] = (1 + defaults.timeout_retries + defaults.degraded_retries)
     policy = planning_policy.describe(defaults, finder)
@@ -266,7 +279,8 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
         matching = [cohort for cohort in data['cohorts'] if cohort['qualified']
             and cohort['pass_kind'] == call['kind'] and call['prompt_bytes'] is not None
             and cohort['input_min_bytes'] <= call['prompt_bytes'] <= cohort['input_max_bytes']
-            and cohort['context_min_bytes'] <= call.get('context_bytes', -1) <= cohort['context_max_bytes']]
+            and cohort['context_min_bytes'] <= call.get('context_bytes', -1) <= cohort['context_max_bytes']
+            and max(cohort['timeout_seconds']) <= call['configured_timeout_seconds']]
         call['historical_duration_sec'] = matching[0]['historical_duration_sec'] if len(matching) == 1 else None
         call['historical_duration_status'] = 'observed_matching_cohort' if len(matching) == 1 else 'unknown'
     known = [call['prompt_bytes'] for call in calls if call['condition'] == 'required' and call['prompt_bytes'] is not None]
@@ -294,7 +308,7 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
             'historical_configuration_available': False, 'task_intent': 'unknown'}
     return {'schema_version': 'review-plan/v1', 'snapshot_only': True,
         'status': 'stale' if changed else 'unreviewable' if diff.truncated_untracked or any(
-            call.get('prompt_truncated') or call.get('structural_floor_truncated')
+            (call.get('prompt_truncated') and not call.get('partial_coverage')) or call.get('structural_floor_truncated')
             or all(path['status'] in ('ineligible', 'invalid_configuration') for path in call['paths'])
             for call in required) else 'planned',
         'mode': mode, 'base': {'requested': requested_base, 'source': source, 'ref': base.ref,
