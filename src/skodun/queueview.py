@@ -197,7 +197,7 @@ def _admission(store, row, now, layers, resources):
     if key not in resources:
         peers = [dict(item) for item in store._c.execute(
             "SELECT * FROM capacity_admissions WHERE resource_class=? AND scope=? "
-            "AND status IN ('queued','admitted','running') ORDER BY queued_at,id LIMIT ?",
+            "AND status IN ('queued','admitted','running') ORDER BY queued_at,rowid LIMIT ?",
             (resource, scope, MAX_PEERS + 1))]
         holders = [{**_owner(store, item), 'admission_id': item['id']}
                    for item in peers[:MAX_PEERS] if item['status'] in ('admitted', 'running')]

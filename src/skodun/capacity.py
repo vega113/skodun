@@ -101,6 +101,8 @@ class WaiterView:
     id: str
     status: str
     queued_at: str
+    # SQLite rowid supplied by Store; no new ID/schema or cross-maintenance promise.
+    enqueue_order: int | None = None
 
 
 @dataclass
@@ -239,7 +241,8 @@ def decide_admit(waiter_id: str, waiters: Sequence[WaiterView],
     """Pure FIFO admit rule.
 
     Eligible only when holders are under capacity and ``waiter_id`` is the
-    earliest ``queued`` row by ``(queued_at, id)``.
+    earliest ``queued`` row by timestamp and the current SQLite insertion tie-break.
+    Legacy pure views without insertion order retain the ID tie-break.
     """
     if capacity < 1:
         return False
@@ -248,15 +251,15 @@ def decide_admit(waiter_id: str, waiters: Sequence[WaiterView],
         return False
     queued = sorted(
         (w for w in waiters if w.status == STATUS_QUEUED),
-        key=lambda w: (w.queued_at, w.id),
+        key=lambda w: (w.queued_at, w.enqueue_order or 0, w.id),
     )
     return bool(queued) and queued[0].id == waiter_id
 
 
 def queue_position_among(waiter_id: str,
                          waiters: Sequence[WaiterView]) -> int | None:
-    """1-based position among active waiters ordered by ``(queued_at, id)``."""
-    ordered = sorted(waiters, key=lambda w: (w.queued_at, w.id))
+    """1-based position using the same SQLite insertion tie-break as admission."""
+    ordered = sorted(waiters, key=lambda w: (w.queued_at, w.enqueue_order or 0, w.id))
     for i, w in enumerate(ordered, start=1):
         if w.id == waiter_id:
             return i

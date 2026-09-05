@@ -3705,12 +3705,12 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
         resource_class = _require_text("resource_class", resource_class)
         scope = _require_text("scope", scope)
         rows = self._c.execute(
-            """SELECT id, status, queued_at FROM capacity_admissions
+            """SELECT rowid AS enqueue_order, id, status, queued_at FROM capacity_admissions
                WHERE resource_class=? AND scope=? AND status IN (?,?,?)
-               ORDER BY queued_at, id""",
+               ORDER BY queued_at, rowid""",
             (resource_class, scope, *self._CAPACITY_ACTIVE)).fetchall()
         return [WaiterView(id=r["id"], status=r["status"],
-                           queued_at=r["queued_at"]) for r in rows]
+                           queued_at=r["queued_at"], enqueue_order=r["enqueue_order"]) for r in rows]
 
     def capacity_position(self, admission_id: str) -> int | None:
         """1-based FIFO position among active peers, or None if terminal/missing."""
@@ -3782,7 +3782,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
             rows = self._c.execute(
                 """SELECT * FROM capacity_admissions
                    WHERE resource_class=? AND scope=? AND status IN (?,?,?)
-                   ORDER BY queued_at, id""",
+                   ORDER BY queued_at, rowid""",
                 (resource_class, scope, *self._CAPACITY_ACTIVE)).fetchall()
             ended_at = _iso_now()
             for row in rows:
@@ -3835,12 +3835,12 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                 self._c.execute("COMMIT")
                 return None if row is None else dict(row)
             peers = self._c.execute(
-                """SELECT id, status, queued_at FROM capacity_admissions
+                """SELECT rowid AS enqueue_order, id, status, queued_at FROM capacity_admissions
                    WHERE resource_class=? AND scope=? AND status IN (?,?,?)""",
                 (row["resource_class"], row["scope"],
                  *self._CAPACITY_ACTIVE)).fetchall()
             views = [WaiterView(id=p["id"], status=p["status"],
-                                queued_at=p["queued_at"]) for p in peers]
+                                queued_at=p["queued_at"], enqueue_order=p["enqueue_order"]) for p in peers]
             if not decide_admit(admission_id, views, capacity):
                 self._c.execute("COMMIT")
                 return None
