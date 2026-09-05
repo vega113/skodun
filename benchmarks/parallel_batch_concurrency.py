@@ -18,7 +18,9 @@ from skodun import provenance, runner, services
 from skodun.store import Store
 
 
-def run_fixture(output, *, delay_seconds=1.0):
+def run_fixture(output, *, delay_seconds=1.0, provider_capacity=2):
+    if type(provider_capacity) is not int or provider_capacity not in (1, 2):
+        raise ValueError('fixture provider capacity must be 1 or 2')
     if type(delay_seconds) not in (int, float) or not 0 < delay_seconds <= 5:
         raise ValueError('fixture delay must be in (0,5] seconds')
     root = Path(output).resolve()
@@ -45,7 +47,7 @@ def run_fixture(output, *, delay_seconds=1.0):
         trial = root / f'workers-{degree}'
         trial.mkdir()
         events = trial / 'provider-events.jsonl'
-        env = _environment(root, database, binary, events, delay_seconds, (1, 2, False))
+        env = _environment(root, database, binary, events, delay_seconds, (1, provider_capacity, False))
         results, rows, queues, gates = [], [], [], []
         started_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         began = time.monotonic()
@@ -91,7 +93,7 @@ def run_fixture(output, *, delay_seconds=1.0):
         (trial / 'queue.json').write_text(json.dumps(queues, indent=2, sort_keys=True) + '\n')
         (trial / 'reviews.json').write_text(json.dumps(records, indent=2, sort_keys=True) + '\n')
         report['trials'].append({'batch_concurrency': degree,
-            'profile': {'foreground': 1, 'provider': 2, 'legacy_dual_hold': False},
+            'profile': {'foreground': 1, 'provider': provider_capacity, 'legacy_dual_hold': False},
             'sample_count': len(lanes), 'sample_denominator': 'requested reviews',
             'elapsed_sample_count': 1, 'elapsed_denominator': 'one four-request trial',
             'elapsed_seconds': elapsed, 'timing_method': 'monotonic trial wall time',
@@ -118,8 +120,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--delay-seconds', type=float, default=1)
+    parser.add_argument('--provider-capacity', type=int, choices=(1, 2), default=2)
     args = parser.parse_args()
-    report = run_fixture(args.output, delay_seconds=args.delay_seconds)
+    report = run_fixture(args.output, delay_seconds=args.delay_seconds, provider_capacity=args.provider_capacity)
     print(json.dumps({'report': str(args.output.resolve() / 'report.json'),
         'trials': [{k: row[k] for k in ('batch_concurrency', 'elapsed_seconds',
             'provider_launches', 'provider_peak', 'trustworthy_completed')} for row in report['trials']]}, indent=2))

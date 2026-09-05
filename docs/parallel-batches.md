@@ -84,3 +84,8 @@ Check trustworthy completion, gates, identical call counts and complete interval
 before interpreting elapsed differences. A failed or incomplete fixture is not
 throughput acceptance. This command never runs a real provider, changes the
 installed authority or satisfies #192's pending shared-authority pilot.
+
+Use `--provider-capacity 1` with a different new output directory for the
+serialization control. Both worker degrees must then show provider peak 1,
+while retaining the same complete workload and trustworthy outcomes. This is
+a fixture-only bound, not a recommendation to change live provider limits.
