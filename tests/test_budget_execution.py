@@ -332,3 +332,78 @@ def test_admission_snapshot_failure_releases_new_ticket(tmp_path, monkeypatch):
         assert status == 4 and not calls
         assert not store.capacity_active_views('review-fg', str(repo / '.git'))
         assert not (repo / '.git' / 'grok-reviews-foreground.lock').exists()
+
+
+def test_snapshot_write_failure_does_not_leave_live_request(tmp_path, monkeypatch):
+    repo = _ready_repo(tmp_path, monkeypatch)
+    def refuse(*args, **kwargs):
+        raise OSError('budget observations unavailable')
+    monkeypatch.setattr(Store, 'save_request_budget', refuse)
+    with Store.open(tmp_path / 'db') as store:
+        status, _, meta = services.svc_review_detailed(store, repo, request_key='failed-budget')
+        row = store.get_request(meta['request']['id'])
+        assert status == 4
+        assert row['state'] == 'failed'
+        assert row['reason_code'] == 'request_failed'
+        assert row['executions'][0]['completed_at'] is not None
+        assert row['links'] == []
+        replay = services.svc_review_detailed(store, repo, request_key='failed-budget')
+        assert replay[2]['request']['reason_code'] == 'request_incomplete'
+
+
+def test_default_fg_deadline_reports_real_admission_bound(tmp_path, monkeypatch):
+    repo = _ready_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv('SKODUN_ADMISSION_WAIT_SECONDS', '7')
+    clock = controlled_clock(monkeypatch)
+    calls, snapshots = [], []
+    monkeypatch.setattr(runner, 'run_with_watchdog', clean_provider(clock, calls))
+    save = Store.save_request_budget
+    def observe(store, rid, seq, owner, snapshot):
+        snapshots.append(snapshot)
+        return save(store, rid, seq, owner, snapshot)
+    monkeypatch.setattr(Store, 'save_request_budget', observe)
+    with Store.open(tmp_path / 'db') as store:
+        status, text, _ = services.svc_review_detailed(store, repo)
+        assert status == 0, text
+    queued = next(snapshot for snapshot in snapshots if snapshot['phase'] == 'queue')
+    from datetime import datetime
+    parse = lambda value: datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ')
+    assert queued['limits']['max_queue_seconds'] is None
+    assert (parse(queued['deadlines']['queue']) - parse(queued['updated_at'])).total_seconds() == 7
+
+
+def test_cancellation_audit_failure_still_stops_owned_provider(tmp_path, monkeypatch):
+    import threading
+    import time
+    from tests.test_pipeline import _fake_grok, _emit, CLEAN, _calls
+    repo = _ready_repo(tmp_path, monkeypatch)
+    _fake_grok(tmp_path, _emit(CLEAN) + '\nsleep 30')
+    event = threading.Event()
+    observed = []
+    def refuse(*args, **kwargs):
+        observed.append(True)
+        raise OSError('synthetic cancellation audit failure')
+    monkeypatch.setattr(Store, 'record_cancellation', refuse)
+    def stop_after_spawn():
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if _calls(tmp_path):
+                event.set()
+                return
+            time.sleep(.02)
+    helper = threading.Thread(target=stop_after_spawn)
+    started = time.monotonic()
+    helper.start()
+    try:
+        with Store.open(tmp_path / 'db') as store:
+            status, _, meta = services.svc_review_detailed(store, repo, cancel=event)
+            assert status == 4 and _calls(tmp_path) == 1
+            assert observed == [True]
+            assert meta['result']['execution']['reason_code'] == 'cancellation_state_unavailable'
+            rec = store.get_review(meta['result']['ids']['review_id'])
+            assert rec['trustworthy'] is False and rec['status'] == 'failed'
+            assert not store.capacity_active_views('provider:xai', 'xai')
+    finally:
+        helper.join(timeout=10)
+    assert not helper.is_alive()
+    assert time.monotonic() - started < 20  # proves cancellation, not the 30s provider exit

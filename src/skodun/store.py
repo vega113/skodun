@@ -38,6 +38,7 @@ import sqlite3
 import stat
 import tempfile
 import time
+from contextlib import closing
 from urllib.parse import quote
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -1716,18 +1717,14 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
         original_version = int(info.version)
         migrated = False
         try:
-            source = sqlite3.connect(path, isolation_level=None)
             target_uri = (f"file:{quote(str(backup.resolve()))}?mode=rw")
-            target = sqlite3.connect(target_uri, uri=True, isolation_level=None)
-            try:
+            with closing(sqlite3.connect(path, isolation_level=None)) as source, closing(
+                    sqlite3.connect(target_uri, uri=True, isolation_level=None)) as target:
                 source.backup(target)
                 if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise ValueError("backup integrity check failed")
-            finally:
-                target.close()
-                source.close()
             backup.chmod(0o600)
-            with sqlite3.connect(path, isolation_level=None) as conn:
+            with closing(sqlite3.connect(path, isolation_level=None)) as conn, conn:
                 _migrate(conn)
                 version = int(conn.execute("PRAGMA user_version").fetchone()[0])
                 if version != SCHEMA_VERSION:

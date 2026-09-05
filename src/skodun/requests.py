@@ -310,21 +310,30 @@ def tracked_review(fn):
                 raise RuntimeError('request ownership lost before completion')
             return status, text, extra
         except BaseException as exc:
-            try:
-                if controller is not None:
+            if controller is not None:
+                try:
                     controller.finish()
+                except Exception:
+                    pass
+            # Advisory snapshot failure must not skip authoritative execution
+            # finalization. Use already observed cause here: another failing
+            # Store poll cannot be allowed to prevent this best-effort write.
+            cause = controller._reason if controller is not None else cancel.reason_code
+            try:
                 store.finish_request(
                     rid, owner_token=owner,
-                    state='cancelled' if cancel.reason_code or isinstance(exc, KeyboardInterrupt) else 'failed',
-                    reason_code=cancel.reason_code or ('signal' if isinstance(exc, KeyboardInterrupt) else 'request_failed'),
+                    state=('expired' if cause in ('queue_budget_exhausted',
+                        'review_budget_exhausted', 'total_budget_exhausted') else
+                        'cancelled' if cause or isinstance(exc, KeyboardInterrupt) else 'failed'),
+                    reason_code=cause or ('signal' if isinstance(exc, KeyboardInterrupt) else 'request_failed'),
                     result=None, now=now())
             except Exception:
                 pass
             if isinstance(exc, KeyboardInterrupt):
                 raise
             return 4, banner_failure('review request did not finish'), {
-                'termination': {'reason_code': cancel.reason_code or 'request_failed'},
-                'request': {**metadata, 'reason_code': cancel.reason_code or 'request_failed',
+                'termination': {'reason_code': cause or 'request_failed'},
+                'request': {**metadata, 'reason_code': cause or 'request_failed',
                             'error_type': type(exc).__name__}}
         finally:
             _CURRENT.reset(token)

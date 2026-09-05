@@ -260,3 +260,34 @@ def test_huge_or_boolean_numbers_are_rejected_before_sql_binding(tmp_path):
         with pytest.raises(ValueError):
             store.record_request_capacity(rid, seq, 'private-owner', admission_id='a',
                 resource_class='review-fg', scope='/repo', effective_capacity=2**100, updated_at=NOW)
+
+
+@pytest.mark.parametrize('backup_refusal', [False, True])
+def test_explicit_migration_closes_every_connection(tmp_path, monkeypatch, backup_refusal):
+    from unittest.mock import patch
+    from skodun import store as store_mod
+    import sqlite3
+    db = tmp_path / 'authority.db'
+    with patch.object(store_mod, 'SCHEMA_VERSION', 18), patch.object(
+            store_mod, '_MIGRATIONS', tuple((target, delta) for target, delta in store_mod._MIGRATIONS if target <= 18)):
+        with Store.open(db):
+            pass
+    opened = []
+    connect = sqlite3.connect
+    def track(path, *args, **kwargs):
+        if backup_refusal and 'backup-before' in str(path):
+            raise sqlite3.OperationalError('synthetic target open refusal')
+        connection = connect(path, *args, **kwargs)
+        opened.append(connection)
+        return connection
+    monkeypatch.setattr(sqlite3, 'connect', track)
+    if backup_refusal:
+        with pytest.raises(sqlite3.OperationalError):
+            Store.migrate_existing(db, build_commit='b' * 40)
+    else:
+        receipt = Store.migrate_existing(db, build_commit='b' * 40)
+        assert receipt['result'] == 'success'
+    assert opened
+    for connection in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+            connection.execute('SELECT 1')

@@ -94,6 +94,7 @@ class ReviewBudget:
         self.started_utc = datetime.now(timezone.utc)
         self.queue_started = self.review_started = self.provider_wait_started = None
         self.queue_elapsed = self.provider_wait_elapsed = 0.0
+        self.queue_deadline_mono = None
         self.queue_at_review_start = 0.0
         self.provider_waiters = 0
         self.provider_deadline_mono = None
@@ -107,10 +108,14 @@ class ReviewBudget:
         if self.on_update is not None:
             self.on_update(self.snapshot())
 
-    def start_queue(self):
+    def start_queue(self, wait_seconds=None):
         with self._lock:
             if self.queue_started is None:
                 self.queue_started = self.clock()
+            remaining = self.queue_remaining()
+            effective = (wait_seconds if remaining is None else remaining if wait_seconds is None
+                         else min(remaining, wait_seconds))
+            self.queue_deadline_mono = None if effective is None else self.clock() + effective
             self._update()
 
     def end_queue(self):
@@ -118,6 +123,7 @@ class ReviewBudget:
             if self.queue_started is not None:
                 self.queue_elapsed += max(0.0, self.clock() - self.queue_started)
                 self.queue_started = None
+                self.queue_deadline_mono = None
             self._update()
 
     def start_provider_wait(self, seconds=None):
@@ -169,7 +175,17 @@ class ReviewBudget:
         with self._lock:
             if self.ended is not None or self._reason is not None:
                 return self._reason is not None
-            if self.cancel is not None and self.cancel.is_set():
+            try:
+                upstream_set = self.cancel is not None and self.cancel.is_set()
+            except KeyboardInterrupt:
+                raise
+            except BaseException:
+                # The upstream is our durable request-cancellation monitor.
+                # Its failed audit/read must not reach the watchdog's generic
+                # unreadable-token guard and let an owned provider continue.
+                self._reason = 'cancellation_state_unavailable'
+                return True
+            if upstream_set:
                 observed = getattr(self.cancel, 'reason_code', None)
                 self._reason = (self._marked_reason if self._marked_reason and observed in
                                 (None, 'unknown_cancel_token', 'cancelled_external') else
@@ -244,8 +260,7 @@ class ReviewBudget:
                           'review' if self.review_started is not None else 'preflight'),
                 'limits': self.limits.to_dict(),
                 'deadlines': {
-                    'queue': utc(self.queue_started + self.limits.queue - self.queue_elapsed)
-                             if self.queue_started is not None and self.limits.queue is not None else None,
+                    'queue': utc(self.queue_deadline_mono),
                     'review': utc(at + self.limits.review - self._review_seconds(at))
                               if self.review_started is not None and self.limits.review is not None
                               and self.queue_started is None else None,
@@ -279,12 +294,12 @@ def foreground_wait(fn):
         controller = current(store)
         if controller is None:
             return fn(store, **kwargs)
-        controller.start_queue()
+        remaining = controller.queue_remaining()
+        if remaining is not None:
+            kwargs['wait_sec'] = min(kwargs['wait_sec'], remaining)
+        controller.start_queue(kwargs['wait_sec'])
         ticket = None
         try:
-            remaining = controller.queue_remaining()
-            if remaining is not None:
-                kwargs['wait_sec'] = min(kwargs['wait_sec'], remaining)
             ticket = fn(store, **kwargs)
             return ticket
         finally:
