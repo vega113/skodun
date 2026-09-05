@@ -107,7 +107,7 @@ def test_spend_ledger_is_per_utc_day_not_lifetime(tmp_path, monkeypatch):
     monkeypatch.setenv("SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY", "0.01")
     _freeze_spend_clock(monkeypatch, "2026-08-04T12:00:00Z")
     st = Store.open(tmp_path / "s.db")
-    assert SCHEMA_VERSION == 16
+    assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     with st:
         # Yesterday's heavy spend must not count.
         spend.record_usage(
