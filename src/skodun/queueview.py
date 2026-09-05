@@ -341,6 +341,38 @@ def _calls(reviews):
                         'complete': bool(launched) and len(tokens) == len(launched)}}
 
 
+def _reused_pass_observations(reviews):
+    """Count explicit reuse once per declared generation/pass, never position.
+
+    This is observed reuse, not an estimate for legacy records without reuse
+    metadata. Positive observations missing identity retain an unknown total.
+    """
+    observed = set()
+    unidentified = 0
+    for review in reviews:
+        generation = review.get('batch_orchestration_id')
+        containers = [('batch', part.get('index'), part)
+                      for part in review.get('batches') or () if isinstance(part, dict)]
+        if isinstance(review.get('integration'), dict):
+            containers.append(('integration', 0, review['integration']))
+        extras = review.get('extra_passes')
+        if isinstance(extras, dict):
+            containers.extend((kind, 0, extras[kind]) for kind in ('security', 'skeptic')
+                              if isinstance(extras.get(kind), dict))
+        for kind, index, part in containers:
+            action = part.get('continuation_action') or _json_object(part.get('provenance')).get('continuation_action')
+            if action != 'reused' and part.get('reused') is not True:
+                continue
+            if (not isinstance(generation, str) or not generation
+                    or type(index) is not int or index < 0):
+                unidentified += 1
+                continue
+            observed.add((generation, kind, index))
+    return {'reused_passes': len(observed) if not unidentified else None,
+            'reported_reused_passes': len(observed), 'reuse_identity_missing': unidentified,
+            'reused_passes_scope': 'explicit reused observations per generation/pass'}
+
+
 def _request(store, row, now, spend_rows, spend_truncated, resources):
     identity = _json_object(row['identity_json'])
     links = [dict(r) for r in store._c.execute(
@@ -398,9 +430,7 @@ def _request(store, row, now, spend_rows, spend_truncated, resources):
     batch_keys = {(rec.get('batch_orchestration_id') or rec['id'], batch.get('index', index))
         for rec in reviews for index, batch in enumerate(rec.get('batches') or ())
         if isinstance(batch, dict)}
-    costs['reused_passes'] = len({(rec.get('batch_orchestration_id') or rec['id'], batch.get('index', index))
-        for rec in reviews for index, batch in enumerate(rec.get('batches') or ())
-        if isinstance(batch, dict) and batch.get('reused')})
+    costs.update(_reused_pass_observations(reviews))
     costs['review_bytes'] = [{'review_id': rec['id'],
         'diff_bytes': _number(rec.get('diff_bytes')),
         'prompt_bytes': _number(rec.get('prompt_bytes')),

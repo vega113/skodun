@@ -253,7 +253,13 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
             passes[key] = checkpoint_state
     next_pass = None
     for row, state in zip(checkpoint_rows, checkpoint_states, strict=True):
-        if row.get("state") in {"pending", "failed"} and state != 'not_planned':
+        followup = row.get('pass_kind') in ('security', 'skeptic')
+        # A running required role fences its dependent work. This read model
+        # does not reclaim leases; the Store remains the claim authority.
+        if followup and row.get('state') == 'running':
+            break
+        retry_followup = followup and row.get('state') == 'complete' and state in {'failed', 'degraded'}
+        if (row.get("state") in {"pending", "failed"} or retry_followup) and state != 'not_planned':
             next_pass = (row.get("pass_index") if row.get("pass_kind") == "batch"
                          else batch_count + {'integration': 1, 'security': 2, 'skeptic': 3}.get(row.get('pass_kind'), 1))
             break

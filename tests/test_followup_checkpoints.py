@@ -45,6 +45,10 @@ def test_required_failure_continues_only_missing_followups(lane, failed, expecte
     source = store.get_orchestration(source_id)
     rows = store.list_checkpoints(source_id)
     assert {'security', 'skeptic'} <= {row['pass_kind'] for row in rows}
+    from skodun.readmodel import project_review
+    projection = project_review(store.get_review(source['final_review_id']), orchestration=source, checkpoints=rows)
+    assert projection.passes[failed] == 'failed'
+    assert projection.next_resumable_pass == source['batch_count'] + (2 if failed == 'security' else 3)
     calls.clear()
     failures.clear()
     code, _, continued = services.svc_review_detailed(store, repo, continue_compatible=True)
@@ -225,6 +229,10 @@ def test_followup_claims_require_binding_and_reject_late_fence(lane, monkeypatch
         if identity.kind == 'security' and result['decision'] == 'claimed':
             other = claim(oid, identity, **{**kwargs, 'owner': 'competing-owner'})
             assert other['decision'] == 'in_flight'
+            from skodun.readmodel import project_review
+            projection = project_review({}, orchestration=store.get_orchestration(oid), checkpoints=store.list_checkpoints(oid))
+            assert projection.passes['security'] == 'running'
+            assert projection.next_resumable_pass is None
             with pytest.raises(ValueError, match='binding'):
                 claim(oid, identity, **{**kwargs, 'binding_hash': 'wrong'})
             with pytest.raises(ValueError, match='binding'):
@@ -365,3 +373,36 @@ def test_racing_continuation_does_not_launch_live_followup_twice(lane, monkeypat
     assert not thread.is_alive()
     assert outcomes == [0]
     assert calls.count('security') == 1 and calls.count('skeptic') == 1
+
+
+def test_queue_counts_reused_base_integration_and_security_once(lane):
+    repo, store, calls, failures = lane
+    failures.add('skeptic')
+    assert services.svc_review_detailed(store, repo)[0] == 4
+    failures.clear()
+    calls.clear()
+    code, _, result = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert code == 0 and calls == ['skeptic']
+    code, text = services.svc_queue(store, request_id=result['request']['id'], output='json')
+    assert code == 0
+    costs = json.loads(text)['requests'][0]['costs']
+    assert costs['reused_passes'] == 6  # four batches, integration, security
+    assert costs['reported_launched_calls'] == 8  # seven original calls + new skeptic
+
+
+def test_degraded_required_checkpoint_is_next_but_capped_success_is_not(lane):
+    from skodun.readmodel import project_review
+    repo, store, _, failures = lane
+    failures.add('skeptic')
+    _, _, result = services.svc_review_detailed(store, repo)
+    _, orchestration, rows = _source(store, result)
+    rec = store.get_review(orchestration['final_review_id'])
+    assert project_review(rec, orchestration=orchestration, checkpoints=rows).next_resumable_pass == 7
+    security = next(row for row in rows if row['pass_kind'] == 'security')
+    payload = json.loads(security['payload_json'])
+    assert payload['diff_truncated'] is True and payload['degraded'] is False
+    payload.update(degraded=True, degraded_reason='fixture degraded response')
+    security['payload_json'] = json.dumps(payload)
+    projection = project_review(rec, orchestration=orchestration, checkpoints=rows)
+    assert projection.passes['security'] == 'degraded'
+    assert projection.next_resumable_pass == 6

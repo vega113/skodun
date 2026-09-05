@@ -55,7 +55,11 @@ pass require no provider output.
 The result's `continuation` extension records source/child IDs, a stable mismatch
 when refused, and bounded reused/executed/failed pass receipts. Reused checkpoint
 attempt IDs stay unchanged, so observed historical calls can be deduplicated.
-Incomplete checkpoint evidence still does not clear the gate.
+Incomplete checkpoint evidence still does not clear the gate. A completed but
+unusable required follow-up appears as the next resumable pass; a running claim
+still fences dependent work. Queue costs count explicit reused batch, integration,
+security and skeptic observations once per declared generation/pass. Missing
+legacy identity leaves the total unknown and preserves the reported lower bound.
 
 The #194 transport guard rechecks the actual complete prompt and the current
 adapter capability before capacity admission. An unchanged oversized fallback

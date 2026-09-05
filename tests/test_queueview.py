@@ -487,3 +487,18 @@ def test_candidate_skips_do_not_all_claim_transport_ineligibility(tmp_path):
         assert costs['eligibility_skips'] == 1
         assert costs['launched_calls'] == 1
         assert costs['aggregate_launched_prompt_bytes'] == 50
+
+
+def test_reused_pass_observations_deduplicate_generations_and_keep_unknown_ids():
+    from skodun.queueview import _reused_pass_observations
+    reused = {'continuation_action': 'reused'}
+    rec = {'batch_orchestration_id': 'generation', 'batches': [{'index': 1, **reused}],
+           'integration': {'provenance': reused}, 'extra_passes': {'security': reused, 'skeptic': reused}}
+    assert _reused_pass_observations([rec, rec])['reused_passes'] == 4
+    next_generation = {**rec, 'batch_orchestration_id': 'next'}
+    assert _reused_pass_observations([rec, next_generation])['reused_passes'] == 8
+    legacy = {'batches': [{'reused': True}]}
+    result = _reused_pass_observations([rec, legacy])
+    assert result['reused_passes'] is None
+    assert result['reported_reused_passes'] == 4
+    assert result['reuse_identity_missing'] == 1
