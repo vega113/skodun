@@ -1776,7 +1776,13 @@ def svc_review_cancel(store, review_id, *, expected_request_id=None,
         if request is not None:
             # The execution-fenced owner observes this durable event before its
             # next queue/provider checkpoint. No signal can hit another request.
-            code, text = 0, f"skodun review-cancel: cancel requested for {rid}"
+            if _pid_alive(request['pid']):
+                code, text = 0, f"skodun review-cancel: cancel requested for {rid}"
+            else:
+                store.finish_cancellations(request_id=request['id'],
+                    owner_token=request['owner_token'], outcome='owner_unreachable', now=requests.now())
+                code, text = 2, (f"skodun review-cancel: request owner is absent for {rid}; "
+                                 "reason_code=request_owner_unreachable; no recovery performed")
         else:
             code, text = _cancel_legacy_review(store, rid)
             current = store.get_review(rid)
@@ -1787,7 +1793,9 @@ def svc_review_cancel(store, review_id, *, expected_request_id=None,
                     outcome=control.cancellation_completion(current),
                     now=requests.now())
         payload = {'target_id':rid, 'request_id':request['id'] if request else None,
-                   'reason_code':'requested_cancel' if code == 0 else 'legacy_owner_unproven', 'audit_id':audit_id,
+                   'reason_code':('requested_cancel' if code == 0 else
+                                  'request_owner_unreachable' if request else 'legacy_owner_unproven'),
+                   'audit_id':audit_id,
                    'identity':identity, 'cancellation':store.cancellation_events(rid)}
         return code, json.dumps(payload, sort_keys=True) if output == 'json' else (
             text + ' audit_id=' + str(audit_id))

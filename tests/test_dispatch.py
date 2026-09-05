@@ -1259,6 +1259,7 @@ def test_a_zero_delay_double_dispatch_leaves_exactly_one_reviewed_record(
     for rid in ids:
         _await(db, rid)
     rows = {r["id"]: r for r in _rows(db)}
+    assert all(r["worktree_root"] == str(repo.resolve()) for r in rows.values())
     superseded = [r for r in rows.values() if r["status"] == "superseded"]
     reviewed = [r for r in rows.values() if r["status"] == "clean"]
     assert len(superseded) == 1 and len(reviewed) == 1, rows

@@ -28,9 +28,10 @@ def _downgrade(path, version=12):
     with closing(sqlite3.connect(path)) as conn:
         if version < 18:
             conn.execute("DROP TABLE IF EXISTS cancellation_audit")
-            columns = {r[1] for r in conn.execute('PRAGMA table_info(review_requests)')}
-            if 'actor' in columns:
-                conn.execute('ALTER TABLE review_requests DROP COLUMN actor')
+            for table in ('review_requests','request_executions'):
+                columns = {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}
+                if 'actor' in columns:
+                    conn.execute(f'ALTER TABLE {table} DROP COLUMN actor')
         conn.execute(f"PRAGMA user_version = {version}")
         conn.commit()
 

@@ -206,6 +206,7 @@ class _Fakes:
         self.started = threading.Event()
         self.release = threading.Event()
         self.cancel_seen: list[bool] = []
+        self.cancel_causes: list[str | None] = []
         self.stores: list[object] = []
         self.review_raises = False
 
@@ -258,6 +259,7 @@ class _Fakes:
                     break
                 time.sleep(0.005)
         self.cancel_seen.append(call.cancel.is_set())
+        self.cancel_causes.append(getattr(call.cancel, "reason_code", None))
         if self.review_raises:
             raise RuntimeError("the review fake was asked to fail")
         return HandlerResult(status=0, text="reviewed", pending_acks=[])
@@ -1007,6 +1009,7 @@ def test_eof_cancels_when_disconnect_policy_is_cancel(monkeypatch):
     assert box["code"] == 0
     assert fakes.cancel_seen == [True], (
         "cancel policy must set the cancel token at EOF")
+    assert fakes.cancel_causes == ["disconnect"]
     assert 1 in _by_id(out), "the in-flight review's response was abandoned"
 
 
@@ -1066,6 +1069,7 @@ def test_drain_timeout_falls_back_to_cancel_if_review_stuck(monkeypatch):
     assert box["code"] == 0
     assert fakes.cancel_seen == [True], (
         "drain timeout must set cancel so a stuck review can finish cleanup")
+    assert fakes.cancel_causes == ["disconnect_deadline"]
 
 
 def test_an_id_less_call_never_occupies_the_review_slot():
@@ -1472,6 +1476,7 @@ def test_a_sigterm_that_actually_cancels_something_adds_no_note():
     server.serve()
 
     assert server._worker_cancel.is_set(), "the cancel must still happen"
+    assert server._worker_cancel.reason_code == "signal"
     assert "SIGTERM" not in server._stderr.getvalue()
 
 

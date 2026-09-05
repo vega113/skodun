@@ -114,6 +114,7 @@ def test_cancel_is_execution_fenced_and_does_not_cancel_another_request(tmp_path
         assert not stale.is_set()
         store.finish_request(one['id'],owner_token='owner',state='cancelled',
             reason_code=token.reason_code,result=None,now=NOW)
+        assert store.get_request(one['id'])['executions'][0]['actor'] == 'claimed client'
         event=store.cancellation_events(one['id'])[0]
         assert event['actor'] == 'claimed client' and event['outcome'] == 'cancelled'
         assert 'execution_token' not in event
@@ -340,3 +341,14 @@ def test_old_review_id_cannot_cancel_another_request_on_the_same_mcp_pid(tmp_pat
             assert store.get_review(stale['id'])['status'] == 'running'
         finally:
             pipeline.unregister_cancel('actual-active-review')
+
+
+def test_dead_request_cancel_reports_unreachable_without_generic_recovery(tmp_path):
+    repo=_mkrepo(tmp_path)
+    with Store.open(tmp_path/'s.db') as store:
+        row=begin(store,repo,'sk_req_1')
+        store._c.execute('UPDATE review_requests SET pid=? WHERE id=?',(2**30,row['id']))
+        code,text=services.svc_review_cancel(store,row['id'],output='json')
+        assert code == 2 and json.loads(text)['reason_code'] == 'request_owner_unreachable'
+        assert store.get_request(row['id'])['state'] == 'accepted'
+        assert store.cancellation_events(row['id'])[0]['outcome'] == 'owner_unreachable'

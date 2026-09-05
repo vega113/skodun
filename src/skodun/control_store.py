@@ -4,6 +4,7 @@ import json
 
 MIGRATION = (
     "ALTER TABLE review_requests ADD COLUMN actor TEXT",
+    "ALTER TABLE request_executions ADD COLUMN actor TEXT",
     """CREATE TABLE cancellation_audit (
       id INTEGER PRIMARY KEY AUTOINCREMENT, target_id TEXT NOT NULL,
       request_id TEXT, execution_token TEXT, identity_json TEXT NOT NULL,

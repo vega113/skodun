@@ -134,8 +134,8 @@ class RequestStoreMixin:
                 self._c.execute('UPDATE review_requests SET actor=? WHERE id=?', (actor, result_id))
                 self._c.execute(
                     """INSERT INTO request_executions
-                       (request_id,owner_token,source,pid,started_at) VALUES(?,?,?,?,?)""",
-                    (result_id, owner_token, source, pid, now))
+                       (request_id,owner_token,source,pid,started_at,actor) VALUES(?,?,?,?,?,?)""",
+                    (result_id, owner_token, source, pid, now, actor))
             self._c.execute('COMMIT')
         except BaseException:
             self._c.execute('ROLLBACK')
@@ -156,7 +156,7 @@ class RequestStoreMixin:
             'SELECT kind,target_id FROM request_links WHERE request_id=? ORDER BY kind,target_id',
             (request_id,)).fetchall()]
         result['executions'] = [dict(r) for r in self._c.execute(
-            """SELECT seq,source,pid,started_at,completed_at,status,reason_code
+            """SELECT seq,source,pid,started_at,completed_at,status,reason_code,actor
                FROM request_executions WHERE request_id=? ORDER BY seq DESC LIMIT 101""",
             (request_id,)).fetchall()]
         result['cancellation'] = self.cancellation_events(request_id)

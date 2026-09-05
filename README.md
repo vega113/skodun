@@ -1188,3 +1188,8 @@ foreground/MCP PID does not prove it still owns that review: cancellation now
 refuses it with `legacy_owner_unproven`, without signalling or demoting the row.
 Cancel through the original owning client's control instead. This prevents an
 old review ID from cancelling a different request on the same MCP process.
+
+If a durable request owner is absent, cancellation reports
+`request_owner_unreachable` and audits that outcome without generic recovery.
+The request/coverage rows remain available for a separate, evidence-based
+lifecycle investigation.

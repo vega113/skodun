@@ -240,6 +240,7 @@ def test_request_schema_upgrade_is_explicit_and_preserves_reviews(tmp_path):
         store.save_review(_round())
     with closing(sqlite3.connect(db)) as c:
         c.execute('DROP TABLE cancellation_audit')
+        c.execute('DROP TABLE request_executions')
         c.execute('DROP TABLE request_links')
         c.execute('DROP TABLE review_requests')
         c.execute('PRAGMA user_version=16')
