@@ -51,4 +51,8 @@ def render(data: Mapping, *, fmt: str = "text") -> str:
          f"never_trustworthy={data['identities']['never_trustworthy']} "
          f"reuse_hits={data['reuse']['hits']} reuse_misses={data['reuse']['misses']}"),
     ]
+    if 'audit_denominators' in data:
+        lines.append('audit_denominators=' + json.dumps(data['audit_denominators'], sort_keys=True))
+        lines.append('call_observations=' + json.dumps(data['call_observations'], sort_keys=True))
+        lines.append('timing_observations=' + json.dumps(timing, sort_keys=True))
     return "\n".join(lines)

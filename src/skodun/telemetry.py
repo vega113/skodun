@@ -68,11 +68,26 @@ def _capacity_timing(raw: object) -> dict | None:
     return {key: raw.get(key) for key in (*timestamps, *waits)}
 
 
+def attempt_launched(attempt: Mapping) -> bool | None:
+    """A skipped candidate is not a provider call; absent evidence is unknown."""
+    if attempt.get('skipped') or attempt.get('launched') is False:
+        return False
+    if (attempt.get('launched') is True or type(attempt.get('rc')) is int
+            or type(attempt.get('timed_out')) is bool):
+        return True
+    return None
+
+
 def attempt_telemetry(attempt: Mapping, *, timeout_sec: int | None) -> dict:
     """Project one attempt into a stable, allowlisted telemetry row."""
     classification = attempt.get("classification")
     classification = classification if isinstance(classification, Mapping) else {}
+    attempt_id = attempt.get('attempt_id')
     row = {
+        "attempt_id": attempt_id if isinstance(attempt_id, str) and len(attempt_id) <= 256 else None,
+        "input_bytes": _reported(attempt.get('input_bytes')),
+        "input_scope": "provider_input",
+        "launched": attempt_launched(attempt),
         "attempt_ordinal": _reported(attempt.get("n")),
         "provider": attempt.get("provider"),
         "model": attempt.get("model"),

@@ -695,11 +695,14 @@ def test_s4_wait_eta_p50_requires_min_samples():
     assert capacity.wait_eta_p50_ms([100, 200, 300, 400]) is not None
 
 
-def test_s4_format_wait_progress_includes_eta_when_present():
-    msg = capacity.format_wait_progress("provider:xai", 2, 12.5, eta_sec=4.0)
+def test_s4_format_wait_progress_labels_history_and_sample_count():
+    msg = capacity.format_wait_progress("provider:xai", 2, 12.5, historical_median_sec=4.0, sample_count=3)
     assert "provider:xai queue position 2" in msg
     assert "wait budget 12.5s remaining" in msg
-    assert "eta≈4s" in msg
+    assert "historical median wait=4s" in msg
+    assert "samples=3" in msg
+    assert "method=median" in msg
+    assert "eta" not in msg
     bare = capacity.format_wait_progress("review-fg", 1, 5.0)
     assert "eta≈" not in bare
 
@@ -735,5 +738,5 @@ def test_s4_progress_eta_from_terminal_samples(store):
     ticket = acquire(
         store, scope="/repo", capacity=1, wait_sec=2.0, poll_sec=0.02,
         on_progress=on_progress)
-    assert any("eta≈" in n for n in notes)
+    assert any("historical median wait=" in n and "samples=3" in n for n in notes)
     finish(store, ticket, status=STATUS_RELEASED)

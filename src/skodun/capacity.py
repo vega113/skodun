@@ -198,12 +198,22 @@ def wait_eta_p50_ms(samples: Sequence[int], *, min_samples: int = ETA_MIN_SAMPLE
 
 
 def format_wait_progress(resource_class: str, position: int, remaining_sec: float,
-                         *, eta_sec: float | None = None) -> str:
-    """One progress line: position, wait budget, optional ETA."""
+                         *, eta_sec: float | None = None,
+                         historical_median_sec: float | None = None,
+                         sample_count: int | None = None) -> str:
+    """Observed queue position and history, never a wait-time prediction.
+
+    ``eta_sec`` is a compatibility input only; output always labels history.
+    """
+    median = historical_median_sec if historical_median_sec is not None else eta_sec
     msg = (f"{resource_class} queue position {position}; "
            f"wait budget {max(remaining_sec, 0.0):g}s remaining")
-    if eta_sec is not None and eta_sec >= 0:
-        msg += f"; eta≈{int(eta_sec)}s"
+    if median is not None or sample_count is not None:
+        shown = f"{median:g}s" if median is not None and median >= 0 else "unknown"
+        count = str(sample_count) if type(sample_count) is int and sample_count >= 0 else "unknown"
+        msg += (f"; historical median wait={shown}; samples={count}; "
+                f"window=latest-{ETA_SAMPLE_K}-terminal-admissions; "
+                "unit=s; denominator=terminal-admissions; method=median")
     return msg
 
 
@@ -493,9 +503,10 @@ def acquire(store: "Store", *, scope: str,
             ticket.position = pos
             if on_progress is not None and pos is not None and pos != noted_pos:
                 noted_pos = pos
-                eta = _eta_seconds(store, resource_class, scope)
+                median, count = _historical_wait(store, resource_class, scope)
                 on_progress(format_wait_progress(
-                    resource_class, pos, max(remaining, 0.0), eta_sec=eta))
+                    resource_class, pos, max(remaining, 0.0),
+                    historical_median_sec=median, sample_count=count))
 
             attempted = True
             cap = _resolve_capacity(capacity, capacity_fn)
@@ -523,16 +534,19 @@ def acquire(store: "Store", *, scope: str,
         raise
 
 
-def _eta_seconds(store: "Store", resource_class: str, scope: str) -> float | None:
+def _historical_wait(store: "Store", resource_class: str, scope: str) -> tuple[float | None, int]:
     try:
-        samples = store.capacity_terminal_wait_ms(
-            resource_class, scope, limit=ETA_SAMPLE_K)
+        samples = store.capacity_terminal_wait_ms(resource_class, scope, limit=ETA_SAMPLE_K)
     except Exception:
-        return None
+        return None, 0
+    samples = [x for x in samples[:ETA_SAMPLE_K] if type(x) is int and x >= 0]
     ms = wait_eta_p50_ms(samples)
-    if ms is None:
-        return None
-    return ms / 1000.0
+    return (ms / 1000.0 if ms is not None else None), len(samples)
+
+
+def _eta_seconds(store: "Store", resource_class: str, scope: str) -> float | None:
+    """Compatibility read helper; its value is historical, not predictive."""
+    return _historical_wait(store, resource_class, scope)[0]
 
 
 def acquire_for_fg(
@@ -598,9 +612,10 @@ def acquire_for_fg(
             ticket.position = pos
             if on_progress is not None and pos is not None and pos != noted_pos:
                 noted_pos = pos
-                eta = _eta_seconds(store, RESOURCE_REVIEW_FG, scope)
+                median, count = _historical_wait(store, RESOURCE_REVIEW_FG, scope)
                 on_progress(format_wait_progress(
-                    RESOURCE_REVIEW_FG, pos, max(remaining, 0.0), eta_sec=eta))
+                    RESOURCE_REVIEW_FG, pos, max(remaining, 0.0),
+                    historical_median_sec=median, sample_count=count))
 
             attempted = True
             active = store.capacity_active_views(RESOURCE_REVIEW_FG, scope)
