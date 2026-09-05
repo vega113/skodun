@@ -37,6 +37,7 @@ class RequestContext:
     owner_token: str
     stack_request: object = None
     config: object = None
+    execution_seq: int | None = None
 
 
 def _config_hash(cfg):
@@ -88,6 +89,8 @@ def bind_review(store, rec):
             rec.setdefault('request_id', rec['id'])
         return
     rec['request_id'] = ctx.id
+    if ctx.execution_seq is not None:
+        rec['request_execution_seq'] = ctx.execution_seq
     for kind, target in (('review', rec['id']),
                          ('recovery_orchestration', rec.get('orchestration_id')),
                          ('batch_orchestration', rec.get('batch_orchestration_id'))):
@@ -132,16 +135,17 @@ def validate_admitted(store, *, repo_id, worktree_root, branch, head, base_sha,
 
 def projection(row):
     """Public request read model: never expose the internal ownership token."""
-    return {key: row.get(key) for key in (
+    from .control import request_lifecycle
+    return {'lifecycle':request_lifecycle(row), **{key: row.get(key) for key in (
         'id', 'scope', 'identity', 'source', 'pid', 'state', 'created_at',
         'updated_at', 'expires_at', 'reason_code', 'links', 'executions',
-        'executions_truncated', 'result')}
+        'executions_truncated', 'result', 'actor', 'cancellation')}}
 
 
 def tracked_review(fn):
     """Wrap the shared detailed service while preserving its public signature."""
     @wraps(fn)
-    def run(store, repo, *, request_key=None, request_source='service', **kwargs):
+    def run(store, repo, *, request_key=None, request_source='service', request_actor=None, **kwargs):
         from .trust import banner_failure
         rid = ids.new_review_id('sk_req_')
         config_sink = {}
@@ -188,6 +192,7 @@ def tracked_review(fn):
                 request_id=rid, scope=identity['worktree_root'],
                 request_key=request_key, identity=identity, intent=intent,
                 owner_token=owner, pid=os.getpid(), source=request_source, now=now(),
+                actor=request_actor,
                 continuation_id=continuation_id,
                 continuation_orchestration_id=(candidate['id'] if candidate is not None else None),
                 expires_at=(datetime.now(timezone.utc) + timedelta(days=1)).strftime(
@@ -201,7 +206,8 @@ def tracked_review(fn):
                 'error_type': type(exc).__name__}}
         rid = row['id']
         metadata.update(id=rid, identity=row['identity'], persisted=True,
-                        continued=decision == 'continued')
+                        continued=decision == 'continued',
+                        execution_seq=row['executions'][0]['seq'] if row['executions'] else None)
         # Even a duplicate/mismatch must tell a plain CLI caller which durable
         # request to inspect; svc_review intentionally discards metadata.
         sink = kwargs.get('progress_sink')
@@ -239,8 +245,12 @@ def tracked_review(fn):
                 'request already in flight; observe its request ID' if active else
                 'request ended without a complete result; use a new request key'), {
                     'request': {**metadata, 'reason_code': reason}}
-        token = _CURRENT.set(RequestContext(
-            rid, store, identity, owner, stack_request, config_sink.get('config')))
+        context = RequestContext(rid, store, identity, owner, stack_request,
+                                 config_sink.get('config'), metadata['execution_seq'])
+        token = _CURRENT.set(context)
+        from .request_cancel import RequestCancel
+        cancel = RequestCancel(store, context, kwargs.get('cancel'))
+        kwargs['cancel'] = cancel
         try:
             status, text, extra = fn(store, repo, **kwargs)
             reused = (extra.get('reuse') or {}).get('review_id')
@@ -250,9 +260,20 @@ def tracked_review(fn):
                 target = (extra.get('recovery') or {}).get(key)
                 if target:
                     store.link_request(rid, kind, target)
+            termination = extra.get('termination') or {}
+            cause = termination.get('reason_code') or cancel.reason_code
+            expired = termination.get('state') == 'expired' or cause in (
+                'queue_budget_exhausted','review_budget_exhausted','total_budget_exhausted')
+            cancelled = bool(cancel.reason_code) and status not in (0, 1)
+            state = 'expired' if expired else 'cancelled' if cancelled else 'finished'
+            if expired or cancelled:
+                extra = {**extra, 'termination': {**termination, 'reason_code': cause,
+                         'state': state, 'retryable': False, 'continuable': False}}
+                metadata['reason_code'] = cause
             extra = {**extra, 'request': metadata}
             if not store.finish_request(
-                    rid, owner_token=owner, state='finished', reason_code='completed',
+                    rid, owner_token=owner, state=state,
+                    reason_code=cause or 'completed',
                     result={'status': status, 'text': text, 'metadata': extra}, now=now()):
                 raise RuntimeError('request ownership lost before completion')
             return status, text, extra
@@ -260,15 +281,16 @@ def tracked_review(fn):
             try:
                 store.finish_request(
                     rid, owner_token=owner,
-                    state='cancelled' if isinstance(exc, KeyboardInterrupt) else 'failed',
-                    reason_code='interrupted' if isinstance(exc, KeyboardInterrupt) else 'request_failed',
+                    state='cancelled' if cancel.reason_code or isinstance(exc, KeyboardInterrupt) else 'failed',
+                    reason_code=cancel.reason_code or ('signal' if isinstance(exc, KeyboardInterrupt) else 'request_failed'),
                     result=None, now=now())
             except Exception:
                 pass
             if isinstance(exc, KeyboardInterrupt):
                 raise
             return 4, banner_failure('review request did not finish'), {
-                'request': {**metadata, 'reason_code': 'request_failed',
+                'termination': {'reason_code': cancel.reason_code or 'request_failed'},
+                'request': {**metadata, 'reason_code': cancel.reason_code or 'request_failed',
                             'error_type': type(exc).__name__}}
         finally:
             _CURRENT.reset(token)

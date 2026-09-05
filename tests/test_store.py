@@ -2435,6 +2435,7 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_store.py",
     "tests/test_checkpoints.py",
     "tests/test_requests.py",
+    "tests/test_scoped_control.py",
     "tests/test_transport_eligibility.py",
     "tests/test_cli.py",
     "tests/test_gate.py",

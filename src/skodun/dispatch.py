@@ -1037,7 +1037,8 @@ def _dispatch_ref(store: "Store", store_path: Path, repo: Path, cfg,
     reservation = store.reserve_prepush(
         ref.branch, ref.local_oid, base.ref, base.sha, diff_hash,
         reserved_budget(cfg, diff.data), evidence,
-        repo=str(gitio.git_common_dir(repo)))
+        repo=str(gitio.git_common_dir(repo)),
+        worktree_root=str(gitio._worktree_root(repo).resolve()))
     if reservation.record_id is None:
         _note(f"{ref.branch}: diff {diff_hash} is already covered by review "
               f"{reservation.suppressed_by}; skipping")

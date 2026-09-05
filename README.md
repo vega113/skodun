@@ -1136,3 +1136,55 @@ directory layout is baked into the tests.
 ## License
 
 [Apache-2.0](LICENSE)
+
+### Observe and control one worktree's requests
+
+`skodun review-status` now defaults to the normalized current worktree.
+`--repo PATH` identifies a worktree, including a subdirectory or symlink to it;
+it no longer selects another worktree sharing that repository. Queued requests
+are visible before a review exists. Multiple active local requests produce an
+`ambiguous_worktree_activity` refusal with their IDs. An empty local lane
+returns `no_worktree_activity`; status never recovers or repairs old records.
+
+Use `review-status --scope repository --repo PATH --json` or
+`review-status --scope host --json` for explicit lists. List entries identify
+the request/review and worktree. An explicit ID intentionally permits inspecting
+or cancelling another worktree; actor labels are audit claims, not authentication.
+
+Capture the `SKODUN REQUEST` ID emitted when review starts, then control that ID:
+
+```sh
+skodun review-status "$REQUEST_ID" --json
+skodun review-cancel "$REQUEST_ID" --expected-request-id "$REQUEST_ID" \
+  --expected-worktree "$WORKTREE" --expected-head "$HEAD_SHA" \
+  --expected-diff-hash "$DIFF_HASH" --reason "Stopping this superseded review request" --json
+skodun triage "$REVIEW_ID" 0 "The existing input guard covers this reported case" \
+  --expected-request-id "$REQUEST_ID" --expected-worktree "$WORKTREE" \
+  --expected-head "$HEAD_SHA" --expected-diff-hash "$DIFF_HASH"
+```
+
+Values above come from the captured status identity, not from a host-wide
+"latest" lookup. Missing target identity and stale guards refuse before control.
+Cancellation and every triage mutation still require explicit IDs; there is no
+bare cancel or bulk triage. CLI guards have equivalent snake_case MCP parameters.
+MCP `review_cancel` records the initiating client name when supplied, or an
+explicit bounded `actor` claim. Never supply credentials as an actor or reason.
+
+Cancellation is persisted before request control. Queued/running request owners
+observe an event for their exact execution; cancelling a queued request cannot
+signal a different active review. Status includes its actor/source, caller
+PID/worktree, reason, cause, timestamp, and eventual outcome. If completion wins
+the race, the audit says `completed_before_cancel` and preserves that result.
+External signal/disconnect causes are observations, with unknown actor; a set
+cancellation token alone does not identify an operator. Process loss is reported
+as a read-only observation, never implicit cleanup or permission to retry.
+
+The sanitized historical attribution limits are recorded in
+[the unfinished-outcome sample](docs/reports/2026-09-05-unfinished-attribution.md).
+
+For legacy reviews without a durable request, an exact in-process review token
+or an exact background-worker identity remains usable. A generic live
+foreground/MCP PID does not prove it still owns that review: cancellation now
+refuses it with `legacy_owner_unproven`, without signalling or demoting the row.
+Cancel through the original owning client's control instead. This prevents an
+old review ID from cancelling a different request on the same MCP process.

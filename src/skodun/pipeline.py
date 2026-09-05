@@ -2245,7 +2245,8 @@ def _install_fg_sigterm(cancel: "threading.Event"):
     import signal
 
     def handler(signum, frame):        # pragma: no cover - driven by a signal
-        cancel.set()
+        from .request_cancel import mark_event
+        mark_event(cancel, "signal")
     try:
         return signal.signal(signal.SIGTERM, handler)
     except (ValueError, OSError, RuntimeError):

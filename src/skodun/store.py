@@ -61,8 +61,9 @@ _REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
 from .request_store import RequestStoreMixin, MIGRATION as _MIGRATION_V17
+from .control_store import ControlStoreMixin, MIGRATION as _MIGRATION_V18
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 
 class SchemaLifecycleError(ValueError):
@@ -984,6 +985,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (15, _MIGRATION_V15),
     (16, _MIGRATION_V16),
     (17, _MIGRATION_V17),
+    (18, _MIGRATION_V18),
 )
 
 
@@ -1484,7 +1486,7 @@ class Reservation:
     superseded: tuple[dict, ...] = field(default_factory=tuple)
 
 
-class Store(RequestStoreMixin):
+class Store(RequestStoreMixin, ControlStoreMixin):
     def __init__(self, conn: sqlite3.Connection, path: Path | None = None,
                  *, _snapshot: tempfile.TemporaryDirectory | None = None):
         self._c = conn
@@ -1914,6 +1916,10 @@ class Store(RequestStoreMixin):
         rec = dict(rec)
         bind_review(self, rec)
         self._c.execute(_INSERT_REVIEW, (rec["id"],) + _review_values(rec))
+        if rec.get("status") != RUNNING:
+            from .control import cancellation_completion
+            self.finish_cancellations(target_id=rec["id"], now=_iso_now(),
+                outcome=cancellation_completion(rec))
         self._write_lineage(rec)
 
     def _write_lineage(self, rec: Mapping) -> None:
@@ -2886,7 +2892,7 @@ class Store(RequestStoreMixin):
     def reserve_prepush(self, branch: str, head: str, base_ref: str,
                         base_sha: str, diff_hash: str, worst_runtime_sec: int,
                         evidence, *, repo: str, now: str | None = None,
-                        id_prefix: str = "sk_") -> Reservation:
+                        id_prefix: str = "sk_", worktree_root: str | None = None) -> Reservation:
         """Decide dedup, retire the branch's older runs, and reserve one record.
 
         ONE `BEGIN IMMEDIATE` transaction, and everything below is inside it
@@ -2966,6 +2972,7 @@ class Store(RequestStoreMixin):
                 findings=[], findings_total=0, summary="", failure_reason=None,
                 usable_output=False, worst_runtime_sec=worst_runtime_sec,
                 pid=None, superseded_by=None, repo=repo,
+                **({"worktree_root":worktree_root} if worktree_root is not None else {}),
             ), label="reserve_prepush"))
             self._c.execute("COMMIT")
             return Reservation(record_id=record_id, superseded=retired)

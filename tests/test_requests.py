@@ -120,7 +120,7 @@ def test_keyboard_interrupt_finishes_request_without_swallowing(tmp_path, monkey
             services.svc_review_detailed(store, repo)
         row = store.list_requests(worktree_root=str(repo.resolve()))[0]
         assert row['state'] == 'cancelled'
-        assert row['reason_code'] == 'interrupted'
+        assert row['reason_code'] == 'signal'
 
 
 def test_request_key_is_scoped_to_worktree(tmp_path, monkeypatch):
@@ -239,6 +239,7 @@ def test_request_schema_upgrade_is_explicit_and_preserves_reviews(tmp_path):
     with Store.open(db) as store:
         store.save_review(_round())
     with closing(sqlite3.connect(db)) as c:
+        c.execute('DROP TABLE cancellation_audit')
         c.execute('DROP TABLE request_links')
         c.execute('DROP TABLE review_requests')
         c.execute('PRAGMA user_version=16')
@@ -349,7 +350,7 @@ def test_remote_changed_during_admission_refuses_before_provider(tmp_path, monke
 
 
 def test_compatible_checkpoint_continuation_preserves_request(tmp_path, monkeypatch):
-    from skodun import pipeline
+    from skodun import pipeline, requests
     from tests.test_batched_review import _clean_checkpoint_sub
     import threading
     repo = _ready_repo(tmp_path, monkeypatch)
@@ -375,6 +376,10 @@ def test_compatible_checkpoint_continuation_preserves_request(tmp_path, monkeypa
             store, repo, batch_target_bytes=10000)
         assert status == 0
         assert first_meta['request']['id'] == second_meta['request']['id']
+        observed = requests.projection(store.get_request(second_meta['request']['id']))
+        assert observed['lifecycle']['reason_code'] == 'completed'
+        assert observed['cancellation'], 'the prior execution audit remains available'
+        assert observed['cancellation'][0]['execution_seq'] != second_meta['request']['execution_seq']
         assert second_meta['request']['continued'] is True
         executions = store.get_request(second_meta['request']['id'])['executions']
         assert [e['status'] for e in executions] == [0, 4]

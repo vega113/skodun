@@ -63,7 +63,7 @@ class RequestStoreMixin:
 
     def begin_request(self, *, request_id, scope, request_key, identity, intent,
                       owner_token, pid, source, now, expires_at, continuation_id=None,
-                      continuation_orchestration_id=None):
+                      continuation_orchestration_id=None, actor=None):
         from .store import _require_ts
         for key, value in (('request_id', request_id), ('scope', scope),
                            ('owner_token', owner_token), ('source', source)):
@@ -78,6 +78,9 @@ class RequestStoreMixin:
             raise ValueError('request expiry must be after creation')
         if not isinstance(identity, dict) or not isinstance(intent, dict):
             raise ValueError('request identity and intent must be objects')
+        if actor is not None:
+            from .control import audit_text
+            actor = audit_text(actor, 'actor', 120)
         encoded = _json(identity)
         if identity.get('worktree_root') != scope:
             raise ValueError('request scope must match its worktree identity')
@@ -128,6 +131,7 @@ class RequestStoreMixin:
                      pid, source, now, now, expires_at))
                 decision, result_id = 'created', request_id
             if decision in ('created', 'continued'):
+                self._c.execute('UPDATE review_requests SET actor=? WHERE id=?', (actor, result_id))
                 self._c.execute(
                     """INSERT INTO request_executions
                        (request_id,owner_token,source,pid,started_at) VALUES(?,?,?,?,?)""",
@@ -155,6 +159,7 @@ class RequestStoreMixin:
             """SELECT seq,source,pid,started_at,completed_at,status,reason_code
                FROM request_executions WHERE request_id=? ORDER BY seq DESC LIMIT 101""",
             (request_id,)).fetchall()]
+        result['cancellation'] = self.cancellation_events(request_id)
         result['executions_truncated'] = len(result['executions']) > 100
         result['executions'] = result['executions'][:100]
         return result
@@ -226,6 +231,10 @@ class RequestStoreMixin:
                     """UPDATE request_executions SET completed_at=?,status=?,reason_code=?
                        WHERE request_id=? AND owner_token=?""",
                     (now, status, reason_code, request_id, owner_token))
+            if cur.rowcount == 1:
+                self.finish_cancellations(request_id=request_id, owner_token=owner_token,
+                    outcome=('cancelled' if state == 'cancelled' else
+                             'completed_before_cancel' if result and result.get('status') in (0,1) else state), now=now)
             self._c.execute('COMMIT')
             return cur.rowcount == 1
         except BaseException:
