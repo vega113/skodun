@@ -38,6 +38,7 @@ class RequestContext:
     stack_request: object = None
     config: object = None
     execution_seq: int | None = None
+    budget: object = None
 
 
 def _config_hash(cfg):
@@ -145,7 +146,8 @@ def projection(row):
 def tracked_review(fn):
     """Wrap the shared detailed service while preserving its public signature."""
     @wraps(fn)
-    def run(store, repo, *, request_key=None, request_source='service', request_actor=None, **kwargs):
+    def run(store, repo, *, request_key=None, request_source='service', request_actor=None,
+            budget_limits=None, **kwargs):
         from .trust import banner_failure
         rid = ids.new_review_id('sk_req_')
         config_sink = {}
@@ -153,6 +155,8 @@ def tracked_review(fn):
                             batch_target_bytes=kwargs.get('batch_target_bytes'))
         intent = {k: v for k, v in kwargs.items()
                   if k not in ('cancel', 'progress_sink', 'reuse_client_family')}
+        if budget_limits is not None:
+            intent['budgets'] = budget_limits.to_dict()
         from .services import _REUSE_INTENT_UNSET
         family_intent = kwargs.get('reuse_client_family', _REUSE_INTENT_UNSET)
         intent['reuse_client_family'] = (
@@ -254,9 +258,30 @@ def tracked_review(fn):
         token = _CURRENT.set(context)
         from .request_cancel import RequestCancel
         cancel = RequestCancel(store, context, kwargs.get('cancel'))
+        from .budgets import ReviewBudget
+        from dataclasses import replace
+        controller = None
+        if budget_limits is not None:
+            def persist_budget(value):
+                active = current()
+                if active is None or active.budget is not controller:
+                    raise RuntimeError('budget observation has no current execution')
+                if not active.store.save_request_budget(
+                        active.id, active.execution_seq, active.owner_token, value):
+                    raise RuntimeError('budget observation lost its execution owner')
+            controller = ReviewBudget(budget_limits, cancel=cancel, on_update=persist_budget)
+            context = replace(context, budget=controller)
+            _CURRENT.set(context)
+            cancel = controller
         kwargs['cancel'] = cancel
         try:
+            if controller is not None:
+                controller._update()
             status, text, extra = fn(store, repo, **kwargs)
+            if controller is not None:
+                controller.finish()
+                extra = {**extra, 'timing': {'scope': 'request_execution',
+                                           **controller.snapshot()['timing']}}
             reused = (extra.get('reuse') or {}).get('review_id')
             if reused:
                 store.link_request(rid, 'review', reused)
@@ -265,7 +290,10 @@ def tracked_review(fn):
                 if target:
                     store.link_request(rid, kind, target)
             termination = extra.get('termination') or {}
-            cause = termination.get('reason_code') or cancel.reason_code
+            observed_cause = cancel.reason_code
+            cause = (observed_cause if observed_cause in (
+                'queue_budget_exhausted', 'review_budget_exhausted', 'total_budget_exhausted')
+                else termination.get('reason_code') or observed_cause)
             expired = termination.get('state') == 'expired' or cause in (
                 'queue_budget_exhausted','review_budget_exhausted','total_budget_exhausted')
             cancelled = bool(cancel.reason_code) and status not in (0, 1)
@@ -283,6 +311,8 @@ def tracked_review(fn):
             return status, text, extra
         except BaseException as exc:
             try:
+                if controller is not None:
+                    controller.finish()
                 store.finish_request(
                     rid, owner_token=owner,
                     state='cancelled' if cancel.reason_code or isinstance(exc, KeyboardInterrupt) else 'failed',

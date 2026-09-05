@@ -89,6 +89,7 @@ def observation(rec):
         code = ('no_compatible_route' if 'transport_ineligible' in causes else
                 'provider_timeout' if 'provider_timeout' in causes else
                 'provider_quota' if 'provider_quota' in causes else
+                'provider_wait_exhausted' if 'provider_wait_exhausted' in causes else
                 'admission_expired' if 'admission_expired' in causes else
                 'review_partial' if partial else 'review_untrustworthy')
     return {
@@ -194,11 +195,13 @@ def project(status, metadata=None, *, reason_code=None):
             {0: 'review_completed', 1: 'review_findings', 2: 'invalid_input',
              3: 'admission_expired', 4: 'review_failed', 130: 'requested_cancel'}.get(status, 'review_failed'))
     state = ('cancelled' if code in ('requested_cancel', 'interrupted') else
-             'expired' if code in ('budget_expired', 'admission_expired', 'recovery_attempts_exhausted') else
+             'expired' if code in ('budget_expired', 'admission_expired', 'recovery_attempts_exhausted',
+                                   'queue_budget_exhausted', 'review_budget_exhausted',
+                                   'total_budget_exhausted', 'provider_wait_exhausted') else
              'refused' if status in (2, 3) else 'completed' if status in (0, 1) else 'failed')
     if observed.get('partial'):
         state = 'partial' if state == 'failed' else state
-    retryable = (True if code in ('admission_expired', 'provider_quota', 'provider_timeout', 'mcp_busy')
+    retryable = (True if code in ('admission_expired', 'provider_wait_exhausted', 'provider_quota', 'provider_timeout', 'mcp_busy')
                  else False if code in ('invalid_input', 'invocation_invalid', 'no_compatible_route',
                                       'request_in_flight', 'request_identity_mismatch') else None)
     return {

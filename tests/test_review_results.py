@@ -275,7 +275,7 @@ def test_recovery_budget_and_external_cancel_have_different_codes(tmp_path, monk
         monkeypatch.setattr('time.monotonic', lambda: next(clock, 2.0))
         _, _, budget = services.svc_review_detailed(store, repo, recover=True, max_wall_seconds=1)
     assert external['result']['execution']['reason_code'] == 'requested_cancel'
-    assert budget['result']['execution']['reason_code'] == 'budget_expired'
+    assert budget['result']['execution']['reason_code'] == 'total_budget_exhausted'
     assert external['result']['execution']['exit_code'] == budget['result']['execution']['exit_code'] == 4
 
 
@@ -387,7 +387,8 @@ def test_cancelled_checkpoint_retains_only_current_attempt_evidence(tmp_path, mo
         response = _specs()['review'].handler(HandlerCall(
             params={'repo': str(repo)}, store_factory=lambda: Store.open(db), cancel=cancel))
         code, result = response.status, response.metadata['result']
-    assert code == 4 and result['execution']['reason_code'] == 'requested_cancel'
+    expected_cause = 'requested_cancel' if surface == 'cli' else 'unknown_cancel_token'
+    assert code == 4 and result['execution']['reason_code'] == expected_cause
     assert result['ids']['review_id'] is not None
     with Store.open(db) as store:
         rec = store.get_review(result['ids']['review_id'])

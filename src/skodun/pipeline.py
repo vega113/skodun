@@ -1432,7 +1432,9 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     # the ceiling is re-derived there from the LARGER of the two plans.
     width = max_chain_width(cfg)
     estimate = _estimate_batch_count(repo, d, finder)
-    ceiling = float(budget.lock_stale_ceiling(d, width, estimate))
+    from . import budgets
+    ceiling = float(budget.lock_stale_ceiling(d, width, estimate) +
+                    budgets.provider_wait_overhead(estimate, extra_passes=2))
     stale = lock_stale if lock_stale is not None else _env_seconds(
         "SKODUN_LOCK_STALE_SECONDS", ceiling)
     wait = lock_wait if lock_wait is not None else _env_seconds(
@@ -1463,9 +1465,6 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     common_dir = gitio.git_common_dir(repo)
     scope = str(common_dir)
     admission_wait = capacity.admission_wait_from_env(wait)
-    # Shared admit+bind wall-clock deadline: review-fg wait + provider waits
-    # and hops consume the same budget (S4). Not reset per hop or phase.
-    admission_deadline = time.monotonic() + float(admission_wait)
     cap_n = capacity.capacity_from_env()
     dual_hold = capacity.legacy_fg_lock_from_env()
     lock_cell: dict = {"lock": None}
@@ -1612,7 +1611,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         # about how long a WAITER will wait. Two runs with the same plan must
         # publish the same budget whether or not their pre-lock estimate happened
         # to guess it.
-        needs = float(budget.lock_stale_ceiling(d, width, planned))
+        needs = float(budget.lock_stale_ceiling(d, width, planned) +
+                      budgets.provider_wait_overhead(planned, extra_passes=2))
         if _grow_lock_budget(lock, needs) and planned > estimate:
             _note(f"this diff needs {planned} batch(es); the lock's published "
                   f"budget is now {int(needs)}s")
@@ -1678,7 +1678,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             # `recover_stale` never has to recompute it from a config that may
             # since have changed — and never sweeps a live multi-batch run at
             # the single-review ceiling.
-            worst_runtime_sec=budget.worst_runtime(d, width, planned),
+            worst_runtime_sec=(budget.worst_runtime(d, width, planned) +
+                               budgets.provider_wait_overhead(planned)),
             # WHICH TREE this record is about. The shared git dir, so a repo
             # and all of its linked worktrees agree on one value -- and so a
             # scoped reader cannot tell two checkouts of the same repository
@@ -2010,7 +2011,6 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 outcome = _run_chain(
                     finder, cfg, d, prompt.text, root, store,
                     scratch, "primary",
-                    admission_deadline=admission_deadline,
                     **_cancel_kw(cancel))
                 rec["attempts"] = outcome.attempts
                 _apply(rec, outcome)
@@ -3104,7 +3104,7 @@ def _estimate_batch_count(repo: Path, d: Defaults,
     return 0 if plan is None else len(plan)
 
 
-def _grow_lock_budget(lock: Lock, seconds: float) -> bool:
+def _grow_lock_budget(lock: Lock | None, seconds: float) -> bool:
     """Raise our lock's published budget, iff the lock is still OURS.
 
     The ABA guard `_release_fg_lock` uses, for the same reason: our stale window
@@ -3114,6 +3114,8 @@ def _grow_lock_budget(lock: Lock, seconds: float) -> bool:
     widen the sidecar costs at worst an early reclaim, and must never be the
     thing that fails a review.
     """
+    if lock is None:
+        return False  # store-only foreground admission has no legacy sidecar
     try:
         if _owner_pid(lock.path) != lock.pid:
             return False

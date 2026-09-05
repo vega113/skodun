@@ -153,7 +153,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="recovery attempt limit, including the first attempt (default: 3)")
     review.add_argument(
         "--max-wall-seconds", type=float, default=None, dest="max_wall_seconds",
-        help="recovery wall-clock budget (default: 900 seconds)")
+        help="total execution budget, including queues (recovery default: 900 seconds)")
+    review.add_argument("--max-queue-seconds", type=float, default=None,
+                        help="cumulative foreground admission budget")
+    review.add_argument("--max-review-seconds", type=float, default=None,
+                        help="budget after first provider launch; pauses during foreground requeue")
+    review.add_argument("--max-provider-wait-seconds", type=float, default=None,
+                        help="provider admission allowance per pass, shared across fallbacks")
     review.add_argument(
         "--reuse-trusted", action="store_true", dest="reuse_trusted",
         help="reuse an exact trustworthy foreground review when available")
@@ -893,6 +899,9 @@ def _cmd_review(args) -> int:
             recover=getattr(args, "recover", False),
             max_attempts=getattr(args, "max_attempts", None),
             max_wall_seconds=getattr(args, "max_wall_seconds", None),
+            max_queue_seconds=getattr(args, "max_queue_seconds", None),
+            max_review_seconds=getattr(args, "max_review_seconds", None),
+            max_provider_wait_seconds=getattr(args, "max_provider_wait_seconds", None),
             reuse_trusted=getattr(args, "reuse_trusted", False),
             fresh=getattr(args, "fresh", False),
             batch_target_bytes=getattr(args, "batch_target_bytes", None),
