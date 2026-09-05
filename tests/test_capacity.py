@@ -85,7 +85,7 @@ def test_capacity_from_env_defaults_and_rejects_junk():
 @pytest.fixture
 def store(tmp_path):
     st = Store.open(tmp_path / "cap.db")
-    assert SCHEMA_VERSION == 16
+    assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     yield st
     st.close()
 

@@ -974,6 +974,16 @@ V16_OBJECTS = {
     ("index", "ix_evidence_receipt_conflicts_identity_time"),
 }
 
+V17_OBJECTS = {
+    ("table", "review_requests"),
+    ("table", "request_links"),
+    ("table", "request_executions"),
+    ("index", "ix_review_requests_scope_time"),
+    ("index", "ix_request_result_retention"),
+    ("index", "ix_request_links_target"),
+    ("index", "ix_request_execution_history"),
+}
+
 #: One legacy `triage` row, in the shipped single-row-per-ledger-key shape the
 #: v3 migration has to seed an event from.
 LEGACY_TRIAGE = dict(ledger_key="b\0" + "s" * 40 + "\0k1", finding_key="k1",
@@ -1059,14 +1069,14 @@ def test_schema_is_frozen_at_the_phase1_baseline():
 def test_fresh_db_lands_at_schema_version(tmp_path):
     db = tmp_path / "s.db"
     st = Store.open(db)
-    assert SCHEMA_VERSION == 16
+    assert SCHEMA_VERSION >= 17
     assert st._c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert ("table", "provider_state") in _objects(db)
     assert V6_TABLE in _objects(db)
     assert V6_INDEX in _objects(db)
     assert V7_TABLE in _objects(db)
     assert V8_TABLE in _objects(db)
-    assert V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | V16_OBJECTS <= _objects(db)
+    assert V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS) <= _objects(db)
     assert ("table", "finding_lineage") in _objects(db)
     for table in V3_TABLES:
         assert ("table", table) in _objects(db)
@@ -1125,13 +1135,13 @@ def test_v12_store_gains_only_the_v13_checkpoint_objects(tmp_path):
         Store._open_for_migration_tests(db).close()
     assert _user_version(db) == 12
     before = _objects(db)
-    assert not ((V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | V16_OBJECTS) & before)
+    assert not ((V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS)) & before)
 
     Store._open_for_migration_tests(db).close()
 
-    assert _user_version(db) == SCHEMA_VERSION == 16
+    assert _user_version(db) == SCHEMA_VERSION
     assert _objects(db) - before == (V13_OBJECTS | V14_OBJECTS | V15_OBJECTS |
-                                     V16_OBJECTS)
+                                     (V16_OBJECTS | V17_OBJECTS))
 
 
 def test_migration_from_true_phase1_db(tmp_path):
@@ -1165,7 +1175,7 @@ def test_phase1_store_upgrade_preserves_every_table_index_and_row(tmp_path):
     after = _objects(db)
     assert before <= after, before - after            # nothing dropped
     assert after - before == {("table", "provider_state"), V5_INDEX} | {
-        ("table", t) for t in V3_TABLES} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | V16_OBJECTS  # nothing else
+        ("table", t) for t in V3_TABLES} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS)  # nothing else
     assert sorted(r["id"] for r in st.list_reviews(None, 100)) == ["r1", "r2", "r3"]
     assert st.triage_for("b", "s" * 40)["k1"]["dismissed_reason"] == "wontfix"
     assert st._c.execute("SELECT count(*) FROM gate_events").fetchone()[0] == 1
@@ -1310,7 +1320,7 @@ def test_a_v2_store_gains_every_v3_delta(tmp_path):
     assert _user_version(db) == SCHEMA_VERSION
     assert before <= _objects(db)                          # nothing dropped
     assert _objects(db) - before == (
-        {("table", t) for t in V3_TABLES} | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | V16_OBJECTS)
+        {("table", t) for t in V3_TABLES} | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS))
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     assert _columns(db, "dedup_events") == V3_DEDUP_EVENT_COLUMNS
     assert _columns(db, "deliveries") == V3_DELIVERY_COLUMNS
@@ -1619,7 +1629,7 @@ def test_no_non_transactional_delta_carries_a_non_idempotent_statement():
     # The last rung is what a fresh store is stamped with. v8 is the
     # v12 records the quota-pool persistence boundary; v11 is transactional
     # because it adds the exact-reuse security column.
-    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION == 16
+    assert _MIGRATIONS[-1][0] == SCHEMA_VERSION
     assert isinstance(_MIGRATIONS[-1][1], tuple)
     assert any(isinstance(d, tuple) for _, d in _MIGRATIONS)
 
@@ -1658,10 +1668,10 @@ def test_a_v3_store_gains_the_widened_vocabulary_and_the_reference_column(tmp_pa
 
     st = Store._open_for_migration_tests(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 16
+    assert _user_version(db) == SCHEMA_VERSION
     # A v3 store climbs v4–v12 in one open: v5 index + capacity, feedback,
     # spend, and telemetry indexes.
-    assert _objects(db) == before | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | V16_OBJECTS, (
+    assert _objects(db) == before | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS), (
         "the rebuild added or dropped an object")
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     # The seeded legacy dismissal came through the rebuild intact...
@@ -1962,7 +1972,7 @@ def test_a_v4_store_gains_the_repo_column_and_its_index(tmp_path):
 
     st = Store._open_for_migration_tests(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 16
+    assert _user_version(db) == SCHEMA_VERSION
     assert "repo" in _columns(db, "reviews")
     row = st._c.execute("SELECT repo FROM reviews WHERE id='r1'").fetchone()
     assert row["repo"] is None, "a pre-v5 row must not be backfilled"
@@ -1986,8 +1996,8 @@ def test_a_v5_store_gains_capacity_admissions(tmp_path):
 
     st = Store._open_for_migration_tests(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 16
-    assert _objects(db) - before == V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | V16_OBJECTS
+    assert _user_version(db) == SCHEMA_VERSION
+    assert _objects(db) - before == V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS)
     assert "repo" in _columns(db, "reviews")
     st.close()
 
@@ -2015,8 +2025,8 @@ def test_a_v6_store_gains_feedback_events(tmp_path):
 
     st = Store._open_for_migration_tests(db)
 
-    assert _user_version(db) == SCHEMA_VERSION == 16
-    assert _objects(db) - before == V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | V16_OBJECTS
+    assert _user_version(db) == SCHEMA_VERSION
+    assert _objects(db) - before == V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS)
     st.close()
 
 
@@ -2610,7 +2620,7 @@ RESERVED_KEYS = {
     "mode", "source", "status", "parse_ok", "degraded", "diff_truncated",
     "findings", "findings_total", "summary", "failure_reason", "usable_output",
     "worst_runtime_sec", "pid", "superseded_by", "repo",
-    "review_started_at", "repo_id",
+    "review_started_at", "repo_id", "request_id",
     # Computed at the chokepoint from the three axes, never caller-supplied.
     "trustworthy",
 }
@@ -2655,6 +2665,7 @@ def test_reserve_prepush_writes_the_documented_running_shape(tmp_path):
     rec = st.get_review(res.record_id)
     assert set(rec) == RESERVED_KEYS, set(rec) ^ RESERVED_KEYS
     assert rec["id"] == res.record_id
+    assert rec["request_id"] == res.record_id
     assert (rec["branch"], rec["head"], rec["base_ref"], rec["base_sha"],
             rec["diff_hash"]) == ("b", "h" * 40, "origin/main", "s" * 40, "d" * 40)
     assert rec["mode"] == "prepush" and rec["source"] == "skodun"
