@@ -169,6 +169,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--fresh", action="store_true", dest="fresh",
         help="run wholly fresh, bypassing trusted reuse and incomplete batch "
              "checkpoints")
+    review.add_argument("--batch-concurrency", type=int, choices=(1, 2), default=1,
+                        help="opt-in foreground batch workers; default sequential")
     review.add_argument(
         "--batch-target-bytes", type=int, default=None,
         dest="batch_target_bytes",
@@ -208,6 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--mode", choices=("now", "prepush"), default=None)
     plan.add_argument("--reviewer", default=None)
     plan.add_argument("--client-family", default=None)
+    plan.add_argument("--batch-concurrency", type=int, choices=(1, 2), default=1)
     plan.add_argument("--batch-target-bytes", type=int, default=None)
     plan.add_argument("--target-source", choices=("configured", "measured"), default="configured")
     plan.add_argument("--target-latency-seconds", type=float, default=None)
@@ -920,6 +923,7 @@ def _cmd_review(args) -> int:
             reuse_trusted=getattr(args, "reuse_trusted", False),
             fresh=getattr(args, "fresh", False),
             batch_target_bytes=getattr(args, "batch_target_bytes", None),
+            batch_concurrency=getattr(args, "batch_concurrency", 1),
             stack_manifest=getattr(args, "stack_manifest", None),
             request_key=getattr(args, "request_key", None), request_source="cli",
             continue_compatible=getattr(args, "continue_compatible", False))
@@ -933,7 +937,7 @@ def _cmd_review_plan(args) -> int:
     from .services import svc_review_plan
     from .store import Store, SchemaLifecycleError
     options = {key: getattr(args, key) for key in (
-        "mode", "reviewer", "client_family", "batch_target_bytes", "target_source",
+        "mode", "reviewer", "client_family", "batch_target_bytes", "batch_concurrency", "target_source",
         "target_latency_seconds", "stack_manifest", "local_ref", "local_oid",
         "remote_ref", "remote_oid", "review_id")}
     with ExitStack() as stack:

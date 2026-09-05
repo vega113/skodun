@@ -126,7 +126,7 @@ def _batch_threshold(defaults, reviewer) -> int:
 
 
 def _identity_for(repo: Path, cfg, base, diff, *, branch: str,
-                  reviewer_name: str | None, candidate: dict | None = None):
+                  reviewer_name: str | None, candidate: dict | None = None, batch_concurrency=1):
     root = gitio._worktree_root(repo)
     selection = checklist.select(
         diff.files, "full", _under(root, cfg.defaults.checklist_dir),
@@ -153,7 +153,7 @@ def _identity_for(repo: Path, cfg, base, diff, *, branch: str,
         checklist_hash=checklist_hash,
         tree_fingerprint=gitio.tree_fingerprint(root, paths=diff.files),
         security_policy_hash=security_policy_identity(cfg),
-        planning_policy=planning_policy.describe(cfg.defaults, reviewer),
+        planning_policy=planning_policy.describe(cfg.defaults, reviewer, batch_concurrency=batch_concurrency),
     )
 
 
@@ -250,7 +250,7 @@ def find_exact_candidate(store, identity: ReuseIdentity) -> dict | None:
 
 def probe(store, repo, *, cfg, reviewer: str | None = None,
           client_family: str | None = None,
-          intent_client_family: str | None = None) -> ReuseProbe:
+          intent_client_family: str | None = None, batch_concurrency=1) -> ReuseProbe:
     """Capture current identity, probe, then recheck the tree before returning."""
     root = gitio._worktree_root(Path(repo))
     if (gitio.is_primary_checkout(root)
@@ -267,7 +267,7 @@ def probe(store, repo, *, cfg, reviewer: str | None = None,
              if entry.enabled and entry.role == "finder"), None)
         current_reviewer = None if default is None else default.name
     identity = _identity_for(
-        root, cfg, base, diff, branch=branch, reviewer_name=current_reviewer)
+        root, cfg, base, diff, branch=branch, reviewer_name=current_reviewer, batch_concurrency=batch_concurrency)
     if diff.truncated_untracked:
         return ReuseProbe(
             None, identity, "untracked scan truncated; reuse refused")
@@ -289,7 +289,7 @@ def probe(store, repo, *, cfg, reviewer: str | None = None,
             continue
         candidate_identity = _identity_for(
             root, cfg, base, diff, branch=branch,
-            reviewer_name=current_reviewer, candidate=loaded)
+            reviewer_name=current_reviewer, candidate=loaded, batch_concurrency=batch_concurrency)
         if planning_reason is None and _candidate_matches(loaded, replace(candidate_identity, planning_policy=None)):
             planning_reason = planning_policy.mismatch(loaded.get('planning_policy'), candidate_identity.planning_policy)
         if _candidate_matches(loaded, candidate_identity):

@@ -666,6 +666,10 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
         call.params, "batch_target_bytes", "review")
     if refusal:
         return _review_result(2, refusal)
+    batch_concurrency, refusal = _int_arg(call.params, "batch_concurrency", "review")
+    if refusal:
+        return _review_result(2, refusal)
+    batch_concurrency = 1 if batch_concurrency is None else batch_concurrency
     from .control import client_actor
     continue_compatible, refusal = _bool_arg(call.params, "continue_compatible", "review")
     if refusal:
@@ -685,7 +689,7 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
             client_family=family, recover=recover,
             max_attempts=max_attempts, max_wall_seconds=max_wall_seconds, **budgets,
             reuse_trusted=reuse_trusted, fresh=fresh,
-            batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest,
+            batch_target_bytes=batch_target_bytes, batch_concurrency=batch_concurrency, stack_manifest=stack_manifest,
             request_key=request_key, request_source="mcp", request_actor=client_actor(call.client_name),
             continue_compatible=continue_compatible,
             reuse_client_family=(
@@ -942,7 +946,7 @@ def _handle_review_plan(call: "HandlerCall") -> "HandlerResult":
     if refusal:
         return HandlerResult(status=2, text=refusal)
     options = {key: call.params[key] for key in (
-        "mode", "reviewer", "client_family", "batch_target_bytes", "target_source",
+        "mode", "reviewer", "client_family", "batch_target_bytes", "batch_concurrency", "target_source",
         "target_latency_seconds", "stack_manifest", "local_ref", "local_oid",
         "remote_ref", "remote_oid", "review_id") if key in call.params}
     factory = call.store_factory
@@ -1154,6 +1158,7 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                     "description": "run wholly fresh, bypassing trusted reuse "
                                    "and incomplete batch checkpoints; useful "
                                    "for a second opinion"},
+                "batch_concurrency": {"type": "integer", "enum": [1, 2], "description": "Foreground independent batch workers; defaults to sequential 1."},
                 "batch_target_bytes": {
                     "type": "integer", "minimum": 0,
                     "description": "optional non-negative deterministic "
@@ -1406,6 +1411,7 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                 "mode": {"type": "string", "enum": ["now", "prepush"], "description": "Execution scope to preview; defaults to now."},
                 "reviewer": {"type": "string", "description": "Explicit foreground reviewer intent."},
                 "client_family": {"type": "string", "description": "Client family used by existing foreground routing."},
+                "batch_concurrency": {"type": "integer", "enum": [1, 2], "description": "Foreground independent batch workers; defaults to sequential 1."},
                 "batch_target_bytes": {"type": "integer", "minimum": 0, "maximum": 10000000, "description": "Explicit fixed diff-byte target; overrides measured suggestions."},
                 "target_source": {"type": "string", "enum": ["configured", "measured"], "description": "Configured target or opt-in measured recommendation."},
                 "target_latency_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 86400, "description": "Declared per-call goal required for measured selection."},

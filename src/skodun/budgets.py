@@ -13,6 +13,7 @@ import math
 import threading
 import time
 from functools import wraps
+from types import SimpleNamespace
 
 
 def _limit(name, value):
@@ -72,21 +73,42 @@ class ProviderAllowance:
     @contextmanager
     def waiting(self):
         self.started = self.clock()
+        token = None
         if self.budget is not None:
-            self.budget.start_provider_wait(self.remaining())
+            token = self.budget.start_provider_wait(self.remaining())
         try:
             yield self
         finally:
             self.spent += max(0.0, self.clock() - self.started)
             self.started = None
             if self.budget is not None:
-                self.budget.end_provider_wait()
+                self.budget.end_provider_wait(token)
 
 
 class ReviewBudget:
     """Event-compatible supervisor; composing an upstream cancellation token."""
 
+    # Only pure state crosses worker threads. Store-bound monitors/callbacks
+    # belong to each handle and are never copied into this namespace.
+    _STATE_FIELDS = frozenset(('limits', 'clock', 'started', 'started_utc',
+        'queue_started', 'review_started', 'provider_wait_started', 'queue_elapsed',
+        'provider_wait_elapsed', 'queue_deadline_mono', 'queue_at_review_start',
+        'provider_waiters', 'provider_deadline_mono', 'ended', '_reason',
+        '_marked_reason', '_event', '_lock', '_publication_lock', '_waits', '_next_wait'))
+
+    def __getattr__(self, name):
+        if name in self._STATE_FIELDS:
+            return getattr(self._shared_state, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        if name in self._STATE_FIELDS:
+            setattr(self._shared_state, name, value)
+        else:
+            object.__setattr__(self, name, value)
+
     def __init__(self, limits, *, cancel=None, clock=None, on_update=None):
+        self._shared_state = SimpleNamespace()
         self.limits, self.cancel = limits, cancel
         self.clock = time.monotonic if clock is None else clock
         self.on_update = on_update
@@ -103,10 +125,26 @@ class ReviewBudget:
         self._marked_reason = None
         self._event = threading.Event()
         self._lock = threading.RLock()
+        self._publication_lock = threading.Lock()
+        self._waits, self._next_wait = {}, 0
+
+    def fork(self, *, cancel, on_update):
+        """A worker-local handle with the same pure, synchronized execution state."""
+        return self.from_shared(self._shared_state, cancel=cancel, on_update=on_update)
+
+    @classmethod
+    def from_shared(cls, state, *, cancel, on_update):
+        handle = object.__new__(cls)
+        handle._shared_state = state
+        handle.cancel, handle.on_update = cancel, on_update
+        return handle
 
     def _update(self):
+        # Never called with the state mutex held. Read a fresh snapshot after
+        # serialization so same-second writes cannot regress execution state.
         if self.on_update is not None:
-            self.on_update(self.snapshot())
+            with self._publication_lock:
+                self.on_update(self.snapshot())
 
     def start_queue(self, wait_seconds=None):
         with self._lock:
@@ -116,7 +154,7 @@ class ReviewBudget:
             effective = (wait_seconds if remaining is None else remaining if wait_seconds is None
                          else min(remaining, wait_seconds))
             self.queue_deadline_mono = None if effective is None else self.clock() + effective
-            self._update()
+        self._update()
 
     def end_queue(self):
         with self._lock:
@@ -124,32 +162,51 @@ class ReviewBudget:
                 self.queue_elapsed += max(0.0, self.clock() - self.queue_started)
                 self.queue_started = None
                 self.queue_deadline_mono = None
-            self._update()
+        self._update()
 
     def start_provider_wait(self, seconds=None):
         with self._lock:
-            if self.provider_waiters == 0:
+            if self.ended is not None:
+                raise ValueError('cannot start a wait after budget completion')
+            if len(self._waits) >= 2:
+                raise ValueError('at most two provider waits may be active')
+            if not self._waits:
                 self.provider_wait_started = self.clock()
-            self.provider_waiters += 1
-            self.provider_deadline_mono = self.clock() + (
-                self.limits.provider_wait if seconds is None else seconds)
+            self._next_wait += 1
+            token = self._next_wait
+            self._waits[token] = self.clock() + (self.limits.provider_wait if seconds is None else seconds)
+            self.provider_waiters = len(self._waits)
+            self.provider_deadline_mono = min(self._waits.values())
+        try:
             self._update()
+        except BaseException:
+            self._end_provider_wait(token)
+            raise
+        return token
 
-    def end_provider_wait(self):
+    def _end_provider_wait(self, token):
         with self._lock:
-            self.provider_waiters = max(0, self.provider_waiters - 1)
-            if self.provider_waiters == 0 and self.provider_wait_started is not None:
+            if token is None and len(self._waits) == 1:
+                token = next(iter(self._waits))
+            if token not in self._waits:
+                raise ValueError('unknown or already-ended provider wait')
+            del self._waits[token]
+            self.provider_waiters = len(self._waits)
+            self.provider_deadline_mono = min(self._waits.values(), default=None)
+            if not self._waits and self.provider_wait_started is not None:
                 self.provider_wait_elapsed += max(0.0, self.clock() - self.provider_wait_started)
                 self.provider_wait_started = None
-                self.provider_deadline_mono = None
-            self._update()
+
+    def end_provider_wait(self, token=None):
+        self._end_provider_wait(token)
+        self._update()
 
     def provider_started(self):
         with self._lock:
             if self.review_started is None:
                 self.review_started = self.clock()
                 self.queue_at_review_start = self._queue_seconds(self.review_started)
-            self._update()
+        self._update()
 
     def provider_allowance(self, seconds=None):
         return ProviderAllowance(self.limits.provider_wait if seconds is None else seconds,
@@ -175,16 +232,18 @@ class ReviewBudget:
         with self._lock:
             if self.ended is not None or self._reason is not None:
                 return self._reason is not None
-            try:
-                upstream_set = self.cancel is not None and self.cancel.is_set()
-            except KeyboardInterrupt:
-                raise
-            except BaseException:
-                # The upstream is our durable request-cancellation monitor.
-                # Its failed audit/read must not reach the watchdog's generic
-                # unreadable-token guard and let an owned provider continue.
-                self._reason = 'cancellation_state_unavailable'
-                return True
+        # Cancellation may poll SQLite: never hold the shared state lock here.
+        try:
+            upstream_set = self.cancel is not None and self.cancel.is_set()
+        except KeyboardInterrupt:
+            raise
+        except BaseException:
+            with self._lock:
+                self._reason = self._reason or 'cancellation_state_unavailable'
+            return True
+        with self._lock:
+            if self.ended is not None or self._reason is not None:
+                return self._reason is not None
             if upstream_set:
                 observed = getattr(self.cancel, 'reason_code', None)
                 self._reason = (self._marked_reason if self._marked_reason and observed in
@@ -227,7 +286,7 @@ class ReviewBudget:
         with self._lock:
             if self.ended is None:
                 self.ended = self.clock()
-            self._update()
+        self._update()
 
     def queue_remaining(self):
         return (None if self.limits.queue is None else
@@ -274,6 +333,8 @@ class ReviewBudget:
                            'total_ms': round(max(0.0, at - self.started) * 1000)},
                 'reason_code': self._reason,
                 'review_paused_for_queue': self.queue_started is not None and self.review_started is not None,
+                'provider_waits': {'active_count': len(self._waits),
+                    'deadlines': sorted(utc(deadline) for deadline in self._waits.values())},
                 'updated_at': utc(at),
             }
 

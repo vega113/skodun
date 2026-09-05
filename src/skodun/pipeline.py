@@ -1656,7 +1656,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             store, root, base.sha, head, diff_hash)
         from .planning_policy import describe as planning_description
         common = dict(
-            planning_policy=planning_description(d, finder),
+            planning_policy=planning_description(d, finder, batch_concurrency=request_context.batch_concurrency if request_context is not None and request_context.store is store else 1),
             id=rid, reviewed_at=review_started_at,
             review_started_at=review_started_at,
             lineage_context_cutoff=lineage_context_cutoff,
@@ -1946,7 +1946,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                             adapter = _adapter_for(finder)
                             common.pop("quota_pool", None)
                             common.update(model=finder.model, adapter=adapter.name,
-                                          planning_policy=planning_description(d, finder), **route_meta)
+                                          planning_policy=planning_description(d, finder, batch_concurrency=request_context.batch_concurrency if request_context is not None and request_context.store is store else 1), **route_meta)
                             pack, prompt = _prepare_single_prompt(
                                 diff, d=d, root=root, finder=finder, selection=selection,
                                 branch=branch, base_ref=base.ref, base_sha=base.sha,
@@ -3830,6 +3830,25 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             checklist_notes.append(selection.note)
         checklist_degraded = checklist_degraded or selection.degraded is True
 
+    parallel_results = None
+    concurrency = (rec.get('planning_policy') or {}).get('execution_policy', {}).get('batch_concurrency', 1)
+    if concurrency == 2 and count > 1:
+        from . import parallel_batches
+        from .requests import current
+        context = current()
+        if rec.get('mode') != 'now' or context is None or context.store is not store or checkpoint_run is None:
+            raise PreflightRefused('parallel batches require a durable foreground checkpoint request')
+        def run_one(item, worker_store, worker_cancel):
+            _note(f"batch {item.identity.index}/{count}: claiming or reusing frozen input")
+            effective = _escalated(d, item.prompt.prompt_bytes, large_prompt)
+            return _checkpointed_sub(
+                checkpoint_run, item.identity, reviewer=finder, cfg=cfg, d=effective,
+                prompt=item.prompt, root=root, store=worker_store, scratch=scratch,
+                tag=f"{tag}.b{item.identity.index}", label=f"batch {item.identity.index}", cancel=worker_cancel)
+        parallel_results = parallel_batches.execute(
+            prepared_plan.batches, context=context, store_path=store._path,
+            run_one=run_one, cancel=cancel, progress=_note)
+
     for index, prepared in enumerate(prepared_plan.batches, 1):
         batch = prepared.batch
         # A BATCH BOUNDARY. The checklist selection, the context pack and the
@@ -3860,18 +3879,19 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
 
         prompt = prepared.prompt
         prompt_bytes += prompt.prompt_bytes
-        _note(f"batch {index}/{count} ({len(batch.files)} file(s), "
-              f"{len(batch.data)} bytes) ...")
+        if parallel_results is None:
+            _note(f"batch {index}/{count} ({len(batch.files)} file(s), "
+                  f"{len(batch.data)} bytes) ...")
         if prompt.diff_truncated:
             _note(f"batch {index}/{count} is {len(batch.data)} bytes "
                   f"(> {mdb}); its prompt is truncated and this "
                   f"review cannot be trustworthy")
         effective_d = _escalated(d, prompt.prompt_bytes, large_prompt)
-        sub = _checkpointed_sub(
+        sub = (parallel_results[index] if parallel_results is not None else _checkpointed_sub(
             checkpoint_run, prepared.identity, reviewer=finder, cfg=cfg,
             d=effective_d, prompt=prompt,
             root=root, store=store, scratch=scratch, tag=f"{tag}.b{index}",
-            label=f"batch {index}", cancel=cancel)
+            label=f"batch {index}", cancel=cancel))
         run_duration_sec = round(sum(
             float(a.get("duration_sec") or 0.0)
             for a in sub.attempts if isinstance(a, dict)

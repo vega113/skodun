@@ -35,18 +35,22 @@ def capability(reviewer):
             'limit_bytes': adapter.prompt_limit()}
 
 
-def execution_policy(defaults):
+def execution_policy(defaults, batch_concurrency=1):
     """Bounded execution knobs; tool configuration is represented only by hash."""
-    return {'max_turns': defaults.max_turns,
-            'deny_tools_hash': hashlib.sha256(defaults.deny_tools.encode()).hexdigest()}
+    validate_concurrency(batch_concurrency)
+    result = {'max_turns': defaults.max_turns,
+              'deny_tools_hash': hashlib.sha256(defaults.deny_tools.encode()).hexdigest()}
+    if batch_concurrency != 1:
+        result['batch_concurrency'] = batch_concurrency
+    return result
 
 
-def describe(defaults, reviewer=None):
+def describe(defaults, reviewer=None, *, batch_concurrency=1):
     payload = {'version': VERSION, 'target_bytes': defaults.batch_target_bytes,
                'effective_diff_budget': effective_diff_budget(defaults, reviewer),
                'prompt_envelope': budget.prompt_budget(defaults, reviewer),
                'context_pack': defaults.context_pack, 'capability': capability(reviewer),
-               'execution_policy': execution_policy(defaults)}
+               'execution_policy': execution_policy(defaults, batch_concurrency)}
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     return {**payload, 'digest': digest}
 
@@ -58,6 +62,8 @@ def mismatch(stored, expected):
         return 'planning_identity_missing'
     if not isinstance(stored, dict) or stored.get('version') != VERSION:
         return 'planning_identity_missing'
+    if stored['execution_policy'].get('batch_concurrency', 1) != expected['execution_policy'].get('batch_concurrency', 1):
+        return 'batch_concurrency_changed'
     if stored.get('target_bytes') != expected['target_bytes']:
         return 'operational_target_changed'
     return None if stored == expected else 'planning_policy_changed'
@@ -74,11 +80,12 @@ def validate(value):
             ('target_bytes', 0), ('effective_diff_budget', 1), ('prompt_envelope', 1))) or type(value['context_pack']) is not bool:
         raise ValueError('invalid planning policy sizing types')
     execution = value['execution_policy']
-    if (not isinstance(execution, dict) or set(execution) != {'max_turns', 'deny_tools_hash'}
+    if (not isinstance(execution, dict) or set(execution) not in ({'max_turns', 'deny_tools_hash'}, {'max_turns', 'deny_tools_hash', 'batch_concurrency'})
             or type(execution['max_turns']) is not int or execution['max_turns'] < 1
             or not isinstance(execution['deny_tools_hash'], str) or len(execution['deny_tools_hash']) != 64
             or any(char not in '0123456789abcdef' for char in execution['deny_tools_hash'])):
         raise ValueError('invalid planning execution policy')
+    validate_concurrency(execution.get('batch_concurrency', 1))
     cap = value['capability']
     if cap is not None:
         if (not isinstance(cap, dict) or set(cap) != {'provider', 'version', 'transport', 'limit_bytes'}
@@ -90,3 +97,9 @@ def validate(value):
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     if value['digest'] != digest:
         raise ValueError('invalid planning policy digest')
+
+
+def validate_concurrency(value):
+    if type(value) is not int or value not in (1, 2):
+        raise ValueError('batch_concurrency must be 1 or 2')
+    return value

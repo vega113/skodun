@@ -492,7 +492,8 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
                 cfg.defaults, batch_target_bytes=batch_target_bytes))
         result = reuse.probe(
             store, root, cfg=cfg, client_family=client_family,
-            intent_client_family=intent_client_family)
+            intent_client_family=intent_client_family,
+            batch_concurrency=ctx.batch_concurrency if ctx is not None and ctx.store is store else 1)
         if (result.candidate is not None and cancel is not None
                 and cancel.is_set()):
             reason = REVIEW_CANCELLED_REASON
@@ -601,13 +602,17 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         max_provider_wait_seconds=None,
                         reuse_trusted=False, fresh=False,
                         reuse_client_family=_REUSE_INTENT_UNSET,
-                        batch_target_bytes=None, stack_manifest=None,
+                        batch_target_bytes=None, stack_manifest=None, batch_concurrency=1,
                         request_key=None, request_source="service", request_actor=None, continue_compatible=False
                         ) -> tuple[int, str, dict]:
     """Durably identify an accepted request before readiness or admission."""
     from .review_results import attach
     from .budgets import Limits
     try:
+        from .planning_policy import validate_concurrency
+        validate_concurrency(batch_concurrency)
+        if batch_concurrency == 2 and (getattr(store, "_path", None) is None or not store._path.is_file()):
+            raise ValueError("parallel batches require the current file-backed request Store")
         limits = Limits.from_args(recover=recover, max_wall_seconds=max_wall_seconds,
             max_queue_seconds=max_queue_seconds, max_review_seconds=max_review_seconds,
             max_provider_wait_seconds=max_provider_wait_seconds)
@@ -628,7 +633,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                   reuse_trusted=reuse_trusted, fresh=fresh,
                   reuse_client_family=reuse_client_family,
                   batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest,
-                  continue_compatible=continue_compatible)
+                  continue_compatible=continue_compatible, batch_concurrency=batch_concurrency)
     # Syntactically invalid options are not accepted execution requests. Keep
     # their no-store validation contract, including overflow/bool refusals.
     if (_validate_batch_target(batch_target_bytes)[1]
@@ -645,7 +650,7 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
                         max_attempts=None, max_wall_seconds=None,
                         reuse_trusted=False, fresh=False,
                         reuse_client_family=_REUSE_INTENT_UNSET,
-                        batch_target_bytes=None, stack_manifest=None, continue_compatible=False
+                        batch_target_bytes=None, stack_manifest=None, continue_compatible=False, batch_concurrency=1
                         ) -> tuple[int, str, dict]:
     """Shared review surface plus recovery metadata for MCP structured output."""
     import threading
@@ -987,7 +992,7 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
                max_provider_wait_seconds=None,
                reuse_trusted=False, fresh=False,
                reuse_client_family=_REUSE_INTENT_UNSET,
-               batch_target_bytes=None, stack_manifest=None,
+               batch_target_bytes=None, batch_concurrency=1, stack_manifest=None,
                request_key=None, request_source="service", continue_compatible=False) -> tuple[int, str]:
     status, text, _ = svc_review_detailed(
         store, repo, progress_sink=progress_sink, cancel=cancel,
@@ -997,7 +1002,7 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
         max_provider_wait_seconds=max_provider_wait_seconds,
         reuse_trusted=reuse_trusted, fresh=fresh,
         reuse_client_family=reuse_client_family,
-        batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest,
+        batch_target_bytes=batch_target_bytes, batch_concurrency=batch_concurrency, stack_manifest=stack_manifest,
         request_key=request_key, request_source=request_source,
         continue_compatible=continue_compatible)
     return status, text

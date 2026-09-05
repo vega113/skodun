@@ -148,3 +148,85 @@ def test_signal_marker_composes_with_upstream_attribution():
     mark_event(budget, 'signal')
     assert event.is_set() and event.reason_code == 'signal'
     assert budget.is_set() and budget.reason_code == 'signal'
+
+
+def test_overlapping_allowances_retain_each_deadline_and_union_wait():
+    clock = Clock()
+    budget = ReviewBudget(Limits(provider_wait=10), clock=clock)
+    first = budget.start_provider_wait(5)
+    first_deadline = budget.snapshot()['deadlines']['provider_wait']
+    clock.value = 2
+    second = budget.start_provider_wait(8)
+    assert budget.snapshot()['deadlines']['provider_wait'] == first_deadline
+    assert budget.snapshot()['provider_waits']['active_count'] == 2
+    clock.value = 4
+    budget.end_provider_wait(second)
+    assert budget.snapshot()['deadlines']['provider_wait'] == first_deadline
+    clock.value = 5
+    budget.end_provider_wait(first)
+    assert budget.snapshot()['timing']['provider_wait_ms'] == 5000
+    assert budget.snapshot()['deadlines']['provider_wait'] is None
+    with pytest.raises(ValueError):
+        budget.end_provider_wait(first)
+
+
+def test_forked_budget_uses_only_local_callbacks_and_cancellation():
+    owner = threading.get_ident()
+    calls = []
+    class Cancel:
+        reason_code = None
+        def __init__(self, thread):
+            self.thread = thread
+        def is_set(self):
+            assert threading.get_ident() == self.thread
+            return False
+    def parent_update(value):
+        assert threading.get_ident() == owner
+    parent = ReviewBudget(Limits(review=10), cancel=Cancel(owner), on_update=parent_update)
+    def work():
+        thread = threading.get_ident()
+        child = parent.fork(cancel=Cancel(thread), on_update=lambda value: calls.append((threading.get_ident(), value)))
+        assert not child.is_set()
+        child.provider_started()
+        assert child.snapshot()['phase'] == 'review'
+        child.set()
+    thread = threading.Thread(target=work)
+    thread.start()
+    thread.join(2)
+    assert not thread.is_alive() and calls
+    assert calls[0][0] != owner
+    assert parent.is_set()
+    assert parent.snapshot()['phase'] == 'review'
+
+
+def test_snapshot_publication_serializes_fresh_values_without_state_lock():
+    from concurrent.futures import ThreadPoolExecutor
+    clock = Clock()
+    budget = ReviewBudget(Limits(), clock=clock)
+    first_entered, release = threading.Event(), threading.Event()
+    values = []
+    def first(snapshot):
+        first_entered.set()
+        assert release.wait(5)
+        values.append(snapshot['timing']['total_ms'])
+    a = budget.fork(cancel=None, on_update=first)
+    b = budget.fork(cancel=None, on_update=lambda snapshot: values.append(snapshot['timing']['total_ms']))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending_a = pool.submit(a.provider_started)
+        assert first_entered.wait(5)
+        clock.value = 2
+        pending_b = pool.submit(b.start_provider_wait, 3)
+        try:
+            # Publication A holds a callback, while state remains independently readable.
+            import time
+            end = time.monotonic() + 5
+            while budget.snapshot()['provider_waits']['active_count'] != 1 and time.monotonic() < end:
+                time.sleep(.005)
+            assert budget.snapshot()['provider_waits']['active_count'] == 1
+            clock.value = 3
+        finally:
+            release.set()
+        pending_a.result()
+        token = pending_b.result()
+    assert values == [0, 3000]
+    budget.end_provider_wait(token)

@@ -130,8 +130,9 @@ def _timeout(call, defaults, cfg, mode):
 
 
 def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_target_bytes=None,
-            target_source='configured', target_latency_seconds=None, stack_manifest=None,
+            target_source='configured', target_latency_seconds=None, stack_manifest=None, batch_concurrency=1,
             local_ref=None, local_oid=None, remote_ref=None, remote_oid=None, review_id=None, now=None):
+    planning_policy.validate_concurrency(batch_concurrency)
     from .services import _validate_batch_target
     if mode is not None and mode not in ('now', 'prepush'):
         raise ValueError('mode must be now or prepush')
@@ -198,6 +199,8 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
     if historical is not None and mode != 'prepush':
         raise ValueError('historical working-tree edits cannot be reconstructed; inspect current foreground scope instead')
     if mode == 'prepush':
+        if batch_concurrency != 1:
+            raise ValueError('parallel batches are supported only for foreground requests')
         if reviewer is not None:
             raise ValueError('prepush execution uses the configured finder; reviewer override is unsupported')
         finder = pipeline._reviewer_for(cfg, 'finder')
@@ -227,7 +230,7 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
     advisory = {'stack_context': stack_context, 'stack_context_truncated': stack_truncated,
         'lineage_context': lineage, 'lineage_context_truncated': lineage_truncated,
         'evidence_context': pipeline._evidence_prompt_context(store, root, base.sha, head, gitio.diff_identity(diff.data))}
-    data = operational_targets.read_evidence(store, reviewer=finder, mode=mode, execution_policy=planning_policy.execution_policy(defaults), context_pack=defaults.context_pack, now=now)
+    data = operational_targets.read_evidence(store, reviewer=finder, mode=mode, execution_policy=planning_policy.execution_policy(defaults, batch_concurrency), context_pack=defaults.context_pack, now=now)
     selected = None
     reason = 'configured_target'
     if diff.truncated_untracked:
@@ -268,14 +271,14 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
         if candidate.name != finder.name and pipeline.batch_plan(diff.data, defaults, candidate) is None:
             finder, route = candidate, candidate_route
             data = operational_targets.read_evidence(store, reviewer=finder, mode=mode,
-                execution_policy=planning_policy.execution_policy(defaults), context_pack=defaults.context_pack, now=now)
+                execution_policy=planning_policy.execution_policy(defaults, batch_concurrency), context_pack=defaults.context_pack, now=now)
             calls, batches, prepared = _prepare(diff, root=root, cfg=cfg, defaults=defaults, finder=finder,
                 branch=branch, base=base, head=head, mode=mode, advisory=advisory)
     for call in calls:
         call['configured_timeout_seconds'] = _timeout(call, defaults, cfg, mode)
         call['timeout_may_escalate_after_results'] = mode == 'prepush' and call['input_status'] == 'pending_results'
         call['attempt_budget_per_entry'] = (1 + defaults.timeout_retries + defaults.degraded_retries)
-    policy = planning_policy.describe(defaults, finder)
+    policy = planning_policy.describe(defaults, finder, batch_concurrency=batch_concurrency)
     primary = [call for call in calls if call['kind'] in ('primary', 'batch')]
     for call in calls:
         matching = [cohort for cohort in data['cohorts'] if cohort['qualified']
@@ -334,7 +337,7 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
         'max_primary_prompt_bytes': max((call['prompt_bytes'] for call in primary), default=None),
         'known_required_prompt_bytes': sum(known),
         'aggregate_required_prompt_bytes': sum(known) if len(known) == len(required) else None,
-        'call_counts': {'required_logical_passes': len(required), 'maximum_conditional_passes': int(bool(conditional)),
+        'call_counts': {'parallel_batch_limit': batch_concurrency, 'required_logical_passes': len(required), 'maximum_conditional_passes': int(bool(conditional)),
             'provider_launch_upper_bound': sum(map(launch_bound, required)) + max(map(launch_bound, conditional), default=0),
             'method': 'configured retries/fallback upper bound; not expected calls', 'expected_launches': None},
         'route': route, 'selection': {'reason': reason, 'target_source': 'measured' if selected else 'explicit' if target is not None else 'configured',

@@ -40,6 +40,7 @@ class RequestContext:
     execution_seq: int | None = None
     budget: object = None
     continue_compatible: bool = False
+    batch_concurrency: int = 1
 
 
 def _config_hash(cfg):
@@ -155,7 +156,8 @@ def tracked_review(fn):
         identity = snapshot(repo, config_sink=config_sink,
                             batch_target_bytes=kwargs.get('batch_target_bytes'))
         intent = {k: v for k, v in kwargs.items()
-                  if k not in ('cancel', 'progress_sink', 'reuse_client_family')}
+                  if k not in ('cancel', 'progress_sink', 'reuse_client_family')
+                  and not (k == 'batch_concurrency' and v == 1)}
         if budget_limits is not None:
             intent['budgets'] = budget_limits.to_dict()
         from .services import _REUSE_INTENT_UNSET
@@ -177,6 +179,8 @@ def tracked_review(fn):
         coverage_intent = {k: intent.get(k) for k in (
             'reviewer', 'client_family', 'reuse_client_family', 'batch_target_bytes',
             'stack_manifest_digest', 'stack_manifest_state')}
+        if kwargs.get('batch_concurrency', 1) != 1:
+            coverage_intent['batch_concurrency'] = kwargs['batch_concurrency']
         identity['coverage_intent_hash'] = hashlib.sha256(json.dumps(
             coverage_intent, sort_keys=True).encode()).hexdigest()
         owner = uuid.uuid4().hex
@@ -268,7 +272,8 @@ def tracked_review(fn):
                     'request': {**metadata, 'reason_code': reason}}
         context = RequestContext(rid, store, identity, owner, stack_request,
                                  config_sink.get('config'), metadata['execution_seq'],
-                                 continue_compatible=compatible)
+                                 continue_compatible=compatible,
+                                 batch_concurrency=kwargs.get("batch_concurrency", 1))
         token = _CURRENT.set(context)
         from .request_cancel import RequestCancel
         cancel = RequestCancel(store, context, kwargs.get('cancel'))
