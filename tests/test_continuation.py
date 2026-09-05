@@ -312,3 +312,53 @@ def test_explicit_compatible_recovery_keeps_successful_batches_across_attempts(l
     assert result['request']['id'] == first['request']['id']
     assert result['recovery']['attempts'] == 2
     assert result['continuation']['counts'] == {'reused': 3, 'executed': 2, 'failed': 0}
+
+
+def test_expired_execution_continues_with_a_new_budget_and_only_missing_work(lane, monkeypatch):
+    from tests.test_budget_execution import controlled_clock
+    repo, store, calls, failures = lane
+    clock = controlled_clock(monkeypatch)
+    provider = runner.run_with_watchdog
+    def measured(cmd, *args, **kwargs):
+        result = provider(cmd, *args, **kwargs)
+        clock.value += .1
+        return result
+    monkeypatch.setattr(runner, 'run_with_watchdog', measured)
+    complete = store.complete_checkpoint
+    def expire_after_three(orchestration_id, kind, index, **kwargs):
+        result = complete(orchestration_id, kind, index, **kwargs)
+        if kind == 'batch' and index == 3:
+            clock.value += 1.1
+        return result
+    monkeypatch.setattr(store, 'complete_checkpoint', expire_after_three)
+    code, _, first = services.svc_review_detailed(store, repo, max_review_seconds=1, max_wall_seconds=2)
+    assert code == 4 and calls == ['b1', 'b2', 'b3']
+    assert first['result']['execution']['reason_code'] == 'review_budget_exhausted'
+    assert store.get_request(first['request']['id'])['state'] == 'expired'
+    monkeypatch.setattr(store, 'complete_checkpoint', complete)
+    calls.clear()
+    code, _, continued = services.svc_review_detailed(
+        store, repo, continue_compatible=True, max_review_seconds=10, max_wall_seconds=20)
+    assert code == 0 and calls == ['b4', 'integration']
+    assert continued['request']['id'] == first['request']['id']
+    assert continued['request']['execution_seq'] != first['request']['execution_seq']
+    assert continued['timing']['review_wall_ms'] == pytest.approx(200)
+    assert continued['continuation']['counts'] == {'reused': 3, 'executed': 2, 'failed': 0}
+
+
+@pytest.mark.parametrize('mutation', ['integration_index', 'extra_key', 'wrong_count', 'fake_truncation'])
+def test_continuation_receipt_rejects_inconsistent_pass_telemetry(mutation):
+    from skodun.continuation import valid_receipt
+    value = {'policy': 'compatible', 'status': 'continued', 'source_orchestration_id': 'source',
+             'orchestration_id': 'child', 'first_mismatch': None,
+             'passes': [{'kind': 'integration', 'index': 0, 'action': 'reused'}],
+             'counts': {'reused': 1, 'executed': 0, 'failed': 0}, 'passes_truncated': False}
+    if mutation == 'integration_index':
+        value['passes'][0]['index'] = 9
+    elif mutation == 'extra_key':
+        value['passes'][0]['unexpected'] = 'field'
+    elif mutation == 'wrong_count':
+        value['counts']['reused'] = 0
+    else:
+        value['passes_truncated'] = True
+    assert not valid_receipt(value)

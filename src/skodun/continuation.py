@@ -74,6 +74,27 @@ def valid_receipt(value):
     passes = value.get('passes')
     if not isinstance(passes, list) or len(passes) > 128 or type(value.get('passes_truncated')) is not bool:
         return False
-    return all(isinstance(item, dict) and item.get('kind') in ('batch','integration')
-               and type(item.get('index')) is int and item['index'] >= 0
-               and item.get('action') in ('reused','executed','failed') for item in passes)
+    if (not isinstance(value.get('source_orchestration_id'), str) or not value['source_orchestration_id']
+            or not isinstance(value.get('orchestration_id'), str) or not value['orchestration_id']
+            or value['source_orchestration_id'] == value['orchestration_id']
+            or value.get('first_mismatch') is not None):
+        return False
+    seen = set()
+    observed = dict.fromkeys(counts, 0)
+    for item in passes:
+        if not isinstance(item, dict) or set(item) != {'kind','index','action'}:
+            return False
+        kind, index, action = item['kind'], item['index'], item['action']
+        if (kind not in ('batch','integration') or type(index) is not int
+                or not isinstance(action, str) or action not in observed):
+            return False
+        if (kind == 'batch' and index < 1) or (kind == 'integration' and index != 0):
+            return False
+        if (kind, index) in seen:
+            return False
+        seen.add((kind, index))
+        observed[action] += 1
+    if not value['passes_truncated']:
+        return counts == observed
+    return (len(passes) == 128 and sum(counts.values()) > len(passes)
+            and all(counts[action] >= number for action, number in observed.items()))

@@ -1,8 +1,8 @@
 # Compatible batch continuation
 
-This core slice depends on the request budget supervisor in #185 before final
-integration/landing. It does not replace the existing recovery budgets or their
-structured termination/timing metadata.
+Compatible continuation uses the request budget supervisor from #185. A new
+execution may choose new runtime limits without changing coverage identity; the
+existing structured termination/timing metadata remains authoritative.
 
 Use an explicit continuation after a batched review returned unusable work or
 was interrupted:
