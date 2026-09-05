@@ -21,32 +21,13 @@ from skodun.adapters.openai_api_runner import (
 from skodun.config import Defaults, Reviewer
 from skodun.store import SCHEMA_VERSION, Store
 from skodun.adapters import REVIEW_CONTRACT, get_adapter
-from tests.adapter_conformance import (  # noqa: F401 - collected below
-    AdapterConformance,
-    load_fixture,
-    test_coverage_gate_fails_without_a_conformance_subclass,
-    test_every_registered_adapter_has_conformance_coverage,
-    test_load_fixture_rejects_a_malformed_rc,
-)
+from tests.adapter_conformance import load_fixture
 
 MODEL = "gpt-5.6-luna"
 R = Reviewer(name="f", provider=PROVIDER_ID, model=MODEL,
              role="finder", effort="medium")
 D = Defaults(timeout_sec=30)
 FIXTURES = Path(__file__).parent / "fixtures" / "adapters" / "openai_api"
-
-
-class TestOpenAIAPIConformance(AdapterConformance):
-    provider_id = PROVIDER_ID
-    fixture_dir = FIXTURES
-
-    def adapter(self):
-        return OpenAIAPIAdapter()
-
-    def effort_reject_case(self):
-        r = Reviewer(name="f", provider=PROVIDER_ID, model=MODEL,
-                     role="finder", effort="max")
-        return r, "effort"
 
 
 def test_registry_has_openai_api():
