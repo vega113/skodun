@@ -229,6 +229,8 @@ def _calls(reviews):
                 key = ('legacy', *scope, hashlib.sha256(json.dumps(
                     signature, sort_keys=True, default=str).encode()).hexdigest())
             if key in unique:
+                if unique[key]['scope']['kind'] == 'review' and scope[1] != 'review':
+                    unique[key]['scope'] = {'namespace': scope[0], 'kind': scope[1], 'id': scope[2]}
                 continue
             if len(unique) >= MAX_ATTEMPTS:
                 truncated = True
@@ -301,6 +303,12 @@ def _request(store, row, now, spend_rows, spend_truncated, resources):
             reviews.append(rec)
         else:
             missing.append(rid)
+    missing_namespace_links = {}
+    for kind, field in (('recovery_orchestration', 'orchestration_id'),
+                        ('batch_orchestration', 'batch_orchestration_id')):
+        observed_ids = {rec[field] for rec in reviews if isinstance(rec.get(field), str) and rec[field]}
+        missing_namespace_links[kind] = sorted(observed_ids - ids[kind])
+        ids[kind].update(observed_ids)
     budget = store.request_budget(row['id']) if hasattr(store, 'request_budget') else None
     budget = _budget(budget, row['id'])
     layers = budget.get('capacity_layers', [])
@@ -331,8 +339,12 @@ def _request(store, row, now, spend_rows, spend_truncated, resources):
                              'scope': 'owned linked review metered API events only',
                              'subscription_cost_usd': None}
     costs['reused_reviews'] = reused
-    costs['reused_passes'] = sum(bool(batch.get('reused')) for rec in reviews
-        for batch in rec.get('batches', ()) if isinstance(batch, dict))
+    batch_keys = {(rec.get('batch_orchestration_id') or rec['id'], batch.get('index', index))
+        for rec in reviews for index, batch in enumerate(rec.get('batches') or ())
+        if isinstance(batch, dict)}
+    costs['reused_passes'] = len({(rec.get('batch_orchestration_id') or rec['id'], batch.get('index', index))
+        for rec in reviews for index, batch in enumerate(rec.get('batches') or ())
+        if isinstance(batch, dict) and batch.get('reused')})
     costs['review_bytes'] = [{'review_id': rec['id'],
         'diff_bytes': _number(rec.get('diff_bytes')),
         'prompt_bytes': _number(rec.get('prompt_bytes')),
@@ -377,7 +389,8 @@ def _request(store, row, now, spend_rows, spend_truncated, resources):
     partial = (truncated or missing or malformed or missing_capacity or executions_truncated
                or costs['attempt_identity_missing'] or costs['launch_unknown']
                or costs['attempts_truncated'] or not budget or unowned
-               or any(missing_orchestrations.values()) or any(a['holders_truncated'] for a in admissions))
+               or any(missing_orchestrations.values()) or any(missing_namespace_links.values())
+               or any(a['holders_truncated'] for a in admissions))
     return {'request_id': row['id'], 'state': row['state'],
         'identity': {key: identity.get(key) for key in ('worktree_root', 'repo_id', 'branch', 'head', 'diff_hash')},
         'created_at': row['created_at'], 'updated_at': row['updated_at'],
@@ -397,11 +410,13 @@ def _request(store, row, now, spend_rows, spend_truncated, resources):
             'review_records': len(reviews), 'review_modes': dict(Counter(str(rec.get('mode') or 'unknown') for rec in reviews)),
             'recovery_orchestration_ids': len(ids['recovery_orchestration']),
             'batch_orchestration_ids': len(ids['batch_orchestration']),
-            'nested_batches': sum(len(rec.get('batches') or ()) for rec in reviews)},
+            'nested_batches': len(batch_keys),
+            'nested_batch_records': sum(len(rec.get('batches') or ()) for rec in reviews)},
         'coverage': {'status': 'partial' if partial else 'complete', 'links_truncated': truncated,
             'executions_truncated': executions_truncated, 'missing_reviews': missing,
             'malformed_reviews': malformed, 'missing_admissions': missing_capacity,
             'review_cost_owner_missing': unowned, 'missing_orchestrations': missing_orchestrations,
+            'missing_namespace_links': missing_namespace_links,
             'usage_complete': costs['token_usage']['complete'],
             'notes': ['Unknown usage is not zero; prompt bytes are not billed tokens.',
                       'External local-gate locks are not Skodun capacity queues.']}}
@@ -451,7 +466,7 @@ def inspect(store, *, request_id=None, worktree_root=None, repository_id=None,
             item['coverage']['status'] = 'partial'
             item['coverage']['output_truncated'] = True
             encoded_size = len(json.dumps(item, ensure_ascii=True).encode())
-        if output_bytes + encoded_size > 2 * 1024 * 1024:
+        if output_bytes + encoded_size > 2 * 1024 * 1024 - 8192:
             truncated = True
             break
         projected.append(item)
@@ -507,7 +522,13 @@ def augment_stats(store, data, *, now=None):
             'SELECT mode,COUNT(*) AS n FROM reviews WHERE COALESCE(review_started_at,reviewed_at)>=? GROUP BY mode',
             (since,))},
         'namespace_note': 'Recovery IDs are not batch IDs or a request denominator.'}
-    data['call_observations'] = {**observed, 'window': window,
+    counts_complete = not (len(records) > 200 or observed['attempt_identity_missing']
+                           or observed['launch_unknown'] or observed['attempts_truncated'])
+    if not counts_complete:
+        observed['launched_calls'] = None
+        observed['token_usage']['total'] = None
+        observed['token_usage']['complete'] = False
+    data['call_observations'] = {**observed, 'counts_complete': counts_complete, 'window': window,
         'sample_count': len(reviews), 'denominator': 'most recent review records in window',
         'review_limit': 200, 'reviews_truncated': len(records) > 200,
         'external_gate_lock_wait_ms': None,

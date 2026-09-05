@@ -270,3 +270,54 @@ def test_queue_shares_indexed_peer_reads_and_labels_legacy_missing_timing(tmp_pa
         legacy = next(r for r in json.loads(text)['requests'] if r['request_id'] == 'sk_req_d')
         assert legacy['admissions'][0]['wait_elapsed_ms'] is None
         assert legacy['admissions'][0]['historical_median_wait']['value_ms'] is None
+
+
+def test_resumed_request_deduplicates_checkpoint_calls_and_execution_wall_time(tmp_path):
+    with Store.open(tmp_path / 's.db') as store:
+        rid = request(store)
+        old = {'attempt_id': 'original-call', 'provider': 'openai', 'rc': 0, 'n': 1,
+            'input_bytes': 10, 'usage': {'input_tokens': 5},
+            'capacity_timing': {'started_at': '2026-09-05T12:00:02Z', 'ended_at': '2026-09-05T12:00:10Z'}}
+        new = {**old, 'attempt_id': 'new-call', 'input_bytes': 20,
+            'capacity_timing': {'started_at': '2026-09-05T12:00:22Z', 'ended_at': NOW}}
+        for rec in (_round(id='first', request_id=rid, batch_orchestration_id='batch',
+                          batches=[{'index': 0, 'attempts': [old]}]),
+                    _round(id='second', request_id=rid, batch_orchestration_id='batch',
+                          batches=[{'index': 0, 'attempts': [old], 'reused': True},
+                                   {'index': 1, 'attempts': [new]}])):
+            store.save_review(rec)
+            store.link_request(rid, 'review', rec['id'])
+        store.finish_request(rid, owner_token=rid, state='finished', reason_code='complete', result=None, now=NOW)
+        store._c.execute("UPDATE request_executions SET completed_at='2026-09-05T12:00:10Z'")
+        store._c.execute('INSERT INTO request_executions(request_id,owner_token,source,pid,started_at,completed_at,status) VALUES(?,?,?,?,?,?,?)',
+            (rid, 'second-owner', 'cli', 123, '2026-09-05T12:00:20Z', NOW, 0))
+        _, text = services.svc_queue(store, request_id=rid, output='json', now=NOW)
+        row = json.loads(text)['requests'][0]
+        assert row['costs']['launched_calls'] == 2
+        assert row['costs']['aggregate_launched_prompt_bytes'] == 30
+        assert row['costs']['reused_passes'] == 1
+        assert row['denominators']['nested_batches'] == 2
+        assert row['denominators']['nested_batch_records'] == 3
+        assert row['denominators']['batch_orchestration_ids'] == 1
+        assert row['coverage']['missing_namespace_links']['batch_orchestration'] == ['batch']
+        assert row['costs']['token_usage']['input'] == 10
+        assert row['costs']['token_usage']['total'] is None
+        assert row['timing']['provider_elapsed']['value_ms'] == 16000
+        assert row['timing']['execution_elapsed']['value_ms'] == 20000
+        assert row['timing']['total_elapsed']['value_ms'] == 30000
+
+
+def test_legacy_calls_and_metered_provider_request_ids_do_not_create_totals(tmp_path):
+    with Store.open(tmp_path / 's.db') as store:
+        rid = request(store)
+        rec = _round(id='legacy', request_id=rid, attempts=[{'rc': 0, 'n': 1, 'provider': 'openai'}])
+        store.save_review(rec); store.link_request(rid, 'review', rec['id'])
+        store.finish_request(rid, owner_token=rid, state='finished', reason_code='complete', result=None, now=NOW)
+        store._c.execute('INSERT INTO api_spend_events(at,provider,prompt_tokens,completion_tokens,total_tokens,cost_usd,request_id) VALUES(?,?,?,?,?,?,?)',
+            (NOW, 'openai-api', 10, 2, 12, 1.0, rid))
+        _, text = services.svc_queue(store, request_id=rid, output='json', now=NOW)
+        costs = json.loads(text)['requests'][0]['costs']
+        assert costs['reported_launched_calls'] == 1
+        assert costs['launched_calls'] is None
+        assert costs['metered_spend']['usd'] is None
+        assert costs['token_usage']['total'] is None
