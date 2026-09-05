@@ -267,7 +267,8 @@ def test_recovery_budget_and_external_cancel_have_different_codes(tmp_path, monk
     import threading
     repo = _ready_repo(tmp_path, monkeypatch)
     cancelled = threading.Event()
-    cancelled.set()
+    from skodun.request_cancel import mark_event
+    mark_event(cancelled, 'requested_cancel')
     with Store.open(tmp_path / 'db') as store:
         _, _, external = services.svc_review_detailed(store, repo, recover=True, cancel=cancelled)
         clock = iter([0.0, 2.0, 2.0, 2.0, 2.0])
@@ -296,7 +297,8 @@ def test_trusted_reuse_names_original_request_and_observed_counts(tmp_path, monk
 
 
 @pytest.mark.parametrize('surface', ['cli', 'mcp'])
-def test_partial_batches_keep_provider_input_and_aggregate_scopes(tmp_path, monkeypatch, capsys, surface):
+@pytest.mark.parametrize('successful_pass', ['batch', 'integration'])
+def test_partial_batches_keep_provider_input_and_aggregate_scopes(tmp_path, monkeypatch, capsys, surface, successful_pass):
     from skodun import runner
     from tests.test_batched_review import _body
     from skodun.mcpserver import HandlerCall
@@ -312,9 +314,12 @@ def test_partial_batches_keep_provider_input_and_aggregate_scopes(tmp_path, monk
     inputs = []
     def provider(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
         from pathlib import Path
-        inputs.append(len(Path(cmd[cmd.index('--prompt-file') + 1]).read_bytes()))
+        prompt_file = Path(cmd[cmd.index('--prompt-file') + 1])
+        inputs.append(len(prompt_file.read_bytes()))
+        clean = (len(inputs) == 1 if successful_pass == 'batch' else
+                 prompt_file.name.startswith('integration.'))
         out.write_bytes(b'{"structuredOutput":{"summary":"s","findings":[]},"stopReason":"EndTurn"}'
-                        if len(inputs) == 1 else b'no usable review')
+                        if clean else b'no usable review')
         return runner.RunResult(rc=0, timed_out=False, duration_sec=.1, first_output_sec=.05)
     monkeypatch.setattr(runner, 'run_with_watchdog', provider)
     if surface == 'cli':
@@ -402,7 +407,8 @@ def test_reuse_cancellation_is_typed(tmp_path, monkeypatch):
     import threading
     repo = _ready_repo(tmp_path, monkeypatch)
     cancelled = threading.Event()
-    cancelled.set()
+    from skodun.request_cancel import mark_event
+    mark_event(cancelled, 'requested_cancel')
     with Store.open(tmp_path / 'db') as store:
         code, _, meta = services.svc_review_detailed(store, repo, reuse_trusted=True, cancel=cancelled)
     assert code == 4 and meta['result']['execution']['reason_code'] == 'requested_cancel'
@@ -499,3 +505,58 @@ def test_unrecorded_security_attempts_make_counts_incomplete(tmp_path, monkeypat
     assert result['counts']['known_provider_launches'] == 1
     assert result['counts']['complete'] is False
     assert result['missing_attempt_scopes'] == [{'kind': 'extra_pass', 'id': 'security'}]
+
+
+
+def test_replay_rejects_success_termination_on_failed_status():
+    from skodun.review_results import valid_replay
+    assert not valid_replay({'status': 4, 'text': 'failed', 'metadata': {
+        'termination': {'reason_code': 'review_clean', 'state': 'completed'}}})
+
+
+@pytest.mark.parametrize('change', ['moved', 'unreadable'])
+def test_identity_recheck_failure_keeps_the_current_persisted_observation(tmp_path, monkeypatch, change):
+    from skodun import pipeline
+    repo = _ready_repo(tmp_path, monkeypatch)
+    run = pipeline.run_review
+    identity = services._recovery_identity
+    if change == 'moved':
+        def run_then_move(*args, **kwargs):
+            rec = run(*args, **kwargs)
+            (repo / 'a.txt').write_text('changed after publication\n')
+            return rec
+        monkeypatch.setattr(pipeline, 'run_review', run_then_move)
+    else:
+        calls = []
+        def unreadable_after_first(root):
+            calls.append(1)
+            if len(calls) > 1:
+                raise OSError('identity unavailable after publication')
+            return identity(root)
+        monkeypatch.setattr(services, '_recovery_identity', unreadable_after_first)
+    with Store.open(tmp_path / 'db') as store:
+        code, _, metadata = services.svc_review_detailed(store, repo, recover=True)
+        result = metadata['result']
+        assert code == 4
+        assert result['ids']['review_id'] == metadata['recovery']['review_ids'][0]
+        assert store.get_review(result['ids']['review_id']) is not None
+    assert result['execution']['reason_code'] == ('identity_changed' if change == 'moved' else 'identity_unavailable')
+
+
+
+def test_recovery_preserves_audited_lifecycle_signal(tmp_path, monkeypatch):
+    from skodun import pipeline, runner
+    from skodun.request_cancel import mark_event
+    repo = _ready_repo(tmp_path, monkeypatch)
+    def signal(*args, **kwargs):
+        mark_event(kwargs['cancel'], 'signal')
+        raise runner.ReviewCancelled('interrupted')
+    monkeypatch.setattr(pipeline, 'run_review', signal)
+    with Store.open(tmp_path / 'db') as store:
+        code, _, meta = services.svc_review_detailed(store, repo, recover=True)
+        request = store.get_request(meta['request']['id'])
+        assert request['state'] == 'cancelled'
+        assert request['reason_code'] == 'signal'
+    assert code == 4
+    assert meta['result']['execution']['reason_code'] == 'signal'
+    assert meta['result']['execution']['state'] == 'cancelled'

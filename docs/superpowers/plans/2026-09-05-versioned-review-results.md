@@ -31,3 +31,21 @@ The cancel-after-first-checkpoint regression failed through service, CLI, and MC
 The same follow-up addresses current review findings: nested and semantic replay validation (10 negative cases failed before tightening), typed reuse cancellation, provider admission expiry, MCP busy, and final recovery persistence failure. Extra-pass metadata without attempt rows now marks counts/causes incomplete and names the missing scopes. No extra-pass schema or execution behavior was added. The MCP store-open status remains the intentionally preserved legacy status 2; authoritative #194 eligibility input bytes remain valid observed data, with the documentation clarified.
 
 Final focused verification: 46 result/inventory tests passed under ResourceWarning-as-error in 14.43 seconds; 168 service/MCP tests passed in 5.10 seconds. An earlier broader ResourceWarning run returned 144 passed with one existing unclosed SQLite finalizer warning in the request dispatch fixture; another earlier MCP warning sweep exposed existing unclosed subprocess pipe finalizers. These are not claims that the complete lifecycle sweep passed. Root still owns that integrated sweep. `git diff --check` and self-review passed; no new external review loop was run.
+
+## Integration with scoped control
+
+Rebased onto schema-18 main at 7ad0a37, preserving actor forwarding, RequestCancel,
+scoped controls, both documentation additions and both lifecycle registrations.
+The focused integration run passed 201 tests (requests, results, scoped controls,
+services) in 39.79 seconds. Recovery now forwards lifecycle causes to the audited
+upstream cancellation token and supports mark_event's reason setter; an explicit
+signal regression first failed and then passed. Unmarked Events retain the new
+unknown_cancel_token semantics.
+
+The remaining current thread findings were covered in the same review batch:
+failed-status receipts reject successful termination metadata, integration-only
+usable output counts as partial evidence, and identity recheck failures retain
+the current persisted observation with explicit current-identity match state.
+Those five regressions failed before their changes; the seven-case focused
+selection then passed. No new external review was requested. Final diff check
+and rebase self-review passed.

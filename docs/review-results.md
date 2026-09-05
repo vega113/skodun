@@ -72,3 +72,9 @@ the display bound, while `counts.complete` / `causes_complete` describe evidence
 completeness. Busy MCP review refusals use `mcp_busy`, preserving their legacy
 status. MCP store-open failure also preserves its existing status 2; the CLI's
 corresponding status remains 4. Both report `persistence_failed` as the stable cause.
+
+If a post-attempt recovery identity check fails, the current persisted
+observation remains available under its exact identity. Execution still fails;
+`coverage.current_identity_match` is false for a demonstrated change and null
+when the recheck was unavailable. Parsed integration evidence also establishes
+partial output when the individual batches did not parse.

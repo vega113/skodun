@@ -82,7 +82,8 @@ def observation(rec):
                 })
     complete = rec.get('trustworthy') is True
     partial = bool(rec.get('batched') and not complete and
-                   any(b.get('parse_ok') for b in rec.get('batches', [])))
+                   (any(b.get('parse_ok') for b in rec.get('batches', [])) or
+                    (rec.get('integration') or {}).get('parse_ok') is True))
     code = 'review_clean' if complete and rec.get('findings_total') == 0 else 'review_findings'
     if not complete:
         code = ('no_compatible_route' if 'transport_ineligible' in causes else
@@ -217,7 +218,8 @@ def project(status, metadata=None, *, reason_code=None):
                       'replayed': request.get('replayed') is True,
                       'reused': (metadata.get('reuse') or {}).get('hit') is True},
         'coverage': {'trustworthy': observed.get('trustworthy'), 'parse_ok': observed.get('parse_ok'),
-                     'partial': observed.get('partial')},
+                     'partial': observed.get('partial'),
+                     'current_identity_match': observed.get('current_identity_match')},
         'findings': {'total': observed.get('findings_total'), 'open': None, 'triage_evaluated': False},
         'gate': {'evaluated': False, 'exit_code': None},
         'timing': metadata.get('timing') or {'scope': 'request_execution', 'duration_sec': None, 'queue_wait_ms': None},
@@ -316,6 +318,10 @@ def valid_replay(value):
             termination.get('reason_code', 'review_completed') not in
             {'review_completed', 'review_clean', 'review_findings', 'trusted_reuse'}):
         return False
+    success_codes = {'review_completed', 'review_clean', 'review_findings', 'trusted_reuse'}
+    if status not in (0, 1) and (termination.get('state') == 'completed' or
+                               termination.get('reason_code') in success_codes):
+        return False
     if 'timing' in metadata and not timing_fields(metadata['timing']):
         return False
     recovery = metadata.get('recovery', {})
@@ -337,7 +343,7 @@ def valid_replay(value):
     for field in ('review_id', 'request_id', 'batch_orchestration_id'):
         if not maybe_string(facts.get(field)):
             return False
-    for field in ('trustworthy', 'parse_ok', 'partial', 'attempts_truncated', 'counts_complete', 'causes_complete'):
+    for field in ('trustworthy', 'parse_ok', 'partial', 'attempts_truncated', 'counts_complete', 'causes_complete', 'current_identity_match'):
         if not maybe_bool(facts.get(field)):
             return False
     if not code(facts.get('reason_code')):
@@ -393,7 +399,12 @@ def valid_replay(value):
                 facts['launched_count'] < sum(row['launched'] for row in rows) or
                 facts['launched_count'] > facts['candidate_count']):
             return False
+    if status not in (0, 1) and not termination.get('reason_code') and (
+            reuse.get('hit') or facts.get('reason_code') in success_codes):
+        return False
     if status in (0, 1):
+        if facts.get('current_identity_match') is False:
+            return False
         if facts.get('trustworthy') is not True or facts.get('parse_ok') is not True or facts.get('partial'):
             return False
         if status == 0 and not reuse.get('hit') and facts.get('findings_total') != 0:

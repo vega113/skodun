@@ -701,6 +701,7 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
         def __init__(self):
             self._event = threading.Event()
             self.deadline_expired = False
+            self._cause = None
 
         def _refresh(self):
             if cancel is not None and cancel.is_set():
@@ -712,14 +713,27 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
         @property
         def reason_code(self):
             self._refresh()
-            return ('budget_expired' if self.deadline_expired else
-                    'requested_cancel' if self._event.is_set() else None)
+            if self.deadline_expired:
+                return 'budget_expired'
+            if self._event.is_set():
+                return getattr(cancel, 'reason_code', None) or self._cause or 'unknown_cancel_token'
+            return None
+
+        @reason_code.setter
+        def reason_code(self, cause):
+            self._cause = cause
 
         def is_set(self):
             self._refresh()
             return self._event.is_set()
 
         def set(self):
+            if cancel is not None:
+                if self._cause is not None:
+                    from .request_cancel import mark_event
+                    mark_event(cancel, self._cause)
+                else:
+                    cancel.set()
             self._event.set()
 
         def wait(self, seconds):
@@ -904,8 +918,13 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
             result_metadata = {}
     if terminal_code is not None:
         result_metadata['termination'] = {'reason_code': terminal_code}
-        if terminal_code in ('identity_changed', 'identity_unavailable', 'persistence_failed'):
+        if terminal_code == 'persistence_failed':
             result_metadata.pop('observation', None)
+        elif terminal_code in ('identity_changed', 'identity_unavailable'):
+            observed = result_metadata.get('observation')
+            if observed is not None:
+                result_metadata['observation'] = {
+                    **observed, 'current_identity_match': False if terminal_code == 'identity_changed' else None}
     prefix = (f"SKODUN RECOVERY: orchestration_id={orchestration_id} "
               f"attempts={attempt_count} "
               f"review_ids={','.join(review_ids) or '-'} "
