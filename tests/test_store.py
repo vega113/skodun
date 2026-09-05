@@ -2450,6 +2450,7 @@ def test_operating_on_a_closed_store_raises_programming_error_not_swallowed(tmp_
 #: that every listed module be a grep hit.
 _STORE_TOUCHING_MODULES = (
     "tests/test_parallel_batches.py",
+    "tests/test_parallel_batch_benchmark.py",
     "tests/test_followup_checkpoints.py",
     "tests/test_store.py",
     "tests/test_checkpoints.py",

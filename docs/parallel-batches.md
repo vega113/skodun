@@ -55,3 +55,32 @@ Rollback is explicit: select `1` for future requests. Finish or cancel an active
 `2` request; never change its frozen plan halfway through execution. The owner
 must accept the real-pilot evidence and effective limit inventory before live
 rollout. Hermetic overlap/fairness tests are not that acceptance.
+
+
+## Reproduce the bounded fixture comparison
+
+From this source checkout, use a new output directory:
+
+```sh
+PYTHONPATH=src python3 -m benchmarks.parallel_batch_concurrency \
+  --output /tmp/skodun-batch-fixture-20260905 --delay-seconds 1
+```
+
+This command creates four benign frozen worktrees and uses only a generated
+local provider. Each profile runs the four requests sequentially, with foreground
+capacity 1 and provider capacity 2, to isolate within-request batch overlap.
+Only batch worker degree changes from 1 to 2. The two profiles share one fixture
+authority and retain identical diffs, batch boundaries and pass policy.
+
+`report.json` contains measured monotonic trial time, actual provider launch
+intervals/peak, request outcomes, exact identities, batch counts/boundaries and
+integration telemetry. Per-request CLI results, complete fixture review records
+and queue observations are retained beside the report. Every reported elapsed
+value is one four-request trial observation; it is not four independent estimates
+of total workload latency. Raw stage observations retain their original precision.
+Missing token/cost, host-memory and SQLite contention totals remain unknown.
+
+Check trustworthy completion, gates, identical call counts and complete intervals
+before interpreting elapsed differences. A failed or incomplete fixture is not
+throughput acceptance. This command never runs a real provider, changes the
+installed authority or satisfies #192's pending shared-authority pilot.
