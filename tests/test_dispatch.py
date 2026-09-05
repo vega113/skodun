@@ -3748,3 +3748,47 @@ def test_unreadable_trusted_post_commit_token_never_bypasses_demotion(tmp_path,m
     with Store.open(db) as store:
         assert store.get_review(rid)['trustworthy'] is False
         assert run_gate(store,repo,load_config(repo)).code == 2
+
+
+def test_prepush_primary_evidence_preserves_actual_escalated_timeout(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from skodun import services
+    repo = _bg_repo(tmp_path, extra_cfg='\n[defaults]\ncontext_pack = false\ntimeout_sec = 420\n\n[dispatch]\ntimeout_sec = 240\nlarge_prompt_bytes = 1\n')
+    caps = []
+    real = pipeline._run_chain
+    def spy(reviewer, cfg, defaults, *args, **kwargs):
+        caps.append(defaults.timeout_sec)
+        return real(reviewer, cfg, defaults, *args, **kwargs)
+    monkeypatch.setattr(pipeline, '_run_chain', spy)
+    observed = _prepush(tmp_path / 'execution.db', repo)
+    assert caps == [420]
+    assert observed['timeout_seconds'] == 240
+    assert observed['primary_timeout_seconds'] == caps[0]
+    # A labeled scalar-history fixture uses the actual shipped execution's
+    # prompt, output and timeout facts; this is not a provider performance pilot.
+    (repo / '.skodun.toml').write_text(CFG + '\n[defaults]\ncontext_pack = false\ntimeout_sec = 240\n\n[dispatch]\ntimeout_sec = 240\nlarge_prompt_bytes = 1\n')
+    options = dict(mode='prepush', local_ref='refs/heads/feat', local_oid=observed['head'],
+        remote_ref='refs/heads/feat', remote_oid='0' * 40, target_source='measured',
+        target_latency_seconds=86400, now=observed['reviewed_at'], output='json')
+    with Store.open(tmp_path / 'history.db') as store:
+        records = []
+        for index in range(20):
+            item = deepcopy(observed)
+            item.update(id=f'fixture-{index}', request_id=f'fixture-request-{index % 5}')
+            item['attempts'][0]['attempt_id'] = f'fixture-call-{index}'
+            records.append(item)
+            store.save_review(item)
+        code, text = services.svc_review_plan(store, repo, **options)
+        plan = json.loads(text)
+        assert code == 0
+        assert plan['calls'][0]['configured_timeout_seconds'] == 240
+        assert plan['measurements']['cohorts'][0]['timeout_seconds'] == [420]
+        assert plan['selection']['reason'] == 'historical_timeout_incompatible'
+        assert plan['selection']['target_source'] == 'configured'
+        for item in records:
+            item.pop('primary_timeout_seconds')
+            store.save_review(item)
+        _, text = services.svc_review_plan(store, repo, **options)
+        legacy = json.loads(text)
+        assert legacy['measurements']['incomplete_rows'] == 20
+        assert legacy['selection']['target_source'] == 'configured'

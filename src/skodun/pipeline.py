@@ -2667,8 +2667,9 @@ def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
     _note(f"reviewing {len(diff.files)} file(s) vs {base.ref} as {record_id} ...")
     # Standalone chain budget: pre-push is not on the FG admit path, so
     # run_chain starts its own shared provider wait deadline (not reset per hop).
-    outcome = _run_chain(finder, cfg,
-                         _escalated(d, prompt.prompt_bytes, large_prompt),
+    effective_d = _escalated(d, prompt.prompt_bytes, large_prompt)
+    rec["primary_timeout_seconds"] = effective_d.timeout_sec
+    outcome = _run_chain(finder, cfg, effective_d,
                          prompt.text, root, store, scratch, "primary",
                          cancel=cancel)
     rec["attempts"] = outcome.attempts

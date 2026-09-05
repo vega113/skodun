@@ -77,6 +77,8 @@ is insufficient. The shipped planner checks
 the entire candidate, including integration's structural floor and every required
 input. Its largest primary/batch prompt and context size must fit the observed
 ranges, and observed timeout caps must not exceed the applicable execution cap.
+Prepush primary observations use the recorded effective timeout after threshold
+escalation; legacy rows missing that fact cannot substitute the configured cap.
 Smaller remainder batches outside those ranges retain unknown timings.
 Insufficient, stale, mismatched, missing, censored or failed evidence retains the
 configured target with a reason. A positive explicit `--batch-target-bytes` always

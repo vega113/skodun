@@ -141,7 +141,11 @@ def evidence(records, *, reviewer, mode, execution_policy, context_pack=False, n
                 byte_dimensions = telemetry.get('bytes') if isinstance(telemetry, dict) else None
                 byte_dimensions = byte_dimensions if isinstance(byte_dimensions, dict) else {}
                 context_bytes = byte_dimensions.get('context') if kind == 'batch' else source.get('context_bytes')
-                timeout = record.get('timeout_seconds') if kind == 'primary' else None
+                timeout = None
+                if kind == 'primary':
+                    # Prepush may escalate above its configured dispatch cap.
+                    # Legacy rows without the actual cap remain unknown.
+                    timeout = record.get('primary_timeout_seconds') if mode == 'prepush' else record.get('timeout_seconds')
                 if kind == 'batch' and isinstance(telemetry, dict):
                     paired = [row for row in telemetry.get('attempts', ()) if isinstance(row, dict) and row.get('attempt_id') == aid]
                     if len(paired) == 1:
