@@ -1043,6 +1043,8 @@ def svc_stats(store, since_days=7, fmt="text") -> tuple[int, str]:
     try:
         lower = stats.since_iso(since_days)
         data = store.telemetry_stats(since_iso=lower)
+        from .queueview import augment_stats
+        data = augment_stats(store, data)
         return 0, stats.render(data, fmt=fmt)
     except KeyboardInterrupt:
         raise
@@ -2138,3 +2140,26 @@ def svc_feedback_list(
         return 0, "skodun feedback: (none)"
     lines = [feedback_mod.format_row(r) for r in rows]
     return 0, "\n".join(lines)
+
+
+def svc_queue(store, repo=None, *, request_id=None, scope='worktree', limit=50,
+              output='text', now=None) -> tuple[int, str]:
+    """Shared read-only request ownership/cost inspection for CLI and MCP."""
+    from . import control, queueview
+    try:
+        if scope not in ('worktree', 'repository', 'host'):
+            raise ValueError('scope must be worktree, repository or host')
+        worktree, repository = None, None
+        if request_id is None and scope != 'host':
+            identity = control.scope_identity(repo or '.')
+            if scope == 'worktree':
+                worktree = identity['worktree_root']
+            else:
+                repository = identity['repo_id']
+        data = queueview.inspect(store, request_id=request_id, worktree_root=worktree,
+            repository_id=repository, scope=scope, limit=limit, now=now)
+        return 0, queueview.render(data, output)
+    except (ValueError, TypeError) as exc:
+        return 2, f'skodun queue: refused: {exc}'
+    except Exception as exc:
+        return 2, f'skodun queue: inspection unavailable: {type(exc).__name__}'

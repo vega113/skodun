@@ -195,6 +195,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", dest="json_output",
         help="render the same statistics as machine-readable JSON")
 
+    queue = sub.add_parser("queue", help="inspect request owners, capacity and observed costs")
+    queue.add_argument("request_id", nargs="?", default=None)
+    queue.add_argument("--repo", type=Path, default=Path("."))
+    queue.add_argument("--scope", choices=("worktree", "repository", "host"), default="worktree")
+    queue.add_argument("--limit", type=int, default=50)
+    queue.add_argument("--json", action="store_true", dest="json_output")
+
     # Epic S1: observe / cancel without a second gate. Hyphenated CLI names
     # match install-hooks / import-legacy; MCP tools use underscores like the
     # rest of the tool surface (review_status, review_cancel).
@@ -895,13 +902,27 @@ def _cmd_review(args) -> int:
     return emit_result(text, code, response[2] if len(response) == 3 else None)
 
 
+def _cmd_queue(args) -> int:
+    """Inspect a read-only store snapshot; never initialize or migrate it."""
+    from .services import svc_queue
+    from .store import Store
+    try:
+        with Store.open_readonly(_store_path()) as store:
+            code, text = svc_queue(store, args.repo, request_id=args.request_id,
+                scope=args.scope, limit=args.limit,
+                output="json" if args.json_output else "text")
+        return _emit(text, code)
+    except Exception as exc:
+        return _emit(f"skodun queue: could not open read-only store: {exc}", 2)
+
+
 def _cmd_stats(args) -> int:
     """Read operational telemetry; this command never mutates gate/trust."""
     from .services import svc_stats
     from .store import Store
 
     try:
-        store = Store.open(_store_path())
+        store = Store.open_readonly(_store_path())
     except BaseException as e:
         return _emit(f"skodun stats: could not open the store: {e!r}", 2)
     with store:
@@ -2246,6 +2267,8 @@ def main(argv: list[str] | None = None) -> int:
                     from .review_results import project
                     return _emit(json.dumps(project(130, reason_code='requested_cancel')), 130)
                 return 130
+        if args.command == "queue":
+            return _cmd_queue(args)
         if args.command == "stats":
             return _cmd_stats(args)
         if args.command == "review-readiness":

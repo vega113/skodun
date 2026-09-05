@@ -922,6 +922,27 @@ def _handle_feedback_list(call: "HandlerCall") -> "HandlerResult":
     return HandlerResult(status=status, text=text)
 
 
+def _handle_queue(call: "HandlerCall") -> "HandlerResult":
+    """Shared request inspection; production opens a migration-free snapshot."""
+    from . import services
+    request_id, refusal = _opt_string_arg(call.params, "request_id", "queue")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    repo, refusal = _repo_arg(call.params, "queue")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    factory = call.store_factory
+    if factory is default_store_factory:
+        from .cli import _store_path
+        from .store import Store
+        factory = lambda: Store.open_readonly(_store_path())
+    with factory() as store:
+        status, text = services.svc_queue(store, repo, request_id=request_id,
+            scope=call.params.get("scope", "worktree"),
+            limit=call.params.get("limit", 50), output=call.params.get("output", "text"))
+    return HandlerResult(status=status, text=text)
+
+
 def _handle_review_status(call: "HandlerCall") -> "HandlerResult":
     """Read local worktree status; explicit broader scopes return lists."""
     from . import services
@@ -1308,6 +1329,21 @@ def default_registry() -> tuple[HandlerSpec, ...]:
             description="Read bounded advisory repository-evidence receipts. "
                         "Receipts never alter gate or trust; JSON matches the "
                         "CLI `skodun evidence --json` projection."),
+        HandlerSpec(
+            name="queue", long_running=False,
+            input_schema=_schema({
+                **_REPO_PROPERTY,
+                "request_id": {"type": "string", "description": "Explicit request identity to inspect."},
+                "scope": {"type": "string", "enum": ["worktree", "repository", "host"],
+                          "description": "Request selection scope; defaults to the current worktree."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100,
+                          "description": "Maximum requests to inspect (default 50)."},
+                "output": {"type": "string", "enum": ["text", "json"],
+                           "description": "Inspection representation; defaults to text."},
+            }), handler=_handle_queue,
+            description="Inspect request ownership, queues and observed costs. Same text/JSON as "
+                        "skodun queue. Historical waits are observations, not predictions. "
+                        "Missing usage is unknown. Read-only; no provider calls or migrations."),
     )
 
 

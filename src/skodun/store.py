@@ -3566,24 +3566,31 @@ class Store(RequestStoreMixin, ControlStoreMixin):
 
     def capacity_terminal_wait_ms(self, resource_class: str, scope: str,
                                   *, limit: int = 20) -> list[int]:
-        """Recent terminal ``wait_ms`` values (newest first), for ETA p50."""
+        """Recent observed queue waits, excluding admitted provider run time.
+
+        The old wait_ms column is total admission lifetime, not queue wait.
+        Expired/rejected never-admitted rows end their wait at ended_at.
+        """
         resource_class = _require_text("resource_class", resource_class)
         scope = _require_text("scope", scope)
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        if type(limit) is not int or not 1 <= limit <= 200:
             limit = 20
         rows = self._c.execute(
-            """SELECT wait_ms FROM capacity_admissions
-               WHERE resource_class=? AND scope=?
-                 AND status IN ('released','expired','rejected')
-                 AND wait_ms IS NOT NULL
-               ORDER BY ended_at DESC, id DESC LIMIT ?""",
+            """SELECT queue_wait_ms,queued_at,admitted_at,started_at,ended_at,status
+                 FROM capacity_admissions WHERE resource_class=? AND scope=?
+                  AND status IN ('released','expired','rejected')
+                ORDER BY ended_at DESC,id DESC LIMIT ?""",
             (resource_class, scope, limit)).fetchall()
-        out: list[int] = []
-        for r in rows:
-            try:
-                out.append(int(r["wait_ms"]))
-            except (TypeError, ValueError):
-                continue
+        out = []
+        for row in rows:
+            value = row['queue_wait_ms']
+            if type(value) is not int or value < 0:
+                end = row['admitted_at']
+                if end is None and row['started_at'] is None and row['status'] in ('expired', 'rejected'):
+                    end = row['ended_at']
+                value = _duration_ms(row['queued_at'], end)
+            if type(value) is int and value >= 0:
+                out.append(value)
         return out
 
     def capacity_holder_count(self, resource_class: str, scope: str) -> int:
