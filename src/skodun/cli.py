@@ -114,6 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
         "review", help="review the outgoing change now, in the foreground")
     review.add_argument("--repo", type=Path, default=Path("."),
                         help="repository to review (default: the current directory)")
+    review.add_argument("--request-key", default=None,
+                        help="idempotency key for this exact worktree request")
     # THE NAME of a `[[reviewers]]` entry, never a provider id: two enabled
     # entries may share a provider, and picking one of them by a rule nobody
     # asked about would also pick its model, its effort, its own prompt budget
@@ -464,6 +466,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="repository whose config is loaded (default: .)")
     retain.add_argument("--dry-run", action="store_true",
                         help="report what would be deleted without deleting")
+    retain.add_argument("--request-results-days", type=int, default=None,
+                        help="expire terminal request result payloads older than N days; "
+                             "keep request keys, links, and review artifacts")
     doctor = sub.add_parser(
         "doctor",
         help="diagnose install, store, adapters, and MCP readiness (read-only)")
@@ -870,7 +875,8 @@ def _cmd_review(args) -> int:
             reuse_trusted=getattr(args, "reuse_trusted", False),
             fresh=getattr(args, "fresh", False),
             batch_target_bytes=getattr(args, "batch_target_bytes", None),
-            stack_manifest=getattr(args, "stack_manifest", None))
+            stack_manifest=getattr(args, "stack_manifest", None),
+            request_key=getattr(args, "request_key", None), request_source="cli")
     return _emit(text, code)
 
 
@@ -1225,6 +1231,10 @@ def _cmd_retain(args) -> int:
     when the store/config/log dir cannot be used. Partial delete errors are
     reported and still exit 2 so a schedule job notices.
     """
+    request_days = getattr(args, "request_results_days", None)
+    if request_days is not None and not 1 <= request_days <= 3650:
+        return _emit("skodun retain: request-results-days must be in 1..3650", 2)
+    request_count = 0
     try:
         from .config import load_config
         from .retention import retain_worker_logs
@@ -1251,6 +1261,12 @@ def _cmd_retain(args) -> int:
                 max_count=cfg.retention.worker_log_max_count,
                 dry_run=bool(args.dry_run),
             )
+            if request_days is not None:
+                from datetime import datetime, timedelta, timezone
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=request_days))
+                request_count = store.prune_request_results(
+                    before=cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    dry_run=bool(args.dry_run))
     except BaseException as e:
         return _emit(f"skodun retain: {e}", 2)
     mode = "dry-run" if report.dry_run else "deleted"
@@ -1260,6 +1276,9 @@ def _cmd_retain(args) -> int:
         f"  policy: max_age_days={cfg.retention.worker_log_max_age_days} "
         f"max_count={cfg.retention.worker_log_max_count}",
     ]
+    if request_days is not None:
+        lines.append(f"  request results: {mode} {request_count} "
+                     "payload(s); request identities and evidence retained")
     for p in report.candidates[:20]:
         lines.append(f"  - {p.name}")
     if len(report.candidates) > 20:

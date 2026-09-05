@@ -373,6 +373,12 @@ def enqueue(store: "Store", *, scope: str,
         pid=os.getpid() if pid is None else pid,
     )
     ticket = _ticket_from_row(row)
+    from .requests import link_capacity
+    try:
+        link_capacity(store, aid, resource_class)
+    except BaseException:
+        finish(store, ticket, status=STATUS_REJECTED, expire_reason="request_link_failed")
+        raise
     ticket.position = store.capacity_position(aid)
     return ticket
 

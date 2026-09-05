@@ -2424,6 +2424,8 @@ def test_operating_on_a_closed_store_raises_programming_error_not_swallowed(tmp_
 _STORE_TOUCHING_MODULES = (
     "tests/test_store.py",
     "tests/test_checkpoints.py",
+    "tests/test_requests.py",
+    "tests/test_transport_eligibility.py",
     "tests/test_cli.py",
     "tests/test_gate.py",
     "tests/test_fallback.py",

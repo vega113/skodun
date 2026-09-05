@@ -703,7 +703,7 @@ def test_the_review_tool_takes_a_reviewer_by_name_in_its_schema():
     assert set(props) == {"repo", "reviewer", "client_family", "recover",
                           "max_attempts", "max_wall_seconds",
                           "reuse_trusted", "fresh", "batch_target_bytes",
-                          "stack_manifest"}
+                          "stack_manifest", "request_key"}
     assert props["reviewer"]["type"] == "string"
     assert props["reviewer"]["description"]
     assert spec.input_schema["required"] == []
@@ -840,9 +840,9 @@ def _review_family(monkeypatch, db, *, client_name=None, **params):
 
     def fake(store, repo, **kw):
         seen.update(kw)
-        return 0, "SKODUN VERDICT: trustworthy=true findings=0"
+        return 0, "SKODUN VERDICT: trustworthy=true findings=0", {}
 
-    monkeypatch.setattr(services, "svc_review", fake)
+    monkeypatch.setattr(services, "svc_review_detailed", fake)
     spec = _specs()["review"]
     spec.handler(HandlerCall(params=params,
                              store_factory=lambda: Store.open(db),

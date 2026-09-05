@@ -264,7 +264,10 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
     except BaseException as e:
         return 2, banner_failure(f"{e}; no review ran")
     try:
-        cfg = load_config(root)
+        from .requests import current
+        ctx = current()
+        cfg = (ctx.config if ctx is not None and ctx.store is store and ctx.config is not None
+               else load_config(root))
     except KeyboardInterrupt:
         raise
     except BaseException as e:
@@ -446,7 +449,10 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
         from .config import load_config
 
         root = _repo_root(Path(repo))
-        cfg = load_config(root)
+        from .requests import current
+        ctx = current()
+        cfg = (ctx.config if ctx is not None and ctx.store is store and ctx.config is not None
+               else load_config(root))
         if batch_target_bytes is not None:
             from dataclasses import replace
             cfg = replace(cfg, defaults=replace(
@@ -557,6 +563,31 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         max_attempts=None, max_wall_seconds=None,
                         reuse_trusted=False, fresh=False,
                         reuse_client_family=_REUSE_INTENT_UNSET,
+                        batch_target_bytes=None, stack_manifest=None,
+                        request_key=None, request_source="service"
+                        ) -> tuple[int, str, dict]:
+    """Durably identify an accepted request before readiness or admission."""
+    kwargs = dict(progress_sink=progress_sink, cancel=cancel, reviewer=reviewer,
+                  client_family=client_family, recover=recover,
+                  max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
+                  reuse_trusted=reuse_trusted, fresh=fresh,
+                  reuse_client_family=reuse_client_family,
+                  batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest)
+    # Syntactically invalid options are not accepted execution requests. Keep
+    # their no-store validation contract, including overflow/bool refusals.
+    if (_validate_batch_target(batch_target_bytes)[1]
+            or (recover and _validate_recovery_limits(max_attempts, max_wall_seconds)[2])):
+        return _svc_review_detailed_impl(store, repo, **kwargs)
+    from .requests import tracked_review
+    return tracked_review(_svc_review_detailed_impl)(
+        store, repo, request_key=request_key, request_source=request_source, **kwargs)
+
+
+def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
+                        reviewer=None, client_family=None, recover=False,
+                        max_attempts=None, max_wall_seconds=None,
+                        reuse_trusted=False, fresh=False,
+                        reuse_client_family=_REUSE_INTENT_UNSET,
                         batch_target_bytes=None, stack_manifest=None
                         ) -> tuple[int, str, dict]:
     """Shared review surface plus recovery metadata for MCP structured output."""
@@ -582,7 +613,10 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
     stack_request = None
     if stack_manifest is not None:
         from . import stack
-        stack_request = stack.load_request(stack_manifest)
+        from .requests import current
+        ctx = current()
+        stack_request = (ctx.stack_request if ctx is not None and ctx.store is store
+                         else stack.load_request(stack_manifest))
 
     reuse_result, reuse_note, reuse_metadata = _try_reuse(
         store, repo, reuse_trusted=reuse_trusted, fresh=fresh,
@@ -833,14 +867,16 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
                max_attempts=None, max_wall_seconds=None,
                reuse_trusted=False, fresh=False,
                reuse_client_family=_REUSE_INTENT_UNSET,
-               batch_target_bytes=None, stack_manifest=None) -> tuple[int, str]:
+               batch_target_bytes=None, stack_manifest=None,
+               request_key=None, request_source="service") -> tuple[int, str]:
     status, text, _ = svc_review_detailed(
         store, repo, progress_sink=progress_sink, cancel=cancel,
         reviewer=reviewer, client_family=client_family, recover=recover,
         max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
         reuse_trusted=reuse_trusted, fresh=fresh,
         reuse_client_family=reuse_client_family,
-        batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest)
+        batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest,
+        request_key=request_key, request_source=request_source)
     return status, text
 
 
@@ -1573,6 +1609,26 @@ def svc_review_status(store, review_id=None, repo=None, *, output="text") -> tup
     Runs `recover_stale` first so an aged FG `running` row is reported as the
     terminal state the sweep produces rather than as forever-running.
     """
+    if isinstance(review_id, str) and review_id.strip().startswith("sk_req_"):
+        import json
+        from .requests import projection
+        rid = review_id.strip()
+        try:
+            row = store.get_request(rid)
+            if row is None:
+                return 2, f"skodun review-status: no such request: {rid}"
+            request = projection(row)
+            if output == "json":
+                return 0, json.dumps({"request": request}, sort_keys=True)
+            identity = row["identity"]
+            return 0, (f"SKODUN REQUEST: id={rid} state={row['state']} "
+                       f"head={identity.get('head')} "
+                       f"worktree={json.dumps(identity.get('worktree_root'))} "
+                       f"reason={row.get('reason_code')}")
+        except KeyboardInterrupt:
+            raise
+        except BaseException as exc:
+            return 2, f"skodun review-status: could not read request: {type(exc).__name__}"
     _maybe_recover_stale(store)
     try:
         if review_id is not None and str(review_id).strip() != "":

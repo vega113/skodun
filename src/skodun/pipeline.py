@@ -1577,6 +1577,11 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         branch = gitio.current_branch(repo)
         head = gitio.head_sha(repo)
         tree_fingerprint = gitio.tree_fingerprint(repo, paths=diff.files)
+        from .requests import validate_admitted
+        validate_admitted(
+            store, repo_id=scope, worktree_root=str(root.resolve()),
+            branch=branch, head=head, base_sha=base.sha, diff_hash=diff_hash,
+            tree_fingerprint=tree_fingerprint, cfg=cfg)
         stack_validation = None
         stack_prompt_context = b""
         stack_prompt_truncated = False
