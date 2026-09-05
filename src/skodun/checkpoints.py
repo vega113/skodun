@@ -82,12 +82,12 @@ class PassIdentity:
     boundary_hash: str
 
     def __post_init__(self) -> None:
-        if self.kind not in ("batch", "integration"):
+        if self.kind not in ("batch", "integration", "security", "skeptic"):
             raise ValueError(f"unknown checkpoint pass kind {self.kind!r}")
         minimum = 1 if self.kind == "batch" else 0
         _plain_int("pass index", self.index, minimum=minimum)
-        if self.kind == "integration" and self.index != 0:
-            raise ValueError("integration pass index must be 0")
+        if self.kind != "batch" and self.index != 0:
+            raise ValueError("non-batch pass index must be 0")
         if self.kind == "batch" and self.prompt_hash is None:
             raise ValueError("a batch prompt_hash is required")
         _text("prompt_hash", self.prompt_hash, optional=True)

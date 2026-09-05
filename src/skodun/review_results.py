@@ -168,6 +168,9 @@ def cancelled_observation(store, prior_reviews):
                                        for row, payload in completed if row['pass_kind'] == 'batch']
                 evidence['integration'] = next((payload for row, payload in completed
                                                 if row['pass_kind'] == 'integration'), {})
+                evidence['extra_passes'] = {**(evidence.get('extra_passes') or {}),
+                    **{row['pass_kind']: dict(payload, ran=True) for row, payload in completed
+                       if row['pass_kind'] in ('security', 'skeptic')}}
             checkpoint_info = {'scope': 'batch_orchestration', 'id': orchestration_id,
                                'completed': len(completed), 'total': len(checkpoints)}
         facts = observation(evidence)

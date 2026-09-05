@@ -1003,10 +1003,10 @@ def test_prepared_plan_builds_the_complete_checkpoint_identity(tmp_path):
     assert identity.batch_budget == pipeline._batch_budget(d, finder)
     assert identity.context_hash == prepared.context_hash
     assert identity.checklist_hash == prepared.checklist_hash
-    assert identity.pass_identities[:-1] == tuple(
+    assert tuple(p for p in identity.pass_identities if p.kind == 'batch') == tuple(
         item.identity for item in prepared.batches)
-    assert identity.pass_identities[-1].kind == "integration"
-    assert identity.pass_identities[-1].prompt_hash is None
+    assert [p.kind for p in identity.pass_identities[-3:]] == ['integration', 'security', 'skeptic']
+    assert all(p.prompt_hash is None for p in identity.pass_identities[-3:])
 
 
 def _clean_checkpoint_sub(label: str) -> pipeline._Sub:
@@ -1078,7 +1078,7 @@ def test_cancel_after_three_batches_resumes_only_the_missing_work(
     checkpoints = store.list_checkpoints(orchestration["id"])
     assert first_calls == ["batch 1", "batch 2", "batch 3"]
     assert [row["state"] for row in checkpoints] == [
-        "complete", "complete", "complete", "pending", "pending"]
+        "complete", "complete", "complete", "pending", "pending", "pending", "pending"]
 
     resumed_calls = []
 
@@ -1144,7 +1144,7 @@ def test_global_wall_timeout_preserves_three_batches_for_resume(
         gitio.repository_identity(repo),
         gitio.observed_worktree_root(repo), gitio.current_branch(repo))
     assert [row["state"] for row in store.list_checkpoints(candidate["id"])] == [
-        "complete", "complete", "complete", "pending", "pending"]
+        "complete", "complete", "complete", "pending", "pending", "pending", "pending"]
 
     resumed_calls = []
 

@@ -113,6 +113,13 @@ def _extra_pass_state(value: object, *, refuter: bool = False) -> str:
 def _checkpoint_state(row: Mapping, rec: Mapping) -> str:
     """Project a terminal checkpoint from its payload when one is present."""
     state = row.get("state")
+    if row.get('pass_kind') in ('security', 'skeptic') and row.get('binding_json'):
+        try:
+            from .followups import decode_binding
+            if not decode_binding(row['binding_json'])['decision']['scheduled']:
+                return 'not_planned'
+        except (ValueError, TypeError):
+            return 'failed'
     if state != "complete":
         return _pass_state(state)
     payload = _checkpoint_payload(row)
@@ -148,6 +155,8 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
     if planned == 0:
         planned = 1
     checkpoint_states = [_checkpoint_state(row, rec) for row in checkpoint_rows]
+    planned += sum(row.get('pass_kind') in ('security', 'skeptic') and state != 'not_planned'
+                   for row, state in zip(checkpoint_rows, checkpoint_states, strict=True))
     complete_rows = [state for state in checkpoint_states
                      if state in {"complete", "degraded"}]
     failed_rows = [state for state in checkpoint_states if state == "failed"]
@@ -236,17 +245,17 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
             passes["finder"] = "complete"
     for row, checkpoint_state in zip(checkpoint_rows, checkpoint_states,
                                      strict=True):
-        key = "finder" if row.get("pass_kind") == "batch" else "integration"
+        key = "finder" if row.get("pass_kind") == "batch" else row.get("pass_kind")
         if (key == "finder" and row.get("state") == "running"
                 and passes[key] not in {"failed", "degraded"}):
             passes[key] = "running"
-        elif key == "integration":
+        elif key in ("integration", "security", "skeptic"):
             passes[key] = checkpoint_state
     next_pass = None
-    for row in checkpoint_rows:
-        if row.get("state") in {"pending", "failed"}:
+    for row, state in zip(checkpoint_rows, checkpoint_states, strict=True):
+        if row.get("state") in {"pending", "failed"} and state != 'not_planned':
             next_pass = (row.get("pass_index") if row.get("pass_kind") == "batch"
-                         else batch_count + 1)
+                         else batch_count + {'integration': 1, 'security': 2, 'skeptic': 3}.get(row.get('pass_kind'), 1))
             break
     required_fail = any(passes[k] == "failed" for k in ("integration", "security", "skeptic"))
     eligible = coverage_state == "complete" and rec.get("trustworthy") is True and not required_fail
