@@ -249,6 +249,10 @@ def _review_result(status: int, text: str,
     # than inferred from the current checkout on disk.
     from .provenance import cached_provenance
 
+    from .review_results import attach
+    # Readiness shares build metadata but is not a review execution.
+    if "readiness" not in (metadata or {}):
+        _, _, metadata = attach(status, text, metadata)
     build = cached_provenance() or {}
     return HandlerResult(
         status=status,
@@ -660,7 +664,13 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
     request_key, refusal = _opt_string_arg(call.params, "request_key", "review")
     if refusal:
         return _review_result(2, refusal)
-    with call.store_factory() as store:
+    try:
+        store = call.store_factory()
+    except Exception as exc:
+        return _review_result(
+            HANDLER_FAILURE_STATUS, _handler_failure_text("review", exc),
+            {"termination": {"reason_code": "persistence_failed"}})
+    with store:
         status, text, metadata = services.svc_review_detailed(
             store, repo, cancel=call.cancel, reviewer=reviewer,
             client_family=family, recover=recover,
@@ -2051,7 +2061,8 @@ class McpServer:
             self._note(f"the {spec.name} tool raised: {e!r}")
             if spec.name == "review":
                 return _review_result(
-                    HANDLER_FAILURE_STATUS, _handler_failure_text(spec.name, e))
+                    HANDLER_FAILURE_STATUS, _handler_failure_text(spec.name, e),
+                    {"termination": {"reason_code": "handler_failed"}})
             return HandlerResult(
                 status=HANDLER_FAILURE_STATUS,
                 text=_handler_failure_text(spec.name, e), pending_acks=[])
