@@ -3385,3 +3385,41 @@ def test_record_cancellation_keeps_partial_when_lineage_enrichment_fails(monkeyp
     assert saved
     assert saved[0]["findings"][0]["title"] == "keep me"
     assert out.code == 0
+
+
+def test_current_detached_worker_cancels_cooperatively_without_pid_signal(tmp_path,monkeypatch,spawned,capsys):
+    import os
+    import signal
+    from skodun.cli import main
+    from tests.test_cli import _artifact
+    repo=_bg_repo(tmp_path,body='sleep 30')
+    db=tmp_path/'s.db'
+    monkeypatch.setenv('SKODUN_DB',str(db))
+    assert run_dispatch(_push_line(repo),repo,db) == 0
+    rid=_ids(db)[0]
+    deadline=time.monotonic()+10
+    while time.monotonic()<deadline:
+        with Store.open(db) as store:
+            rec=store.get_review(rid)
+        if rec.get('cancellation_protocol') == 'record_audit_v1':
+            break
+        time.sleep(.02)
+    assert rec.get('cancellation_protocol') == 'record_audit_v1'
+    with Store.open(db) as store:
+        store.save_review(_artifact([],id='unrelated-live',status='running',pid=os.getpid(),findings_total=0))
+        unrelated=store.get_review('unrelated-live')
+    real_kill=os.kill
+    def no_control_signal(pid,sig):
+        assert sig not in (signal.SIGTERM,signal.SIGKILL), 'control must not signal a numeric worker PID'
+        return real_kill(pid,sig)
+    monkeypatch.setattr(os,'kill',no_control_signal)
+    assert main(['review-cancel',rid,'--json']) == 0
+    response=json.loads(capsys.readouterr().out)
+    assert response['delivery_state'] == 'pending_owner_acknowledgement'
+    assert response['owner_reachability'] == 'unverified'
+    terminal=_await(db,rid,timeout=15)
+    assert terminal['status'] == 'failed' and terminal['trustworthy'] is False
+    with Store.open(db) as store:
+        assert store.get_review('unrelated-live') == unrelated
+        event=store.cancellation_events(rid)[0]
+        assert event['outcome'] == 'cancelled' and event['completed_at']

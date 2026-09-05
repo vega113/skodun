@@ -67,3 +67,40 @@ class RequestCancel:
                 return False
             self._local.wait(.05 if remaining is None else min(.05,remaining))
         return True
+
+
+RECORD_CANCEL_PROTOCOL = 'record_audit_v1'
+
+
+class RecordCancel:
+    """Current prepush worker's cooperative, record-ID-specific cancellation.
+
+    The validated worker publishes support before invoking its provider. No
+    caller signals a PID; legacy rows lacking the marker cannot opt into it.
+    """
+    def __init__(self, store, record_id, upstream):
+        self.store, self.record_id, self.upstream = store, record_id, upstream
+        self._local = threading.Event()
+        self.reason_code = None
+
+    def set(self):
+        self._local.set()
+
+    def is_set(self):
+        if self._local.is_set() or self.upstream.is_set():
+            return True
+        for event in self.store.cancellation_events(self.record_id):
+            if event['target_id'] == self.record_id and event['request_id'] is None and event['outcome'] in ('requested','observed'):
+                self.reason_code = event['cause']
+                self._local.set()
+                return True
+        return False
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            remaining = None if deadline is None else deadline-time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            self._local.wait(.05 if remaining is None else min(.05,remaining))
+        return True

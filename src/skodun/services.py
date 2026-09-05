@@ -1667,6 +1667,8 @@ def svc_review_status(store, review_id=None, repo=None, *, output="text",
         rec = store.get_review(rid)
         if rec is None:
             return 2, f"skodun review-status: no such review or request: {rid}"
+        lifecycle = control.lifecycle(rec, store.cancellation_events(
+            rec.get('request_id') or rec['id']))
     except KeyboardInterrupt:
         raise
     except BaseException as exc:
@@ -1689,8 +1691,7 @@ def svc_review_status(store, review_id=None, repo=None, *, output="text",
         import json
         payload = {"id": rec.get("id"), "state": report_state(rec),
                    "coverage": projection.to_dict(), "identity": control.review_identity(rec),
-                   "lifecycle": control.lifecycle(rec, store.cancellation_events(
-                       rec.get("request_id") or rec["id"]))}
+                   "lifecycle": lifecycle}
         for key in ("stack_context_bytes", "stack_context_truncated",
                     "lineage_context_bytes", "lineage_context_truncated",
                     "lineage_context_diagnostics", "fingerprint_diagnostics",
@@ -1702,8 +1703,7 @@ def svc_review_status(store, review_id=None, repo=None, *, output="text",
         return 0, json.dumps(payload, sort_keys=True)
     return 0, (format_status_line(rec, projection=projection) + " identity=" +
                json.dumps(control.review_identity(rec), sort_keys=True) + " lifecycle=" +
-               json.dumps(control.lifecycle(rec, store.cancellation_events(
-                   rec.get("request_id") or rec["id"])), sort_keys=True))
+               json.dumps(lifecycle, sort_keys=True))
 
 
 def svc_evidence_summary(store, identity_digest: str, *, output="text") -> tuple[int, str]:
@@ -1777,7 +1777,8 @@ def svc_review_cancel(store, review_id, *, expected_request_id=None,
             # The execution-fenced owner observes this durable event before its
             # next queue/provider checkpoint. No signal can hit another request.
             if _pid_alive(request['pid']):
-                code, text = 0, f"skodun review-cancel: cancel requested for {rid}"
+                code, text = 0, (f"skodun review-cancel: cancel requested for {rid}; "
+                                 "pending owner acknowledgement; reachability unverified")
             else:
                 store.finish_cancellations(request_id=request['id'],
                     owner_token=request['owner_token'], outcome='owner_unreachable', now=requests.now())
@@ -1796,7 +1797,9 @@ def svc_review_cancel(store, review_id, *, expected_request_id=None,
                    'reason_code':('requested_cancel' if code == 0 else
                                   'request_owner_unreachable' if request else 'legacy_owner_unproven'),
                    'audit_id':audit_id,
-                   'identity':identity, 'cancellation':store.cancellation_events(rid)}
+                   'identity':identity, 'cancellation':store.cancellation_events(rid),
+                   'delivery_state':'pending_owner_acknowledgement' if code == 0 and (request or (rec or {}).get('cancellation_protocol')) else 'not_pending',
+                   'owner_reachability':'unverified' if code == 0 and (request or (rec or {}).get('cancellation_protocol')) else 'not_asserted'}
         return code, json.dumps(payload, sort_keys=True) if output == 'json' else (
             text + ' audit_id=' + str(audit_id))
     except KeyboardInterrupt:
@@ -1816,8 +1819,8 @@ def _cancel_legacy_review(store, review_id) -> tuple[int, str]:
        surfaces).
     2. Set the in-process cancel token when this process holds it (MCP /
        same-process FG).
-    3. SIGTERM only a background worker whose argv names this exact review.
-       A generic foreground/MCP PID is not proof of ownership of this review.
+    3. Current prepush workers observe record-specific durable audit intent.
+       Legacy argv/PID matches alone are never enough to authorize signals.
     4. If nothing is alive to finish the demotion, `fail_if_running` with a
        cancel reason so the row is not forever-`running` and the next FG wait
        is not blocked by a ghost.
@@ -1826,10 +1829,7 @@ def _cancel_legacy_review(store, review_id) -> tuple[int, str]:
     still owns cleanup when the process is reachable; this function does not
     re-implement that stack.
     """
-    import os
-    import signal
-
-    from . import dispatch, pipeline
+    from . import pipeline
     from .store import RUNNING
 
     if review_id is None or str(review_id).strip() == "":
@@ -1848,58 +1848,30 @@ def _cancel_legacy_review(store, review_id) -> tuple[int, str]:
         return 2, (f"skodun review-cancel: review {rid} is already terminal "
                    f"({state})")
 
+    from .request_cancel import RECORD_CANCEL_PROTOCOL
+    if rec.get('cancellation_protocol') == RECORD_CANCEL_PROTOCOL:
+        return 0, (f"skodun review-cancel: cancel requested for {rid}; "
+                   "pending worker acknowledgement; reachability unverified")
+
     token_set = pipeline.request_cancel(rid)
-    signalled = False
     pid = rec.get("pid")
-    # When the token is in THIS process, setting it is enough: SIGTERM would
-    # hit our own process (tests, MCP server) and is unnecessary. Cross-process
-    # cancel is the only case that needs a signal.
-    if not token_set:
-        if dispatch.pid_is_skodun_worker(pid, rid):
-            try:
-                os.kill(int(pid), signal.SIGTERM)
-                signalled = True
-            except (OSError, ProcessLookupError, ValueError, TypeError):
-                pass
-
-    demoted = False
-    if not token_set and not signalled and _pid_alive(pid):
-        return 2, (f"skodun review-cancel: refused {rid}; "
-                   "reason_code=legacy_owner_unproven; use the original caller's cancellation control")
-    if not token_set and not signalled:
-        # Dead or unconfirmable holder: durable terminal now, same fail-closed
-        # posture as recover_stale, with a cancel reason so report_state maps
-        # to `cancelled` rather than a generic failed sweep.
-        try:
-            demoted = bool(store.fail_if_running(rid, REVIEW_CANCEL_DURABLE_REASON))
-        except KeyboardInterrupt:
-            raise
-        except BaseException as e:
-            return 2, (f"skodun review-cancel: could not demote review {rid}: "
-                       f"{e!r}")
-    elif signalled:
-        # Wait briefly for the holder to demote via its cancel path. If the
-        # process died without demoting (no SIGTERM handler — the MCP bug this
-        # poll closes), finish the row here so it is not forever-running.
-        outcome = _await_cancel_or_demote(store, rid, pid)
-        if outcome == "done":
-            return 0, f"skodun review-cancel: cancel completed for {rid}"
-        if outcome == "demoted":
-            return 0, (f"skodun review-cancel: cancelled {rid} "
-                       f"(durable terminal; holder exited without demoting)")
-        # Still running: cancel was requested; the holder is finishing.
-        return 0, f"skodun review-cancel: cancel requested for {rid}"
-
-    if demoted:
-        return 0, (f"skodun review-cancel: cancelled {rid} "
-                   f"(durable terminal; holder was not reachable)")
+    # Legacy artifacts have no immutable process-instance witness. Even argv
+    # naming this review can belong to a reused PID or another invocation.
     if token_set:
         return 0, f"skodun review-cancel: cancel requested for {rid}"
-    # Live but unconfirmable pid: do not SIGTERM a stranger. Operator can
-    # re-run after the process dies, or recover_stale will sweep by age.
-    return 0, (f"skodun review-cancel: cancel noted for {rid}; "
-               f"holder pid {pid!r} could not be confirmed — "
-               f"re-check with review-status")
+    if _pid_alive(pid):
+        return 2, (f"skodun review-cancel: refused {rid}; "
+                   "reason_code=legacy_owner_unproven; use the original caller's cancellation control")
+    try:
+        demoted = store.fail_if_running(rid, REVIEW_CANCEL_DURABLE_REASON)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        return 2, f"skodun review-cancel: could not demote review {rid}: {type(exc).__name__}"
+    if demoted:
+        return 0, (f"skodun review-cancel: cancelled {rid} "
+                   "(durable terminal; holder was not reachable)")
+    return 2, f"skodun review-cancel: target {rid} became terminal"
 
 
 #: How long cross-process cancel waits for the holder to demote before either

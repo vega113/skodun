@@ -86,6 +86,8 @@ class ControlStoreMixin:
 
     def finish_cancellations(self, *, outcome, now, request_id=None,
                              owner_token=None, target_id=None):
+        from .store import _require_ts
+        _require_ts('now', now)
         if request_id is not None:
             where, args = 'request_id=? AND execution_token=?', (request_id, owner_token)
         else:
@@ -94,13 +96,41 @@ class ControlStoreMixin:
             "UPDATE cancellation_audit SET outcome=?,completed_at=? WHERE " + where +
             " AND outcome IN ('requested','observed')", (outcome, now, *args))
 
-    def control_reviews(self, *, worktree_root=None, repo_id=None, limit=100):
-        where, args = '', []
+    def publish_record_cancellation(self, record_id, pid):
+        """Publish capability only from the validated current worker path."""
+        from .request_cancel import RECORD_CANCEL_PROTOCOL
+        if type(pid) is not int or pid <= 0:
+            raise ValueError('invalid worker pid')
+        cur = self._c.execute(
+            """UPDATE reviews SET artifact_json=json_set(artifact_json,
+                 '$.cancellation_protocol',?) WHERE id=? AND mode='prepush'
+                 AND status='running' AND (pid IS NULL OR pid=?)""",
+            (RECORD_CANCEL_PROTOCOL, record_id, pid))
+        return cur.rowcount == 1
+
+    def control_reviews(self, *, worktree_root=None, repo_id=None, limit=100,
+                        exclude_active_request_links=False):
+        clauses, args = [], []
         if worktree_root is not None:
-            where, args = ' WHERE worktree_root=?', [worktree_root]
+            clauses.append('worktree_root=?')
+            args.append(worktree_root)
         elif repo_id is not None:
-            where, args = ' WHERE repo=? OR repo_id=?', [repo_id, repo_id]
+            clauses.append('(repo=? OR repo_id=?)')
+            args.extend((repo_id,repo_id))
+        if exclude_active_request_links:
+            nested = ''
+            if worktree_root is not None:
+                nested = ' AND r.scope=?'
+                args.append(worktree_root)
+            elif repo_id is not None:
+                nested = " AND json_extract(r.identity_json,'$.repo_id')=?"
+                args.append(repo_id)
+            clauses.append("""NOT EXISTS (SELECT 1 FROM request_links l
+                JOIN review_requests r ON r.id=l.request_id
+                WHERE l.kind='review' AND l.target_id=reviews.id
+                  AND r.state IN ('accepted','queued','running')""" + nested + ')')
+        where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
         rows = self._c.execute('SELECT artifact_json FROM reviews' + where +
-                               ' ORDER BY reviewed_at DESC,id DESC LIMIT ?',
+                               " ORDER BY (status='running') DESC,reviewed_at DESC,id DESC LIMIT ?",
                                (*args, limit)).fetchall()
         return [json.loads(row[0]) for row in rows]

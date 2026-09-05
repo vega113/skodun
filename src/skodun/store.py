@@ -3174,6 +3174,9 @@ class Store(RequestStoreMixin, ControlStoreMixin):
                 self._consume_orchestration_in_transaction(
                     batch_orchestration_id, record_id, _iso_now())
             if applied:
+                from .control import cancellation_completion
+                self.finish_cancellations(target_id=record_id, now=_iso_now(),
+                    outcome=cancellation_completion(merged))
                 self._write_lineage(merged)
             self._c.execute("COMMIT")
             return applied

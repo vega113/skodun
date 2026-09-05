@@ -1222,6 +1222,11 @@ def _work(store: "Store", cancel: threading.Event, record_id: str, repo: Path,
         store.fail_if_running(record_id, reason)
         return WorkerOutcome(0, _banner_failure(reason))
 
+    from .request_cancel import RecordCancel
+    if not store.publish_record_cancellation(record_id, os.getpid()):
+        return WorkerOutcome(0, _banner_failure('worker no longer owns its reservation'))
+    cancel = RecordCancel(store, record_id, cancel)
+
     cfg = _load_config(repo)
     d = effective_defaults(cfg.defaults, cfg.dispatch)
     rec = pipeline.run_prepush_review(store, repo, record_id, branch, local_oid,

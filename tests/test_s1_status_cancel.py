@@ -133,6 +133,7 @@ def test_svc_review_status_by_id_and_current_for_repo(tmp_path):
 
         code, text = services.svc_review_status(st, repo=repo)
         assert code == 2  # No resolvable caller worktree; never select by shared repo.
+        assert "reason_code=scope_unavailable" in text
         code, text = services.svc_review_status(st, scope="host")
         assert code == 0 and "sk_run" in text and "sk_done" in text
 

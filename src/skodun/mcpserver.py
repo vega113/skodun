@@ -656,6 +656,7 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
         call.params, "batch_target_bytes", "review")
     if refusal:
         return _review_result(2, refusal)
+    from .control import client_actor
     request_key, refusal = _opt_string_arg(call.params, "request_key", "review")
     if refusal:
         return _review_result(2, refusal)
@@ -666,7 +667,7 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
             max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
             reuse_trusted=reuse_trusted, fresh=fresh,
             batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest,
-            request_key=request_key, request_source="mcp", request_actor=call.client_name,
+            request_key=request_key, request_source="mcp", request_actor=client_actor(call.client_name),
             reuse_client_family=(
                 family if call.params.get("client_family") is not None else None))
     return _review_result(status, text, metadata)
@@ -946,12 +947,13 @@ def _handle_evidence(call: "HandlerCall") -> "HandlerResult":
 def _handle_review_cancel(call: "HandlerCall") -> "HandlerResult":
     """Cancel-by-id. Same service the CLI calls."""
     from . import services
+    from .control import client_actor
     review_id, refusal = _string_arg(call.params, "review_id", "review_cancel")
     if refusal:
         return HandlerResult(status=2, text=refusal)
     with call.store_factory() as store:
         status, text = services.svc_review_cancel(store, review_id,
-            **_expected_control(call), actor=call.params.get("actor") or call.client_name or "unknown",
+            **_expected_control(call), actor=call.params.get("actor") if "actor" in call.params else client_actor(call.client_name),
             source="mcp", reason=call.params.get("reason","Explicit cancellation requested"),
             output=call.params.get("output","text"))
     return HandlerResult(status=status, text=text)
@@ -1615,6 +1617,7 @@ class McpServer:
         import signal
 
         from . import pipeline
+        from .request_cancel import mark_event
 
         # Resolved HERE, not in the handler: `fileno()` on a wrapped stream can
         # take that stream's lock, which is the one thing the handler must not
@@ -1629,7 +1632,6 @@ class McpServer:
             cancelled = 0
             cancel = self._worker_cancel
             if cancel is not None:
-                from .request_cancel import mark_event
                 mark_event(cancel, "signal")
                 cancelled += 1
             try:

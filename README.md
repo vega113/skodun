@@ -1182,10 +1182,12 @@ as a read-only observation, never implicit cleanup or permission to retry.
 The sanitized historical attribution limits are recorded in
 [the unfinished-outcome sample](docs/reports/2026-09-05-unfinished-attribution.md).
 
-For legacy reviews without a durable request, an exact in-process review token
-or an exact background-worker identity remains usable. A generic live
-foreground/MCP PID does not prove it still owns that review: cancellation now
-refuses it with `legacy_owner_unproven`, without signalling or demoting the row.
+Current prepush workers publish `record_audit_v1` after validating their
+reservation and observe cancellation for that exact record ID, without PID
+signals. An exact in-process review token also remains usable. Truly legacy
+workers have no immutable process-instance witness: an argv/review-ID match or
+live foreground/MCP PID alone is refused with `legacy_owner_unproven`, without
+signalling or demoting the row.
 Cancel through the original owning client's control instead. This prevents an
 old review ID from cancelling a different request on the same MCP process.
 
@@ -1193,3 +1195,8 @@ If a durable request owner is absent, cancellation reports
 `request_owner_unreachable` and audits that outcome without generic recovery.
 The request/coverage rows remain available for a separate, evidence-based
 lifecycle investigation.
+
+A successful cancellation submission acknowledges durable intent only.
+`delivery_state=pending_owner_acknowledgement` and
+`owner_reachability=unverified` remain explicit until the owning execution
+records its outcome; numeric PID existence is not proof of delivery.

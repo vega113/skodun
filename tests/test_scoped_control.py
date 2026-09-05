@@ -352,3 +352,183 @@ def test_dead_request_cancel_reports_unreachable_without_generic_recovery(tmp_pa
         assert code == 2 and json.loads(text)['reason_code'] == 'request_owner_unreachable'
         assert store.get_request(row['id'])['state'] == 'accepted'
         assert store.cancellation_events(row['id'])[0]['outcome'] == 'owner_unreachable'
+
+
+@pytest.mark.parametrize('bad_now',['2026-9-5T10:00:00Z','2026-09-05 10:00:00','2026-09-05T10:00:00+00:00',None,True])
+def test_cancel_completion_validates_timestamp_before_writing(tmp_path,bad_now):
+    repo=_mkrepo(tmp_path)
+    with Store.open(tmp_path/'s.db') as store:
+        row=begin(store,repo,'sk_req_1')
+        assert services.svc_review_cancel(store,row['id'])[0] == 0
+        before=store.cancellation_events(row['id'])
+        with pytest.raises(ValueError):
+            store.finish_cancellations(request_id=row['id'],owner_token='owner',outcome='cancelled',now=bad_now)
+        assert store.cancellation_events(row['id']) == before
+
+
+def test_legacy_worker_argv_match_does_not_prove_process_instance(tmp_path,monkeypatch):
+    from skodun import dispatch,pipeline
+    with Store.open(tmp_path/'s.db') as store:
+        rec=_artifact([],id='old-worker',status='running',pid=4444,findings_total=0)
+        store.save_review(rec)
+        monkeypatch.setattr(pipeline,'request_cancel',lambda rid:False)
+        monkeypatch.setattr(dispatch,'pid_is_skodun_worker',lambda *a:True)
+        monkeypatch.setattr(services,'_pid_alive',lambda pid:True)
+        monkeypatch.setattr(os,'kill',lambda *a:pytest.fail('reused/crafted worker argv must not authorize signal'))
+        code,text=services.svc_review_cancel(store,rec['id'])
+        assert code == 2 and 'legacy_owner_unproven' in text
+        assert store.get_review(rec['id'])['status'] == 'running'
+
+
+def test_live_numeric_pid_cannot_claim_request_delivery(tmp_path,monkeypatch):
+    repo=_mkrepo(tmp_path)
+    with Store.open(tmp_path/'s.db') as store:
+        row=begin(store,repo,'sk_req_1')
+        monkeypatch.setattr(services,'_pid_alive',lambda pid:True)
+        code,text=services.svc_review_cancel(store,row['id'],output='json')
+        payload=json.loads(text)
+        assert code == 0  # The durable intent was accepted, not acknowledged.
+        assert payload['delivery_state'] == 'pending_owner_acknowledgement'
+        assert payload['owner_reachability'] == 'unverified'
+        assert payload['cancellation'][0]['completed_at'] is None
+
+
+@pytest.mark.parametrize('output',['text','json'])
+def test_lifecycle_read_failure_returns_shared_refusal(tmp_path,monkeypatch,output):
+    with Store.open(tmp_path/'s.db') as store:
+        rec=_artifact([],findings_total=0)
+        store.save_review(rec)
+        def fail(*args): raise ValueError('broken audit JSON')
+        monkeypatch.setattr(store,'cancellation_events',fail)
+        code,text=services.svc_review_status(store,rec['id'],output=output)
+        assert code == 2 and 'scope_unavailable' in text
+
+
+def test_worker_finalization_completes_audit_and_keeps_actual_lifecycle(tmp_path):
+    with Store.open(tmp_path/'s.db') as store:
+        rec=_artifact([],id='worker',status='running',mode='prepush',pid=None,findings_total=0)
+        store.save_review(rec)
+        stored=store.get_review(rec['id'])
+        from skodun.control import review_identity
+        store.record_cancellation(target_id=rec['id'],request=None,identity=review_identity(stored),
+            actor='operator',source='test',caller_pid=os.getpid(),caller_worktree=None,
+            reason='Explicit cancellation requested',cause='requested_cancel',now=NOW)
+        done=dict(stored,status='clean')
+        assert store.finalize_review(rec['id'],done)
+        event=store.cancellation_events(rec['id'])[0]
+        assert event['outcome'] == 'completed_before_cancel' and event['completed_at']
+        code,text=services.svc_review_status(store,rec['id'],output='json')
+        life=json.loads(text)['lifecycle']
+        assert code == 0 and life['reason_code'] != 'requested_cancel'
+        assert life['cancellation'][0]['outcome'] == 'completed_before_cancel'
+
+
+def test_refused_cancel_remains_audit_history_without_overriding_lifecycle(tmp_path,monkeypatch):
+    from skodun import pipeline
+    with Store.open(tmp_path/'s.db') as store:
+        rec=_artifact([],status='running',pid=os.getpid(),findings_total=0)
+        store.save_review(rec)
+        monkeypatch.setattr(pipeline,'request_cancel',lambda rid:False)
+        assert services.svc_review_cancel(store,rec['id'])[0] == 2
+        code,text=services.svc_review_status(store,rec['id'],output='json')
+        life=json.loads(text)['lifecycle']
+        assert life['reason_code'] != 'requested_cancel'
+        assert life['cancellation'][0]['outcome'] == 'refused_unproven_owner'
+
+
+def test_request_completion_winning_cancel_race_keeps_actual_cause(tmp_path):
+    repo=_mkrepo(tmp_path)
+    with Store.open(tmp_path/'s.db') as store:
+        row=begin(store,repo,'sk_req_1')
+        assert services.svc_review_cancel(store,row['id'])[0] == 0
+        store.finish_request(row['id'],owner_token='owner',state='finished',reason_code='completed',
+            result={'status':0,'text':'done','metadata':{}},now=NOW)
+        code,text=services.svc_review_status(store,row['id'],output='json')
+        result=json.loads(text)['request']
+        assert result['lifecycle']['reason_code'] == 'completed'
+        assert result['cancellation'][0]['outcome'] == 'completed_before_cancel'
+
+
+@pytest.mark.parametrize('client',['','client\nname','x'*121,'Bearer example-credential'])
+def test_optional_mcp_client_label_cannot_block_review_admission(tmp_path,monkeypatch,client):
+    from tests.test_requests import _ready_repo
+    repo=_ready_repo(tmp_path,monkeypatch); db=tmp_path/'s.db'
+    spec=next(s for s in default_registry() if s.name == 'review')
+    result=spec.handler(HandlerCall(params={'repo':str(repo)},
+        store_factory=lambda:Store.open(db),cancel=threading.Event(),client_name=client))
+    assert result.status == 0
+    with Store.open(db) as store:
+        row=store.list_requests()[0]
+        assert row['actor'] == 'unknown'
+
+
+def test_scope_predicates_and_active_priority_precede_display_limits(tmp_path):
+    repo=_mkrepo(tmp_path); other=tmp_path/'other'
+    _git(repo,'worktree','add','-b','other',str(other))
+    with Store.open(tmp_path/'s.db') as store:
+        target=begin(store,repo,'sk_req_target')
+        template=dict(target['identity'],repo_id='/other/repository',worktree_root=str(other))
+        rows=[(f'noise-{n}',str(other),json.dumps(template),'digest',f'noise-owner-{n}',
+               os.getpid(),'test','finished','2026-09-05T11:00:00Z','2026-09-05T11:00:00Z',
+               '2026-09-06T11:00:00Z') for n in range(1001)]
+        store._c.executemany('''INSERT INTO review_requests(id,scope,identity_json,intent_digest,
+            owner_token,pid,source,state,created_at,updated_at,expires_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)''',rows)
+        code,text=services.svc_review_status(store,repo=repo,scope='repository',output='json')
+        assert code == 0 and json.loads(text)['entries'][0]['id'] == target['id']
+        # Reclassify noise into the local lane: an old active request still wins.
+        store._c.execute('UPDATE review_requests SET scope=?,identity_json=? WHERE id LIKE ?',
+                         (str(repo.resolve()),json.dumps(target['identity']),'noise-%'))
+        code,text=services.svc_review_status(store,repo=repo,output='json')
+        assert code == 0 and json.loads(text)['request']['id'] == target['id']
+
+
+def test_old_active_review_is_not_hidden_by_new_terminal_reviews(tmp_path):
+    repo=_mkrepo(tmp_path)
+    with Store.open(tmp_path/'s.db') as store:
+        old=_artifact([],id='old-active',status='running',worktree_root=str(repo.resolve()),
+            reviewed_at=NOW,findings_total=0)
+        store.save_review(old)
+        for n in range(101):
+            store.save_review(_artifact([],id=f'terminal-{n}',worktree_root=str(repo.resolve()),
+                reviewed_at='2026-09-05T11:00:00Z',findings_total=0))
+        code,text=services.svc_review_status(store,repo=repo,output='json')
+        assert code == 0 and json.loads(text)['id'] == old['id']
+
+
+def test_sigterm_handlers_do_not_import_during_signal_delivery(monkeypatch):
+    import builtins
+    import signal
+    from skodun import pipeline
+    from skodun.mcpserver import McpServer
+    token=threading.Event()
+    previous=pipeline._install_fg_sigterm(token)
+    handler=signal.getsignal(signal.SIGTERM)
+    original_import=builtins.__import__
+    def no_import(*args,**kwargs):
+        raise AssertionError('signal handler acquired import machinery')
+    try:
+        with monkeypatch.context() as local:
+            local.setattr(builtins,'__import__',no_import)
+            handler(signal.SIGTERM,None)
+        assert token.is_set() and token.reason_code == 'signal'
+    finally:
+        pipeline._restore_fg_sigterm(previous)
+
+
+def test_linked_review_rows_cannot_hide_another_active_lane(tmp_path):
+    repo=_mkrepo(tmp_path)
+    with Store.open(tmp_path/'s.db') as store:
+        request=begin(store,repo,'sk_req_1')
+        old=_artifact([],id='independent-active',status='running',worktree_root=str(repo.resolve()),
+            reviewed_at=NOW,findings_total=0)
+        store.save_review(old)
+        for n in range(101):
+            rid=f'linked-{n}'
+            store.save_review(_artifact([],id=rid,status='running',worktree_root=str(repo.resolve()),
+                reviewed_at='2026-09-05T11:00:00Z',findings_total=0))
+            store.link_request(request['id'],'review',rid)
+        code,text=services.svc_review_status(store,repo=repo,output='json')
+        assert code == 2
+        entries=json.loads(text)['entries']
+        assert {item['id'] for item in entries} == {request['id'],old['id']}

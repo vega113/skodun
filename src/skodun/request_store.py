@@ -176,15 +176,19 @@ class RequestStoreMixin:
             (orchestration_id, _json(identity))).fetchone()
         return row['id'] if row else None
 
-    def list_requests(self, *, worktree_root=None, limit=50):
+    def list_requests(self, *, worktree_root=None, repo_id=None, limit=50, active_first=False):
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError('request limit must be between 1 and 1000')
         where, args = '', ()
         if worktree_root is not None:
             _text('worktree_root', worktree_root)
             where, args = ' WHERE scope=?', (worktree_root,)
+        elif repo_id is not None:
+            _text('repo_id', repo_id)
+            where, args = " WHERE json_extract(identity_json,'$.repo_id')=?", (repo_id,)
+        order = ("(state IN ('accepted','queued','running')) DESC," if active_first else '')
         rows = self._c.execute('SELECT id FROM review_requests' + where +
-                               ' ORDER BY created_at DESC,id DESC LIMIT ?',
+                               ' ORDER BY ' + order + 'created_at DESC,id DESC LIMIT ?',
                                (*args, limit)).fetchall()
         return [self.get_request(r['id']) for r in rows]
 
