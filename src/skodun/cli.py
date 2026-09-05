@@ -114,6 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
         "review", help="review the outgoing change now, in the foreground")
     review.add_argument("--repo", type=Path, default=Path("."),
                         help="repository to review (default: the current directory)")
+    review.add_argument("--json", action="store_true",
+                        help="emit one versioned structured review result")
     review.add_argument("--request-key", default=None,
                         help="idempotency key for this exact worktree request")
     # THE NAME of a `[[reviewers]]` entry, never a provider id: two enabled
@@ -833,6 +835,14 @@ def _cmd_review(args) -> int:
     # failure to import it is the one import failure no banner can report.
     from .trust import banner_failure
 
+    def emit_result(text, code, metadata=None, reason_code=None):
+        if getattr(args, "json", False):
+            import json
+            from .review_results import project
+            return _emit(json.dumps(project(code, metadata, reason_code=reason_code),
+                                    sort_keys=True, allow_nan=False), code)
+        return _emit(text, code)
+
     try:
         # Inside the guard: an import error here -- a partial install, a syntax
         # error introduced in `services.py`, a missing stdlib module in a
@@ -840,7 +850,7 @@ def _cmd_review(args) -> int:
         # stderr and leaves stdout without the verdict line the contract
         # promises. 2, not 4: nothing ran, so this is a refusal, not a review
         # that came back badly.
-        from .services import svc_review
+        from .services import svc_review, svc_review_detailed
         from .store import Store
     except KeyboardInterrupt:
         # Ctrl-C during the import itself: nothing ran, but that is not what
@@ -848,8 +858,8 @@ def _cmd_review(args) -> int:
         # BaseException` immediately below would otherwise give it.
         raise
     except BaseException as e:
-        return _emit(banner_failure(
-            f"could not load the review pipeline: {e!r}; no review ran"), 2)
+        return emit_result(banner_failure(
+            f"could not load the review pipeline: {e!r}; no review ran"), 2, reason_code="pipeline_unavailable")
 
     try:
         store = Store.open(_store_path())
@@ -857,7 +867,7 @@ def _cmd_review(args) -> int:
         raise
     except BaseException as e:
         # No store means no record, which is exactly what 4 says.
-        return _emit(banner_failure(f"could not open the review store: {e!r}"), 4)
+        return emit_result(banner_failure(f"could not open the review store: {e!r}"), 4, reason_code="persistence_failed")
 
     with store:
         # `svc_review` re-raises `KeyboardInterrupt` past every one of its own
@@ -868,7 +878,8 @@ def _cmd_review(args) -> int:
         # this seam has not read, and the MCP tool must be refused in the same
         # words. `getattr` because `_cmd_review` is called by name in the suite
         # with hand-built argument objects that predate the flag.
-        code, text = svc_review(
+        invoke = svc_review_detailed if getattr(args, "json", False) else svc_review
+        response = invoke(
             store, Path(args.repo),
             reviewer=getattr(args, "reviewer", None),
             client_family=getattr(args, "client_family", None),
@@ -880,7 +891,8 @@ def _cmd_review(args) -> int:
             batch_target_bytes=getattr(args, "batch_target_bytes", None),
             stack_manifest=getattr(args, "stack_manifest", None),
             request_key=getattr(args, "request_key", None), request_source="cli")
-    return _emit(text, code)
+    code, text = response[:2]
+    return emit_result(text, code, response[2] if len(response) == 3 else None)
 
 
 def _cmd_stats(args) -> int:
@@ -2202,6 +2214,11 @@ def main(argv: list[str] | None = None) -> int:
             # stdout -- argparse's own message goes to stderr, and a consumer
             # reading stdout would see silence where a refusal belongs.
             from .trust import banner_failure
+            raw_args = list(sys.argv[1:] if argv is None else argv)
+            if raw_args[:1] == ['review'] and '--json' in raw_args:
+                import json
+                from .review_results import project
+                return _emit(json.dumps(project(code, reason_code='invalid_input')), code)
             return _emit(banner_failure(
                 "usage error; no review ran"), code)
         if args.command == "gate":
@@ -2224,6 +2241,10 @@ def main(argv: list[str] | None = None) -> int:
                 # to 2, and a Ctrl-C during argument parsing or a subcommand
                 # this carve-out does not name is "nothing ran", which 2
                 # already says correctly.
+                if getattr(args, 'json', False):
+                    import json
+                    from .review_results import project
+                    return _emit(json.dumps(project(130, reason_code='requested_cancel')), 130)
                 return 130
         if args.command == "stats":
             return _cmd_stats(args)

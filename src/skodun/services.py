@@ -234,6 +234,12 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
     # so a failure to import it is the one import failure no banner can report.
     from .trust import banner, banner_failure
 
+    def failure(code):
+        if result_metadata is not None:
+            result_metadata.clear()
+            result_metadata['termination'] = {'reason_code': code}
+
+
     try:
         # Inside the guard: an import error here — a partial install, a syntax
         # error introduced in `pipeline.py`, a missing stdlib module in a
@@ -247,6 +253,7 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
     except KeyboardInterrupt:
         raise
     except BaseException as e:
+        failure("pipeline_unavailable")
         return 2, banner_failure(
             f"could not load the review pipeline: {e!r}; no review ran")
 
@@ -262,6 +269,7 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
     except KeyboardInterrupt:
         raise
     except BaseException as e:
+        failure("repository_invalid")
         return 2, banner_failure(f"{e}; no review ran")
     try:
         from .requests import current
@@ -273,8 +281,11 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
     except BaseException as e:
         # A config that will not load is a refusal before anything ran, not a
         # review that came back badly: 2, the preflight code.
+        failure("configuration_invalid")
         return 2, banner_failure(f"could not load the config: {e!r}")
 
+    from .review_results import linked_reviews, cancelled_observation
+    prior_reviews = linked_reviews(store)
     try:
         if batch_target_bytes is not None:
             from dataclasses import replace
@@ -287,18 +298,27 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
                          resume_checkpoints=resume_checkpoints,
                          stack_request=stack_request)
     except PreflightRefused as e:
+        failure(getattr(e, "reason_code", "preflight_refused"))
         return 2, banner_failure(str(e))
     except LockTimeout as e:
+        failure("admission_expired")
         return 3, banner_failure(str(e))
     except PersistenceFailed:
+        failure("persistence_failed")
         return 4, banner_failure("no review was recorded")
     except GitError as e:
+        failure("repository_invalid")
         # A directory that is not a git checkout at all, a git that will not run,
         # a repo with no HEAD: every git call the pipeline makes happens before
         # the reviewer is launched, so this is a preflight failure — nothing ran
         # — and preflight refusals are 2, not "the review failed".
         return 2, banner_failure(f"{e}; no review ran")
     except ReviewCancelled:
+        failure(getattr(cancel, "reason_code", None) or "requested_cancel")
+        if result_metadata is not None:
+            facts = cancelled_observation(store, prior_reviews)
+            if facts is not None:
+                result_metadata['observation'] = facts
         # BEFORE the general `BaseException` below, and it has to be: a
         # cancellation is not "the review failed" with a stack trace worth
         # quoting, and `run_review`'s own `finally` has already downgraded
@@ -314,6 +334,7 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
         raise
     except BaseException as e:
         # Anything else: the review did not complete, so it certifies nothing.
+        failure("execution_failed")
         return 4, banner_failure(f"the review failed: {e!r}")
 
     # The verdict and optional stack projection are derived from the PERSISTED
@@ -321,6 +342,9 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
     # line on both CLI and MCP surfaces.
     if result_metadata is not None and isinstance(rec.get("stack"), dict):
         result_metadata["stack"] = dict(rec["stack"])
+    if result_metadata is not None:
+        from .review_results import observation
+        result_metadata["observation"] = observation(rec)
     text = banner(rec)
     if rec.get("trustworthy") is not True:
         return 4, text
@@ -442,8 +466,11 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
         from .trust import banner_failure
         reason = REVIEW_CANCELLED_REASON
         return (4, banner_failure(reason)), None, {
+                "termination": {"reason_code": getattr(cancel, "reason_code", None) or "requested_cancel"},
             "reuse": {"hit": False, "reason": reason}}
     result = None
+    from .review_results import observation
+
     try:
         from .cli import _repo_root
         from .config import load_config
@@ -466,6 +493,7 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
             _reuse_audit(store, result, outcome="bypass", reason=reason)
             from .trust import banner_failure
             return (4, banner_failure(reason)), None, {
+                "termination": {"reason_code": getattr(cancel, "reason_code", None) or "requested_cancel"},
                 "reuse": {"hit": False, "reason": reason}}
         if result.candidate is None:
             _reuse_audit(store, result, outcome="miss", reason=result.reason)
@@ -478,12 +506,14 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
             reason = REVIEW_CANCELLED_REASON
             from .trust import banner_failure
             return (4, banner_failure(reason)), None, {
+                "termination": {"reason_code": getattr(cancel, "reason_code", None) or "requested_cancel"},
                 "reuse": {"hit": False, "reason": reason}}
         _reuse_audit(store, result, outcome="hit", reason=result.reason)
         text = (f"SKODUN REUSE: review_id={result.candidate['id']} "
                 f"reason={result.reason}\n{verdict}")
         return (status, text), None, {
-            "reuse": {"hit": True, "review_id": result.candidate["id"]}}
+            "reuse": {"hit": True, "review_id": result.candidate["id"]},
+            "observation": observation(result.candidate)}
     except KeyboardInterrupt:
         raise
     except BaseException as exc:
@@ -518,9 +548,9 @@ def _recovery_review_id(text: str) -> str | None:
 
 
 def _annotate_recovery_attempt(store, text: str, orchestration_id: str,
-                               ordinal: int) -> tuple[dict | None, str | None]:
+                               ordinal: int, *, review_id=None) -> tuple[dict | None, str | None]:
     """Persist v9 orchestration metadata without changing trust axes."""
-    review_id = _recovery_review_id(text)
+    review_id = review_id or _recovery_review_id(text)
     if review_id is None:
         return None, None
     rec = store.get_review(review_id)
@@ -567,6 +597,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         request_key=None, request_source="service", request_actor=None
                         ) -> tuple[int, str, dict]:
     """Durably identify an accepted request before readiness or admission."""
+    from .review_results import attach
     kwargs = dict(progress_sink=progress_sink, cancel=cancel, reviewer=reviewer,
                   client_family=client_family, recover=recover,
                   max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
@@ -577,11 +608,11 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
     # their no-store validation contract, including overflow/bool refusals.
     if (_validate_batch_target(batch_target_bytes)[1]
             or (recover and _validate_recovery_limits(max_attempts, max_wall_seconds)[2])):
-        return _svc_review_detailed_impl(store, repo, **kwargs)
+        return attach(*_svc_review_detailed_impl(store, repo, **kwargs))
     from .requests import tracked_review
-    return tracked_review(_svc_review_detailed_impl)(
+    return attach(*tracked_review(_svc_review_detailed_impl)(
         store, repo, request_key=request_key, request_source=request_source,
-        request_actor=request_actor, **kwargs)
+        request_actor=request_actor, **kwargs))
 
 
 def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
@@ -600,6 +631,7 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
     if target_reason:
         from .trust import banner_failure
         return 2, banner_failure(target_reason), {
+            "termination": {"reason_code": "invalid_input"},
             "telemetry": {"batch_target_bytes": batch_target_bytes,
                            "validation_error": target_reason}}
 
@@ -609,6 +641,7 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
         if reason:
             from .trust import banner_failure
             return 2, banner_failure(reason), {
+                "termination": {"reason_code": "invalid_input"},
                 "recovery": {"terminal_reason": reason}}
 
     stack_request = None
@@ -668,6 +701,7 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
         def __init__(self):
             self._event = threading.Event()
             self.deadline_expired = False
+            self._cause = None
 
         def _refresh(self):
             if cancel is not None and cancel.is_set():
@@ -676,11 +710,30 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
                 self.deadline_expired = True
                 self._event.set()
 
+        @property
+        def reason_code(self):
+            self._refresh()
+            if self.deadline_expired:
+                return 'budget_expired'
+            if self._event.is_set():
+                return getattr(cancel, 'reason_code', None) or self._cause or 'unknown_cancel_token'
+            return None
+
+        @reason_code.setter
+        def reason_code(self, cause):
+            self._cause = cause
+
         def is_set(self):
             self._refresh()
             return self._event.is_set()
 
         def set(self):
+            if cancel is not None:
+                if self._cause is not None:
+                    from .request_cancel import mark_event
+                    mark_event(cancel, self._cause)
+                else:
+                    cancel.set()
             self._event.set()
 
         def wait(self, seconds):
@@ -718,6 +771,7 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
     last_status, last_text = 4, banner_failure("no review was recorded")
     last_rec: dict | None = None
     terminal_reason = ""
+    terminal_code = None
     result_metadata = {}
     for ordinal in range(max_attempts):
         reason = cancellation_reason()
@@ -726,19 +780,23 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
             if reason == "recovery wall budget exhausted":
                 last_text = banner_failure(reason)
             terminal_reason = reason
+            terminal_code = request_cancel.reason_code
             break
         if ordinal and initial_identity is not None:
             try:
                 if _recovery_identity(repo) != initial_identity:
                     terminal_reason = "repository identity or diff moved between recovery attempts"
+                    terminal_code = "identity_changed"
                     break
             except KeyboardInterrupt:
                 raise
             except BaseException as e:
                 terminal_reason = f"could not recheck identity before recovery: {e!r}"
+                terminal_code = "identity_unavailable"
                 break
         if time.monotonic() >= deadline:
             terminal_reason = "recovery wall budget exhausted"
+            terminal_code = "budget_expired"
             break
 
         attempt_count += 1
@@ -756,22 +814,35 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
             resume_checkpoints=False, batch_target_bytes=batch_target_bytes,
             stack_request=stack_request,
             result_metadata=attempt_metadata)
+        result_metadata = attempt_metadata
         try:
-            last_rec, review_id = _annotate_recovery_attempt(
-                store, last_text, orchestration_id, ordinal)
+            observed_id = (attempt_metadata.get('observation') or {}).get('review_id')
+            if observed_id:
+                last_rec, review_id = _annotate_recovery_attempt(
+                    store, last_text, orchestration_id, ordinal, review_id=observed_id)
+            elif 'termination' in attempt_metadata:
+                # Typed no-record failures cannot borrow an ID from prose.
+                last_rec, review_id = None, None
+            else:
+                last_rec, review_id = _annotate_recovery_attempt(
+                    store, last_text, orchestration_id, ordinal)
         except KeyboardInterrupt:
             raise
         except BaseException as e:
             terminal_reason = f"could not persist recovery metadata: {e!r}"
+            terminal_code = "persistence_failed"
+            result_metadata = {}
+            last_status = 4
             break
         # Keep only metadata belonging to the persisted terminal attempt. A
         # preflight refusal or lock timeout may leave no record at all; in that
         # case a prior attempt's stack projection must not be rendered beside
         # the later failure banner.
-        result_metadata = attempt_metadata if last_rec is not None else {}
         if review_id is not None:
             review_ids.append(review_id)
         if last_rec is None:
+            terminal_code = (request_cancel.reason_code or
+                             (attempt_metadata.get("termination") or {}).get("reason_code"))
             terminal_reason = (
                 cancellation_reason() or
                 (REVIEW_CANCELLED_REASON if "cancel" in last_text.lower()
@@ -782,28 +853,33 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
             break
         if last_rec.get("status") == RUNNING:
             terminal_reason = "review remained running; recovery stopped"
+            terminal_code = "review_incomplete"
             break
         reason = cancellation_reason()
         if reason is not None:
             last_status = 4
             terminal_reason = reason
+            terminal_code = request_cancel.reason_code
             break
         if initial_identity is None:
             last_status = 4
             terminal_reason = ("could not establish recovery identity; "
                                "recovery stopped")
+            terminal_code = "identity_unavailable"
             break
         try:
             if (_recovery_record_identity(last_rec) != initial_identity
                     or _recovery_identity(repo) != initial_identity):
                 last_status = 4
                 terminal_reason = "repository identity or diff moved after recovery attempt"
+                terminal_code = "identity_changed"
                 break
         except KeyboardInterrupt:
             raise
         except BaseException as e:
             last_status = 4
             terminal_reason = f"could not recheck identity after recovery: {e!r}"
+            terminal_code = "identity_unavailable"
             break
         if last_rec.get("trustworthy") is True:
             terminal_reason = "trustworthy review reached"
@@ -824,6 +900,7 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
 
     if not terminal_reason:
         terminal_reason = "recovery attempt budget exhausted"
+        terminal_code = "recovery_attempts_exhausted"
     if last_rec is not None:
         try:
             last_rec["terminal_reason"] = terminal_reason
@@ -835,7 +912,19 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
         except KeyboardInterrupt:
             raise
         except BaseException:
-            pass
+            terminal_code = "persistence_failed"
+            last_status = 4
+            last_text = banner_failure("could not persist recovery result")
+            result_metadata = {}
+    if terminal_code is not None:
+        result_metadata['termination'] = {'reason_code': terminal_code}
+        if terminal_code == 'persistence_failed':
+            result_metadata.pop('observation', None)
+        elif terminal_code in ('identity_changed', 'identity_unavailable'):
+            observed = result_metadata.get('observation')
+            if observed is not None:
+                result_metadata['observation'] = {
+                    **observed, 'current_identity_match': False if terminal_code == 'identity_changed' else None}
     prefix = (f"SKODUN RECOVERY: orchestration_id={orchestration_id} "
               f"attempts={attempt_count} "
               f"review_ids={','.join(review_ids) or '-'} "

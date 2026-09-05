@@ -237,6 +237,10 @@ def tracked_review(fn):
         if decision == 'existing':
             result = row['result']
             if result is not None:
+                from .review_results import valid_replay
+                if not valid_replay(result):
+                    return 4, banner_failure('stored request result is invalid'), {
+                        'request': {**metadata, 'reason_code': 'request_result_invalid'}}
                 return result['status'], result['text'], {
                     **result['metadata'], 'request': {**metadata, 'replayed': True}}
             active = row['state'] in ('accepted', 'queued', 'running')

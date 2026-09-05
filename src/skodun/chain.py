@@ -30,6 +30,7 @@ import shutil
 import threading
 import time
 import contextvars
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -49,6 +50,7 @@ _DEFAULT_PROVIDER_WAIT_SEC = 30.0
 _SPAWN_UNAVAILABLE_ERRNOS = frozenset({
     errno.ENOENT, errno.EACCES, errno.EPERM, errno.ENOEXEC,
 })
+_CURRENT_INPUT_BYTES = contextvars.ContextVar("skodun_input_bytes", default=None)
 _CURRENT_EXECUTION = contextvars.ContextVar(
     "skodun_attempt_execution", default=None)
 
@@ -110,7 +112,8 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
              classification: dict | None = None,
              skipped: str | None = None,
              usage: dict | None = None,
-             capacity_timing: dict | None = None) -> dict:
+             capacity_timing: dict | None = None,
+             reason_code: str | None = None) -> dict:
     """One `attempts[]` row, in the ONE shape the artifact schema defines.
 
     Every row carries the identity of the entry it belongs to (`provider`,
@@ -132,6 +135,8 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
     """
     row: dict = {
         "n": n,
+        "attempt_id": uuid.uuid4().hex,
+        "input_bytes": _CURRENT_INPUT_BYTES.get(),
         "provider": r.provider,
         "model": r.model,
         "effort": r.effort,
@@ -141,6 +146,8 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
         "first_output_sec": first_output_sec,
         "classification": classification,
     }
+    if reason_code is not None:
+        row["reason_code"] = reason_code
     if skipped is not None:
         row["skipped"] = skipped
     if usage is not None:
@@ -522,6 +529,7 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
     """
     from .pipeline import _chain_for, _note
     _CURRENT_EXECUTION.set(None)
+    _CURRENT_INPUT_BYTES.set(len(prompt))
     chain = _chain_for(cfg, head)
     attempts: list[dict] = []
     exhausted: list[str] = []
@@ -609,7 +617,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
             except Exception as e:
                 n += 1
                 attempts.append(_attempt(
-                    n, entry, skipped=f"could not build the invocation: {e!r}"))
+                    n, entry, skipped=f"could not build the invocation: {e!r}",
+                    reason_code="invocation_invalid"))
                 return _Outcome(None, attempts,
                                 f"reviewer {entry.name!r} could not be "
                                 f"invoked: {e!r}")
@@ -644,6 +653,7 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                 _note(f"{entry.name} ({entry.provider}): {detail}")
                 attempts.append(_attempt(
                     n, entry, skipped=f"provider capacity: {detail}",
+                    reason_code="admission_expired",
                     capacity_timing=capacity_timing))
                 exhausted.append(
                     f"{entry.name}/{entry.provider}: provider capacity wait")
@@ -687,6 +697,7 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                     attempts.append(_attempt(
                         n, entry,
                         skipped=f"could not build the invocation: {e!r}",
+                        reason_code="invocation_invalid",
                         capacity_timing=capacity_timing))
                     return _Outcome(None, attempts,
                                     f"reviewer {entry.name!r} could not be "
