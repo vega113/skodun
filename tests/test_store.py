@@ -990,6 +990,12 @@ V18_OBJECTS = {
     ("index", "ix_cancel_execution"),
 }
 
+V19_OBJECTS = {
+    ("table", "request_budget_snapshots"),
+    ("table", "request_capacity_layers"),
+    ("index", "ix_request_capacity_execution"),
+}
+
 #: One legacy `triage` row, in the shipped single-row-per-ledger-key shape the
 #: v3 migration has to seed an event from.
 LEGACY_TRIAGE = dict(ledger_key="b\0" + "s" * 40 + "\0k1", finding_key="k1",
@@ -1082,7 +1088,7 @@ def test_fresh_db_lands_at_schema_version(tmp_path):
     assert V6_INDEX in _objects(db)
     assert V7_TABLE in _objects(db)
     assert V8_TABLE in _objects(db)
-    assert V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS) <= _objects(db)
+    assert V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS | V19_OBJECTS) <= _objects(db)
     assert ("table", "finding_lineage") in _objects(db)
     for table in V3_TABLES:
         assert ("table", table) in _objects(db)
@@ -1141,13 +1147,13 @@ def test_v12_store_gains_only_the_v13_checkpoint_objects(tmp_path):
         Store._open_for_migration_tests(db).close()
     assert _user_version(db) == 12
     before = _objects(db)
-    assert not ((V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS)) & before)
+    assert not ((V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS | V19_OBJECTS)) & before)
 
     Store._open_for_migration_tests(db).close()
 
     assert _user_version(db) == SCHEMA_VERSION
     assert _objects(db) - before == (V13_OBJECTS | V14_OBJECTS | V15_OBJECTS |
-                                     (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS))
+                                     (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS | V19_OBJECTS))
 
 
 def test_migration_from_true_phase1_db(tmp_path):
@@ -1181,7 +1187,7 @@ def test_phase1_store_upgrade_preserves_every_table_index_and_row(tmp_path):
     after = _objects(db)
     assert before <= after, before - after            # nothing dropped
     assert after - before == {("table", "provider_state"), V5_INDEX} | {
-        ("table", t) for t in V3_TABLES} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS)  # nothing else
+        ("table", t) for t in V3_TABLES} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS | V19_OBJECTS)  # nothing else
     assert sorted(r["id"] for r in st.list_reviews(None, 100)) == ["r1", "r2", "r3"]
     assert st.triage_for("b", "s" * 40)["k1"]["dismissed_reason"] == "wontfix"
     assert st._c.execute("SELECT count(*) FROM gate_events").fetchone()[0] == 1
@@ -1326,7 +1332,7 @@ def test_a_v2_store_gains_every_v3_delta(tmp_path):
     assert _user_version(db) == SCHEMA_VERSION
     assert before <= _objects(db)                          # nothing dropped
     assert _objects(db) - before == (
-        {("table", t) for t in V3_TABLES} | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS))
+        {("table", t) for t in V3_TABLES} | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS | V19_OBJECTS))
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     assert _columns(db, "dedup_events") == V3_DEDUP_EVENT_COLUMNS
     assert _columns(db, "deliveries") == V3_DELIVERY_COLUMNS
@@ -1677,7 +1683,7 @@ def test_a_v3_store_gains_the_widened_vocabulary_and_the_reference_column(tmp_pa
     assert _user_version(db) == SCHEMA_VERSION
     # A v3 store climbs v4–v12 in one open: v5 index + capacity, feedback,
     # spend, and telemetry indexes.
-    assert _objects(db) == before | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS), (
+    assert _objects(db) == before | {V5_INDEX} | V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS | V19_OBJECTS), (
         "the rebuild added or dropped an object")
     assert _columns(db, "triage_events") == V4_TRIAGE_EVENT_COLUMNS
     # The seeded legacy dismissal came through the rebuild intact...
@@ -2003,7 +2009,7 @@ def test_a_v5_store_gains_capacity_admissions(tmp_path):
     st = Store._open_for_migration_tests(db)
 
     assert _user_version(db) == SCHEMA_VERSION
-    assert _objects(db) - before == V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS)
+    assert _objects(db) - before == V6_OBJECTS | V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS | V19_OBJECTS)
     assert "repo" in _columns(db, "reviews")
     st.close()
 
@@ -2032,7 +2038,7 @@ def test_a_v6_store_gains_feedback_events(tmp_path):
     st = Store._open_for_migration_tests(db)
 
     assert _user_version(db) == SCHEMA_VERSION
-    assert _objects(db) - before == V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS)
+    assert _objects(db) - before == V7_OBJECTS | V8_OBJECTS | V9_OBJECTS | V10_OBJECTS | V13_OBJECTS | V14_OBJECTS | V15_OBJECTS | (V16_OBJECTS | V17_OBJECTS | V18_OBJECTS | V19_OBJECTS)
     st.close()
 
 
@@ -2441,6 +2447,7 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_store.py",
     "tests/test_checkpoints.py",
     "tests/test_requests.py",
+    "tests/test_budget_store.py",
     "tests/test_scoped_control.py",
     "tests/test_review_results.py",
     "tests/test_transport_eligibility.py",

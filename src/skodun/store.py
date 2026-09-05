@@ -62,8 +62,9 @@ _REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 #: higher was written by a newer skodun and is refused, untouched.
 from .request_store import RequestStoreMixin, MIGRATION as _MIGRATION_V17
 from .control_store import ControlStoreMixin, MIGRATION as _MIGRATION_V18
+from .budget_store import BudgetStoreMixin, MIGRATION as _MIGRATION_V19
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 
 class SchemaLifecycleError(ValueError):
@@ -986,6 +987,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (16, _MIGRATION_V16),
     (17, _MIGRATION_V17),
     (18, _MIGRATION_V18),
+    (19, _MIGRATION_V19),
 )
 
 
@@ -1486,7 +1488,7 @@ class Reservation:
     superseded: tuple[dict, ...] = field(default_factory=tuple)
 
 
-class Store(RequestStoreMixin, ControlStoreMixin):
+class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
     def __init__(self, conn: sqlite3.Connection, path: Path | None = None,
                  *, _snapshot: tempfile.TemporaryDirectory | None = None):
         self._c = conn
