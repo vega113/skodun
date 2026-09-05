@@ -701,8 +701,8 @@ def test_the_review_tool_takes_a_reviewer_by_name_in_its_schema():
     spec = _specs()["review"]
     props = spec.input_schema["properties"]
     assert set(props) == {"repo", "reviewer", "client_family", "recover",
-                          "max_attempts", "max_wall_seconds",
-                          "reuse_trusted", "fresh", "batch_target_bytes",
+                          "max_attempts", "max_wall_seconds", "max_queue_seconds",
+                          "max_review_seconds", "max_provider_wait_seconds", "reuse_trusted", "fresh", "batch_target_bytes",
                           "stack_manifest", "request_key"}
     assert props["reviewer"]["type"] == "string"
     assert props["reviewer"]["description"]

@@ -591,6 +591,8 @@ def _recovery_attempt_provider(rec: dict) -> str | None:
 def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         reviewer=None, client_family=None, recover=False,
                         max_attempts=None, max_wall_seconds=None,
+                        max_queue_seconds=None, max_review_seconds=None,
+                        max_provider_wait_seconds=None,
                         reuse_trusted=False, fresh=False,
                         reuse_client_family=_REUSE_INTENT_UNSET,
                         batch_target_bytes=None, stack_manifest=None,
@@ -598,6 +600,15 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         ) -> tuple[int, str, dict]:
     """Durably identify an accepted request before readiness or admission."""
     from .review_results import attach
+    from .budgets import Limits
+    try:
+        limits = Limits.from_args(recover=recover, max_wall_seconds=max_wall_seconds,
+            max_queue_seconds=max_queue_seconds, max_review_seconds=max_review_seconds,
+            max_provider_wait_seconds=max_provider_wait_seconds)
+    except (ValueError, TypeError, OverflowError) as exc:
+        from .trust import banner_failure
+        return attach(2, banner_failure(str(exc)), {
+            "termination": {"reason_code": "invalid_input"}})
     kwargs = dict(progress_sink=progress_sink, cancel=cancel, reviewer=reviewer,
                   client_family=client_family, recover=recover,
                   max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
@@ -612,7 +623,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
     from .requests import tracked_review
     return attach(*tracked_review(_svc_review_detailed_impl)(
         store, repo, request_key=request_key, request_source=request_source,
-        request_actor=request_actor, **kwargs))
+        request_actor=request_actor, budget_limits=limits, **kwargs))
 
 
 def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
@@ -749,8 +760,11 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
     request_cancel = _RecoveryCancel()
 
     def cancellation_reason():
-        if request_cancel.deadline_expired:
+        cause = getattr(cancel, 'reason_code', None)
+        if request_cancel.deadline_expired or cause == 'total_budget_exhausted':
             return "recovery wall budget exhausted"
+        if cause in ('queue_budget_exhausted', 'review_budget_exhausted'):
+            return cause.replace('_', ' ')
         if cancel is not None and cancel.is_set():
             return REVIEW_CANCELLED_REASON
         return None
@@ -955,6 +969,8 @@ def _render_review_banner(rec: dict) -> str:
 def svc_review(store, repo, *, progress_sink=None, cancel=None,
                reviewer=None, client_family=None, recover=False,
                max_attempts=None, max_wall_seconds=None,
+               max_queue_seconds=None, max_review_seconds=None,
+               max_provider_wait_seconds=None,
                reuse_trusted=False, fresh=False,
                reuse_client_family=_REUSE_INTENT_UNSET,
                batch_target_bytes=None, stack_manifest=None,
@@ -963,6 +979,8 @@ def svc_review(store, repo, *, progress_sink=None, cancel=None,
         store, repo, progress_sink=progress_sink, cancel=cancel,
         reviewer=reviewer, client_family=client_family, recover=recover,
         max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
+        max_queue_seconds=max_queue_seconds, max_review_seconds=max_review_seconds,
+        max_provider_wait_seconds=max_provider_wait_seconds,
         reuse_trusted=reuse_trusted, fresh=fresh,
         reuse_client_family=reuse_client_family,
         batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest,

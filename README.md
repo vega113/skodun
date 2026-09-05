@@ -152,6 +152,30 @@ execution is reserved but not exposed by this release, so every runnable
 stack-aware artifact remains `coverage_scope=certification_full` and
 `gate_eligible=true`.
 
+
+Foreground review budgets are independent. `--max-queue-seconds` limits cumulative
+foreground admission waiting. `--max-review-seconds` starts at the first provider
+launch, includes later provider waits, and pauses during foreground re-admission.
+`--max-provider-wait-seconds` sets each pass's cumulative provider admission
+allowance, shared across fallback candidates; model runtime does not spend it.
+Its default is `SKODUN_ADMISSION_WAIT_SECONDS` when set, otherwise 30 seconds;
+zero still permits an immediate free-slot attempt. Batches, integration, and
+follow-up passes use the same policy. Transport-ineligible candidates spend none
+of this allowance. A free capable fallback may still run when provider waiting
+is exhausted, provided the review and total budgets remain available.
+
+`--max-wall-seconds` is a total execution ceiling including every queue, also
+without `--recover`; recovery keeps its 900-second default. Queue and review
+limits are optional. All explicit limits are bounded to one day. The versioned
+`review --json` / MCP result distinguishes `queue_budget_exhausted`,
+`provider_wait_exhausted`, `review_budget_exhausted`, and `total_budget_exhausted`.
+Timing reports `queue_wait_ms`, `provider_wait_ms`, literal `review_wall_ms`,
+charged `review_active_ms`, and `total_ms`; these overlap and must not be summed.
+Budget and effective-capacity observations belong to an exact request execution
+and admission ticket. Old records have unknown limits. Observing or replaying a
+request key never buys another queue position or restarts an expired request;
+changing limits requires a new key or an explicitly supported new execution.
+
 ## Configuration
 
 Global config at `~/.config/skodun/config.toml` (override with `SKODUN_CONFIG`),

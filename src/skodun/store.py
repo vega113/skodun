@@ -38,6 +38,7 @@ import sqlite3
 import stat
 import tempfile
 import time
+from contextlib import closing
 from urllib.parse import quote
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -62,8 +63,9 @@ _REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 #: higher was written by a newer skodun and is refused, untouched.
 from .request_store import RequestStoreMixin, MIGRATION as _MIGRATION_V17
 from .control_store import ControlStoreMixin, MIGRATION as _MIGRATION_V18
+from .budget_store import BudgetStoreMixin, MIGRATION as _MIGRATION_V19
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 
 class SchemaLifecycleError(ValueError):
@@ -986,6 +988,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (16, _MIGRATION_V16),
     (17, _MIGRATION_V17),
     (18, _MIGRATION_V18),
+    (19, _MIGRATION_V19),
 )
 
 
@@ -1486,7 +1489,7 @@ class Reservation:
     superseded: tuple[dict, ...] = field(default_factory=tuple)
 
 
-class Store(RequestStoreMixin, ControlStoreMixin):
+class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
     def __init__(self, conn: sqlite3.Connection, path: Path | None = None,
                  *, _snapshot: tempfile.TemporaryDirectory | None = None):
         self._c = conn
@@ -1714,18 +1717,14 @@ class Store(RequestStoreMixin, ControlStoreMixin):
         original_version = int(info.version)
         migrated = False
         try:
-            source = sqlite3.connect(path, isolation_level=None)
             target_uri = (f"file:{quote(str(backup.resolve()))}?mode=rw")
-            target = sqlite3.connect(target_uri, uri=True, isolation_level=None)
-            try:
+            with closing(sqlite3.connect(path, isolation_level=None)) as source, closing(
+                    sqlite3.connect(target_uri, uri=True, isolation_level=None)) as target:
                 source.backup(target)
                 if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise ValueError("backup integrity check failed")
-            finally:
-                target.close()
-                source.close()
             backup.chmod(0o600)
-            with sqlite3.connect(path, isolation_level=None) as conn:
+            with closing(sqlite3.connect(path, isolation_level=None)) as conn, conn:
                 _migrate(conn)
                 version = int(conn.execute("PRAGMA user_version").fetchone()[0])
                 if version != SCHEMA_VERSION:

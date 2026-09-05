@@ -33,7 +33,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from . import ids
+from . import ids, budgets
 
 if TYPE_CHECKING:
     import threading
@@ -476,6 +476,7 @@ def acquire(store: "Store", *, scope: str,
     noted_pos: int | None = None
     # Always allow one attempt even when wait_sec is 0 (tests + free path).
     attempted = False
+    observed_cap = None
 
     try:
         while True:
@@ -501,19 +502,24 @@ def acquire(store: "Store", *, scope: str,
 
             pos = store.capacity_position(ticket.id)
             ticket.position = pos
+
+            attempted = True
+            cap = _resolve_capacity(capacity, capacity_fn)
+            if cap != observed_cap:
+                budgets.record_capacity(store, ticket, cap, configured=capacity,
+                                        legacy=False if resource_class == RESOURCE_REVIEW_FG else None)
+                observed_cap = cap
+            try_admit(store, ticket, capacity=cap)
+            if ticket.status in HOLDER_STATUSES:
+                mark_started(store, ticket)
+                return ticket
+
             if on_progress is not None and pos is not None and pos != noted_pos:
                 noted_pos = pos
                 median, count = _historical_wait(store, resource_class, scope)
                 on_progress(format_wait_progress(
                     resource_class, pos, max(remaining, 0.0),
                     historical_median_sec=median, sample_count=count))
-
-            attempted = True
-            cap = _resolve_capacity(capacity, capacity_fn)
-            try_admit(store, ticket, capacity=cap)
-            if ticket.status in HOLDER_STATUSES:
-                mark_started(store, ticket)
-                return ticket
 
             remaining = deadline - now()
             if remaining <= 0:
@@ -549,6 +555,7 @@ def _eta_seconds(store: "Store", resource_class: str, scope: str) -> float | Non
     return _historical_wait(store, resource_class, scope)[0]
 
 
+@budgets.foreground_wait
 def acquire_for_fg(
         store: "Store", *, scope: str,
         capacity: int | None = None,
@@ -588,6 +595,7 @@ def acquire_for_fg(
     attempted = False
 
     try:
+        budgets.record_capacity(store, ticket, min(cap, 1), configured=cap, legacy=True)
         while True:
             if _cancelled(cancel):
                 finish(store, ticket, status=STATUS_REJECTED,
@@ -610,12 +618,6 @@ def acquire_for_fg(
 
             pos = store.capacity_position(ticket.id)
             ticket.position = pos
-            if on_progress is not None and pos is not None and pos != noted_pos:
-                noted_pos = pos
-                median, count = _historical_wait(store, RESOURCE_REVIEW_FG, scope)
-                on_progress(format_wait_progress(
-                    RESOURCE_REVIEW_FG, pos, max(remaining, 0.0),
-                    historical_median_sec=median, sample_count=count))
 
             attempted = True
             active = store.capacity_active_views(RESOURCE_REVIEW_FG, scope)
@@ -633,6 +635,13 @@ def acquire_for_fg(
                     _apply_row(ticket, row)
                     mark_started(store, ticket)
                     return ticket
+
+            if on_progress is not None and pos is not None and pos != noted_pos:
+                noted_pos = pos
+                median, count = _historical_wait(store, RESOURCE_REVIEW_FG, scope)
+                on_progress(format_wait_progress(
+                    RESOURCE_REVIEW_FG, pos, max(remaining, 0.0),
+                    historical_median_sec=median, sample_count=count))
 
             remaining = deadline - now()
             if remaining <= 0:

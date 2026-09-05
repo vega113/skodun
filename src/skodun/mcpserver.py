@@ -645,6 +645,12 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
     max_attempts, refusal = _int_arg(call.params, "max_attempts", "review")
     if refusal:
         return _review_result(2, refusal)
+    budgets = {}
+    for name in ("max_queue_seconds", "max_review_seconds", "max_provider_wait_seconds"):
+        value, refusal = _float_arg(call.params, name, "review")
+        if refusal:
+            return _review_result(2, refusal)
+        budgets[name] = value
     max_wall_seconds, refusal = _float_arg(
         call.params, "max_wall_seconds", "review")
     if refusal:
@@ -674,7 +680,7 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
         status, text, metadata = services.svc_review_detailed(
             store, repo, cancel=call.cancel, reviewer=reviewer,
             client_family=family, recover=recover,
-            max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
+            max_attempts=max_attempts, max_wall_seconds=max_wall_seconds, **budgets,
             reuse_trusted=reuse_trusted, fresh=fresh,
             batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest,
             request_key=request_key, request_source="mcp", request_actor=client_actor(call.client_name),
@@ -1085,10 +1091,22 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                     "type": "string",
                     "description": "Idempotency key for this exact worktree request.",
                 },
+                "max_queue_seconds": {
+                    "type": "number", "exclusiveMinimum": 0, "maximum": 86400,
+                    "description": "Cumulative foreground admission budget; excludes model runtime.",
+                },
+                "max_review_seconds": {
+                    "type": "number", "exclusiveMinimum": 0, "maximum": 86400,
+                    "description": "Budget from first provider launch; pauses during foreground requeue.",
+                },
+                "max_provider_wait_seconds": {
+                    "type": "number", "minimum": 0, "maximum": 86400,
+                    "description": "Admission wait per pass, shared across fallbacks; runtime excluded.",
+                },
                 "max_wall_seconds": {
                     "type": "number", "exclusiveMinimum": 0,
-                    "description": "maximum recovery wall-clock budget in "
-                                   "seconds (default 900; maximum 86400)"},
+                    "description": "total execution budget including all queues in "
+                                   "seconds (recovery default 900; otherwise optional; maximum 86400)"},
                 "reuse_trusted": {
                     "type": "boolean",
                     "description": "opt into reuse of an exact trustworthy "

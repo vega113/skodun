@@ -521,11 +521,10 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
     design: it is a `BaseException` precisely so the `except Exception` guards
     between here and the worker cannot turn a killed run into a degraded review.
 
-    ``admission_deadline`` is a ``time.monotonic()`` absolute end for the
-    shared admit+bind budget (review-fg wait already spent by the pipeline
-    before this call, plus every provider wait/hop here). When omitted, a
-    fresh budget is started for this chain so standalone callers and tests
-    still get one wall-clock bound that is **not** reset per hop.
+    ``admission_deadline`` remains a compatibility input: its initial
+    remainder supplies this pass's cumulative provider admission allowance.
+    Foreground callers use the request policy. Only actual admission waits
+    spend the allowance; model runtime is excluded and fallbacks share it.
     """
     from .pipeline import _chain_for, _note
     _CURRENT_EXECUTION.set(None)
@@ -537,11 +536,16 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
     # `attempts[]` list has a unique ordinal; the per-entry count below is what
     # the retry budgets and the timeout message talk about.
     n = 0
-    # One wall-clock deadline for all provider waits/hops in this chain.
-    if admission_deadline is None:
-        admission_deadline = (
-            time.monotonic()
-            + capacity.admission_wait_from_env(_DEFAULT_PROVIDER_WAIT_SEC))
+    # One cumulative admission allowance per pass. Model runtime and the
+    # foreground queue never spend this allowance; fallback waits share it.
+    from . import budgets
+    controller = budgets.current(store)
+    wait_limit = (_remaining_admission_sec(admission_deadline)
+                  if admission_deadline is not None else
+                  controller.limits.provider_wait if controller is not None else
+                  capacity.admission_wait_from_env(_DEFAULT_PROVIDER_WAIT_SEC))
+    allowance = (controller.provider_allowance(wait_limit) if controller is not None
+                 else budgets.ProviderAllowance(wait_limit))
 
     for i, entry in enumerate(chain):
         # Do not let a skipped fallback inherit the prior entry's executable
@@ -624,15 +628,16 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                                 f"invoked: {e!r}")
 
         # Remaining shared admit+bind budget — not a fresh full wait per hop.
-        wait_sec = _remaining_admission_sec(admission_deadline)
+        wait_sec = allowance.remaining()
         provider_ticket: capacity.Ticket | None = None
         capacity_timing: dict | None = None
         try:
             try:
-                provider_ticket = _acquire_provider_slot(
-                    store, entry.provider, quota_pool=quota_pool,
-                    wait_sec=wait_sec,
-                    cancel=cancel, on_progress=_note)
+                with allowance.waiting():
+                    provider_ticket = _acquire_provider_slot(
+                        store, entry.provider, quota_pool=quota_pool,
+                        wait_sec=wait_sec,
+                        cancel=cancel, on_progress=_note)
             except capacity.AdmissionCancelled as e:
                 raise runner.ReviewCancelled(str(e)) from e
             except capacity.AdmissionTimeout as e:
@@ -653,7 +658,7 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                 _note(f"{entry.name} ({entry.provider}): {detail}")
                 attempts.append(_attempt(
                     n, entry, skipped=f"provider capacity: {detail}",
-                    reason_code="admission_expired",
+                    reason_code="provider_wait_exhausted",
                     capacity_timing=capacity_timing))
                 exhausted.append(
                     f"{entry.name}/{entry.provider}: provider capacity wait")
@@ -710,6 +715,10 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                               if getattr(adapter, "stdin_from_prompt_file", False)
                               else None)
                 try:
+                    if runner._cancelled(cancel):
+                        raise runner.ReviewCancelled("review cancelled before provider launch")
+                    if controller is not None:
+                        controller.provider_started()
                     result = runner.run_with_watchdog(
                         cmd, d.timeout_sec, cwd, out_path, err_path,
                         stdin_path=stdin_path, cancel=cancel)
