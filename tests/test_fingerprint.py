@@ -443,3 +443,280 @@ def test_lineage_prompt_path_quoting_survives_surrogate_filenames():
     assert digest in text
     assert "reason=prior" in text
     assert "\udcff" not in text
+
+
+def _history_record(rid, findings, *, repository='canonical', when='2026-08-12T09:00:00Z'):
+    return dict(id=rid, reviewed_at=when, branch='main', head='h', base_ref='origin/main',
+                base_sha='b', diff_hash='d', context_hash='', mode='now', model='m',
+                adapter='a', status='clean', parse_ok=True, degraded=False,
+                diff_truncated=False, trustworthy=True, stop_reason='done',
+                findings_total=len(findings), severity={}, summary='ok', repo_id='repo',
+                lineage_repository_id=repository,
+                findings=fingerprint.annotate_findings(findings))
+
+
+def test_indexed_lineage_finds_old_exact_after_201_unrelated_findings(tmp_path):
+    wanted = {'file': 'src/needed.py', 'title': 'Missing validation'}
+    with Store.open(tmp_path / 's.db') as store:
+        store.save_review(_history_record('old', [wanted]))
+        store.save_review(_history_record('other-repo', [wanted], repository='elsewhere'))
+        store.save_review(_history_record('recent', [
+            {'file': f'unrelated/{i}.py', 'title': str(i)} for i in range(201)],
+            when='2026-08-12T10:00:00Z'))
+        current = _history_record('current', [wanted], when='2026-08-12T11:00:00Z')
+        result = pipeline._persist(store, current)
+        lineage = result['findings'][0]['finding_lineage_v2']
+        assert lineage['match_reason'] == 'repeated'
+        assert lineage['predecessor_review_id'] == 'old'
+        assert result['fingerprint_diagnostics']['exact_matched'] == 1
+        assert result['fingerprint_diagnostics']['fallback_truncated'] is True
+        assert store.triage_state('main', 'b') == {}
+
+
+def test_prompt_ranks_relevant_paths_deduplicates_and_reports_byte_limit(tmp_path):
+    rows = fingerprint.annotate_findings([
+        {'file': 'unrelated.py', 'title': 'other'},
+        {'file': 'needed.py', 'title': 'needed'},
+    ])
+    with Store.open(tmp_path / 's.db') as store:
+        store.save_review(_history_record('one', rows))
+        store.save_review(_history_record('two', rows, when='2026-08-12T10:00:00Z'))
+        diag = {}
+        context, truncated = pipeline._lineage_prompt_context(
+            store, 'canonical', before='2026-08-12T11:00:00Z',
+            changed_paths=['needed.py'], diagnostics=diag)
+        assert context.index(b'needed.py') < context.index(b'unrelated.py')
+        assert context.count(b'path="needed.py"') == 1
+        assert diag['candidate_count'] == 4
+        assert diag['matched_count'] == 1
+        assert diag['selected_count'] == 2
+        assert diag['candidate_truncated'] is False
+        assert diag['prompt_bytes_truncated'] is False
+        assert truncated is False
+
+
+@pytest.mark.parametrize('count,duplicate,candidate_truncated,byte_truncated', [
+    (201, True, True, False), (20, False, False, True),
+])
+def test_lineage_candidate_and_prompt_byte_limits_are_independent(
+        tmp_path, count, duplicate, candidate_truncated, byte_truncated):
+    findings = [{'file': 'same.py' if duplicate else f'{i}.py', 'title': 'same'}
+                for i in range(count)]
+    with Store.open(tmp_path / 's.db') as store:
+        store.save_review(_history_record('history', findings))
+        diag = {}
+        data, truncated = pipeline._lineage_prompt_context(
+            store, 'canonical', before='2026-08-12T11:00:00Z', diagnostics=diag)
+        assert diag['candidate_truncated'] is candidate_truncated
+        assert diag['prompt_bytes_truncated'] is byte_truncated
+        assert diag['scanned_count'] == min(count, 201)
+        assert len(data) <= fingerprint.MAX_LINEAGE_PROMPT_BYTES
+        assert truncated
+
+
+@pytest.mark.parametrize('corruption', ['repository', 'version', 'digest', 'timestamp', 'json'])
+def test_indexed_lineage_rejects_invalid_projection_and_artifact_rows(tmp_path, corruption):
+    wanted = {'file': 'a.py', 'title': 'same'}
+    with Store.open(tmp_path / 's.db') as store:
+        store.save_review(_history_record('invalid', [wanted], repository=(
+            'other' if corruption == 'repository' else 'canonical')))
+        if corruption == 'repository':
+            store._c.execute("UPDATE finding_lineage SET repository_id='canonical'")
+        elif corruption == 'version':
+            store._c.execute("UPDATE finding_lineage SET fingerprint_version='old-v1'")
+        elif corruption == 'digest':
+            stored = store.get_review('invalid')
+            stored['findings'][0]['title'] = 'changed'
+            import json
+            store._c.execute('UPDATE reviews SET artifact_json=?', (json.dumps(stored),))
+        elif corruption == 'timestamp':
+            store._c.execute("UPDATE finding_lineage SET created_at='2026-08-12T10:00:00Z'")
+        else:
+            store._c.execute("UPDATE reviews SET artifact_json='invalid json'")
+        current = _history_record('current', [wanted], when='2026-08-12T11:00:00Z')
+        pipeline.annotate_lineage(store, current)
+        assert current['fingerprint_status'] == 'complete'
+        assert current['fingerprint_diagnostics']['exact_matched'] == 0
+        assert current['findings'][0]['finding_lineage_v2']['match_reason'] == 'new'
+
+
+def test_actual_candidate_queries_use_indexes_without_sort_or_table_scan(tmp_path):
+    wanted = {'file': 'a.py', 'title': 'same'}
+    with Store.open(tmp_path / 's.db') as store:
+        store.save_review(_history_record('history', [wanted] * 5))
+        queries = []
+        store._c.set_trace_callback(queries.append)
+        _, exact = store.lineage_candidates_with_diagnostics(
+            'canonical', fingerprint=fingerprint.finding_fingerprint(wanted), limit=2)
+        _, recent = store.lineage_candidates_with_diagnostics('canonical', limit=2)
+        store._c.set_trace_callback(None)
+        plans = []
+        for query in queries:
+            if query.startswith('SELECT rowid AS serial'):
+                plan = ' '.join(row['detail'] for row in store._c.execute(
+                    'EXPLAIN QUERY PLAN ' + query))
+                assert 'SEARCH finding_lineage USING INDEX' in plan
+                assert 'TEMP B-TREE' not in plan
+                plans.append(plan)
+        assert any('ix_finding_lineage_lookup' in plan for plan in plans)
+        assert any('ix_finding_lineage_repo_created_review' in plan for plan in plans)
+        assert exact['scanned_count'] == recent['scanned_count'] == 3
+
+
+def test_prompt_ranking_uses_stack_owner_and_prior_disposition():
+    rows = fingerprint.annotate_findings([
+        {'file': 'b.py', 'title': 'other'},
+        {'file': 'c.py', 'title': 'owner', 'scope_attribution': {'owner_slice_id': 'current'}},
+        {'file': 'd.py', 'title': 'disposed', '_lineage_disposition': 'dismiss'},
+        {'file': 'a.py', 'title': 'changed'},
+    ])
+    ranked, matched = fingerprint.rank_prompt_candidates(
+        rows, changed_paths=['a.py'], owner_ids=['current'])
+    assert [row['file'] for row in ranked] == ['a.py', 'c.py', 'd.py', 'b.py']
+    assert matched == 2
+
+
+def test_prompt_reads_prior_disposition_but_never_copies_reason_or_triages(tmp_path):
+    from skodun.textnorm import finding_key
+    wanted = {'file': 'a.py', 'title': 'same'}
+    with Store.open(tmp_path / 's.db') as store:
+        store.save_review(_history_record('history', [wanted]))
+        store.add_triage(dict(ledger_key='ledger', finding_key=finding_key('a.py', 'same'),
+                             review_id='history', branch='main', base_sha='b',
+                             dismissed_reason='NEVER COPY THIS REASON INTO A PROMPT',
+                             dismissed_at='2026-08-12T10:00:00Z'))
+        context, _ = pipeline._lineage_prompt_context(
+            store, 'canonical', before='2026-08-12T11:00:00Z')
+        assert b'disposition=dismiss' in context
+        assert b'NEVER COPY' not in context
+        result = pipeline._persist(store, _history_record(
+            'current', [wanted], when='2026-08-12T11:00:00Z'))
+        assert 'dismissed_reason' not in result['findings'][0]
+        assert store._c.execute('SELECT COUNT(*) FROM triage_events').fetchone()[0] == 1
+
+
+def test_lineage_failure_and_unknown_repository_are_explicit_and_advisory():
+    class BrokenStore:
+        def lineage_prompt_candidates(self, *args, **kwargs):
+            raise RuntimeError('sensitive path')
+        def lineage_candidates_with_diagnostics(self, *args, **kwargs):
+            raise RuntimeError('sensitive path')
+    diag = {}
+    assert pipeline._lineage_prompt_context(
+        BrokenStore(), 'canonical', before=None, diagnostics=diag) == (b'', False)
+    assert diag['status'] == 'unavailable'
+    assert diag['error'] == 'RuntimeError'
+    assert 'sensitive path' not in str(diag)
+    current = _history_record('current', [{'file': 'a.py', 'title': 'same'}])
+    pipeline.annotate_lineage(BrokenStore(), current)
+    assert current['fingerprint_status'] == 'unavailable'
+    assert current['trustworthy'] is True
+    assert current['status'] == 'clean'
+    pipeline._lineage_prompt_context(None, 'unknown', before=None, diagnostics=diag)
+    assert diag['status'] == 'unknown'
+
+
+def test_exact_lookup_preserves_ambiguity_and_caps_total_scan_work(tmp_path):
+    wanted = {'file': 'a.py', 'title': 'same'}
+    with Store.open(tmp_path / 's.db') as store:
+        store.save_review(_history_record('old', [wanted] * 20))
+        store.save_review(_history_record('recent', [
+            {'file': f'{i}.py', 'title': 'other'} for i in range(250)],
+            when='2026-08-12T10:00:00Z'))
+        current = _history_record('current', [wanted], when='2026-08-12T11:00:00Z')
+        pipeline.annotate_lineage(store, current)
+        assert current['findings'][0]['finding_lineage_v2']['match_reason'] == 'ambiguous'
+        assert current['findings'][0]['finding_lineage_v2']['predecessor_review_id'] is None
+        diag = current['fingerprint_diagnostics']
+        assert diag['exact_matched'] == 2
+        assert diag['exact_scanned'] == 3
+        assert diag['exact_truncated'] is True
+        assert diag['fallback_scanned'] == 201
+        assert diag['candidate_count'] == 202
+        assert diag['status'] == 'partial'
+
+
+def test_exact_lookup_bounds_keys_and_disposition_scan_is_explicit(tmp_path):
+    with Store.open(tmp_path / 's.db') as store:
+        current = _history_record('current', [
+            {'file': f'{i}.py', 'title': 'same'} for i in range(201)])
+        queries = []
+        store._c.set_trace_callback(queries.append)
+        pipeline.annotate_lineage(store, current)
+        store._c.set_trace_callback(None)
+        exact_queries = [query for query in queries
+                         if query.startswith('SELECT rowid AS serial')
+                         and 'fingerprint_version=' in query]
+        assert len(exact_queries) == 200
+        assert current['fingerprint_diagnostics']['exact_truncated'] is True
+        assert current['findings'][-1]['finding_lineage_v2']['match_reason'] == 'ambiguous'
+        assert current['findings'][-1]['finding_lineage_v2']['predecessor_review_id'] is None
+        assert current['fingerprint_diagnostics']['incomplete_exact_count'] == 1
+        assert current['fingerprint_diagnostics']['matched_count'] == 0
+        store.save_review(_history_record('history', [{'file': 'a.py', 'title': 'same'}]))
+        store._c.executemany(
+            "INSERT INTO triage_events (review_id,finding_key,event) VALUES (?,?,?)",
+            [('unrelated', str(i), 'dismiss') for i in range(1025)])
+        rows, meta = store.lineage_prompt_candidates('canonical')
+        assert rows[0]['_lineage_disposition'] == 'unknown'
+        assert meta['disposition_scanned_count'] == 1024
+        assert meta['disposition_truncated'] is True
+
+
+def test_lineage_limits_reject_bool_and_unbounded_values(tmp_path):
+    with Store.open(tmp_path / 's.db') as store:
+        for kwargs in ({'limit': True}, {'limit': 201}, {'scan_limit': True},
+                       {'scan_limit': 1025}, {'fingerprint': 'injected'}):
+            with pytest.raises(ValueError):
+                store.lineage_candidates_with_diagnostics('canonical', **kwargs)
+
+
+def test_incomplete_exact_singleton_cannot_be_reintroduced_by_recent_fallback(tmp_path):
+    wanted = {'file': 'a.py', 'title': 'same'}
+    with Store.open(tmp_path / 's.db') as store:
+        store.save_review(_history_record('older', [wanted]))
+        store.save_review(_history_record('unrelated', [
+            {'file': f'unrelated/{i}.py', 'title': str(i)} for i in range(201)],
+            when='2026-08-12T10:00:00Z'))
+        store.save_review(_history_record('visible', [wanted],
+                                         when='2026-08-12T10:02:00Z'))
+        for index in range(11):
+            store._c.execute(
+                '''INSERT INTO finding_lineage
+                   (review_id,finding_index,repository_id,fingerprint_version,
+                    fingerprint,match_reason,created_at)
+                   VALUES (?,?,?,?,?,?,?)''',
+                (f'ghost-{index}', 0, 'canonical', fingerprint.VERSION,
+                 fingerprint.finding_fingerprint(wanted), 'new', '2026-08-12T10:01:00Z'))
+        exact, meta = store.lineage_candidates_with_diagnostics(
+            'canonical', fingerprint=fingerprint.finding_fingerprint(wanted), limit=2)
+        assert [item['_lineage_review_id'] for item in exact] == ['visible']
+        assert meta['truncated'] and meta['scan_truncated']
+        recent, _ = store.lineage_finding_candidates_with_meta('canonical')
+        assert any(item['_lineage_review_id'] == 'visible' for item in recent)
+        assert all(item['_lineage_review_id'] != 'older' for item in recent)
+        current = _history_record('current', [wanted], when='2026-08-12T11:00:00Z')
+        result = pipeline._persist(store, current)
+        lineage = result['findings'][0]['finding_lineage_v2']
+        assert lineage['match_reason'] == 'ambiguous'
+        assert lineage['predecessor_review_id'] is None
+        assert lineage['predecessor_index'] is None
+        assert result['fingerprint_diagnostics']['exact_scan_truncated'] is True
+        assert result['fingerprint_diagnostics']['incomplete_exact_count'] == 1
+        assert result['fingerprint_diagnostics']['matched_count'] == 0
+        assert result['trustworthy'] is True
+
+
+def test_known_open_disposition_wins_unknown_duplicate_at_equal_relevance():
+    finding = fingerprint.annotate_findings([{'file': 'a.py', 'title': 'same'}])[0]
+    unknown = {**finding, '_lineage_disposition': 'unknown', '_lineage_review_id': 'newer'}
+    known = {**finding, '_lineage_disposition': 'open', '_lineage_review_id': 'older'}
+    ranked, matched = fingerprint.rank_prompt_candidates(
+        [unknown, known], changed_paths=['a.py'])
+    assert len(ranked) == 1
+    assert ranked[0]['_lineage_review_id'] == 'older'
+    assert matched == 1
+    # Known dispositions at the same relevance still preserve source recency.
+    ranked, _ = fingerprint.rank_prompt_candidates(
+        [known, {**known, '_lineage_disposition': 'dismiss', '_lineage_review_id': 'oldest'}])
+    assert ranked[0]['_lineage_review_id'] == 'older'
