@@ -5,6 +5,7 @@ mark the upstream Event; the owner audits that observation before propagating
 cancellation to the pipeline. Explicit control persists its event first.
 """
 
+from dataclasses import dataclass
 import os
 import threading
 import time
@@ -72,14 +73,48 @@ class RequestCancel:
 RECORD_CANCEL_PROTOCOL = 'record_audit_v1'
 
 
+@dataclass(frozen=True)
+class RecordOwner:
+    """Captured by the validated current worker, never an external control input."""
+    record_id: str
+    pid: int
+    identity: tuple
+    worktree_root: str | None
+
+    def __post_init__(self):
+        fields = ('id','branch','head','base_ref','base_sha','diff_hash','repo')
+        if (type(self.pid) is not int or self.pid <= 0
+                or tuple(key for key,value in self.identity) != fields
+                or dict(self.identity).get('id') != self.record_id):
+            raise ValueError('invalid captured worker observation identity')
+
+    @classmethod
+    def capture(cls, record, worktree_root=None):
+        pid = os.getpid()
+        if (record.get('status') != 'running' or record.get('mode') != 'prepush'
+                or record.get('cancellation_protocol') != RECORD_CANCEL_PROTOCOL
+                or record.get('pid') not in (None,pid)):
+            raise ValueError('cannot capture cancellation observation for an unowned worker')
+        fields = ('id','branch','head','base_ref','base_sha','diff_hash','repo')
+        return cls(record['id'], pid, tuple((key,record.get(key)) for key in fields),
+                   worktree_root or record.get('worktree_root'))
+
+    def matches(self, record):
+        return (os.getpid() == self.pid and record.get('mode') == 'prepush'
+                and record.get('pid') in (None,self.pid)
+                and all(record.get(key) == value for key,value in self.identity))
+
+
 class RecordCancel:
     """Current prepush worker's cooperative, record-ID-specific cancellation.
 
     The validated worker publishes support before invoking its provider. No
     caller signals a PID; legacy rows lacking the marker cannot opt into it.
     """
-    def __init__(self, store, record_id, upstream):
+    def __init__(self, store, record_id, upstream, worktree_root=None):
         self.store, self.record_id, self.upstream = store, record_id, upstream
+        self.owner = RecordOwner.capture(store.get_review(record_id) or {}, worktree_root)
+        self._audited = False
         self._local = threading.Event()
         self.reason_code = None
 
@@ -87,11 +122,19 @@ class RecordCancel:
         self._local.set()
 
     def is_set(self):
+        if self._audited:
+            return True
         if self._local.is_set() or self.upstream.is_set():
+            from .requests import now
+            cause = getattr(self.upstream, 'reason_code', None) or self.reason_code
+            self.reason_code = cause if cause in CAUSES else 'unknown_cancel_token'
+            self.store.observe_worker_cancellation(self.owner, cause=self.reason_code, now=now())
+            self._audited = True
             return True
         for event in self.store.cancellation_events(self.record_id):
             if event['target_id'] == self.record_id and event['request_id'] is None and event['outcome'] in ('requested','observed'):
                 self.reason_code = event['cause']
+                self._audited = True
                 self._local.set()
                 return True
         return False

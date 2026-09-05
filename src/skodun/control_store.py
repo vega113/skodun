@@ -84,6 +84,40 @@ class ControlStoreMixin:
             self._c.execute('ROLLBACK')
             raise
 
+    def observe_worker_cancellation(self, owner, *, cause, now):
+        """Audit the current worker's observation, even after its own commit.
+
+        This separate owner-only path does not relax external cancellation's
+        running-only guard. Captured reservation identity and the current
+        process must still match before any audit write.
+        """
+        from .request_cancel import RecordOwner
+        from .store import _require_ts
+        from .control import audit_text, review_identity
+        _require_ts('now', now)
+        cause = audit_text(cause, 'cause', 80)
+        if not isinstance(owner, RecordOwner):
+            raise ValueError('worker cancellation requires a captured owner')
+        self._c.execute('BEGIN IMMEDIATE')
+        try:
+            row = self._c.execute('SELECT artifact_json FROM reviews WHERE id=?',
+                                  (owner.record_id,)).fetchone()
+            record = json.loads(row[0]) if row else {}
+            if not owner.matches(record):
+                raise ValueError('worker cancellation observation ownership changed')
+            cur = self._c.execute(
+                """INSERT INTO cancellation_audit(target_id,identity_json,actor,
+                   source,caller_pid,caller_worktree,created_at,reason,cause,outcome)
+                   VALUES(?,?,'unknown','worker_lifecycle',?,?,?,
+                          'Cancellation observed by current worker',?,'observed')""",
+                (owner.record_id,json.dumps(review_identity(record),sort_keys=True),
+                 owner.pid,owner.worktree_root,now,cause))
+            self._c.execute('COMMIT')
+            return cur.lastrowid
+        except BaseException:
+            self._c.execute('ROLLBACK')
+            raise
+
     def finish_cancellations(self, *, outcome, now, request_id=None,
                              owner_token=None, target_id=None):
         from .store import _require_ts

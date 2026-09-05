@@ -1157,9 +1157,10 @@ def run_worker(record_id: str, repo: Path, branch: str, local_oid: str,
             return WorkerOutcome(2, _banner_failure(
                 f"the review worker could not open its store: {e!r}"))
         with store:
+            owner_context = {}
             try:
                 return _work(store, cancel, record_id, repo, branch, local_oid,
-                             base_sha, base_ref)
+                             base_sha, base_ref, owner_context=owner_context)
             except pipeline.ReviewCancelled as exc:
                 # A SIGTERM landing after the last watchdog tick and outside
                 # every checkpoint. Converted here into the SAME orderly
@@ -1178,13 +1179,25 @@ def run_worker(record_id: str, repo: Path, branch: str, local_oid: str,
                 except BaseException:       # pragma: no cover - defensive
                     pass
                 return WorkerOutcome(0, _banner_failure(reason))
+            finally:
+                owner = owner_context.get('owner')
+                if owner is not None:
+                    try:
+                        current = store.get_review(record_id) or {}
+                        if owner.matches(current) and current.get('status') != 'running':
+                            from .control import cancellation_completion
+                            from .requests import now
+                            store.finish_cancellations(target_id=record_id,
+                                outcome=cancellation_completion(current), now=now())
+                    except Exception as exc:
+                        _note(f'worker cancellation audit completion pending: {type(exc).__name__}')
     finally:
         _restore_sigterm(previous)
 
 
 def _work(store: "Store", cancel: threading.Event, record_id: str, repo: Path,
           branch: str, local_oid: str, base_sha: str,
-          base_ref: str) -> WorkerOutcome:
+          base_ref: str, *, owner_context=None) -> WorkerOutcome:
     """Steps 2-8 of `run_worker`. Raises; the caller owns every failure shape."""
     from . import gitio, pipeline
     from .trust import banner
@@ -1225,7 +1238,9 @@ def _work(store: "Store", cancel: threading.Event, record_id: str, repo: Path,
     from .request_cancel import RecordCancel
     if not store.publish_record_cancellation(record_id, os.getpid()):
         return WorkerOutcome(0, _banner_failure('worker no longer owns its reservation'))
-    cancel = RecordCancel(store, record_id, cancel)
+    cancel = RecordCancel(store, record_id, cancel, str(gitio._worktree_root(repo).resolve()))
+    if owner_context is not None:
+        owner_context['owner'] = cancel.owner
 
     cfg = _load_config(repo)
     d = effective_defaults(cfg.defaults, cfg.dispatch)
@@ -1261,7 +1276,16 @@ def _work(store: "Store", cancel: threading.Event, record_id: str, repo: Path,
     # BEFORE the store call and therefore cannot see a signal that arrives while
     # SQLite holds the write lock -- and such a signal would otherwise leave a
     # trustworthy record for a review that was killed.
-    if pipeline.runner._cancelled(cancel):
+    try:
+        # This is our trusted owner token. Do not let runner's defensive
+        # third-party Event guard swallow an audit failure after publication.
+        cancelled = cancel.is_set()
+    except Exception:
+        current = store.get_review(record_id) or {}
+        if cancel.owner.matches(current):
+            store.mark_cancelled(record_id, 'cancelled after finalization; cancellation audit failed')
+        raise
+    if cancelled:
         if store.mark_cancelled(record_id, "cancelled during finalization"):
             _note("cancelled during finalization; the committed record was "
                   "demoted")
@@ -1366,8 +1390,10 @@ def _install_sigterm(cancel: threading.Event):
     cancelled still terminates on its own watchdog budget, so this is degraded
     rather than fatal.
     """
+    from .request_cancel import mark_event
+
     def handler(signum, frame):        # pragma: no cover - driven by a signal
-        cancel.set()
+        mark_event(cancel, 'signal')
     try:
         # `signal.signal` returns the PREVIOUS handler, which is what
         # `_restore_sigterm` puts back. It can legitimately be `SIG_DFL`, whose

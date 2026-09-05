@@ -1,0 +1,12 @@
+# Worker-owned cancellation audit follow-up (#204)
+
+- Reproduce actual worker SIGTERM and a signal injected after finalize_review commits; assert the signal cause has a durable effective audit and the final artifact remains untrustworthy.
+- Capture a frozen current-worker observation context only after its reservation/diff and cooperative marker are validated. Owner observations compare the captured immutable reservation fields and current PID before audit insertion, including after the owner's successful finalization. External record_cancellation keeps its running-only guard.
+- Record upstream/local observations before RecordCancel returns True; preserve a recognized upstream cause, or unknown_cancel_token. Latch successfully audited cancellation, and avoid duplicate events.
+- Mark dispatch SIGTERM as signal through a preloaded helper. Keep post-commit cancellation demotion effective when observation occurs after finalization, and complete the audit after that demotion.
+- Strengthen the detached-control assertion to permit only signal 0. No external PID signals, production store/config/provider operations, schema changes, or extra external review loop.
+- Run focused worker/control/store checks, self-review, push a follow-up PR; root merges.
+
+Self-review: the terminal observation API is internal and takes a captured owner context rather than caller-controlled target arguments. It does not relax the external terminal-cancel refusal. Owner identity must match before any audit write. An audit error after finalization must not bypass the owner's existing post-commit demotion. Unknown signal initiators stay unknown.
+
+Verification: the two actual SIGTERM boundaries failed before the implementation because neither had an audit event. The first combined worker/control run passed251 tests with10 skips; the final full dispatcher run passed202 tests with10 skips. The final targeted ResourceWarning run covers eight cases, including the added PID-mismatch guard, and passes without warnings. Audit persistence failure after commit is separately injected and cannot leave trustworthy coverage. Owner settlement is limited to the captured matching execution; terminal replay does not repair historical pending events. The strict numeric-signal guard is scoped to the control call so fixture-owned child cleanup remains available on assertion failure. No schema, gate/trust, production config/store, or live provider changes.

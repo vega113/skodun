@@ -3410,10 +3410,11 @@ def test_current_detached_worker_cancels_cooperatively_without_pid_signal(tmp_pa
         unrelated=store.get_review('unrelated-live')
     real_kill=os.kill
     def no_control_signal(pid,sig):
-        assert sig not in (signal.SIGTERM,signal.SIGKILL), 'control must not signal a numeric worker PID'
+        assert sig == 0, 'control must not signal a numeric worker PID'
         return real_kill(pid,sig)
-    monkeypatch.setattr(os,'kill',no_control_signal)
-    assert main(['review-cancel',rid,'--json']) == 0
+    with monkeypatch.context() as control_patch:
+        control_patch.setattr(os,'kill',no_control_signal)
+        assert main(['review-cancel',rid,'--json']) == 0
     response=json.loads(capsys.readouterr().out)
     assert response['delivery_state'] == 'pending_owner_acknowledgement'
     assert response['owner_reachability'] == 'unverified'
@@ -3423,3 +3424,123 @@ def test_current_detached_worker_cancels_cooperatively_without_pid_signal(tmp_pa
         assert store.get_review('unrelated-live') == unrelated
         event=store.cancellation_events(rid)[0]
         assert event['outcome'] == 'cancelled' and event['completed_at']
+
+
+@pytest.mark.parametrize('boundary',['after_review','after_commit'])
+def test_worker_signal_is_durably_attributed_across_finalization(tmp_path,monkeypatch,boundary):
+    import os
+    import signal
+    from skodun import services
+    repo=_bg_repo(tmp_path)
+    db=tmp_path/'s.db'
+    rid,ident=_reserve(db,repo)
+    if boundary == 'after_review':
+        real=pipeline.run_prepush_review
+        def signalled(*args,**kwargs):
+            result=real(*args,**kwargs)
+            os.kill(os.getpid(),signal.SIGTERM)
+            return result
+        monkeypatch.setattr(pipeline,'run_prepush_review',signalled)
+    else:
+        real=Store.finalize_review
+        def signalled(store,*args,**kwargs):
+            applied=real(store,*args,**kwargs)
+            if applied:
+                assert store.get_review(rid)['trustworthy'] is True
+                os.kill(os.getpid(),signal.SIGTERM)
+            return applied
+        monkeypatch.setattr(Store,'finalize_review',signalled)
+    result=run_worker(rid,repo,'feat',ident['head'],ident['base_sha'],ident['base_ref'],db)
+    assert result.code == 0
+    terminal=_assert_cancelled_shape(db,repo,rid)
+    with Store.open(db) as store:
+        events=store.cancellation_events(rid)
+        assert len(events) == 1
+        assert events[0]['cause'] == 'signal'
+        assert events[0]['source'] == 'worker_lifecycle'
+        assert events[0]['actor'] == 'unknown'
+        assert events[0]['outcome'] == 'cancelled' and events[0]['completed_at']
+        code,text=services.svc_review_status(store,rid,output='json')
+        assert code == 0 and json.loads(text)['lifecycle']['reason_code'] == 'signal'
+        # Owner observation after commit never enables external terminal cancel.
+        assert services.svc_review_cancel(store,rid)[0] == 2
+
+
+def test_post_commit_owner_audit_failure_cannot_leave_trustworthy_coverage(tmp_path,monkeypatch):
+    import os
+    import signal
+    repo=_bg_repo(tmp_path)
+    db=tmp_path/'s.db'
+    rid,ident=_reserve(db,repo)
+    real=Store.finalize_review
+    def signalled(store,*args,**kwargs):
+        applied=real(store,*args,**kwargs)
+        if applied: os.kill(os.getpid(),signal.SIGTERM)
+        return applied
+    def audit_failure(*args,**kwargs):
+        raise OSError('injected owner audit persistence failure')
+    monkeypatch.setattr(Store,'finalize_review',signalled)
+    monkeypatch.setattr(Store,'observe_worker_cancellation',audit_failure)
+    result=run_worker(rid,repo,'feat',ident['head'],ident['base_sha'],ident['base_ref'],db)
+    assert result.code == 0
+    rec=_assert_cancelled_shape(db,repo,rid)
+    assert 'audit failed' in rec['failure_reason']
+
+
+def test_local_worker_cancellation_is_audited_once_with_unknown_initiator(tmp_path,monkeypatch):
+    repo=_bg_repo(tmp_path)
+    db=tmp_path/'s.db'
+    rid,ident=_reserve(db,repo)
+    real=pipeline.run_prepush_review
+    def local_cancel(*args,**kwargs):
+        result=real(*args,**kwargs)
+        kwargs['cancel'].set()
+        assert kwargs['cancel'].is_set()
+        assert kwargs['cancel'].is_set()
+        return result
+    monkeypatch.setattr(pipeline,'run_prepush_review',local_cancel)
+    run_worker(rid,repo,'feat',ident['head'],ident['base_sha'],ident['base_ref'],db)
+    with Store.open(db) as store:
+        events=store.cancellation_events(rid)
+        assert len(events) == 1
+        assert events[0]['cause'] == 'unknown_cancel_token'
+        assert events[0]['actor'] == 'unknown'
+        assert events[0]['outcome'] == 'cancelled'
+
+
+@pytest.mark.parametrize('field,value',[('head','changed'),('pid',2**30)])
+def test_owner_observation_rejects_changed_worker_identity(tmp_path,field,value):
+    import os
+    from skodun.request_cancel import RecordOwner
+    from skodun.requests import now
+    repo=_bg_repo(tmp_path)
+    db=tmp_path/'s.db'
+    rid,ident=_reserve(db,repo)
+    with Store.open(db) as store:
+        assert store.publish_record_cancellation(rid,os.getpid())
+        owner=RecordOwner.capture(store.get_review(rid))
+        store._c.execute('UPDATE reviews SET artifact_json=json_set(artifact_json,?,?) WHERE id=?',
+                         ('$.'+field,value,rid))
+        with pytest.raises(ValueError,match='ownership changed'):
+            store.observe_worker_cancellation(owner,cause='signal',now=now())
+        assert store.cancellation_events(rid) == []
+
+
+def test_terminal_worker_replay_does_not_settle_historical_pending_audit(tmp_path):
+    import os
+    from skodun.control import review_identity
+    from skodun.requests import now
+    repo=_bg_repo(tmp_path)
+    db=tmp_path/'s.db'
+    rid,ident=_reserve(db,repo)
+    with Store.open(db) as store:
+        record=store.get_review(rid)
+        store.record_cancellation(target_id=rid,request=None,identity=review_identity(record),
+            actor='operator',source='test',caller_pid=os.getpid(),caller_worktree=None,
+            reason='Historical pending cancellation',cause='requested_cancel',now=now())
+        # Reproduce a pre-fix terminal snapshot whose audit was never settled.
+        store._c.execute("UPDATE reviews SET status='failed',artifact_json=json_set(artifact_json,'$.status','failed') WHERE id=?",(rid,))
+        before=store.cancellation_events(rid)
+    run_worker(rid,repo,'feat',ident['head'],ident['base_sha'],ident['base_ref'],db)
+    with Store.open(db) as store:
+        assert store.cancellation_events(rid) == before
