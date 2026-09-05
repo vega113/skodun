@@ -196,18 +196,13 @@ def build_parser() -> argparse.ArgumentParser:
     # Epic S1: observe / cancel without a second gate. Hyphenated CLI names
     # match install-hooks / import-legacy; MCP tools use underscores like the
     # rest of the tool surface (review_status, review_cancel).
-    rstatus = sub.add_parser(
-        "review-status",
-        help="show status of a review by id, or the current one for --repo")
-    rstatus.add_argument(
-        "review_id", nargs="?", default=None, metavar="REVIEW-ID",
-        help="review id to inspect (default: current for --repo, or host-wide)")
-    rstatus.add_argument(
-        "--repo", type=Path, default=None,
-        help="when no id is given, report the current review for this "
-             "repository (default: host-wide current)")
-    rstatus.add_argument("--json", action="store_true", dest="json_output",
-                         help="render coverage and pass state as JSON")
+    rstatus = sub.add_parser("review-status", help="observe local worktree activity or an explicit ID")
+    rstatus.add_argument("review_id", nargs="?", default=None, metavar="REVIEW-OR-REQUEST-ID")
+    rstatus.add_argument("--repo", type=Path, default=Path("."), help="caller worktree (default .)")
+    rstatus.add_argument("--scope", choices=("worktree","repository","host"), default="worktree",
+                         help="broader scopes list identifiable entries")
+    rstatus.add_argument("--limit", type=int, default=50)
+    rstatus.add_argument("--json", action="store_true", dest="json_output")
 
     evidence = sub.add_parser(
         "evidence", help="show bounded advisory evidence receipts")
@@ -497,6 +492,14 @@ def build_parser() -> argparse.ArgumentParser:
     tri.add_argument("--adopt-refuter", action="store_true", dest="adopt_refuter",
                      help="dismiss ONE finding by adopting its refuter "
                           "annotation as the audited reason")
+    from .control import GUARDS
+    for parser in (tri, rcancel):
+        for name in GUARDS:
+            parser.add_argument("--" + name.replace("_", "-"), default=None,
+                                help="refuse if the explicit target identity differs")
+    rcancel.add_argument("--actor", default="operator", help="audited claim, not authentication")
+    rcancel.add_argument("--reason", default="Explicit cancellation requested")
+    rcancel.add_argument("--json", action="store_true", dest="json_output")
     return p
 
 
@@ -1921,22 +1924,15 @@ def _cmd_review_status(args) -> int:
     """Print one status line for a review. Service owns refusals; we own Store."""
     from .services import svc_review_status
 
-    repo = None
-    if getattr(args, "repo", None) is not None and args.review_id is None:
-        from . import gitio
-        try:
-            repo = str(gitio.git_common_dir(Path(args.repo)))
-        except BaseException as e:
-            return _emit(f"skodun review-status: could not resolve --repo: "
-                         f"{e!r}", 2)
     try:
         from .store import Store
-        store = Store.open(_store_path())
+        store = Store.open_readonly(_store_path())
     except BaseException as e:
         return _emit(f"skodun review-status: could not read the store: {e!r}", 2)
     with store:
         code, text = svc_review_status(
-            store, review_id=getattr(args, "review_id", None), repo=repo,
+            store, review_id=getattr(args, "review_id", None), repo=getattr(args, "repo", "."),
+            scope=getattr(args,"scope","worktree"), limit=getattr(args,"limit",50),
             output="json" if getattr(args, "json_output", False) else "text")
     return _emit(text, code)
 
@@ -1966,7 +1962,11 @@ def _cmd_review_cancel(args) -> int:
     except BaseException as e:
         return _emit(f"skodun review-cancel: could not read the store: {e!r}", 2)
     with store:
-        code, text = svc_review_cancel(store, args.review_id)
+        from .control import GUARDS
+        code, text = svc_review_cancel(store, args.review_id,
+            **{name:getattr(args,name,None) for name in GUARDS},
+            actor=args.actor, reason=args.reason, source="cli",
+            output="json" if args.json_output else "text")
     return _emit(text, code)
 
 
@@ -2142,12 +2142,14 @@ def _cmd_triage(args) -> int:
     except BaseException as e:
         return _emit(f"skodun triage: could not open the store: {e!r}", 2)
 
+    from .control import GUARDS
+    expected = {name:getattr(args,name,None) for name in GUARDS}
     with store:
         if args.list_only:
             code, text = svc_triage_list(store, args.review_id)
         elif args.reopen:
             code, text = svc_triage_reopen(store, args.review_id,
-                                           args.finding_index, args.reason)
+                                           args.finding_index, args.reason, **expected)
         elif args.defer:
             # THE POSITIONAL REMAPPING, in the one place it happens: under
             # `--defer` the third positional is the TRACKING REFERENCE and the
@@ -2157,13 +2159,13 @@ def _cmd_triage(args) -> int:
             code, text = svc_triage_defer(store, args.review_id,
                                           args.finding_index,
                                           args.reason,        # <tracking-ref>
-                                          args.defer_reason)  # "<reason>"
+                                          args.defer_reason, **expected)  # "<reason>"
         elif args.adopt_refuter:
             code, text = svc_adopt_refuter(store, args.review_id,
-                                           args.finding_index)
+                                           args.finding_index, **expected)
         else:
             code, text = svc_triage_dismiss(store, args.review_id,
-                                            args.finding_index, args.reason)
+                                            args.finding_index, args.reason, **expected)
     # A review with no findings lists nothing and exits 0; a blank line is not
     # an empty listing.
     return _emit(text, code) if text else code
