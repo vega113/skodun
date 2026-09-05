@@ -140,8 +140,14 @@ def finding_fingerprint(finding: Mapping[str, Any]) -> str:
 def annotate_findings(
     findings: Iterable[object],
     previous: Iterable[object] = (),
+    *, incomplete_exact: Iterable[str] = (),
 ) -> list[object]:
-    """Add fingerprint and conservative lineage metadata to finding dicts."""
+    """Add fingerprints without asserting uniqueness after incomplete reads.
+
+    Incomplete exact keys remain ambiguous even if recent/fuzzy fallback
+    supplies a singleton: another unseen exact occurrence may still exist.
+    """
+    incomplete = frozenset(incomplete_exact)
     prior: dict[str, list[tuple[str | None, int, str | None]]] = {}
     prior_payloads: list[tuple[Mapping[str, Any], str | None, int, str | None]] = []
     for index, item in enumerate(previous):
@@ -164,7 +170,9 @@ def annotate_findings(
         matches = prior.get(digest, [])
         predecessor_review_id = None
         predecessor = None
-        if len(matches) == 1:
+        if digest in incomplete:
+            reason = "ambiguous"
+        elif len(matches) == 1:
             predecessor_review_id, predecessor, predecessor_at = matches[0]
             old = next((candidate for candidate in prior_payloads
                         if candidate[1] == predecessor_review_id
@@ -268,8 +276,8 @@ def rank_prompt_candidates(rows: Iterable[object], *, changed_paths=(),
         path_match = _path(item.get("file")) in paths
         owner_match = bool(owner and _norm(owner) in owners)
         disposition = item.get("_lineage_disposition")
-        disposed = disposition in ("dismiss", "defer", "reopen")
-        candidates.append(((not path_match, not owner_match, not disposed), item))
+        known_disposition = disposition in ("open", "dismiss", "defer", "reopen")
+        candidates.append(((not path_match, not owner_match, not known_disposition), item))
     candidates.sort(key=lambda pair: pair[0])
     seen = set()
     selected = []

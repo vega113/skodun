@@ -16,6 +16,12 @@ truncation, and retrieval state. Counts describe bounded work, not repository
 history totals. Duplicate provenance rows are collapsed; independent exact or
 fuzzy occurrences remain ambiguous. Incomplete retrieval can miss lineage;
 `partial`/truncation signals prevent treating those misses as exhaustive.
+An exact key whose scan is incomplete before finding two valid occurrences, or
+whose lookup is skipped by key/scan limits, remains `ambiguous` with no
+predecessor even if recent/fuzzy fallback supplies a singleton. A partial read
+cannot establish unique lineage. `incomplete_exact_count` exposes these keys;
+`matched_count` excludes their unproven annotations, while `exact_matched` still
+reports how many exact candidate rows were retrieved.
 
 Candidate reads validate each source artifact's repository, review ID,
 timestamp, finding index, version, and recomputed digest. Invalid projection or

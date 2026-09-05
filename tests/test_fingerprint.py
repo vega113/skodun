@@ -649,6 +649,10 @@ def test_exact_lookup_bounds_keys_and_disposition_scan_is_explicit(tmp_path):
                          and 'fingerprint_version=' in query]
         assert len(exact_queries) == 200
         assert current['fingerprint_diagnostics']['exact_truncated'] is True
+        assert current['findings'][-1]['finding_lineage_v2']['match_reason'] == 'ambiguous'
+        assert current['findings'][-1]['finding_lineage_v2']['predecessor_review_id'] is None
+        assert current['fingerprint_diagnostics']['incomplete_exact_count'] == 1
+        assert current['fingerprint_diagnostics']['matched_count'] == 0
         store.save_review(_history_record('history', [{'file': 'a.py', 'title': 'same'}]))
         store._c.executemany(
             "INSERT INTO triage_events (review_id,finding_key,event) VALUES (?,?,?)",
@@ -665,3 +669,54 @@ def test_lineage_limits_reject_bool_and_unbounded_values(tmp_path):
                        {'scan_limit': 1025}, {'fingerprint': 'injected'}):
             with pytest.raises(ValueError):
                 store.lineage_candidates_with_diagnostics('canonical', **kwargs)
+
+
+def test_incomplete_exact_singleton_cannot_be_reintroduced_by_recent_fallback(tmp_path):
+    wanted = {'file': 'a.py', 'title': 'same'}
+    with Store.open(tmp_path / 's.db') as store:
+        store.save_review(_history_record('older', [wanted]))
+        store.save_review(_history_record('unrelated', [
+            {'file': f'unrelated/{i}.py', 'title': str(i)} for i in range(201)],
+            when='2026-08-12T10:00:00Z'))
+        store.save_review(_history_record('visible', [wanted],
+                                         when='2026-08-12T10:02:00Z'))
+        for index in range(11):
+            store._c.execute(
+                '''INSERT INTO finding_lineage
+                   (review_id,finding_index,repository_id,fingerprint_version,
+                    fingerprint,match_reason,created_at)
+                   VALUES (?,?,?,?,?,?,?)''',
+                (f'ghost-{index}', 0, 'canonical', fingerprint.VERSION,
+                 fingerprint.finding_fingerprint(wanted), 'new', '2026-08-12T10:01:00Z'))
+        exact, meta = store.lineage_candidates_with_diagnostics(
+            'canonical', fingerprint=fingerprint.finding_fingerprint(wanted), limit=2)
+        assert [item['_lineage_review_id'] for item in exact] == ['visible']
+        assert meta['truncated'] and meta['scan_truncated']
+        recent, _ = store.lineage_finding_candidates_with_meta('canonical')
+        assert any(item['_lineage_review_id'] == 'visible' for item in recent)
+        assert all(item['_lineage_review_id'] != 'older' for item in recent)
+        current = _history_record('current', [wanted], when='2026-08-12T11:00:00Z')
+        result = pipeline._persist(store, current)
+        lineage = result['findings'][0]['finding_lineage_v2']
+        assert lineage['match_reason'] == 'ambiguous'
+        assert lineage['predecessor_review_id'] is None
+        assert lineage['predecessor_index'] is None
+        assert result['fingerprint_diagnostics']['exact_scan_truncated'] is True
+        assert result['fingerprint_diagnostics']['incomplete_exact_count'] == 1
+        assert result['fingerprint_diagnostics']['matched_count'] == 0
+        assert result['trustworthy'] is True
+
+
+def test_known_open_disposition_wins_unknown_duplicate_at_equal_relevance():
+    finding = fingerprint.annotate_findings([{'file': 'a.py', 'title': 'same'}])[0]
+    unknown = {**finding, '_lineage_disposition': 'unknown', '_lineage_review_id': 'newer'}
+    known = {**finding, '_lineage_disposition': 'open', '_lineage_review_id': 'older'}
+    ranked, matched = fingerprint.rank_prompt_candidates(
+        [unknown, known], changed_paths=['a.py'])
+    assert len(ranked) == 1
+    assert ranked[0]['_lineage_review_id'] == 'older'
+    assert matched == 1
+    # Known dispositions at the same relevance still preserve source recency.
+    ranked, _ = fingerprint.rank_prompt_candidates(
+        [known, {**known, '_lineage_disposition': 'dismiss', '_lineage_review_id': 'oldest'}])
+    assert ranked[0]['_lineage_review_id'] == 'older'

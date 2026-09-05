@@ -2840,24 +2840,29 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
                            fallback_candidate_limit=CANDIDATE_LIMIT,
                            raw_scan_limit=1024 + min((CANDIDATE_LIMIT + 1) * 4, 1024))
         exact = []
+        incomplete_exact: set[str] = set()
         if repository_id != "unknown":
             if hasattr(store, "lineage_candidates_with_diagnostics"):
                 diagnostics["exact_state"] = "indexed"
                 digests = list(dict.fromkeys(
                     finding_fingerprint(item) for item in rec.get("findings") or ()
                     if isinstance(item, dict)))
+                incomplete_exact.update(digests[CANDIDATE_LIMIT:])
                 diagnostics["exact_key_truncated"] = len(digests) > CANDIDATE_LIMIT
                 diagnostics["exact_truncated"] = diagnostics["exact_key_truncated"]
-                for digest in digests[:CANDIDATE_LIMIT]:
+                for digest_index, digest in enumerate(digests[:CANDIDATE_LIMIT]):
                     remaining = 1024 - diagnostics["exact_scanned"]
                     if remaining <= 0:
                         diagnostics["exact_truncated"] = True
                         diagnostics["exact_scan_truncated"] = True
+                        incomplete_exact.update(digests[digest_index:CANDIDATE_LIMIT])
                         break
                     matches, meta = store.lineage_candidates_with_diagnostics(
                         repository_id, before_reviewed_at=rec.get("reviewed_at"),
                         fingerprint=digest, limit=2, scan_limit=remaining)
                     exact.extend(matches)
+                    if meta["truncated"] and len(matches) < 2:
+                        incomplete_exact.add(digest)
                     diagnostics["exact_scanned"] += meta["scanned_count"]
                     diagnostics["exact_truncated"] |= meta["truncated"]
                     diagnostics["exact_scan_truncated"] |= meta["scan_truncated"]
@@ -2900,12 +2905,16 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
                 candidates = store.lineage_review_candidates(repository_id)
                 previous, truncated = _flatten_lineage_candidates(
                     rec, candidates, False, CANDIDATE_LIMIT)
-        rec["findings"] = annotate_findings(rec.get("findings") or (), previous)
+        rec["findings"] = annotate_findings(
+            rec.get("findings") or (), previous, incomplete_exact=incomplete_exact)
         rec["fingerprint_status"] = "complete"
         diagnostics["candidate_count"] = len(previous)
+        diagnostics["incomplete_exact_count"] = len(incomplete_exact)
         diagnostics["matched_count"] = sum(
-            isinstance(item, dict) and item.get("finding_lineage_v2", {}).get(
-                "match_reason") != "new" for item in rec["findings"])
+            isinstance(item, dict)
+            and item.get("finding_fingerprint_v2") not in incomplete_exact
+            and item.get("finding_lineage_v2", {}).get("match_reason") != "new"
+            for item in rec["findings"])
         rec["fingerprint_diagnostics"] = diagnostics
         rec["fingerprint_candidate_limit"] = CANDIDATE_LIMIT
         rec["fingerprint_candidate_count"] = len(previous)
