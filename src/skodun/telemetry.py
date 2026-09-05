@@ -78,6 +78,15 @@ def attempt_launched(attempt: Mapping) -> bool | None:
     return None
 
 
+def confirmed_input_skip(attempt: Mapping) -> bool:
+    """Count a deterministic input refusal, not binary/quota/admission skips."""
+    eligibility = attempt.get('input_eligibility')
+    reason = eligibility.get('reason') if isinstance(eligibility, Mapping) else None
+    return attempt_launched(attempt) is False and (
+        reason == 'prompt_too_large' or attempt.get('reason_code') == 'transport_ineligible'
+        or attempt.get('input_ineligible') is True)
+
+
 def attempt_telemetry(attempt: Mapping, *, timeout_sec: int | None) -> dict:
     """Project one attempt into a stable, allowlisted telemetry row."""
     classification = attempt.get("classification")
@@ -88,6 +97,7 @@ def attempt_telemetry(attempt: Mapping, *, timeout_sec: int | None) -> dict:
         "input_bytes": _reported(attempt.get('input_bytes')),
         "input_scope": "provider_input",
         "launched": attempt_launched(attempt),
+        "input_ineligible": confirmed_input_skip(attempt),
         "attempt_ordinal": _reported(attempt.get("n")),
         "provider": attempt.get("provider"),
         "model": attempt.get("model"),

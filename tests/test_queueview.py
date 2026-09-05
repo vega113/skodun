@@ -59,7 +59,8 @@ def test_request_costs_dedup_nested_attempts_and_union_concurrent_intervals(tmp_
     a = attempt('call-a', '2026-09-05T12:00:01Z', '2026-09-05T12:00:11Z', 3_000_000,
                 {'total_tokens': 9})
     b = attempt('call-b', '2026-09-05T12:00:06Z', '2026-09-05T12:00:16Z', 3_900_000)
-    skip = {'n': 2, 'provider': 'openai', 'skipped': 'prompt_too_large', 'input_bytes': 9_000_000}
+    skip = {'n': 2, 'provider': 'openai', 'skipped': 'prompt_too_large', 'input_bytes': 9_000_000,
+            'input_eligibility': {'reason': 'prompt_too_large'}}
     rec = _round(id='review', request_id='sk_req_a', batch_orchestration_id='same', orchestration_id='same',
                  prompt_bytes=6_900_000, batches=[{'index': 0, 'attempts': [a, skip],
                      'telemetry': {'attempts': [a, skip]}}, {'index': 1, 'attempts': [b]}],
@@ -464,3 +465,25 @@ def test_real_budget_api_keeps_current_timing_and_historical_admission_caps_sepa
         assert row['execution_budget_timing']['measurements_ms']['review_wall_ms'] == 110000
         capacities = {item['id']: item['effective_limit'] for item in row['admissions']}
         assert capacities == {'old-admission': 4, 'new-admission': 1}
+
+
+def test_candidate_skips_do_not_all_claim_transport_ineligibility(tmp_path):
+    rows = [
+        {'attempt_id': 'transport', 'skipped': 'too big', 'input_bytes': 200,
+         'input_eligibility': {'reason': 'prompt_too_large', 'input_bytes': 200, 'limit_bytes': 100}},
+        {'attempt_id': 'binary', 'skipped': 'binary missing'},
+        {'attempt_id': 'quota', 'skipped': 'cached quota', 'classification': {'category': 'quota'}},
+        {'attempt_id': 'admission', 'skipped': 'provider capacity wait', 'reason_code': 'provider_wait_exhausted'},
+        {'attempt_id': 'launched', 'rc': 0, 'input_bytes': 50, 'provider': 'openai'},
+    ]
+    with Store.open(tmp_path / 's.db') as store:
+        rid = request(store)
+        rec = _round(id='mixed-skips', request_id=rid, attempts=rows)
+        store.save_review(rec); store.link_request(rid, 'review', rec['id'])
+        store.finish_request(rid, owner_token=rid, state='finished', reason_code='completed', result=None, now=NOW)
+        _, text = services.svc_queue(store, request_id=rid, output='json', now=NOW)
+        costs = json.loads(text)['requests'][0]['costs']
+        assert costs['candidate_skips'] == 4
+        assert costs['eligibility_skips'] == 1
+        assert costs['launched_calls'] == 1
+        assert costs['aggregate_launched_prompt_bytes'] == 50

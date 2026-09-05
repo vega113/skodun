@@ -34,8 +34,10 @@ history can supply older admissions' exact caps without replacing current timing
 Cost counts use original artifact request ownership. A review linked for reuse
 is historical coverage, not new provider execution. The #184 `attempt_id`
 deduplicates raw/telemetry/checkpoint copies; old rows without stable IDs retain
-explicitly incomplete identity coverage. Provider-eligibility skips are not
-launched calls. Retry counts mean repeated launches of the same provider/model
+explicitly incomplete identity coverage. `candidate_skips` counts all candidates
+that did not launch; `eligibility_skips` counts only confirmed deterministic input
+refusals. Missing binaries, cached quota and expired admission waits are candidate
+skips, not transport-ineligibility evidence. Neither category is a launched call. Retry counts mean repeated launches of the same provider/model
 within the same pass namespace. Recovery orchestration IDs and batch
 orchestration IDs are never joined interchangeably.
 
@@ -79,4 +81,5 @@ cancelled observations keep full totals unknown. Complete #188 acceptance still
 requires #185's persisted getter/timing and free-admission progress placement.
 The real save/query integration fixture activates when that API lands; it is
 explicitly skipped while the dependency is absent. Interface fixtures alone do
-not certify that dependency, and the PR remains draft until integration passes.
+not certify that dependency. The core reader can land separately, but #188
+remains open until the integrated API and runtime checks pass.

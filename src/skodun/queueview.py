@@ -15,7 +15,7 @@ import statistics
 from collections import Counter
 from datetime import datetime, timezone
 
-from .telemetry import attempt_launched, _token_usage
+from .telemetry import attempt_launched, confirmed_input_skip, _token_usage
 from .store import _is_canonical_ts
 
 MAX_LINKS = 200
@@ -302,7 +302,7 @@ def _calls(reviews):
             unique[key] = {'attempt_id': attempt_id, 'scope': {'namespace': scope[0],
                 'kind': scope[1], 'id': scope[2]}, 'provider': item.get('provider'),
                 'model': item.get('model'),
-                'launched': launched, 'input_bytes': _number(item.get('input_bytes')),
+                'launched': launched, 'input_ineligible': confirmed_input_skip(item), 'input_bytes': _number(item.get('input_bytes')),
                 'total_tokens': tokens, 'usage': usage, 'ordinal': item.get('n', item.get('attempt_ordinal')),
                 'interval': _interval(timing.get('started_at'), timing.get('ended_at'))}
             unidentified += int(key[0] == 'legacy')
@@ -322,7 +322,8 @@ def _calls(reviews):
         usage_summary['reported_' + kind] = sum(reported) if reported else None
         usage_summary[kind + '_reported_calls'] = len(reported)
     return calls, {'launched_calls': len(launched), 'reported_launched_calls': len(launched),
-        'eligibility_skips': sum(row['launched'] is False for row in calls),
+        'candidate_skips': sum(row['launched'] is False for row in calls),
+        'eligibility_skips': sum(row['input_ineligible'] for row in calls),
         'launch_unknown': sum(row['launched'] is None for row in calls),
         'attempt_identity_missing': unidentified, 'attempts_truncated': truncated,
         'missing_attempt_scopes': missing_scopes[:MAX_LINKS],
