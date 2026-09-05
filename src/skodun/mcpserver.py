@@ -2017,7 +2017,8 @@ class McpServer:
                                             f"{name}")
         if spec.long_running:
             if not self._start_long_running(spec, arguments, id_):
-                busy = (_review_result(BUSY_STATUS, BUSY_TEXT)
+                busy = (_review_result(BUSY_STATUS, BUSY_TEXT,
+                        {"termination": {"reason_code": "mcp_busy", "retryable": True}})
                         if spec.name == "review" else
                         HandlerResult(status=BUSY_STATUS, text=BUSY_TEXT,
                                       pending_acks=[]))

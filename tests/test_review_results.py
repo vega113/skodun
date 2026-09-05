@@ -1,4 +1,9 @@
-"""Versioned outcomes through shipped CLI, MCP, and shared review services."""
+"""Versioned outcomes through shipped CLI, MCP, and shared review services.
+
+The external contract preserves typed causes and exact current request evidence,
+keeps provider input separate from aggregates, and never turns incomplete work
+or malformed replay data into successful coverage or gate clearance.
+"""
 import json
 
 import pytest
@@ -327,3 +332,170 @@ def test_partial_batches_keep_provider_input_and_aggregate_scopes(tmp_path, monk
     assert [a['input_bytes'] for a in result['attempts']] == inputs
     assert result['bytes']['prompt_bytes'] > max(inputs)
     assert result['attempts'][0]['scope']['kind'] == 'batch'
+
+
+@pytest.mark.parametrize('surface', ['service', 'cli', 'mcp'])
+@pytest.mark.parametrize('cancel_at', ['boundary', 'inflight'])
+def test_cancelled_checkpoint_retains_only_current_attempt_evidence(tmp_path, monkeypatch, capsys, surface, cancel_at):
+    import threading
+    from skodun import pipeline, runner
+    from tests.test_batched_review import _body
+    from skodun.mcpserver import HandlerCall
+    from tests.test_mcptools import _specs
+    repo = _ready_repo(tmp_path, monkeypatch)
+    cfg = repo / '.skodun.toml'
+    cfg.write_text(cfg.read_text() + '\n[defaults]\nmax_diff_bytes=4000\n')
+    for i in range(3):
+        (repo / f'f{i}.txt').write_text(_body(f'f{i}'))
+    db = tmp_path / 'db'
+    monkeypatch.setenv('SKODUN_DB', str(db))
+    cancel = threading.Event()
+    run = pipeline.run_review
+    def with_cancel(*args, **kwargs):
+        kwargs['cancel'] = cancel
+        return run(*args, **kwargs)
+    monkeypatch.setattr(pipeline, 'run_review', with_cancel)
+    complete = Store.complete_checkpoint
+    def completed(store, orchestration_id, kind, index, **kwargs):
+        applied = complete(store, orchestration_id, kind, index, **kwargs)
+        if applied and kind == 'batch' and index == 1 and cancel_at == 'boundary':
+            cancel.set()
+        return applied
+    monkeypatch.setattr(Store, 'complete_checkpoint', completed)
+    calls = []
+    def provider(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        calls.append(cmd)
+        if len(calls) == 2 and cancel_at == 'inflight':
+            cancel.set()
+            raise runner.ReviewCancelled('provider stopped mid-pass')
+        out.write_bytes(b'{"structuredOutput":{"summary":"s","findings":[]},"stopReason":"EndTurn"}')
+        return runner.RunResult(rc=0, timed_out=False, duration_sec=.1, first_output_sec=.05)
+    monkeypatch.setattr(runner, 'run_with_watchdog', provider)
+    if surface == 'service':
+        with Store.open(db) as store:
+            code, _, meta = services.svc_review_detailed(store, repo, cancel=cancel)
+        result = meta['result']
+    elif surface == 'cli':
+        code = main(['review', '--repo', str(repo), '--json'])
+        result = json.loads(capsys.readouterr().out)
+    else:
+        response = _specs()['review'].handler(HandlerCall(
+            params={'repo': str(repo)}, store_factory=lambda: Store.open(db), cancel=cancel))
+        code, result = response.status, response.metadata['result']
+    assert code == 4 and result['execution']['reason_code'] == 'requested_cancel'
+    assert result['ids']['review_id'] is not None
+    with Store.open(db) as store:
+        rec = store.get_review(result['ids']['review_id'])
+        assert rec['request_id'] == result['ids']['request_id']
+        assert rec['batch_orchestration_id'] == result['ids']['batch_orchestration_id']
+    assert len(calls) == (1 if cancel_at == 'boundary' else 2)
+    assert result['coverage']['trustworthy'] is False
+    assert result['coverage']['partial'] is True
+    assert result['checkpoints']['completed'] == 1
+    assert result['counts']['complete'] is False
+    assert result['counts']['provider_launches'] is None
+    assert result['counts']['known_provider_launches'] == 1
+    assert result['attempts'][0]['launched'] is True
+
+
+def test_reuse_cancellation_is_typed(tmp_path, monkeypatch):
+    import threading
+    repo = _ready_repo(tmp_path, monkeypatch)
+    cancelled = threading.Event()
+    cancelled.set()
+    with Store.open(tmp_path / 'db') as store:
+        code, _, meta = services.svc_review_detailed(store, repo, reuse_trusted=True, cancel=cancelled)
+    assert code == 4 and meta['result']['execution']['reason_code'] == 'requested_cancel'
+
+
+def test_provider_admission_expiry_is_terminal_expiry():
+    from skodun.review_results import attach, observation
+    facts = observation({'id': 'r', 'trustworthy': False, 'attempts': [{
+        'n': 1, 'skipped': 'arbitrary prose', 'reason_code': 'admission_expired'}]})
+    result = attach(4, 'arbitrary prose', {'observation': facts})[2]['result']
+    assert result['execution']['reason_code'] == 'admission_expired'
+    assert result['execution']['state'] == 'expired'
+
+
+@pytest.mark.parametrize('field, value', [
+    ('trustworthy', False), ('partial', 'yes'), ('causes', {'bad': 'shape'}),
+    ('attempts', [{'launched': 'false'}]), ('attempts_truncated', 1),
+])
+def test_replay_rejects_nested_contract_or_success_contradictions(field, value):
+    from skodun.review_results import valid_replay, observation
+    facts = observation({'id': 'r', 'trustworthy': True, 'parse_ok': True,
+                         'findings_total': 0, 'attempts': []})
+    facts[field] = value
+    assert not valid_replay({'status': 0, 'text': 'clean', 'metadata': {'observation': facts}})
+
+
+@pytest.mark.parametrize('metadata', [
+    {'termination': {'retryable': 'yes'}},
+    {'termination': {'state': 'cancelled', 'reason_code': 'requested_cancel'}},
+    {'timing': {'scope': 'request_execution', 'review_wall_ms': float('nan')}},
+    {'timing': {'scope': 'request_execution', 'review_wall_ms': 'fast'}},
+    {'recovery': {'review_ids': 7}},
+])
+def test_replay_rejects_invalid_projected_metadata(metadata):
+    from skodun.review_results import valid_replay
+    assert not valid_replay({'status': 0, 'text': 'clean', 'metadata': metadata})
+
+
+
+def test_pre_record_recovery_cancel_does_not_borrow_prior_review(tmp_path, monkeypatch):
+    from skodun import pipeline, runner
+    repo = _ready_repo(tmp_path, monkeypatch)
+    cfg = repo / '.skodun.toml'
+    cfg.write_text(cfg.read_text() + '\n[defaults]\ndegraded_retries=0\n')
+    run = pipeline.run_review
+    calls = []
+    def run_or_cancel(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise runner.ReviewCancelled('cancelled before this attempt has a record')
+        return run(*args, **kwargs)
+    def unusable(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        out.write_bytes(b'not a review')
+        return runner.RunResult(rc=0, timed_out=False, duration_sec=.1, first_output_sec=.05)
+    monkeypatch.setattr(pipeline, 'run_review', run_or_cancel)
+    monkeypatch.setattr(runner, 'run_with_watchdog', unusable)
+    with Store.open(tmp_path / 'db') as store:
+        code, _, meta = services.svc_review_detailed(store, repo, recover=True, max_attempts=2)
+    assert code == 4 and len(calls) == 2
+    assert len(meta['result']['orchestration']['recovery']['review_ids']) == 1
+    assert meta['result']['ids']['review_id'] is None
+    assert meta['result']['ids']['batch_orchestration_id'] is None
+    assert meta['result']['coverage']['partial'] is None
+
+
+def test_final_recovery_persistence_failure_is_not_success(tmp_path, monkeypatch):
+    repo = _ready_repo(tmp_path, monkeypatch)
+    save = Store.save_review
+    def save_except_terminal(store, rec, **kwargs):
+        if rec.get('terminal_reason'):
+            raise OSError('cannot publish terminal metadata')
+        return save(store, rec, **kwargs)
+    monkeypatch.setattr(Store, 'save_review', save_except_terminal)
+    with Store.open(tmp_path / 'db') as store:
+        code, _, meta = services.svc_review_detailed(store, repo, recover=True)
+    assert code == 4
+    assert meta['result']['execution']['reason_code'] == 'persistence_failed'
+    assert meta['result']['ids']['review_id'] is None
+    assert meta['result']['coverage']['trustworthy'] is None
+
+
+
+def test_unrecorded_security_attempts_make_counts_incomplete(tmp_path, monkeypatch):
+    from tests.test_pipeline import _calls
+    repo = _ready_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv('SKODUN_SECURITY_PASS', '1')
+    (repo / 'auth').mkdir()
+    (repo / 'auth' / 'session.py').write_text('def authenticate(): return True\n')
+    with Store.open(tmp_path / 'db') as store:
+        code, _, meta = services.svc_review_detailed(store, repo)
+    result = meta['result']
+    assert code == 0 and _calls(tmp_path) == 2
+    assert result['counts']['provider_launches'] is None
+    assert result['counts']['known_provider_launches'] == 1
+    assert result['counts']['complete'] is False
+    assert result['missing_attempt_scopes'] == [{'kind': 'extra_pass', 'id': 'security'}]

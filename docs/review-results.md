@@ -24,7 +24,8 @@ Each attempt's `input_scope=provider_input` names the complete encoded payload
 offered to that candidate. `launched=false` means no provider process started;
 input bytes then describe the rejected/offered payload, not transmitted work.
 Even a launched process is not proof of a model API call or charge. Historical
-artifacts lacking `input_bytes` report null, even when aggregate bytes exist.
+artifacts without either attempt-level bytes or an authoritative transport
+eligibility byte count report null; aggregate bytes never fill that gap.
 Attempt IDs survive persisted checkpoint copying; ordinals alone are not unique
 across chains or resumed executions.
 
@@ -54,3 +55,20 @@ A successful fallback still reports `review_clean`/`review_findings`; earlier
 failures remain in `causes` and scoped attempt rows. A no-review failure keeps
 `ids.review_id` and observed coverage null instead of copying an earlier recovery
 attempt. Result projection is additive and needs no store schema migration.
+
+
+Cancellation preserves the verified current attempt's persisted review ID and
+its validated completed checkpoint evidence. It never substitutes a prior
+recovery attempt. Because cancellation may interrupt a provider before its row
+is persisted, `counts.complete=false` and totals remain null; `known_candidates`
+and `known_provider_launches` are evidence lower bounds. `checkpoints` names the
+batch orchestration and its completed/total pass counts. Coverage remains
+untrustworthy even when completed checkpoints establish `coverage.partial=true`.
+
+Extra passes whose historical metadata contains no attempt rows also make totals
+and causes incomplete. `missing_attempt_scopes` identifies them; the projection
+does not invent execution details from prose. `attempts_truncated` describes only
+the display bound, while `counts.complete` / `causes_complete` describe evidence
+completeness. Busy MCP review refusals use `mcp_busy`, preserving their legacy
+status. MCP store-open failure also preserves its existing status 2; the CLI's
+corresponding status remains 4. Both report `persistence_failed` as the stable cause.

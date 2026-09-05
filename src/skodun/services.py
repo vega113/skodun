@@ -284,6 +284,8 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
         failure("configuration_invalid")
         return 2, banner_failure(f"could not load the config: {e!r}")
 
+    from .review_results import linked_reviews, cancelled_observation
+    prior_reviews = linked_reviews(store)
     try:
         if batch_target_bytes is not None:
             from dataclasses import replace
@@ -313,6 +315,10 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
         return 2, banner_failure(f"{e}; no review ran")
     except ReviewCancelled:
         failure(getattr(cancel, "reason_code", None) or "requested_cancel")
+        if result_metadata is not None:
+            facts = cancelled_observation(store, prior_reviews)
+            if facts is not None:
+                result_metadata['observation'] = facts
         # BEFORE the general `BaseException` below, and it has to be: a
         # cancellation is not "the review failed" with a stack trace worth
         # quoting, and `run_review`'s own `finally` has already downgraded
@@ -460,6 +466,7 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
         from .trust import banner_failure
         reason = REVIEW_CANCELLED_REASON
         return (4, banner_failure(reason)), None, {
+                "termination": {"reason_code": getattr(cancel, "reason_code", None) or "requested_cancel"},
             "reuse": {"hit": False, "reason": reason}}
     result = None
     from .review_results import observation
@@ -486,6 +493,7 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
             _reuse_audit(store, result, outcome="bypass", reason=reason)
             from .trust import banner_failure
             return (4, banner_failure(reason)), None, {
+                "termination": {"reason_code": getattr(cancel, "reason_code", None) or "requested_cancel"},
                 "reuse": {"hit": False, "reason": reason}}
         if result.candidate is None:
             _reuse_audit(store, result, outcome="miss", reason=result.reason)
@@ -498,6 +506,7 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
             reason = REVIEW_CANCELLED_REASON
             from .trust import banner_failure
             return (4, banner_failure(reason)), None, {
+                "termination": {"reason_code": getattr(cancel, "reason_code", None) or "requested_cancel"},
                 "reuse": {"hit": False, "reason": reason}}
         _reuse_audit(store, result, outcome="hit", reason=result.reason)
         text = (f"SKODUN REUSE: review_id={result.candidate['id']} "
@@ -539,9 +548,9 @@ def _recovery_review_id(text: str) -> str | None:
 
 
 def _annotate_recovery_attempt(store, text: str, orchestration_id: str,
-                               ordinal: int) -> tuple[dict | None, str | None]:
+                               ordinal: int, *, review_id=None) -> tuple[dict | None, str | None]:
     """Persist v9 orchestration metadata without changing trust axes."""
-    review_id = _recovery_review_id(text)
+    review_id = review_id or _recovery_review_id(text)
     if review_id is None:
         return None, None
     rec = store.get_review(review_id)
@@ -793,8 +802,16 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
             result_metadata=attempt_metadata)
         result_metadata = attempt_metadata
         try:
-            last_rec, review_id = _annotate_recovery_attempt(
-                store, last_text, orchestration_id, ordinal)
+            observed_id = (attempt_metadata.get('observation') or {}).get('review_id')
+            if observed_id:
+                last_rec, review_id = _annotate_recovery_attempt(
+                    store, last_text, orchestration_id, ordinal, review_id=observed_id)
+            elif 'termination' in attempt_metadata:
+                # Typed no-record failures cannot borrow an ID from prose.
+                last_rec, review_id = None, None
+            else:
+                last_rec, review_id = _annotate_recovery_attempt(
+                    store, last_text, orchestration_id, ordinal)
         except KeyboardInterrupt:
             raise
         except BaseException as e:
@@ -881,7 +898,10 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
         except KeyboardInterrupt:
             raise
         except BaseException:
-            pass
+            terminal_code = "persistence_failed"
+            last_status = 4
+            last_text = banner_failure("could not persist recovery result")
+            result_metadata = {}
     if terminal_code is not None:
         result_metadata['termination'] = {'reason_code': terminal_code}
         if terminal_code in ('identity_changed', 'identity_unavailable', 'persistence_failed'):

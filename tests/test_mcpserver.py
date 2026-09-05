@@ -856,6 +856,8 @@ def test_a_second_review_is_refused_while_one_is_in_flight_and_the_loop_stays_li
         assert busy["isError"] is True
         assert busy["content"][0]["text"] == mcpserver.BUSY_TEXT
         assert busy["structuredContent"]["status"] != 0
+        assert busy["structuredContent"]["result"]["execution"]["reason_code"] == "mcp_busy"
+        assert busy["structuredContent"]["result"]["execution"]["retryable"] is True
         assert busy["structuredContent"]["skodun_version"] == skodun.__version__
         assert got[3]["result"]["content"][0]["text"] == "alive"
         assert 1 not in got, "the review answered before it was released"
