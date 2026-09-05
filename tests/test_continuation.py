@@ -63,7 +63,7 @@ def test_consumed_untrustworthy_continuation_retries_failed_and_dependent_work(l
 
 def test_interrupted_after_three_usable_batches_runs_only_missing_and_integration(lane, monkeypatch):
     from skodun.request_cancel import mark_event
-    repo, store, calls, failures = lane
+    repo, store, calls, _failures = lane
     cancel = threading.Event()
     complete = store.complete_checkpoint
     def stop_after_three(orchestration_id, kind, index, **kwargs):
@@ -87,7 +87,7 @@ def test_interrupted_after_three_usable_batches_runs_only_missing_and_integratio
 
 
 def test_continue_rejects_fresh_intent_without_execution(lane):
-    repo, store, calls, failures = lane
+    repo, store, calls, _failures = lane
     status, _, metadata = services.svc_review_detailed(store, repo, continue_compatible=True, fresh=True)
     assert status == 2 and not calls
     assert metadata['result']['execution']['reason_code'] == 'invalid_input'
@@ -163,7 +163,7 @@ def test_explicit_continuation_on_both_shipped_surfaces(lane, tmp_path, monkeypa
     from skodun.cli import main
     from skodun.mcpserver import HandlerCall
     from tests.test_mcptools import _specs
-    repo, store, calls, failures = lane
+    repo, _store, calls, failures = lane
     monkeypatch.setenv('SKODUN_DB', str(tmp_path / 'db'))
     failures.add('integration')
     if surface == 'cli':
@@ -192,7 +192,7 @@ def test_explicit_continuation_on_both_shipped_surfaces(lane, tmp_path, monkeypa
 def test_changed_capability_reconsiders_transport_without_provider_poisoning(lane, monkeypatch):
     from skodun import chain
     from skodun.adapters.agy import AgyAdapter
-    repo, store, calls, failures = lane
+    repo, store, _calls, _failures = lane
     cfg = repo / '.skodun.toml'
     cfg.write_text(cfg.read_text().replace('role = "finder"', 'role = "finder"\nfallbacks = ["small"]') +
                    '\n[[reviewers]]\nname="small"\nprovider="google"\nmodel="small-model"\nrole="finder"\n')
@@ -228,7 +228,7 @@ def test_changed_capability_reconsiders_transport_without_provider_poisoning(lan
 def test_child_identity_is_distinct_while_source_canonical_identity_stays_stable(lane):
     import json
     from skodun.checkpoints import OrchestrationIdentity, first_mismatch
-    repo, store, calls, failures = lane
+    repo, store, _calls, failures = lane
     failures.add('integration')
     _, _, initial = services.svc_review_detailed(store, repo)
     source = store.get_orchestration(initial['result']['ids']['batch_orchestration_id'])
@@ -316,7 +316,7 @@ def test_explicit_compatible_recovery_keeps_successful_batches_across_attempts(l
 
 def test_expired_execution_continues_with_a_new_budget_and_only_missing_work(lane, monkeypatch):
     from tests.test_budget_execution import controlled_clock
-    repo, store, calls, failures = lane
+    repo, store, calls, _failures = lane
     clock = controlled_clock(monkeypatch)
     provider = runner.run_with_watchdog
     def measured(cmd, *args, **kwargs):
@@ -362,3 +362,141 @@ def test_continuation_receipt_rejects_inconsistent_pass_telemetry(mutation):
     else:
         value['passes_truncated'] = True
     assert not valid_receipt(value)
+
+
+@pytest.mark.parametrize('malformation', ['missing_field', 'unexpected_field'])
+def test_malformed_pass_identity_is_a_stable_continuation_refusal(lane, malformation):
+    import json
+    repo, store, calls, failures = lane
+    failures.add('integration')
+    _, _, first = services.svc_review_detailed(store, repo)
+    source_id = first['result']['ids']['batch_orchestration_id']
+    identity = json.loads(store.get_orchestration(source_id)['identity_json'])
+    if malformation == 'missing_field':
+        identity['pass_identities'][0].pop('diff_hash')
+    else:
+        identity['pass_identities'][0]['unexpected'] = 'field'
+    store._c.execute('UPDATE review_orchestrations SET identity_json=? WHERE id=?',
+                     (json.dumps(identity), source_id))
+    calls.clear()
+    code, _, metadata = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert code == 2 and calls == []
+    assert metadata['result']['execution']['reason_code'] == 'continuation_identity_mismatch'
+    assert metadata['continuation']['first_mismatch'] == 'identity_json'
+    assert metadata['result']['ids']['review_id'] is None
+
+
+def test_local_integration_build_failure_is_in_the_failed_pass_receipt(lane, monkeypatch):
+    from skodun import passes, pipeline
+    from skodun.review_results import observation
+    repo, store, calls, failures = lane
+    failures.add('integration')
+    assert services.svc_review_detailed(store, repo)[0] == 4
+    calls.clear()
+    failures.clear()
+    captured = []
+    orchestrate = pipeline._orchestrate
+    def observe_orchestration(*args, **kwargs):
+        rec = orchestrate(*args, **kwargs)
+        captured.append(rec)
+        return rec
+    def cannot_prepare(*args, **kwargs):
+        raise ValueError('local integration preparation failed')
+    monkeypatch.setattr(pipeline, '_orchestrate', observe_orchestration)
+    monkeypatch.setattr(passes, 'integration_prompt', cannot_prepare)
+    assert services.svc_review_detailed(store, repo, continue_compatible=True)[0] == 4
+    assert calls == []
+    rec, = captured
+    assert rec['integration']['ran'] is False
+    assert rec['integration']['attempts'] == []
+    assert rec['integration']['telemetry']['attempts'] == []
+    receipt = observation(rec)['continuation']
+    assert receipt['counts'] == {'reused': 4, 'executed': 0, 'failed': 1}
+    assert {'kind': 'integration', 'index': 0, 'action': 'failed'} in receipt['passes']
+    # This remains a local failed pass, not a made-up completed checkpoint or
+    # provider call; the existing atomic publication guard still refuses it.
+    child = store.get_orchestration(rec['batch_orchestration_id'])
+    assert child['state'] != 'consumed'
+    assert any(row['pass_kind'] == 'integration' and row['state'] == 'pending'
+               for row in store.list_checkpoints(child['id']))
+
+
+def test_known_source_request_mismatch_is_refused_before_a_new_request(lane, monkeypatch):
+    repo, store, calls, failures = lane
+    failures.add('integration')
+    assert services.svc_review_detailed(store, repo)[0] == 4
+    before = store.list_requests(worktree_root=str(repo.resolve()))
+    calls.clear()
+    monkeypatch.setenv('SKODUN_GROK_BIN', '/bin/sh')
+    code, _, metadata = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert code == 2 and calls == []
+    assert metadata['result']['execution']['reason_code'] == 'continuation_identity_mismatch'
+    assert metadata['continuation']['first_mismatch'] == 'policy_hash'
+    assert metadata['request']['persisted'] is False
+    assert store.list_requests(worktree_root=str(repo.resolve())) == before
+
+
+@pytest.mark.parametrize('mutation', ['missing', 'different_receipts', 'different_generation'])
+def test_explicit_continuation_replay_requires_one_matching_receipt(lane, mutation):
+    import copy
+    from skodun.review_results import valid_replay
+    repo, store, _calls, failures = lane
+    failures.add('integration')
+    services.svc_review_detailed(store, repo)
+    failures.clear()
+    code, _, metadata = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert code == 0
+    saved = copy.deepcopy(store.get_request(metadata['request']['id'])['result'])
+    assert saved['metadata']['request']['continuation_policy'] == 'compatible'
+    assert valid_replay(saved)
+    if mutation == 'missing':
+        saved['metadata'].pop('continuation')
+        saved['metadata']['observation']['continuation'] = None
+    elif mutation == 'different_receipts':
+        saved['metadata']['continuation']['source_orchestration_id'] = 'different-source'
+    else:
+        saved['metadata']['continuation']['orchestration_id'] = 'different-child'
+        saved['metadata']['observation']['continuation']['orchestration_id'] = 'different-child'
+    assert not valid_replay(saved)
+
+
+def test_ordinary_same_request_resume_does_not_require_explicit_receipt(lane, monkeypatch):
+    from skodun.request_cancel import mark_event
+    from skodun.review_results import valid_replay
+    repo, store, _calls, _failures = lane
+    cancel = threading.Event()
+    complete = store.complete_checkpoint
+    def stop_after_three(orchestration_id, kind, index, **kwargs):
+        applied = complete(orchestration_id, kind, index, **kwargs)
+        if kind == 'batch' and index == 3:
+            mark_event(cancel, 'requested_cancel')
+        return applied
+    monkeypatch.setattr(store, 'complete_checkpoint', stop_after_three)
+    assert services.svc_review_detailed(store, repo, cancel=cancel)[0] == 4
+    monkeypatch.setattr(store, 'complete_checkpoint', complete)
+    code, _, metadata = services.svc_review_detailed(store, repo)
+    assert code == 0 and metadata['request']['continued'] is True
+    assert metadata.get('continuation') is None
+    assert valid_replay(store.get_request(metadata['request']['id'])['result'])
+
+
+@pytest.mark.parametrize('status', [2, 4])
+def test_explicit_policy_failure_before_a_generation_needs_no_receipt(status):
+    from skodun.review_results import valid_replay
+    value = {'status': status, 'text': 'refused before generation', 'metadata': {
+        'request': {'continued': True, 'continuation_policy': 'compatible'},
+        'termination': {'reason_code': 'preflight_refused' if status == 2 else 'persistence_failed'}}}
+    assert valid_replay(value)
+
+
+def test_missing_source_ownership_does_not_invent_an_identity_mismatch(lane):
+    repo, store, calls, failures = lane
+    failures.add('integration')
+    _, _, first = services.svc_review_detailed(store, repo)
+    source_id = first['result']['ids']['batch_orchestration_id']
+    store._c.execute("DELETE FROM request_links WHERE kind='batch_orchestration' AND target_id=?", (source_id,))
+    calls.clear()
+    code, _, metadata = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert code == 2 and calls == []
+    assert metadata['result']['execution']['reason_code'] == 'continuation_request_ownership'
+    assert metadata['continuation']['first_mismatch'] is None

@@ -3266,8 +3266,7 @@ def _begin_checkpoint_run(store: Store, identity: checkpoints.OrchestrationIdent
                 created_at=now, expires_at=_iso_after(CHECKPOINT_RETENTION_SEC))
         except ValueError as exc:
             code = getattr(exc, 'reason_code', 'continuation_source_invalid')
-            refuse(code, 'Continuation source could not be safely claimed; no checkpoint reused.',
-                   first_mismatch='request_identity' if code == 'continuation_request_ownership' else None)
+            refuse(code, 'Continuation source could not be safely claimed; no checkpoint reused.')
         child_identity = checkpoints.OrchestrationIdentity.from_json(child['identity_json'])
         rec['continuation'] = {'policy': 'compatible', 'status': 'continued',
                                'source_orchestration_id': candidate['id'],
@@ -3967,6 +3966,9 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                                    reason, [], {"provider": None, "model": None,
                                                 "effort": None, "note": reason},
                                    None)
+            if checkpoint_run is not None and checkpoint_run.identity.continuation_source is not None:
+                integration_sub = replace(integration_sub, provenance={
+                    **integration_sub.provenance, 'continuation_action': 'failed'})
             integration = passes.integration_meta(
                 "failed", ran=False, checklist=meta_checklist, note=reason,
                 stop_reason=integration_sub.stop_reason,

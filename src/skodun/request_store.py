@@ -184,6 +184,26 @@ class RequestStoreMixin:
             (orchestration_id, _json(identity))).fetchone()
         return row['id'] if row else None
 
+    def continuation_request_mismatch(self, orchestration_id, identity):
+        """Name a known source-request mismatch, without guessing when none is known."""
+        _text('orchestration_id', orchestration_id)
+        if not isinstance(identity, dict):
+            raise ValueError('request identity must be an object')
+        row = self._c.execute(
+            """SELECT r.identity_json FROM review_requests r
+               JOIN request_links l ON l.request_id=r.id
+               WHERE l.kind='batch_orchestration' AND l.target_id=?
+               ORDER BY r.updated_at DESC,r.id DESC LIMIT 1""", (orchestration_id,)).fetchone()
+        if row is None:
+            return None
+        source = json.loads(row['identity_json'])
+        if not isinstance(source, dict):
+            return None
+        for field in sorted(set(source) | set(identity)):
+            if field not in source or field not in identity or source[field] != identity[field]:
+                return field
+        return None
+
     def list_requests(self, *, worktree_root=None, repo_id=None, limit=50, active_first=False):
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError('request limit must be between 1 and 1000')

@@ -65,3 +65,14 @@ explicit fresh/replan path rather than borrowing mismatched checkpoints.
 This slice persists batch and integration evidence only. Required extra-pass
 persistence is #187; their existing execution behavior is unchanged. There is no
 new schema migration in this core slice.
+
+Malformed stored pass identities normalize to the stable identity-mismatch
+refusal. A known source-request mismatch is rejected before another request is
+created, with the actual differing field; missing ownership alone does not invent
+an identity mismatch. Explicit receipts are marked by
+`request.continuation_policy=compatible`. This differs from the older
+`request.continued` flag, which also describes ordinary same-request resume.
+Duplicate receipt locations must agree and match the observed generation; early
+failures before a generation and ordinary resume do not require an explicit pass
+receipt. Local integration preparation failures count as failed local passes,
+without fabricating a provider launch or completing a pending checkpoint.

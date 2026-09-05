@@ -161,7 +161,7 @@ class OrchestrationIdentity:
     def from_json(cls, text: str) -> "OrchestrationIdentity":
         try:
             raw = json.loads(text)
-        except (TypeError, json.JSONDecodeError) as exc:
+        except (TypeError, json.JSONDecodeError, RecursionError) as exc:
             raise ValueError(f"invalid orchestration identity JSON: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("orchestration identity JSON must be an object")
@@ -176,10 +176,13 @@ class OrchestrationIdentity:
         passes = raw.pop("pass_identities")
         if not isinstance(passes, list):
             raise ValueError("pass_identities must be an array")
-        raw["pass_identities"] = tuple(
-            PassIdentity(**value) if isinstance(value, dict) else value
-            for value in passes)
-        return cls(**raw)
+        try:
+            raw["pass_identities"] = tuple(
+                PassIdentity(**value) if isinstance(value, dict) else value
+                for value in passes)
+            return cls(**raw)
+        except TypeError as exc:
+            raise ValueError(f"invalid orchestration identity fields: {exc}") from exc
 
 
 def first_mismatch(left: OrchestrationIdentity,

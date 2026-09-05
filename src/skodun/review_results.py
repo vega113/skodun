@@ -309,7 +309,7 @@ def valid_replay(value):
     metadata = value.get('metadata')
     if not isinstance(value.get('text'), str) or not isinstance(metadata, dict):
         return False
-    for field in ('termination', 'recovery', 'reuse', 'timing'):
+    for field in ('termination', 'recovery', 'reuse', 'timing', 'request'):
         if field in metadata and not isinstance(metadata[field], dict):
             return False
     termination = metadata.get('termination', {})
@@ -341,15 +341,32 @@ def valid_replay(value):
     if 'hit' in reuse and type(reuse['hit']) is not bool:
         return False
     from .continuation import valid_receipt
-    if not valid_receipt(metadata.get('continuation')):
+    policy = metadata.get('request', {}).get('continuation_policy')
+    if policy not in (None, 'compatible'):
+        return False
+    receipt = metadata.get('continuation')
+    if not valid_receipt(receipt):
         return False
     facts = metadata.get('observation')
     if facts is None:
-        return True  # Old result receipts have no coverage observation.
+        # Ordinary #182 resume may have continued=True without this policy.
+        # Explicit failures before an observed generation need no pass receipt.
+        return not (policy == 'compatible' and status in (0, 1))
     if not isinstance(facts, dict) or not isinstance(facts.get('identity'), dict):
         return False
-    if not valid_receipt(facts.get('continuation')):
+    observed_receipt = facts.get('continuation')
+    if not valid_receipt(observed_receipt):
         return False
+    if receipt is not None and observed_receipt is not None and receipt != observed_receipt:
+        return False
+    receipt = receipt if receipt is not None else observed_receipt
+    generation = facts.get('batch_orchestration_id')
+    if policy == 'compatible' and (status in (0, 1) or generation is not None):
+        if receipt is None or receipt.get('status') != 'continued' or generation is None:
+            return False
+    if receipt is not None and receipt.get('status') == 'continued' and generation is not None:
+        if receipt.get('orchestration_id') != generation:
+            return False
     if not all(maybe_string(v) for v in facts['identity'].values()):
         return False
     for field in ('review_id', 'request_id', 'batch_orchestration_id'):

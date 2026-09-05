@@ -180,7 +180,8 @@ def tracked_review(fn):
         identity['coverage_intent_hash'] = hashlib.sha256(json.dumps(
             coverage_intent, sort_keys=True).encode()).hexdigest()
         owner = uuid.uuid4().hex
-        metadata = {'id': rid, 'identity': identity, 'replayed': False}
+        metadata = {'id': rid, 'identity': identity, 'replayed': False,
+                    'continuation_policy': 'compatible' if kwargs.get('continue_compatible') is True else None}
         try:
             continuation_id = None
             candidate = None
@@ -195,6 +196,15 @@ def tracked_review(fn):
                     include_consumed=compatible)
                 if candidate is not None:
                     continuation_id = store.request_for_orchestration(candidate['id'], identity)
+                    if compatible and continuation_id is None:
+                        mismatch = store.continuation_request_mismatch(candidate['id'], identity)
+                        if mismatch is not None:
+                            return 2, banner_failure(f'Continuation request identity differs: {mismatch}'), {
+                                'request': {**metadata, 'persisted': False,
+                                            'reason_code': 'continuation_identity_mismatch'},
+                                'continuation': {'policy': 'compatible', 'status': 'refused',
+                                                 'source_orchestration_id': candidate['id'],
+                                                 'first_mismatch': mismatch}}
             decision, row = store.begin_request(
                 request_id=rid, scope=identity['worktree_root'],
                 request_key=request_key, identity=identity, intent=intent,

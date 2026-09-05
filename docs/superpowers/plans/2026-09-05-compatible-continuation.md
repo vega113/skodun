@@ -45,3 +45,24 @@ closed pass fields, uniqueness, action totals and truncation consistency now pas
 That was the one useful independent review pass; no external provider review was
 requested. Source compatibility, ownership/fence checks and integration dependencies
 had no demonstrated defect in that pass. Final diff check/self-review passed.
+
+## Bounded contract-review follow-up
+
+The requested malformed-identity and local-integration-failure cases first failed
+three regressions, then passed after normalizing constructor TypeError at the
+identity door and marking only the actual failed local integration action.
+The integration test exercises the real service/orchestrator, proves zero new
+provider calls, and retains the existing pending-checkpoint publication refusal.
+
+The approved same-batch follow-up also proved and corrected source-request
+mismatch labeling before a new request is created. Unknown ownership keeps its
+mismatch field null. Explicit continuation receipts now carry a distinct policy
+marker, must agree across duplicate locations and match the observed generation.
+Negative cases and a real ordinary same-request resume preserve #182 compatibility;
+explicit failures before generation do not spuriously require a pass receipt.
+Only unused fixture bindings in the edited test module were underscored.
+
+Final focused validation: 86 continuation/checkpoint/inventory tests passed under
+ResourceWarning-as-error in 37.97 seconds; 201 request/result/service/scoped-control
+tests passed in 42.94 seconds. Diff check and self-review passed. No migration,
+gate/trust change, extra agent or new review loop was introduced.
