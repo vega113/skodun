@@ -22,7 +22,14 @@ deadlines, execution sequence, measured timing and capacity layers. Each layer
 is joined by admission ID as well as resource class and scope, so a resumed
 request's latest limit cannot rewrite older admission history. Configured
 capacity, effective capacity and legacy dual-hold remain separate facts. No
-machine-wide layer is invented while PR #180 remains unlanded.
+machine-wide layer is invented while PR #180 remains unlanded. Current execution
+phase and `review_paused_for_queue` are reported directly. `review_active_ms`
+measures charged review allowance; `review_wall_ms` is literal time since first
+provider launch. They overlap and must not be added. The review deadline remains
+null while review allowance is paused for foreground readmission. An absent
+budget getter is explicitly unavailable; a supported getter without a current
+snapshot is missing. Getter failures report only their error category. Bounded
+history can supply older admissions' exact caps without replacing current timing.
 
 Cost counts use original artifact request ownership. A review linked for reuse
 is historical coverage, not new provider execution. The #184 `attempt_id`
@@ -65,8 +72,11 @@ truncation are coverage facts, not zeros.
 
 ## Integration status
 
-The core reader and CLI/MCP fixtures are implemented independently. Complete
-#188 acceptance still requires integration against #184's shipped attempt-ID
-writer and #185's persisted budget getter/timing plus free-admission progress
-placement. Interface fixtures alone do not certify those dependencies. The PR
-must remain open until those integrated paths are exercised.
+The reader is rebased onto the shipped #184 result/attempt-ID implementation,
+and a tracked review with an executable fixture verifies that its actual IDs and
+input sizes reach request costs. Missing extra-pass attempts and incomplete
+cancelled observations keep full totals unknown. Complete #188 acceptance still
+requires #185's persisted getter/timing and free-admission progress placement.
+The real save/query integration fixture activates when that API lands; it is
+explicitly skipped while the dependency is absent. Interface fixtures alone do
+not certify that dependency, and the PR remains draft until integration passes.

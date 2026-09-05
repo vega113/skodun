@@ -10,11 +10,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import statistics
 from collections import Counter
 from datetime import datetime, timezone
 
 from .telemetry import attempt_launched, _token_usage
+from .store import _is_canonical_ts
 
 MAX_LINKS = 200
 MAX_ATTEMPTS = 2000
@@ -22,11 +24,14 @@ MAX_PEERS = 200
 
 
 def _number(value):
-    return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+    try:
+        return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+    except OverflowError:
+        return None
 
 
 def _epoch(value):
-    if not isinstance(value, str):
+    if not _is_canonical_ts(value):
         return None
     try:
         parsed = datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
@@ -115,6 +120,7 @@ def _budget(raw, request_id):
             continue
         admission_id = item.get('admission_id')
         layer['admission_id'] = admission_id if isinstance(admission_id, str) and len(admission_id) <= 4096 else None
+        layer['execution_seq'] = item.get('execution_seq') if type(item.get('execution_seq')) is int else None
         for key in ('effective_capacity', 'configured_capacity'):
             value = item.get(key)
             layer[key] = value if type(value) is int and value >= 0 else None
@@ -123,14 +129,60 @@ def _budget(raw, request_id):
         layers.append(layer)
     return {'scope': 'request_execution', 'request_id': request_id,
         'execution_seq': raw.get('execution_seq') if type(raw.get('execution_seq')) is int else None,
+        'phase': raw.get('phase') if isinstance(raw.get('phase'), str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', raw['phase']) else None,
+        'review_paused_for_queue': raw.get('review_paused_for_queue') if type(raw.get('review_paused_for_queue')) is bool else None,
+        'reason_code': raw.get('reason_code') if isinstance(raw.get('reason_code'), str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', raw['reason_code']) else None,
+        'capacity_layers_truncated': raw.get('capacity_layers_truncated') is True or len(raw_layers or ()) > MAX_PEERS,
         'limits': {key: _number(limits.get(key)) for key in ('max_queue_seconds',
             'max_review_seconds', 'max_provider_wait_seconds', 'max_wall_seconds')},
         'deadlines': {key: deadlines.get(key) if _epoch(deadlines.get(key)) is not None else None
                       for key in ('queue', 'review', 'total', 'provider_wait')},
         'capacity_layers': layers,
         'timing': {key: _number(timing.get(key)) for key in
-                   ('queue_wait_ms', 'provider_wait_ms', 'review_wall_ms', 'total_ms')},
+                   ('queue_wait_ms', 'provider_wait_ms', 'review_wall_ms', 'review_active_ms', 'total_ms')},
         'updated_at': raw.get('updated_at') if _epoch(raw.get('updated_at')) is not None else None}
+
+
+def _read_budgets(store, request_id):
+    status, reason, current = 'unavailable', 'budget_getter_unavailable', {}
+    getter = getattr(store, 'request_budget', None)
+    if callable(getter):
+        try:
+            raw = getter(request_id)
+            current = _budget(raw, request_id)
+            status = 'known' if current else 'missing' if raw is None else 'invalid'
+            reason = None if current else 'budget_snapshot_missing' if raw is None else 'budget_snapshot_invalid'
+        except Exception as exc:
+            reason = 'budget_read_failed:' + type(exc).__name__
+    history_status, history_truncated = 'unavailable', False
+    history = []
+    history_getter = getattr(store, 'request_budgets', None)
+    if callable(history_getter):
+        try:
+            result = history_getter(request_id, limit=100)
+            if not isinstance(result, dict) or not isinstance(result.get('budgets'), list):
+                raise ValueError('invalid budget history')
+            history = [_budget(item, request_id) for item in result['budgets'][:100]]
+            history_truncated = result.get('truncated') is True or len(result['budgets']) > 100
+            history_status = 'partial' if history_truncated or any(not item for item in history) else 'known'
+        except Exception:
+            history_status = 'unavailable'
+    layers = {}
+    # Each admission keeps its persisted execution owner, never a new cap
+    # inferred from the latest request budget. Current and history may overlap.
+    for budget in [current, *history]:
+        for layer in budget.get('capacity_layers', ()):
+            key = (layer['admission_id'], layer['execution_seq'])
+            if key in layers:
+                continue
+            if len(layers) >= MAX_LINKS:
+                history_truncated = True
+                break
+            layers[key] = layer
+        history_truncated |= budget.get('capacity_layers_truncated', False)
+    if history_truncated and history_status == 'known':
+        history_status = 'partial'
+    return current, list(layers.values()), status, reason, history_status, history_truncated
 
 
 def _admission(store, row, now, layers, resources):
@@ -182,7 +234,7 @@ def _admission(store, row, now, layers, resources):
                            'to': max((s['ended_at'] for s in samples if _epoch(s['ended_at']) is not None), default=None)}}}
 
 
-def _attempt_rows(review):
+def _attempt_rows(review, missing_scopes):
     """Visit raw pass attempts once; nested telemetry is a duplicate projection."""
     namespace = review.get('batch_orchestration_id') or review.get('id')
     containers = [('review', review.get('id'), review)]
@@ -198,7 +250,10 @@ def _attempt_rows(review):
         # An explicit raw list, even empty, is authoritative over telemetry.
         attempts = container.get('attempts')
         if attempts is None:
-            attempts = _json_object(container.get('telemetry')).get('attempts', ())
+            attempts = _json_object(container.get('telemetry')).get('attempts')
+        if attempts is None and container.get('status') != 'skipped' and not (
+                kind == 'review' and (review.get('batched') or review.get('batches'))):
+            missing_scopes.append({'namespace': namespace, 'kind': kind, 'id': part})
         if not isinstance(attempts, (list, tuple)):
             continue
         for item in attempts:
@@ -208,11 +263,12 @@ def _attempt_rows(review):
 
 def _calls(reviews):
     unique = {}
+    missing_scopes = []
     unidentified = 0
     truncated = False
     examined = 0
     for review in reviews:
-        for scope, item in _attempt_rows(review):
+        for scope, item in _attempt_rows(review, missing_scopes):
             examined += 1
             if examined > MAX_ATTEMPTS * 3:
                 truncated = True
@@ -269,6 +325,7 @@ def _calls(reviews):
         'eligibility_skips': sum(row['launched'] is False for row in calls),
         'launch_unknown': sum(row['launched'] is None for row in calls),
         'attempt_identity_missing': unidentified, 'attempts_truncated': truncated,
+        'missing_attempt_scopes': missing_scopes[:MAX_LINKS],
         'retry_calls': sum(max(0, count - 1) for count in retry_groups.values()),
         'retry_method': 'repeated provider/model launches within one pass namespace',
         'max_per_call_prompt_bytes': max(bytes_known, default=None),
@@ -309,9 +366,7 @@ def _request(store, row, now, spend_rows, spend_truncated, resources):
         observed_ids = {rec[field] for rec in reviews if isinstance(rec.get(field), str) and rec[field]}
         missing_namespace_links[kind] = sorted(observed_ids - ids[kind])
         ids[kind].update(observed_ids)
-    budget = store.request_budget(row['id']) if hasattr(store, 'request_budget') else None
-    budget = _budget(budget, row['id'])
-    layers = budget.get('capacity_layers', [])
+    budget, layers, budget_status, budget_reason, history_status, history_truncated = _read_budgets(store, row['id'])
     admissions, missing_capacity = [], []
     for aid in sorted(ids['capacity']):
         item = store.capacity_get(aid)
@@ -350,10 +405,14 @@ def _request(store, row, now, spend_rows, spend_truncated, resources):
         'prompt_bytes': _number(rec.get('prompt_bytes')),
         'prompt_scope': 'aggregate_batches_and_integration' if rec.get('batched') or rec.get('batches')
                         else 'recorded_review_prompt'} for rec in reviews]
+    observation = _json_object(_json_object(_json_object(row['result_json']).get('metadata')).get('observation'))
+    observation_incomplete = observation.get('request_id') == row['id'] and observation.get('counts_complete') is False
     counts_complete = not (missing or unowned or truncated or costs['launch_unknown']
+        or costs['missing_attempt_scopes'] or observation_incomplete
         or costs['attempts_truncated'] or costs['attempt_identity_missing']
         or row['state'] in ('accepted', 'queued', 'running'))
     costs['counts_complete'] = counts_complete
+    costs['result_observation_incomplete'] = observation_incomplete
     if not counts_complete:
         costs['launched_calls'] = None
         costs['aggregate_launched_prompt_bytes'] = None
@@ -388,7 +447,8 @@ def _request(store, row, now, spend_rows, spend_truncated, resources):
               'external_gate_lock_wait_ms': None}
     partial = (truncated or missing or malformed or missing_capacity or executions_truncated
                or costs['attempt_identity_missing'] or costs['launch_unknown']
-               or costs['attempts_truncated'] or not budget or unowned
+               or costs['attempts_truncated'] or costs['missing_attempt_scopes'] or observation_incomplete or not budget or unowned
+               or history_truncated
                or any(missing_orchestrations.values()) or any(missing_namespace_links.values())
                or any(a['holders_truncated'] for a in admissions))
     return {'request_id': row['id'], 'state': row['state'],
@@ -402,7 +462,10 @@ def _request(store, row, now, spend_rows, spend_truncated, resources):
             'unit': 'ms', 'method': 'observed_runtime_clock', 'denominator': 'request execution',
             'window': {'from': next((e['started_at'] for e in executions if e['seq'] == budget.get('execution_seq')), None),
                        'to': budget.get('updated_at')}} if budget else None),
-        'budget_status': 'known' if budget else 'missing',
+        'budget_status': budget_status, 'budget_reason_code': budget_reason,
+        'budget_phase': budget.get('phase'), 'review_paused_for_queue': budget.get('review_paused_for_queue'),
+        'budget_execution_reason_code': budget.get('reason_code'),
+        'budget_history_status': history_status, 'budget_history_truncated': history_truncated,
         'admissions': admissions, 'costs': costs, 'timing': timing,
         'orchestrations': {kind: sorted(ids[kind]) for kind in
                           ('recovery_orchestration', 'batch_orchestration')},
@@ -523,11 +586,16 @@ def augment_stats(store, data, *, now=None):
             (since,))},
         'namespace_note': 'Recovery IDs are not batch IDs or a request denominator.'}
     counts_complete = not (len(records) > 200 or observed['attempt_identity_missing']
-                           or observed['launch_unknown'] or observed['attempts_truncated'])
+                           or observed['launch_unknown'] or observed['attempts_truncated']
+                           or observed['missing_attempt_scopes'])
     if not counts_complete:
         observed['launched_calls'] = None
         observed['token_usage']['total'] = None
         observed['token_usage']['complete'] = False
+        observed['aggregate_launched_prompt_bytes'] = None
+        observed['max_per_call_prompt_bytes'] = None
+        for kind in ('input', 'output', 'cache', 'reasoning'):
+            observed['token_usage'][kind] = None
     data['call_observations'] = {**observed, 'counts_complete': counts_complete, 'window': window,
         'sample_count': len(reviews), 'denominator': 'most recent review records in window',
         'review_limit': 200, 'reviews_truncated': len(records) > 200,

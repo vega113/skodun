@@ -32,3 +32,19 @@ no live stores/configs. Root185 owns progress emission timing/historical label
 runtime changes to avoid concurrent edits. Root183 owns shared scope controls;
 mirror their worktree/repository/host vocabulary until that helper lands. Keep
 query and output limits explicit; partial telemetry is not a complete total.
+
+## Integration follow-up after #184/#183 landed
+
+- Rebase onto current main; use control.scope_identity for queue selection.
+- Fix the demonstrated CI failure: describe every queue MCP schema property.
+- Preserve #184 incomplete attempt/cancellation accounting rather than inventing
+  totals from missing extra-pass rows. Verify a real tracked executable-fixture
+  review feeds its persisted attempt ID and input bytes into costs.
+- Consume #185 phase, paused-review state, review_active_ms and exact historical
+  admission layers. Keep absent/missing/failed getter states explicit and distinct.
+- Add a real save/query fixture that activates after #185's migration/API lands;
+  keep schema 19 out of this PR until root's runtime slice merges.
+
+Self-review: no runtime budget hooks/progress placement edits in this follow-up;
+no owner tokens or raw exception text enter read projections. Phase/timing
+counters overlap and are never summed. Existing review threads were empty.

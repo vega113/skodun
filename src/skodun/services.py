@@ -2145,17 +2145,17 @@ def svc_feedback_list(
 def svc_queue(store, repo=None, *, request_id=None, scope='worktree', limit=50,
               output='text', now=None) -> tuple[int, str]:
     """Shared read-only request ownership/cost inspection for CLI and MCP."""
-    from . import gitio, queueview
+    from . import control, queueview
     try:
         if scope not in ('worktree', 'repository', 'host'):
             raise ValueError('scope must be worktree, repository or host')
         worktree, repository = None, None
         if request_id is None and scope != 'host':
-            root = gitio._worktree_root(Path(repo or '.')).resolve()
+            identity = control.scope_identity(repo or '.')
             if scope == 'worktree':
-                worktree = str(root)
+                worktree = identity['worktree_root']
             else:
-                repository = str(gitio.git_common_dir(root))
+                repository = identity['repo_id']
         data = queueview.inspect(store, request_id=request_id, worktree_root=worktree,
             repository_id=repository, scope=scope, limit=limit, now=now)
         return 0, queueview.render(data, output)

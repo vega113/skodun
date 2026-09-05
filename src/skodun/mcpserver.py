@@ -1334,9 +1334,12 @@ def default_registry() -> tuple[HandlerSpec, ...]:
             input_schema=_schema({
                 **_REPO_PROPERTY,
                 "request_id": {"type": "string", "description": "Explicit request identity to inspect."},
-                "scope": {"type": "string", "enum": ["worktree", "repository", "host"]},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                "output": {"type": "string", "enum": ["text", "json"]},
+                "scope": {"type": "string", "enum": ["worktree", "repository", "host"],
+                          "description": "Request selection scope; defaults to the current worktree."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100,
+                          "description": "Maximum requests to inspect (default 50)."},
+                "output": {"type": "string", "enum": ["text", "json"],
+                           "description": "Inspection representation; defaults to text."},
             }), handler=_handle_queue,
             description="Inspect request ownership, queues and observed costs. Same text/JSON as "
                         "skodun queue. Historical waits are observations, not predictions. "

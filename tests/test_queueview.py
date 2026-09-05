@@ -2,6 +2,8 @@
 import json
 import threading
 
+import pytest
+
 from skodun import cli, mcpserver, services
 from skodun.store import Store
 from tests.test_cli import _round
@@ -321,3 +323,144 @@ def test_legacy_calls_and_metered_provider_request_ids_do_not_create_totals(tmp_
         assert costs['launched_calls'] is None
         assert costs['metered_spend']['usd'] is None
         assert costs['token_usage']['total'] is None
+
+
+def test_absent_budget_getter_is_explicitly_unavailable(tmp_path):
+    class LegacyStore:
+        def __init__(self, store):
+            self._c = store._c
+            self.get_review = store.get_review
+            self.capacity_get = store.capacity_get
+    with Store.open(tmp_path / 's.db') as store:
+        rid = request(store)
+        _, text = services.svc_queue(LegacyStore(store), request_id=rid, output='json', now=NOW)
+        row = json.loads(text)['requests'][0]
+        assert row['budget_status'] == 'unavailable'
+        assert row['budget_reason_code'] == 'budget_getter_unavailable'
+        assert row['execution_budget_timing'] is None
+        assert row['time_limits'] is None
+
+
+def test_paused_review_budget_preserves_active_time_and_wall_time_separately(tmp_path):
+    with Store.open(tmp_path / 's.db') as store:
+        rid = request(store)
+        store.request_budget = lambda _rid: {
+            'scope': 'request_execution', 'request_id': rid, 'execution_seq': 1,
+            'phase': 'queue', 'limits': {}, 'deadlines': {'review': None},
+            'timing': {'review_active_ms': 10000, 'review_wall_ms': 110000, 'total_ms': 110000},
+            'review_paused_for_queue': True, 'reason_code': 'readmission', 'capacity_layers': [],
+            'updated_at': '2026-09-05T12:01:50Z'}
+        _, text = services.svc_queue(store, request_id=rid, output='json', now='2026-09-05T12:01:50Z')
+        row = json.loads(text)['requests'][0]
+        assert row['budget_phase'] == 'queue'
+        assert row['review_paused_for_queue'] is True
+        assert row['deadlines']['review'] is None
+        measured = row['execution_budget_timing']['measurements_ms']
+        assert measured['review_active_ms'] == 10000
+        assert measured['review_wall_ms'] == measured['total_ms'] == 110000
+
+
+def test_missing_extra_pass_attempts_keep_current_cost_totals_unknown(tmp_path):
+    with Store.open(tmp_path / 's.db') as store:
+        rid = request(store)
+        rec = _round(id='partial-telemetry', request_id=rid, attempts=[{
+            'attempt_id': 'known', 'provider': 'openai', 'rc': 0, 'input_bytes': 10}],
+            extra_passes={'skeptic': {'status': 'clean', 'ran': True}})
+        store.save_review(rec)
+        store.link_request(rid, 'review', rec['id'])
+        store.finish_request(rid, owner_token=rid, state='finished', reason_code='completed', result=None, now=NOW)
+        _, text = services.svc_queue(store, request_id=rid, output='json', now=NOW)
+        costs = json.loads(text)['requests'][0]['costs']
+        assert costs['reported_launched_calls'] == 1
+        assert costs['counts_complete'] is False
+        assert costs['launched_calls'] is None
+        assert costs['aggregate_launched_prompt_bytes'] is None
+        assert costs['missing_attempt_scopes'][0]['id'] == 'skeptic'
+
+
+def test_real_review_attempt_ids_feed_request_costs(tmp_path, monkeypatch):
+    from tests.test_requests import _ready_repo
+    repo = _ready_repo(tmp_path, monkeypatch)  # executable fixture, no external provider
+    with Store.open(tmp_path / 's.db') as store:
+        status, _, metadata = services.svc_review_detailed(store, repo)
+        assert status == 0
+        rid = metadata['request']['id']
+        observed = metadata['observation']
+        assert observed['attempts'][0]['attempt_id']
+        _, text = services.svc_queue(store, request_id=rid, output='json')
+        costs = json.loads(text)['requests'][0]['costs']
+        assert costs['counts_complete'] is True
+        assert costs['launched_calls'] == observed['launched_count'] == 1
+        assert costs['aggregate_launched_prompt_bytes'] == observed['attempts'][0]['input_bytes']
+
+
+def test_budget_reader_failure_remains_explicit_without_sensitive_error_text(tmp_path):
+    with Store.open(tmp_path / 's.db') as store:
+        rid = request(store)
+        def broken(_rid):
+            raise ValueError('sensitive diagnostic text')
+        store.request_budget = broken
+        _, text = services.svc_queue(store, request_id=rid, output='json', now=NOW)
+        row = json.loads(text)['requests'][0]
+        assert row['budget_status'] == 'unavailable'
+        assert row['budget_reason_code'] == 'budget_read_failed:ValueError'
+        assert 'sensitive diagnostic text' not in text
+
+
+def test_cancelled_observation_does_not_turn_empty_stub_into_zero_calls(tmp_path):
+    with Store.open(tmp_path / 's.db') as store:
+        rid = request(store)
+        rec = _round(id='stub', request_id=rid, attempts=[])
+        store.save_review(rec); store.link_request(rid, 'review', rec['id'])
+        store.finish_request(rid, owner_token=rid, state='cancelled', reason_code='interrupted',
+            result={'status': 4, 'text': 'cancelled', 'metadata': {'observation': {
+                'request_id': rid, 'counts_complete': False}}}, now=NOW)
+        _, text = services.svc_queue(store, request_id=rid, output='json', now=NOW)
+        row = json.loads(text)['requests'][0]
+        assert row['costs']['launched_calls'] is None
+        assert row['costs']['reported_launched_calls'] == 0
+        assert row['costs']['result_observation_incomplete'] is True
+        assert row['coverage']['status'] == 'partial'
+
+
+@pytest.mark.skipif(not hasattr(Store, 'save_request_budget'), reason='real #185 budget store not yet merged')
+def test_real_budget_api_keeps_current_timing_and_historical_admission_caps_separate(tmp_path):
+    from tests.test_checkpoints import _created
+    with Store.open(tmp_path / 's.db') as store:
+        rid = request(store)
+        first = store.get_request(rid)
+        old_seq = first['executions'][0]['seq']
+        def persist(seq, owner, phase, when, paused=False):
+            assert store.save_request_budget(rid, seq, owner, {
+                'scope': 'request_execution', 'request_id': rid, 'execution_seq': seq,
+                'phase': phase, 'limits': {}, 'deadlines': {'review': None},
+                'timing': {'review_active_ms': 10000, 'review_wall_ms': 110000, 'total_ms': 110000},
+                'review_paused_for_queue': paused, 'reason_code': None, 'updated_at': when})
+        def capacity(seq, owner, aid, cap, when):
+            store.capacity_enqueue(admission_id=aid, resource_class='review-fg', scope='/common')
+            store.link_request(rid, 'capacity', aid)
+            assert store.record_request_capacity(rid, seq, owner, admission_id=aid,
+                resource_class='review-fg', scope='/common', effective_capacity=cap,
+                configured_capacity=4, legacy_dual_hold=cap == 1, updated_at=when)
+        persist(old_seq, rid, 'review', NOW)
+        capacity(old_seq, rid, 'old-admission', 4, NOW)
+        store.capacity_finish('old-admission', status='released')
+        store.finish_request(rid, owner_token=rid, state='failed', reason_code='interrupted', result=None, now=NOW)
+        _created(store, orchestration_id='resume')
+        _, resumed = store.begin_request(request_id='unused', scope='/work/a', request_key=None,
+            identity=first['identity'], intent={}, owner_token='next', pid=123, source='cli',
+            now='2026-09-05T12:00:20Z', expires_at='2026-09-06T12:00:00Z',
+            continuation_id=rid, continuation_orchestration_id='resume')
+        new_seq = resumed['executions'][0]['seq']
+        persist(new_seq, 'next', 'queue', '2026-09-05T12:02:10Z', paused=True)
+        capacity(new_seq, 'next', 'new-admission', 1, '2026-09-05T12:02:10Z')
+        _, text = services.svc_queue(store, request_id=rid, output='json', now='2026-09-05T12:02:10Z')
+        row = json.loads(text)['requests'][0]
+        assert row['budget_status'] == 'known'
+        assert row['budget_history_status'] == 'known'
+        assert row['budget_phase'] == 'queue' and row['review_paused_for_queue'] is True
+        assert row['execution_budget_timing']['execution_seq'] == new_seq
+        assert row['execution_budget_timing']['measurements_ms']['review_active_ms'] == 10000
+        assert row['execution_budget_timing']['measurements_ms']['review_wall_ms'] == 110000
+        capacities = {item['id']: item['effective_limit'] for item in row['admissions']}
+        assert capacities == {'old-admission': 4, 'new-admission': 1}
