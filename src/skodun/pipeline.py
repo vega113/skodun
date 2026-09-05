@@ -1135,6 +1135,9 @@ def resolve_review_head(cfg: Config, store: Store, *,
     through the store, and a policy that lived in one of them would be a policy
     the others do not have.
 
+    Read-only readiness and review-plan also use this foreground selection
+    policy to explain the same current route without launching a provider.
+
     Three paths, in priority order:
 
     * **Pinned.** A `reviewer` name is absolute in every mode. It is not scored,
@@ -1648,7 +1651,9 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             diagnostics=lineage_context_diagnostics)
         evidence_prompt_context = _evidence_prompt_context(
             store, root, base.sha, head, diff_hash)
+        from .planning_policy import describe as planning_description
         common = dict(
+            planning_policy=planning_description(d, finder),
             id=rid, reviewed_at=review_started_at,
             review_started_at=review_started_at,
             lineage_context_cutoff=lineage_context_cutoff,
@@ -1888,27 +1893,10 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                           f"exceeds the {checklist.BUDGET}-byte budget after "
                           f"eviction; only undroppable sections remain")
 
-                pack = None
-                pack_body = None
-                if d.context_pack:
-                    headroom = promptbuild.context_headroom(
-                        mdb, len(diff.data), packing=True)
-                    # `pack_large_added=False`: this is the SINGLE-SHOT path, so
-                    # the diff already carries every added file whole. Packing a
-                    # large one again would spend headroom saying the same thing
-                    # twice -- and since selection is size-descending it would be
-                    # packed FIRST, crowding out the modified files whose current
-                    # contents only the packer can show. (When the diff is
-                    # truncated the copy in the prompt is incomplete, but a
-                    # truncated diff is never trustworthy anyway, so no trust
-                    # decision rides on that case.)
-                    pack = contextpack.pack(root, diff.files, diff.statuses,
-                                            headroom, pack_large_added=False)
-                    pack_body = pack.body
-
-                prompt = promptbuild.build(
-                    branch, base.ref, base.sha, f"{head} (working tree)",
-                    diff.data, mdb, selection, pack_body,
+                pack, prompt = _prepare_single_prompt(
+                    diff, d=d, root=root, finder=finder, selection=selection,
+                    branch=branch, base_ref=base.ref, base_sha=base.sha,
+                    head_label=f"{head} (working tree)",
                     stack_context=stack_prompt_context,
                     stack_context_truncated=stack_prompt_truncated,
                     lineage_context=lineage_prompt_context,
@@ -1941,7 +1929,6 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                                 f"routing: keeping {finder.name}; {candidate.name} "
                                 "requires a different batch plan")
                         else:
-                            previous_mdb = mdb
                             finder = candidate
                             mdb = candidate_mdb
                             route_meta = {
@@ -1956,21 +1943,11 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                             adapter = _adapter_for(finder)
                             common.pop("quota_pool", None)
                             common.update(model=finder.model, adapter=adapter.name,
-                                          **route_meta)
-                            if candidate_mdb != previous_mdb:
-                                pack = None
-                                pack_body = None
-                                if d.context_pack:
-                                    headroom = promptbuild.context_headroom(
-                                        mdb, len(diff.data), packing=True)
-                                    pack = contextpack.pack(
-                                        root, diff.files, diff.statuses,
-                                        headroom, pack_large_added=False)
-                                    pack_body = pack.body
-                            prompt = promptbuild.build(
-                                branch, base.ref,
-                                base.sha, f"{head} (working tree)",
-                                diff.data, mdb, selection, pack_body,
+                                          planning_policy=planning_description(d, finder), **route_meta)
+                            pack, prompt = _prepare_single_prompt(
+                                diff, d=d, root=root, finder=finder, selection=selection,
+                                branch=branch, base_ref=base.ref, base_sha=base.sha,
+                                head_label=f"{head} (working tree)",
                                 stack_context=stack_prompt_context,
                                 stack_context_truncated=stack_prompt_truncated,
                                 lineage_context=lineage_prompt_context,
@@ -2424,7 +2401,8 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
     diff_hash = gitio.diff_identity(diff.data)
     evidence_prompt_context = _evidence_prompt_context(
         store, root, base.sha, local_oid, diff_hash)
-    common = dict(
+    from .planning_policy import describe as planning_description
+    common = dict(planning_policy=planning_description(d, finder),
         id=record_id, reviewed_at=reserved.get("reviewed_at") or _iso_now(),
         source="skodun", branch=branch, head=local_oid, base_ref=base.ref,
         base_sha=base.sha, diff_hash=diff_hash, mode="prepush",
@@ -2597,6 +2575,22 @@ def _empty_shell() -> dict:
     )
 
 
+def _prepare_single_prompt(diff, *, d, root, finder, selection, branch,
+                           base_ref, base_sha, head_label, context_source="wt",
+                           context_oid=None, **advisory):
+    """Prepare one exact input for preview and both execution modes; no writes."""
+    envelope = budget.prompt_budget(d, finder)
+    pack = None
+    if d.context_pack:
+        headroom = promptbuild.context_headroom(envelope, len(diff.data), packing=True)
+        kwargs = {} if context_source == "wt" else {"source": context_source, "oid": context_oid}
+        pack = contextpack.pack(root, list(diff.files), dict(diff.statuses), headroom,
+                                pack_large_added=False, **kwargs)
+    prompt = promptbuild.build(branch, base_ref, base_sha, head_label, diff.data,
+        envelope, selection, pack.body if pack is not None else None, **advisory)
+    return pack, prompt
+
+
 def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
                  store: Store, scratch: Path, finder: Reviewer, branch: str,
                  base, local_oid: str, large_prompt: tuple[int, int] | None,
@@ -2643,28 +2637,13 @@ def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
     # would ever dedup-match again.
     mdb = budget.prompt_budget(d, finder)
 
-    pack = None
-    pack_body = None
-    if d.context_pack:
-        headroom = promptbuild.context_headroom(
-            mdb, len(diff.data), packing=True)
-        # `pack_large_added=False`: the single-shot diff already carries every
-        # added file whole. This is the SAME call `dispatch.build_dedup_evidence`
-        # makes for its candidate hash, and it has to stay that way — a different
-        # headroom or a different large-added rule would be a different identity
-        # for the same commit, so nothing would ever dedup-match again.
-        pack = contextpack.pack(root, list(diff.files), dict(diff.statuses),
-                                headroom, source="oid", oid=local_oid,
-                                pack_large_added=False)
-        pack_body = pack.body
-
-    prompt = promptbuild.build(branch, base.ref, base.sha, local_oid, diff.data,
-                              mdb, selection, pack_body,
-                              stack_context=stack_context,
-                              stack_context_truncated=stack_context_truncated,
-                              lineage_context=lineage_context,
-                              lineage_context_truncated=lineage_context_truncated,
-                              evidence_context=evidence_context)
+    pack, prompt = _prepare_single_prompt(
+        diff, d=d, root=root, finder=finder, selection=selection, branch=branch,
+        base_ref=base.ref, base_sha=base.sha, head_label=local_oid,
+        context_source="oid", context_oid=local_oid,
+        stack_context=stack_context, stack_context_truncated=stack_context_truncated,
+        lineage_context=lineage_context, lineage_context_truncated=lineage_context_truncated,
+        evidence_context=evidence_context)
     if prompt.diff_truncated:
         _note(f"diff is {len(diff.data)} bytes (> {mdb}); the "
               f"prompt is truncated and this review cannot be trustworthy")
@@ -2688,8 +2667,9 @@ def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
     _note(f"reviewing {len(diff.files)} file(s) vs {base.ref} as {record_id} ...")
     # Standalone chain budget: pre-push is not on the FG admit path, so
     # run_chain starts its own shared provider wait deadline (not reset per hop).
-    outcome = _run_chain(finder, cfg,
-                         _escalated(d, prompt.prompt_bytes, large_prompt),
+    effective_d = _escalated(d, prompt.prompt_bytes, large_prompt)
+    rec["primary_timeout_seconds"] = effective_d.timeout_sec
+    outcome = _run_chain(finder, cfg, effective_d,
                          prompt.text, root, store, scratch, "primary",
                          cancel=cancel)
     rec["attempts"] = outcome.attempts
@@ -3049,20 +3029,15 @@ def _batch_budget(d: Defaults, reviewer: Reviewer | None = None) -> int:
     computed budget can arrive at zero, and splitting maximally with every unit
     flagged as an irreducible floor says strictly more than refusing to split.
     """
-    envelope = budget.prompt_budget(d, reviewer)
-    if d.context_pack:
-        envelope //= 2
-    return max(1, envelope)
+    from .planning_policy import diff_budget
+    return diff_budget(d, reviewer)
 
 
 def _effective_batch_budget(d: Defaults,
                             reviewer: Reviewer | None = None) -> int:
     """Return the provider ceiling narrowed by an optional batch hint."""
-    budget = _batch_budget(d, reviewer)
-    target = d.batch_target_bytes
-    if target > 0:
-        return min(budget, target)
-    return budget
+    from .planning_policy import effective_diff_budget
+    return effective_diff_budget(d, reviewer)
 
 
 def batch_plan(diff: bytes, d: Defaults,
@@ -3668,6 +3643,7 @@ def _orchestration_identity(
         # checkpoints must not silently become approximately compatible.
         "config": asdict(cfg),
         "effective_defaults": asdict(d),
+        "planning_policy": rec.get("planning_policy"),
     })
     pass_identities = list(item.identity for item in prepared.batches)
     if prepared.integration_selection is not None:
@@ -3694,7 +3670,8 @@ def _orchestration_identity(
         batch_count=len(prepared.batches),
         boundary_digest=prepared.boundary_digest,
         integration_plan_digest=prepared.integration_plan_digest,
-        pass_identities=tuple(pass_identities))
+        pass_identities=tuple(pass_identities),
+        planning_policy=rec.get("planning_policy"))
 
 
 def _revalidate_foreground_orchestration(

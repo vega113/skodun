@@ -2196,3 +2196,15 @@ def svc_queue(store, repo=None, *, request_id=None, scope='worktree', limit=50,
         return 2, f'skodun queue: refused: {exc}'
     except Exception as exc:
         return 2, f'skodun queue: inspection unavailable: {type(exc).__name__}'
+
+
+def svc_review_plan(store, repo, *, output='text', history_unavailable_reason=None, **options) -> tuple[int, str]:
+    """Preview the shared planner without requests, capacity or provider calls."""
+    from . import plan_preview
+    try:
+        data = plan_preview.preview(store, Path(repo), **options)
+        if history_unavailable_reason is not None:
+            data['measurements']['unavailable_reason'] = history_unavailable_reason
+        return (2 if data['status'] in ('stale', 'unreviewable') else 0), plan_preview.render(data, output)
+    except Exception as exc:
+        return 2, f'skodun review-plan: refused: {exc}'

@@ -174,6 +174,7 @@ class DedupEvidence:
     enabled: bool
     valid: bool = False
     candidate_context_hash: str | None = None
+    planning_policy: dict | None = None
 
 
 def _classify(artifact: object) -> tuple[str, str | None]:
@@ -256,6 +257,12 @@ def evidence_permits_suppression(artifact: object,
         return False
     if evidence.enabled is not True or evidence.valid is not True:
         return False
+    if evidence.planning_policy is not None:
+        from .planning_policy import mismatch
+        if not isinstance(artifact, dict) or not isinstance(evidence.planning_policy, dict):
+            return False
+        if mismatch(artifact.get('planning_policy'), evidence.planning_policy) is not None:
+            return False
     return context_permits_suppression(artifact, evidence.candidate_context_hash)
 
 
@@ -317,9 +324,11 @@ def build_dedup_evidence(store: "Store", repo: Path, diff: "Diff", oid: str,
         # a non-bool that happens to be truthy must not turn dedup on.
         return DedupEvidence(enabled=False)
     try:
+        from .planning_policy import describe
+        policy = describe(d, finder)
         if not d.context_pack:
             return DedupEvidence(enabled=True, valid=True,
-                                 candidate_context_hash=None)
+                                 candidate_context_hash=None, planning_policy=policy)
         headroom = promptbuild.context_headroom(
             budget.prompt_budget(d, finder), len(diff.data), packing=True)
         pack = contextpack.pack(Path(repo), list(diff.files), dict(diff.statuses),
@@ -333,7 +342,7 @@ def build_dedup_evidence(store: "Store", repo: Path, diff: "Diff", oid: str,
         _note(f"dedup evidence unavailable for {oid or '<no oid>'} "
               f"({type(exc).__name__}: {exc}); this push will be reviewed")
         return DedupEvidence(enabled=True, valid=False)
-    return DedupEvidence(enabled=True, valid=True, candidate_context_hash=candidate)
+    return DedupEvidence(enabled=True, valid=True, candidate_context_hash=candidate, planning_policy=policy)
 
 
 # ===========================================================================
