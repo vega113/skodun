@@ -28,17 +28,28 @@ def receipt(rec):
     sources = [('batch', row.get('index'), row) for row in rec.get('batches', [])]
     if isinstance(rec.get('integration'), dict):
         sources.append(('integration', 0, rec['integration']))
+    for kind in ('security', 'skeptic'):
+        value = (rec.get('extra_passes') or {}).get(kind)
+        if isinstance(value, dict):
+            sources.append((kind, 0, value))
     counts = {'reused': 0, 'executed': 0, 'failed': 0}
     for kind, index, row in sources:
         action = row.get('continuation_action') or (row.get('provenance') or {}).get('continuation_action')
         if action in counts:
             counts[action] += 1
             if len(passes) < 128:
-                passes.append({'kind': kind, 'index': index, 'action': action})
+                item = {'kind': kind, 'index': index, 'action': action}
+                if kind in ('security', 'skeptic') and row.get('continuation_reason'):
+                    item['reason'] = row['continuation_reason']
+                passes.append(item)
     fields = {key: base.get(key) for key in ('policy', 'status', 'source_orchestration_id',
               'orchestration_id', 'first_mismatch')}
+    skipped = [{'kind': kind, 'index': 0, 'reason': decision['reason']}
+               for kind, decision in (rec.get('followup_decisions') or {}).items()
+               if kind in ('security', 'skeptic') and decision.get('scheduled') is False]
     return {**fields, 'passes': passes, 'counts': counts,
-            'passes_truncated': sum(counts.values()) > len(passes)}
+            'passes_truncated': sum(counts.values()) > len(passes),
+            **({'skipped_passes': skipped} if skipped else {})}
 
 
 def refuse(reason_code, message, *, first_mismatch=None):
@@ -65,7 +76,7 @@ def valid_receipt(value):
     base_fields = {'policy','status','source_orchestration_id','orchestration_id','first_mismatch'}
     if value['status'] == 'refused':
         return set(value) <= base_fields
-    if set(value) - base_fields - {'passes','counts','passes_truncated'}:
+    if set(value) - base_fields - {'passes','counts','passes_truncated','skipped_passes'}:
         return False
     counts = value.get('counts')
     if (not isinstance(counts, dict) or set(counts) != {'reused','executed','failed'} or
@@ -82,18 +93,33 @@ def valid_receipt(value):
     seen = set()
     observed = dict.fromkeys(counts, 0)
     for item in passes:
-        if not isinstance(item, dict) or set(item) != {'kind','index','action'}:
+        if not isinstance(item, dict) or set(item) not in ({'kind','index','action'}, {'kind','index','action','reason'}):
+            return False
+        if 'reason' in item and (item.get('kind') not in ('security','skeptic') or item['reason'] not in (
+                'followup_upstream_changed','followup_schedule_changed','followup_prompt_changed','followup_candidate_unusable')):
             return False
         kind, index, action = item['kind'], item['index'], item['action']
-        if (kind not in ('batch','integration') or type(index) is not int
+        if (kind not in ('batch','integration','security','skeptic') or type(index) is not int
                 or not isinstance(action, str) or action not in observed):
             return False
-        if (kind == 'batch' and index < 1) or (kind == 'integration' and index != 0):
+        if (kind == 'batch' and index < 1) or (kind != 'batch' and index != 0):
             return False
         if (kind, index) in seen:
             return False
         seen.add((kind, index))
         observed[action] += 1
+    skipped = value.get('skipped_passes', [])
+    if not isinstance(skipped, list) or len(skipped) > 2:
+        return False
+    for item in skipped:
+        if (not isinstance(item, dict) or set(item) != {'kind', 'index', 'reason'}
+                or item['kind'] not in ('security', 'skeptic') or type(item['index']) is not int
+                or item['index'] != 0 or item['reason'] not in (
+                    'followup_upstream_changed', 'followup_schedule_changed',
+                    'followup_prompt_changed', 'followup_candidate_unusable')
+                or (item['kind'], 0) in seen):
+            return False
+        seen.add((item['kind'], 0))
     if not value['passes_truncated']:
         return counts == observed
     return (len(passes) == 128 and sum(counts.values()) > len(passes)

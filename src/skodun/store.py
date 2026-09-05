@@ -45,6 +45,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import ids
+from .followups import table_for
+from .followup_store import FollowupStoreMixin, MIGRATION_V20
 from .trust import is_trustworthy
 
 _TRUST_AXES = ("parse_ok", "degraded", "diff_truncated")
@@ -65,7 +67,7 @@ from .request_store import RequestStoreMixin, MIGRATION as _MIGRATION_V17
 from .control_store import ControlStoreMixin, MIGRATION as _MIGRATION_V18
 from .budget_store import BudgetStoreMixin, MIGRATION as _MIGRATION_V19
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 
 class SchemaLifecycleError(ValueError):
@@ -451,19 +453,22 @@ def migration_blockers(path: Path) -> tuple[str, ...]:
                         break
             if live_review:
                 blockers.append("active_review")
-        if "review_checkpoints" in tables:
-            columns = _table_columns(conn, "review_checkpoints")
+        for checkpoint_table in ('review_checkpoints', 'review_followup_checkpoints'):
+            if checkpoint_table not in tables:
+                continue
+            columns = _table_columns(conn, checkpoint_table)
             if "lease_expires_at" in columns:
                 live = conn.execute(
-                    "SELECT 1 FROM review_checkpoints WHERE state='running' "
+                    f"SELECT 1 FROM {checkpoint_table} WHERE state='running' "
                     "AND lease_expires_at IS NOT NULL AND lease_expires_at > ? "
                     "LIMIT 1", (now,)).fetchone()
             else:
                 live = conn.execute(
-                    "SELECT 1 FROM review_checkpoints WHERE state='running' "
+                    f"SELECT 1 FROM {checkpoint_table} WHERE state='running' "
                     "LIMIT 1").fetchone()
             if live:
                 blockers.append("active_checkpoint_claim")
+                break
         if "capacity_admissions" in tables:
             from .capacity import DEFAULT_STALE_SEC, should_reclaim_admission
             rows = conn.execute(
@@ -989,6 +994,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (17, _MIGRATION_V17),
     (18, _MIGRATION_V18),
     (19, _MIGRATION_V19),
+    (20, MIGRATION_V20),
 )
 
 
@@ -1489,7 +1495,7 @@ class Reservation:
     superseded: tuple[dict, ...] = field(default_factory=tuple)
 
 
-class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
+class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStoreMixin):
     def __init__(self, conn: sqlite3.Connection, path: Path | None = None,
                  *, _snapshot: tempfile.TemporaryDirectory | None = None):
         self._c = conn
@@ -1854,6 +1860,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
                 lineage_annotator(self, normalized)
                 normalized = _normalize_record(
                     normalized, label="save_checkpointed_review")
+            self._require_followup_publication(orchestration_id, rec=normalized)
             self._write_review(normalized)
             persisted = self.get_review(normalized["id"])
             if persisted is None:
@@ -2429,14 +2436,14 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
              identity.batch_count, identity.boundary_digest,
              identity.integration_plan_digest, identity.digest(),
              identity.canonical_json()))
-        self._c.executemany(
-            """INSERT INTO review_checkpoints (
-                 orchestration_id, pass_kind, pass_index, state,
-                 prompt_hash, diff_hash, boundary_hash)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?)""",
-            [(orchestration_id, item.kind, item.index, item.prompt_hash,
-              item.diff_hash, item.boundary_hash)
-             for item in identity.pass_identities])
+        for item in identity.pass_identities:
+            self._c.execute(
+                f"""INSERT INTO {table_for(item.kind)} (
+                     orchestration_id, pass_kind, pass_index, state,
+                     prompt_hash, diff_hash, boundary_hash)
+                   VALUES (?, ?, ?, 'pending', ?, ?, ?)""",
+                (orchestration_id, item.kind, item.index, item.prompt_hash,
+                 item.diff_hash, item.boundary_hash))
 
     def get_orchestration(self, orchestration_id: str) -> dict | None:
         orchestration_id = _require_text("orchestration_id", orchestration_id)
@@ -2556,6 +2563,8 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
                         usable.append((row, payload))
             batches_complete = sum(row['pass_kind'] == 'batch' for row, _ in usable) == identity.batch_count
             for row, payload in usable:
+                if row['pass_kind'] in ('security', 'skeptic'):
+                    continue
                 if row['pass_kind'] == 'integration' and not batches_complete:
                     continue
                 value = payload.as_dict()
@@ -2566,6 +2575,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
                     """UPDATE review_checkpoints SET state='complete',payload_json=?,completed_at=?,prompt_hash=?
                        WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",
                     (payload.json_text,row['completed_at'],row['prompt_hash'],child_id,row['pass_kind'],row['pass_index']))
+            self._seed_followup_candidates(source_id, child_id, rows)
             self.link_request(request_id, 'batch_orchestration', child_id)
             self._c.execute('COMMIT')
             return self.get_orchestration(child_id)
@@ -2595,10 +2605,15 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
                 WHERE orchestration_id=?
                 ORDER BY CASE pass_kind WHEN 'batch' THEN 0 ELSE 1 END,
                          pass_index""", (orchestration_id,)).fetchall()
-        return [dict(row) for row in rows]
+        result = [dict(row) for row in rows]
+        extras = self._c.execute(
+            "SELECT * FROM review_followup_checkpoints WHERE orchestration_id=? ORDER BY pass_kind",
+            (orchestration_id,)).fetchall()
+        return result + [dict(row) for row in extras]
 
     def claim_checkpoint(self, orchestration_id: str, pass_identity, *,
-                         owner: str, now: str, lease_expires_at: str) -> dict:
+                         owner: str, now: str, lease_expires_at: str,
+                         binding_hash: str | None = None) -> dict:
         """Claim a missing pass, reuse a complete one, or observe live work.
 
         The returned `claim_token` plus monotonic `fence` is the completion
@@ -2629,7 +2644,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
                     f"orchestration {orchestration_id!r} is "
                     f"{orchestration['state']!r}, not resumable")
             row = self._c.execute(
-                """SELECT * FROM review_checkpoints
+                f"""SELECT * FROM {table_for(pass_identity.kind)}
                     WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",
                 (orchestration_id, pass_identity.kind,
                  pass_identity.index)).fetchone()
@@ -2639,12 +2654,14 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
                 raise ValueError("checkpoint diff_hash does not match the plan")
             if row["boundary_hash"] != pass_identity.boundary_hash:
                 raise ValueError("checkpoint boundary_hash does not match the plan")
+            if pass_identity.kind in ("security", "skeptic"):
+                self._require_followup_claim_binding(orchestration_id, row, binding_hash)
             stored_prompt = row["prompt_hash"]
             if stored_prompt is None:
-                if pass_identity.kind != "integration":
+                if pass_identity.kind not in ("integration", "security", "skeptic"):
                     raise ValueError("checkpoint prompt_hash is missing")
                 self._c.execute(
-                    """UPDATE review_checkpoints SET prompt_hash=?
+                    f"""UPDATE {table_for(pass_identity.kind)} SET prompt_hash=?
                         WHERE orchestration_id=? AND pass_kind=? AND pass_index=?
                           AND prompt_hash IS NULL""",
                     (pass_identity.prompt_hash, orchestration_id,
@@ -2667,7 +2684,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
             token = ids.new_review_id("sk_claim_")
             fence = int(row["fence"] or 0) + 1
             self._c.execute(
-                """UPDATE review_checkpoints
+                f"""UPDATE {table_for(pass_identity.kind)}
                       SET state='running', claim_token=?, fence=?, claim_owner=?,
                           claimed_at=?, lease_expires_at=?, failure_reason=NULL
                     WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",
@@ -2681,7 +2698,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
                     WHERE id=?""",
                 (now, lease_expires_at, lease_expires_at, orchestration_id))
             claimed = self._c.execute(
-                """SELECT * FROM review_checkpoints
+                f"""SELECT * FROM {table_for(pass_identity.kind)}
                     WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",
                 (orchestration_id, pass_identity.kind,
                  pass_identity.index)).fetchone()
@@ -2699,7 +2716,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
     def complete_checkpoint(
             self, orchestration_id: str, pass_kind: str, pass_index: int, *,
             owner: str, claim_token: str, fence: int, payload,
-            completed_at: str) -> bool:
+            completed_at: str, binding_hash: str | None = None) -> bool:
         """Conditionally complete the caller's exact fenced claim."""
         from .checkpoints import CheckpointPayload
 
@@ -2717,8 +2734,14 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
         payload = CheckpointPayload.from_mapping(payload.as_dict())
         self._c.execute("BEGIN IMMEDIATE")
         try:
+            if pass_kind in ('security', 'skeptic'):
+                row = self._c.execute('SELECT * FROM review_followup_checkpoints WHERE orchestration_id=? AND pass_kind=?',
+                                      (orchestration_id, pass_kind)).fetchone()
+                if row is None:
+                    raise ValueError('follow-up checkpoint missing')
+                self._require_followup_claim_binding(orchestration_id, row, binding_hash)
             cur = self._c.execute(
-                """UPDATE review_checkpoints
+                f"""UPDATE {table_for(pass_kind)}
                       SET state='complete', payload_json=?, completed_at=?,
                           claim_token=NULL, claim_owner=NULL, claimed_at=NULL,
                           lease_expires_at=NULL, failure_reason=NULL
@@ -2756,7 +2779,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
         self._c.execute("BEGIN IMMEDIATE")
         try:
             cur = self._c.execute(
-                """UPDATE review_checkpoints
+                f"""UPDATE {table_for(pass_kind)}
                       SET state='pending', claim_token=NULL, claim_owner=NULL,
                           claimed_at=NULL, lease_expires_at=NULL, failure_reason=?
                     WHERE orchestration_id=? AND pass_kind=? AND pass_index=?
@@ -2801,6 +2824,10 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin):
                         SELECT id FROM review_orchestrations
                          WHERE state='expired' AND expires_at <= ?)""",
                 (now,))
+            self._c.execute(
+                """UPDATE review_followup_checkpoints SET payload_json=NULL,candidate_json=NULL
+                   WHERE orchestration_id IN (SELECT id FROM review_orchestrations
+                     WHERE state='expired' AND expires_at <= ?)""", (now,))
             self._c.execute("COMMIT")
             return cur.rowcount
         except BaseException:

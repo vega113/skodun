@@ -166,6 +166,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+from . import followups
 from . import (batching, budget, capacity, chain, checklist, checkpoints,
                contextpack, gitio, ids, passes, promptbuild, provenance, reuse,
                routing, runner, stack, telemetry)
@@ -1302,6 +1303,8 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
       availability alone. It is a HINT worth one tie-break, never a filter: see
       `routing.pick_finder`.
     """
+    if isinstance(mode, str):
+        mode = mode.strip()
     repo = Path(repo)
     d = cfg.defaults
     if progress_sink is not None:
@@ -2033,15 +2036,15 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             finder_findings_total = rec["findings_total"]
 
             # --- 9. the extra passes, still under the lock ----------------
-            if hold_for_security:
+            if (checkpoint_run is not None and mode == "now") or hold_for_security:
                 # Sized for the reviewer that will RUN this pass, which may not
                 # be the finder and may not be on the finder's provider: a
                 # `[reviewers]` entry with role `security` is preferred here
                 # (see `_extra_pass`), and it can be a CLI with a tighter
                 # ceiling. One `prompt_budget` call per pass, per reviewer.
                 sec_reviewer = _pass_reviewer(cfg, "security", finder)
-                rec = _extra_pass(
-                    rec, "security",
+                rec = _required_followup(
+                    checkpoint_run, hold_for_security, rec, "security",
                     lambda: passes.security_prompt(
                         branch, base.ref, base.sha, f"{head} (working tree)",
                         diff.data, budget.prompt_budget(d, sec_reviewer),
@@ -2049,14 +2052,15 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     sec_reviewer, cfg, d, root,
                     store, scratch, cancel=cancel)
 
-            if passes.should_run_skeptic(
+            run_skeptic = passes.should_run_skeptic(
                     mode,
                     is_trustworthy(rec["parse_ok"], rec["degraded"],
                                    rec["diff_truncated"]),
-                    rec["findings_total"]):
+                    rec["findings_total"])
+            if (checkpoint_run is not None and mode == "now") or run_skeptic:
                 skeptic_reviewer = _pass_reviewer(cfg, "skeptic", finder)
-                rec = _extra_pass(
-                    rec, "skeptic",
+                rec = _required_followup(
+                    checkpoint_run, run_skeptic, rec, "skeptic",
                     lambda: passes.skeptic_prompt(
                         branch, base.ref, base.sha, f"{head} (working tree)",
                         diff.data, budget.prompt_budget(d, skeptic_reviewer)),
@@ -3294,7 +3298,8 @@ def _checkpointed_sub(
         pass_identity: checkpoints.PassIdentity, *, reviewer: Reviewer,
         cfg: Config, d: Defaults, prompt, root: Path, store: Store,
         scratch: Path, tag: str, label: str,
-        cancel: "threading.Event | None") -> _Sub:
+        cancel: "threading.Event | None", binding_hash: str | None = None,
+        preparation_failure: str | None = None) -> _Sub:
     """Reuse or exclusively run one exact pass under a fenced store claim."""
     if checkpoint_run is None:
         return _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
@@ -3306,12 +3311,13 @@ def _checkpointed_sub(
     # for large prompts. Keeping the calculation at the claim boundary makes
     # the lease cover retries plus grace, rather than a stale pre-escalation
     # default.
-    lease_seconds = _checkpoint_lease_seconds(d, width)
+    lease_seconds = _checkpoint_lease_seconds(d, width, store=store)
     try:
         claim = store.claim_checkpoint(
             checkpoint_run.orchestration_id, pass_identity,
             owner=checkpoint_run.owner, now=now,
-            lease_expires_at=_iso_after(lease_seconds))
+            lease_expires_at=_iso_after(lease_seconds),
+            **({"binding_hash": binding_hash} if binding_hash is not None else {}))
     except Exception as exc:
         raise PersistenceFailed(
             f"could not claim checkpoint for {label}: {exc!r}") from exc
@@ -3334,8 +3340,11 @@ def _checkpointed_sub(
     try:
         started = time.monotonic()
         started_at = _iso_now()
-        sub = _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
-                       label, cancel=cancel)
+        sub = (_Sub(False, False, "", None, False, "", [], preparation_failure, [],
+                    {"provider": None, "model": None, "effort": None}, None)
+               if preparation_failure is not None else
+               _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
+                        label, cancel=cancel))
         completed_at = _iso_now()
         capacity_timing = sub.provenance.get("capacity_timing")
         checkpoint_timing = (dict(capacity_timing)
@@ -3358,14 +3367,16 @@ def _checkpointed_sub(
         })
         payload = checkpoints.payload_from_sub(sub)
         if checkpoint_run.identity.continuation_source is not None:
-            action = 'executed' if checkpoints.usable_payload(payload) else 'failed'
+            usable = followups.usable(payload) if pass_identity.kind in followups.KINDS else checkpoints.usable_payload(payload)
+            action = 'executed' if usable else 'failed'
             sub = replace(sub, provenance={**sub.provenance, 'continuation_action': action})
             payload = checkpoints.payload_from_sub(sub)
         applied = store.complete_checkpoint(
             checkpoint_run.orchestration_id, pass_identity.kind,
             pass_identity.index, owner=checkpoint_run.owner,
             claim_token=claim["claim_token"], fence=claim["fence"],
-            payload=payload, completed_at=_iso_now())
+            payload=payload, completed_at=_iso_now(),
+            **({"binding_hash": binding_hash} if binding_hash is not None else {}))
         if not applied:
             raise CheckpointClaimLost(
                 f"lost fenced checkpoint claim for {label}; refusing to "
@@ -3383,10 +3394,13 @@ def _checkpointed_sub(
         raise
 
 
-def _checkpoint_lease_seconds(d: Defaults, chain_width: int) -> float:
-    """Cover one pass's retries plus its configured provider admission wait."""
-    return (budget.worst_runtime(d, chain_width, 0)
-            + capacity.admission_wait_from_env(30.0))
+def _checkpoint_lease_seconds(d: Defaults, chain_width: int, *, store=None) -> float:
+    """Cover retries and the same store-owned provider wait used by the chain."""
+    from . import budgets
+    controller = budgets.current(store) if store is not None else None
+    provider_wait = (controller.limits.provider_wait if controller is not None
+                     else capacity.admission_wait_from_env(30.0))
+    return budget.worst_runtime(d, chain_width, 0) + provider_wait
 
 
 def _milliseconds_to_seconds(value: object) -> float | None:
@@ -3651,6 +3665,13 @@ def _orchestration_identity(
             kind="integration", index=0, prompt_hash=None,
             diff_hash=gitio.diff_identity(diff.data),
             boundary_hash=prepared.integration_plan_digest))
+    if rec.get("mode") == "now":
+        for kind in followups.KINDS:
+            pass_identities.append(checkpoints.PassIdentity(
+                kind=kind, index=0, prompt_hash=None,
+                diff_hash=gitio.diff_identity(diff.data),
+                boundary_hash=checkpoints.canonical_digest({
+                    "kind": kind, "policy": reuse.security_policy_identity(cfg)})))
     return checkpoints.OrchestrationIdentity(
         repo_id=gitio.repository_identity(root),
         worktree_root=gitio.observed_worktree_root(root),
@@ -3665,7 +3686,8 @@ def _orchestration_identity(
         reviewer_hash=reviewer_hash,
         config_hash=config_hash,
         policy_hash=reuse.security_policy_identity(cfg),
-        planner_version=checkpoints.PLANNER_VERSION,
+        planner_version=(followups.PLANNER_VERSION if rec.get("mode") == "now"
+                         else checkpoints.PLANNER_VERSION),
         batch_budget=_effective_batch_budget(d, finder),
         batch_count=len(prepared.batches),
         boundary_digest=prepared.boundary_digest,
@@ -4227,6 +4249,71 @@ def _failed_pass(rec: dict, name: str, reason: str, note: str) -> dict:
     merged = passes.merge_failed_extra_pass(rec, name, reason)
     return _with_provenance(merged, name, {
         "provider": None, "model": None, "effort": None, "note": note})
+
+
+def _required_followup(checkpoint_run, scheduled, rec, name, build_prompt,
+                       reviewer, cfg, d, cwd, store, scratch, *, cancel=None):
+    """Bind a conditional required role, then run/reuse its exact fenced output."""
+    if checkpoint_run is None:
+        return _extra_pass(rec, name, build_prompt, reviewer, cfg, d, cwd,
+                           store, scratch, cancel=cancel) if scheduled else rec
+    _checkpoint(cancel, rec, f"before the {name} pass")
+    prompt, preparation_failure = None, None
+    reason = ('scheduled' if scheduled else 'aggregate_not_clean'
+              if name == 'skeptic' and os.environ.get(passes.SKEPTIC_PASS_ENV, '1').strip() != '0'
+              else 'policy_not_scheduled')
+    if scheduled:
+        try:
+            prompt = build_prompt()
+        except Exception as exc:
+            preparation_failure = f"extra pass {name} could not be prepared: {exc!r}"
+            reason = 'preparation_failed'
+    prompt_identity = ({'hash': gitio.diff_identity(prompt.text),
+                        'bytes': prompt.prompt_bytes, 'diff_truncated': bool(prompt.diff_truncated)}
+                       if prompt is not None else None)
+    planned = next(p for p in checkpoint_run.identity.pass_identities if p.kind == name)
+    identity = replace(planned, prompt_hash=prompt_identity['hash'] if prompt_identity else None)
+    from .requests import current
+    ctx = current()
+    request = ({'request_id': ctx.id, 'owner_token': ctx.owner_token}
+               if ctx is not None and ctx.store is store else {})
+    try:
+        binding = followups.build_binding(
+            checkpoint_run.identity, name, store.list_checkpoints(checkpoint_run.orchestration_id), rec,
+            scheduled=scheduled, reason=reason, prompt=prompt_identity)
+        binding_hash = store.bind_followup_checkpoint(
+            checkpoint_run.orchestration_id, identity, binding=binding, now=_iso_now(), **request)
+    except Exception as exc:
+        raise PersistenceFailed(f"could not bind {name} checkpoint: {exc!r}") from exc
+    if not scheduled:
+        row = next(r for r in store.list_checkpoints(checkpoint_run.orchestration_id) if r['pass_kind'] == name)
+        if row.get('invalidation_reason'):
+            rec = {**rec, 'followup_decisions': {**(rec.get('followup_decisions') or {}),
+                name: {'scheduled': False, 'reason': row['invalidation_reason']}}}
+        return rec
+    sub = _checkpointed_sub(checkpoint_run, identity, reviewer=reviewer, cfg=cfg, d=d,
+        prompt=prompt, root=cwd, store=store, scratch=scratch, tag=name,
+        label=f"extra pass {name}", cancel=cancel, binding_hash=binding_hash,
+        preparation_failure=preparation_failure)
+    if not sub.parse_ok:
+        reason = sub.failure_reason or passes.failed_pass_reason(name)
+        if not reason.startswith('extra pass'):
+            reason = f"extra pass {name}: {reason}"
+        merged = passes.merge_failed_extra_pass(rec, name, reason)
+    else:
+        extra = {'id': f"{rec['id']}.{name}", 'parse_ok': sub.parse_ok,
+                 'degraded': sub.degraded, 'degraded_reason': sub.degraded_reason,
+                 'diff_truncated': sub.diff_truncated, 'stop_reason': sub.stop_reason,
+                 'summary': sub.summary, 'findings': sub.findings,
+                 'failure_reason': sub.failure_reason}
+        merged = passes.merge_extra_pass(rec, extra, name)
+    row = next(r for r in store.list_checkpoints(checkpoint_run.orchestration_id) if r['pass_kind'] == name)
+    metadata = {**sub.provenance, 'attempts': sub.attempts,
+                'followup_output_hash': checkpoints.canonical_digest(
+                    followups.semantic_payload(checkpoints.payload_from_sub(sub)))}
+    if row.get('invalidation_reason'):
+        metadata['continuation_reason'] = row['invalidation_reason']
+    return _with_provenance(merged, name, metadata)
 
 
 def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,

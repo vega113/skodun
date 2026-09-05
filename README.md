@@ -1227,4 +1227,4 @@ A successful cancellation submission acknowledges durable intent only.
 records its outcome; numeric PID existence is not proof of delivery.
 Structured automation output: see [versioned review results](docs/review-results.md) for `review --json`, MCP parity, reason codes, and scoped counts.
 
-Explicit [compatible batch continuation](docs/compatible-continuation.md) retries failed work while preserving usable exact checkpoints (`review --continue`, MCP `continue_compatible`).
+Explicit [compatible batch continuation](docs/compatible-continuation.md) retries failed batches, integration, and required foreground security/skeptic passes while preserving usable exact checkpoints (`review --continue`, MCP `continue_compatible`). Optional refuter annotation retains its existing policy.

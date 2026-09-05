@@ -26,6 +26,8 @@ from skodun.store import (SCHEMA_VERSION, SchemaInfo, SchemaLifecycleError,
 
 def _downgrade(path, version=12):
     with closing(sqlite3.connect(path)) as conn:
+        if version < 20:
+            conn.execute("DROP TABLE IF EXISTS review_followup_checkpoints")
         if version < 18:
             conn.execute("DROP TABLE IF EXISTS cancellation_audit")
             for table in ('review_requests','request_executions'):

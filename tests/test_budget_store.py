@@ -198,7 +198,7 @@ def test_v19_upgrade_is_explicit_additive_and_preserves_requests(tmp_path):
     from unittest.mock import patch
     from skodun import store as store_mod
     from skodun.budget_store import MIGRATION
-    from tests.test_store import V19_OBJECTS, _objects
+    from tests.test_store import V19_OBJECTS, V20_OBJECTS, _objects
     db = tmp_path / 's.db'
     with patch.object(store_mod, 'SCHEMA_VERSION', 18), patch.object(
             store_mod, '_MIGRATIONS', tuple((target, delta) for target, delta in store_mod._MIGRATIONS if target <= 18)):
@@ -213,8 +213,8 @@ def test_v19_upgrade_is_explicit_additive_and_preserves_requests(tmp_path):
     assert db.read_bytes() == before_bytes
     receipt = Store.migrate_existing(db, build_commit='a' * 40)
     assert receipt['schema_from'] == 18
-    assert receipt['schema_to'] == 19
-    assert _objects(db) - before_objects == V19_OBJECTS
+    assert receipt['schema_to'] == store_mod.SCHEMA_VERSION
+    assert _objects(db) - before_objects == V19_OBJECTS | V20_OBJECTS
     with Store.open(db) as store:
         assert store.get_request(rid)['executions'][0]['seq'] == seq
         assert store.request_budget(rid) is None
