@@ -1225,3 +1225,5 @@ A successful cancellation submission acknowledges durable intent only.
 `owner_reachability=unverified` remain explicit until the owning execution
 records its outcome; numeric PID existence is not proof of delivery.
 Structured automation output: see [versioned review results](docs/review-results.md) for `review --json`, MCP parity, reason codes, and scoped counts.
+
+Explicit [compatible batch continuation](docs/compatible-continuation.md) retries failed work while preserving usable exact checkpoints (`review --continue`, MCP `continue_compatible`).

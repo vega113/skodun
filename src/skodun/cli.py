@@ -116,6 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="repository to review (default: the current directory)")
     review.add_argument("--json", action="store_true",
                         help="emit one versioned structured review result")
+    review.add_argument("--continue", dest="continue_compatible", action="store_true",
+                        help="continue usable exact batch checkpoints, retrying failed work")
     review.add_argument("--request-key", default=None,
                         help="idempotency key for this exact worktree request")
     # THE NAME of a `[[reviewers]]` entry, never a provider id: two enabled
@@ -906,7 +908,8 @@ def _cmd_review(args) -> int:
             fresh=getattr(args, "fresh", False),
             batch_target_bytes=getattr(args, "batch_target_bytes", None),
             stack_manifest=getattr(args, "stack_manifest", None),
-            request_key=getattr(args, "request_key", None), request_source="cli")
+            request_key=getattr(args, "request_key", None), request_source="cli",
+            continue_compatible=getattr(args, "continue_compatible", False))
     code, text = response[:2]
     return emit_result(text, code, response[2] if len(response) == 3 else None)
 

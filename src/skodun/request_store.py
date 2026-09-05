@@ -63,7 +63,7 @@ class RequestStoreMixin:
 
     def begin_request(self, *, request_id, scope, request_key, identity, intent,
                       owner_token, pid, source, now, expires_at, continuation_id=None,
-                      continuation_orchestration_id=None, actor=None):
+                      continuation_orchestration_id=None, actor=None, allow_consumed=False):
         from .store import _require_ts
         for key, value in (('request_id', request_id), ('scope', scope),
                            ('owner_token', owner_token), ('source', source)):
@@ -86,6 +86,8 @@ class RequestStoreMixin:
             raise ValueError('request scope must match its worktree identity')
         if len(encoded.encode('utf-8')) > 65536:
             raise ValueError('request identity exceeds 64 KiB')
+        if type(allow_consumed) is not bool:
+            raise ValueError('allow_consumed must be bool')
         digest = hashlib.sha256(_json(intent).encode()).hexdigest()
         self._c.execute('BEGIN IMMEDIATE')
         try:
@@ -105,15 +107,21 @@ class RequestStoreMixin:
                             and prior['intent_digest'] == digest else 'mismatch')
                 result_id = prior['id']
                 if (continuation_id is not None and request_key is None
-                        and prior['state'] in ('finished', 'failed', 'cancelled')):
+                        and prior['state'] in ('finished', 'failed', 'cancelled', 'expired')):
                     old_result = json.loads(prior['result_json']) if prior['result_json'] else None
                     complete = old_result is not None and old_result.get('status') in (0, 1)
                     target = self._c.execute(
-                        'SELECT state FROM review_orchestrations WHERE id=?',
+                        'SELECT state,final_review_id FROM review_orchestrations WHERE id=?',
                         (continuation_orchestration_id,)).fetchone()
+                    consumed_failed = False
+                    if allow_consumed and target is not None and target['state'] == 'consumed':
+                        review = self._c.execute('SELECT trustworthy,status FROM reviews WHERE id=?',
+                                                 (target['final_review_id'],)).fetchone()
+                        consumed_failed = (review is not None and review['trustworthy'] == 0
+                                           and review['status'] != 'running')
                     if complete:
                         decision = 'existing'
-                    elif target is None or target['state'] not in ('active', 'cancelled', 'failed', 'complete'):
+                    elif target is None or (target['state'] not in ('active', 'cancelled', 'failed', 'complete') and not consumed_failed):
                         decision = 'continuation_unavailable'
                     else:
                         self._c.execute(
@@ -170,11 +178,31 @@ class RequestStoreMixin:
         row = self._c.execute(
             """SELECT r.id FROM review_requests r JOIN request_links l ON l.request_id=r.id
                WHERE l.kind='batch_orchestration' AND l.target_id=? AND r.identity_json=?
-                 AND (r.state IN ('accepted','queued','running','failed','cancelled')
+                 AND (r.state IN ('accepted','queued','running','failed','cancelled','expired')
                       OR (r.state='finished' AND json_extract(r.result_json,'$.status') > 1))
                ORDER BY r.updated_at DESC,r.id DESC LIMIT 1""",
             (orchestration_id, _json(identity))).fetchone()
         return row['id'] if row else None
+
+    def continuation_request_mismatch(self, orchestration_id, identity):
+        """Name a known source-request mismatch, without guessing when none is known."""
+        _text('orchestration_id', orchestration_id)
+        if not isinstance(identity, dict):
+            raise ValueError('request identity must be an object')
+        row = self._c.execute(
+            """SELECT r.identity_json FROM review_requests r
+               JOIN request_links l ON l.request_id=r.id
+               WHERE l.kind='batch_orchestration' AND l.target_id=?
+               ORDER BY r.updated_at DESC,r.id DESC LIMIT 1""", (orchestration_id,)).fetchone()
+        if row is None:
+            return None
+        source = json.loads(row['identity_json'])
+        if not isinstance(source, dict):
+            return None
+        for field in sorted(set(source) | set(identity)):
+            if field not in source or field not in identity or source[field] != identity[field]:
+                return field
+        return None
 
     def list_requests(self, *, worktree_root=None, repo_id=None, limit=50, active_first=False):
         if type(limit) is not int or not 1 <= limit <= 1000:

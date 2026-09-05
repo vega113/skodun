@@ -1023,7 +1023,7 @@ def _without_run_identity(rec: dict) -> dict:
     """Comparable aggregate fields across two independently minted reviews."""
     ignored = {
         "id", "reviewed_at", "review_started_at", "review_completed_at",
-        "batch_orchestration_id", "tree_fingerprint",
+        "batch_orchestration_id", "tree_fingerprint", "lineage_context_cutoff",
     }
     out = {key: value for key, value in rec.items() if key not in ignored}
     out["batches"] = [

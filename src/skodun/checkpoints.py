@@ -127,6 +127,7 @@ class OrchestrationIdentity:
     boundary_digest: str
     integration_plan_digest: str
     pass_identities: tuple[PassIdentity, ...]
+    continuation_source: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -135,6 +136,7 @@ class OrchestrationIdentity:
                 "config_hash", "policy_hash", "planner_version",
                 "boundary_digest", "integration_plan_digest"):
             _text(name, getattr(self, name))
+        _text("continuation_source", self.continuation_source, optional=True)
         _text("context_hash", self.context_hash, optional=True)
         _text("checklist_hash", self.checklist_hash, optional=True)
         _plain_int("batch_budget", self.batch_budget, minimum=1)
@@ -146,7 +148,10 @@ class OrchestrationIdentity:
             raise ValueError("pass_identities must be a non-empty tuple of PassIdentity")
 
     def canonical_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True,
+        fields = asdict(self)
+        if self.continuation_source is None:
+            fields.pop('continuation_source')  # Preserve existing identity bytes.
+        return json.dumps(fields, ensure_ascii=False, sort_keys=True,
                           separators=(",", ":"), allow_nan=False)
 
     def digest(self) -> str:
@@ -156,11 +161,13 @@ class OrchestrationIdentity:
     def from_json(cls, text: str) -> "OrchestrationIdentity":
         try:
             raw = json.loads(text)
-        except (TypeError, json.JSONDecodeError) as exc:
+        except (TypeError, json.JSONDecodeError, RecursionError) as exc:
             raise ValueError(f"invalid orchestration identity JSON: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("orchestration identity JSON must be an object")
         expected = set(_IDENTITY_FIELDS)
+        if 'continuation_source' in raw:
+            expected.add('continuation_source')
         if set(raw) != expected:
             raise ValueError(
                 "orchestration identity fields differ: "
@@ -169,15 +176,23 @@ class OrchestrationIdentity:
         passes = raw.pop("pass_identities")
         if not isinstance(passes, list):
             raise ValueError("pass_identities must be an array")
-        raw["pass_identities"] = tuple(
-            PassIdentity(**value) if isinstance(value, dict) else value
-            for value in passes)
-        return cls(**raw)
+        try:
+            raw["pass_identities"] = tuple(
+                PassIdentity(**value) if isinstance(value, dict) else value
+                for value in passes)
+            return cls(**raw)
+        except TypeError as exc:
+            raise ValueError(f"invalid orchestration identity fields: {exc}") from exc
 
 
 def first_mismatch(left: OrchestrationIdentity,
                    right: OrchestrationIdentity) -> str | None:
-    """Return the first exact identity field that differs, in stable order."""
+    """Return the first exact content field that differs, in stable order.
+
+    continuation_source namespaces generation ownership and is included in the
+    digest, but is not content compatibility. Only the explicit owned fork path
+    may seed a different generation after every field below matches.
+    """
     if not isinstance(left, OrchestrationIdentity) \
             or not isinstance(right, OrchestrationIdentity):
         raise ValueError("first_mismatch requires two OrchestrationIdentity values")
@@ -365,3 +380,11 @@ def sub_fields_from_payload(payload: CheckpointPayload) -> dict[str, Any]:
     if not isinstance(payload, CheckpointPayload):
         raise ValueError("payload must be a CheckpointPayload")
     return CheckpointPayload.from_mapping(payload.as_dict()).as_dict()
+
+
+
+def usable_payload(payload: CheckpointPayload) -> bool:
+    """Only validated, parsed, complete and non-degraded evidence is reusable."""
+    value = sub_fields_from_payload(payload)
+    return (value['parse_ok'] is True and value['degraded'] is False
+            and value['diff_truncated'] is False and not value['failure_reason'])
