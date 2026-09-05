@@ -555,3 +555,24 @@ def test_mcp_preview_rejects_boolean_and_invalid_enum_inputs(tmp_path, monkeypat
             result = handler(mcpserver.HandlerCall(params={'repo': str(repo), **invalid},
                 store_factory=lambda: nullcontext(store), cancel=threading.Event()))
             assert result.status == 2
+
+
+def test_untracked_capture_limit_reports_incomplete_scope_and_no_application(tmp_path, monkeypatch):
+    from skodun import config, gitio
+    repo = _ready_repo(tmp_path, monkeypatch)
+    for index in range(3):
+        (repo / f'untracked-{index}.txt').write_text('uncaptured scope\n')
+    cfg = config.load_config(repo)
+    cfg = replace(cfg, defaults=replace(cfg.defaults, untracked_max=1))
+    monkeypatch.setattr(config, 'load_config', lambda _root: cfg)
+    captured = gitio.capture_diff(repo, gitio.resolve_base(repo).sha, cfg.defaults.untracked_max)
+    assert captured.truncated_untracked
+    code, text = services.svc_review_plan(None, repo, batch_target_bytes=4000,
+        target_source='measured', target_latency_seconds=30, output='json')
+    plan = json.loads(text)
+    assert code == 2 and plan['status'] == 'unreviewable'
+    assert plan['scope_capture']['truncated_untracked']
+    assert plan['scope_capture']['reason_code'] == 'untracked_capture_limit'
+    assert not plan['all_diff_bytes_preserved']
+    assert plan['selection']['reason'] == 'incomplete_scope_capture'
+    assert plan['selection']['application'] is None

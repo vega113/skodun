@@ -16,6 +16,8 @@ A preview is a snapshot, not a review, request reservation, or gate certificate.
 Exit `0` means the plan was produced; `2` means invalid input, unavailable scope,
 a stale tree, or required inputs known to be unreviewable. Check the individual
 paths and truncation flags: future integration/refuter inputs are still unknown.
+The `scope_capture` fields expose an untracked capture limit explicitly; such a
+preview cannot claim all diff bytes are preserved or return application arguments.
 Execution captures its own current inputs. Re-run the preview after editing the
 tree, rebasing, changing configuration, or changing stack annotations.
 

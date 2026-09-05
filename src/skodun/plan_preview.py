@@ -230,7 +230,9 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
     data = operational_targets.read_evidence(store, reviewer=finder, mode=mode, context_pack=defaults.context_pack, now=now)
     selected = None
     reason = 'configured_target'
-    if target_source == 'measured':
+    if diff.truncated_untracked:
+        reason = 'incomplete_scope_capture'
+    elif target_source == 'measured':
         reason = ('explicit_override' if target is not None else 'latency_objective_required'
                   if target_latency_seconds is None else 'route_not_stable'
                   if mode == 'now' and reviewer is None and cfg.routing.mode == 'auto' else 'insufficient_matching_evidence')
@@ -318,11 +320,15 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
         'stack': validation.to_dict() if validation else None,
         'changed_file_count': len(diff.files), 'changed_files': list(diff.files)[:MAX_DISPLAY_FILES],
         'changed_files_truncated': len(diff.files) > MAX_DISPLAY_FILES,
+        'scope_capture': {'complete': not diff.truncated_untracked,
+            'truncated_untracked': diff.truncated_untracked,
+            'reason_code': 'untracked_capture_limit' if diff.truncated_untracked else None,
+            'untracked_max': defaults.untracked_max},
         'diff_bytes': len(diff.data), 'diff_hash': gitio.diff_identity(diff.data), 'tree_fingerprint': tree,
         'planning_policy': policy, 'plan_digest': plan_digest,
         'batch_count': 0 if batches is None else len(batches),
         'boundary_digest': prepared.boundary_digest if prepared else None,
-        'all_diff_bytes_preserved': b''.join(item.data for item in batches) == diff.data if batches else True,
+        'all_diff_bytes_preserved': not diff.truncated_untracked and (b''.join(item.data for item in batches) == diff.data if batches else True),
         'calls': calls[:MAX_DISPLAY_CALLS], 'calls_truncated': len(calls) > MAX_DISPLAY_CALLS,
         'primary_aggregate_prompt_bytes': sum(call['prompt_bytes'] for call in primary),
         'max_primary_prompt_bytes': max((call['prompt_bytes'] for call in primary), default=None),
@@ -333,9 +339,9 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
             'method': 'configured retries/fallback upper bound; not expected calls', 'expected_launches': None},
         'route': route, 'selection': {'reason': reason, 'target_source': 'measured' if selected else 'explicit' if target is not None else 'configured',
             'target_bytes': defaults.batch_target_bytes, 'cohort_digest': selected['sample_digest'] if selected else None,
-            'application': ['--batch-target-bytes', str(defaults.batch_target_bytes)] if mode == 'now' and (target is not None or defaults.batch_target_bytes > 0) else None,
+            'application': ['--batch-target-bytes', str(defaults.batch_target_bytes)] if mode == 'now' and not diff.truncated_untracked and (target is not None or defaults.batch_target_bytes > 0) else None,
             'prepush_configuration_target': defaults.batch_target_bytes if mode == 'prepush' else None,
-            'application_note': 'Manually set defaults.batch_target_bytes in configuration before dispatch; no foreground command reproduces this pushed-ref scope.' if mode == 'prepush' else 'Apply the returned fixed arguments to review; execution captures fresh inputs and does not resample history.'},
+            'application_note': 'Scope capture is incomplete; no target application is qualified. Resolve the capture limit and preview again.' if diff.truncated_untracked else 'Manually set defaults.batch_target_bytes in configuration before dispatch; no foreground command reproduces this pushed-ref scope.' if mode == 'prepush' else 'Apply the returned fixed arguments to review; execution captures fresh inputs and does not resample history.'},
         'measurements': data, 'request_runtime_range_seconds': None,
         'runtime_note': 'Per-call historical ranges are observations; conditional calls and queue waits prevent a request ETA.',
         'provider_processes_launched': 0}
