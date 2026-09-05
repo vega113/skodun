@@ -338,44 +338,19 @@ class AgyAdapter:
         """
         return MAX_PROMPT_ARG_BYTES
 
-    def build_cmd(self, prompt_file: Path, r: Reviewer, d: Defaults,
-                  cwd: Path,
-                  contract: OutputContract = REVIEW_CONTRACT) -> list[str]:
-        """The full argv for one attempt. Writes nothing.
+    prompt_transport = "argv"
+    prompt_capability_version = "agy-argv-v1"
 
-        Every flag here was accepted by agy 1.1.8 during the probe. The
-        load-bearing ones:
+    def validate_prompt(self, prompt: bytes, r: Reviewer) -> None:
+        """Check the actual bytes before capacity or invocation staging.
 
-        * `--print <text>` — the only prompt channel this CLI has. See the
-          module docstring; the size guard below is the price.
-        * `--output-format json` — one envelope on stdout instead of prose.
-        * `--json-schema <string>` — the contract's schema, verbatim.
-        * `--model` — always explicit, never inherited from the CLI's own
-          settings file.
-        * `--sandbox` — "run in a sandbox with terminal restrictions enabled".
-          Paired with the ABSENCE of `--dangerously-skip-permissions`: a tool
-          call that needs permission is then auto-denied, because a reviewer
-          must not be able to execute anything.
-        * `--print-timeout` — set to `d.timeout_sec`, the SAME deadline the
-          watchdog (`runner.py`) enforces, and the watchdog starts counting
-          first and always wins the race in practice: it is armed before
-          `Popen` even returns, while the CLI's own `--print-timeout` clock
-          starts later, after its own startup work. So this flag is NOT what
-          gives a stalled run a chance to self-report before the watchdog
-          kills it — at equal deadlines with a later start, it essentially
-          never fires first. What it actually buys is real and different:
-          agy's default `--print-timeout` is `5m0s` (300s, `agy --help`), well
-          under `Defaults.timeout_sec` (420s), so WITHOUT this flag the CLI
-          would self-terminate at five minutes while skodun still had two
-          minutes of budget left. Passing the runner's own deadline raises
-          agy's internal timeout to match skodun's, so the CLI does not give
-          up on its own before the watchdog would.
-
-        `cwd` takes no flag: agy has no `--cwd`/`-C`, and the runner already
-        spawns the child in that directory. `d.max_turns` and `d.deny_tools`
-        have no counterpart either — the sandbox plus auto-denied permissions
-        is what stands in for the latter.
+        Share the authoritative build guard, including fatal effort, decoding
+        and NUL precedence. No file writes, CLI probes, or model calls.
         """
+        self._cli_effort(r)
+        self._validated_prompt(prompt)
+
+    def _cli_effort(self, r: Reviewer) -> str | None:
         effort = None if r.effort in _EFFORT_OFF else r.effort
         cli_effort = None
         if effort is not None:
@@ -392,8 +367,11 @@ class AgyAdapter:
                     f"{effort!r} (known: {sorted(mapping)})")
             cli_effort = mapping[effort]
 
+        return cli_effort
+
+    def _validated_prompt(self, prompt_bytes: bytes) -> str:
         try:
-            prompt = prompt_file.read_text(encoding="utf-8")
+            prompt = prompt_bytes.decode("utf-8")
         except UnicodeDecodeError as e:
             # STRICT, not `errors="replace"`. This is the SOURCE side of the
             # pipeline (the diff under review, read back from the file
@@ -436,8 +414,9 @@ class AgyAdapter:
                 f"byte, which a subprocess argv cannot carry; review this "
                 f"change with another provider")
 
-        size = len(prompt.encode("utf-8"))
-        if size > MAX_PROMPT_ARG_BYTES:
+        size = len(prompt_bytes)
+        limit = self.prompt_limit()
+        if limit is not None and size > limit:
             # BYTES, not characters: the kernel's per-argument cap counts
             # bytes, so a multibyte prompt that looks short in characters can
             # still be refused by `execve`.
@@ -452,11 +431,54 @@ class AgyAdapter:
             # reviewing the same bytes elsewhere would hide them.
             raise PromptTooLarge(
                 f"adapter {self.name!r}: prompt is too large to pass on the "
-                f"command line ({size} bytes > {MAX_PROMPT_ARG_BYTES}); this "
+                f"command line ({size} bytes > {limit}); this "
                 f"CLI has no prompt-file flag and ignores stdin, so lower "
                 f"`max_diff_bytes` or review this change with another "
                 f"provider",
-                size=size, limit=MAX_PROMPT_ARG_BYTES)
+                size=size, limit=limit)
+
+        return prompt
+
+    def build_cmd(self, prompt_file: Path, r: Reviewer, d: Defaults,
+                  cwd: Path,
+                  contract: OutputContract = REVIEW_CONTRACT) -> list[str]:
+        """The full argv for one attempt. Writes nothing.
+
+        Every flag here was accepted by agy 1.1.8 during the probe. The
+        load-bearing ones:
+
+        * `--print <text>` — the only prompt channel this CLI has. See the
+          module docstring; the shared size guard is the price.
+        * `--output-format json` — one envelope on stdout instead of prose.
+        * `--json-schema <string>` — the contract's schema, verbatim.
+        * `--model` — always explicit, never inherited from the CLI's own
+          settings file.
+        * `--sandbox` — "run in a sandbox with terminal restrictions enabled".
+          Paired with the ABSENCE of `--dangerously-skip-permissions`: a tool
+          call that needs permission is then auto-denied, because a reviewer
+          must not be able to execute anything.
+        * `--print-timeout` — set to `d.timeout_sec`, the SAME deadline the
+          watchdog (`runner.py`) enforces, and the watchdog starts counting
+          first and always wins the race in practice: it is armed before
+          `Popen` even returns, while the CLI's own `--print-timeout` clock
+          starts later, after its own startup work. So this flag is NOT what
+          gives a stalled run a chance to self-report before the watchdog
+          kills it — at equal deadlines with a later start, it essentially
+          never fires first. What it actually buys is real and different:
+          agy's default `--print-timeout` is `5m0s` (300s, `agy --help`), well
+          under `Defaults.timeout_sec` (420s), so WITHOUT this flag the CLI
+          would self-terminate at five minutes while skodun still had two
+          minutes of budget left. Passing the runner's own deadline raises
+          agy's internal timeout to match skodun's, so the CLI does not give
+          up on its own before the watchdog would.
+
+        `cwd` takes no flag: agy has no `--cwd`/`-C`, and the runner already
+        spawns the child in that directory. `d.max_turns` and `d.deny_tools`
+        have no counterpart either — the sandbox plus auto-denied permissions
+        is what stands in for the latter.
+        """
+        cli_effort = self._cli_effort(r)
+        prompt = self._validated_prompt(prompt_file.read_bytes())
 
         cmd = [
             resolve_agy_bin(),

@@ -155,6 +155,31 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
     return row
 
 
+def _prompt_size_skip(n: int, entry: Reviewer, adapter, error: PromptTooLarge,
+                      *, next_entry: bool,
+                      capacity_timing: dict | None = None) -> dict:
+    """One prompt-local refusal, never provider-wide quota unavailability."""
+    from .pipeline import _note
+
+    next_step = "trying the next entry" if next_entry else "no entries remain"
+    _note(f"{entry.name} ({entry.provider}) cannot take this prompt "
+          f"({error.size} bytes > {error.limit}); {next_step}")
+    verdict = ClassifyResult("unavailable", PROMPT_TOO_LARGE_CATEGORY, str(error))
+    row = _attempt(n, entry,
+                   skipped=f"prompt too large for this provider: {error}",
+                   classification=_classification(verdict),
+                   capacity_timing=capacity_timing)
+    row["input_eligibility"] = {
+        "adapter_name": adapter.name,
+        "transport": getattr(adapter, "prompt_transport", None),
+        "capability_version": getattr(adapter, "prompt_capability_version", None),
+        "reason": "prompt_too_large",
+        "input_bytes": error.size,
+        "limit_bytes": error.limit,
+    }
+    return row
+
+
 def _classification(verdict) -> dict:
     """A `ClassifyResult` as it is persisted. Three keys, always all three."""
     return {"kind": verdict.kind, "category": verdict.category,
@@ -566,6 +591,29 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
             exhausted.append(f"{entry.name}/{entry.provider}: {detail}")
             continue
 
+        # Deterministic transport eligibility is prompt-local and runs before
+        # slot admission or scratch-file staging. The bounded adapter shares
+        # this guard with build_cmd, including fatal validation precedence;
+        # do not substitute a raw len(prompt) comparison that hides config or
+        # decoding errors. Unknown-limit adapters need no size preflight.
+        validate_prompt = getattr(adapter, "validate_prompt", None)
+        if validate_prompt is not None:
+            try:
+                validate_prompt(prompt, entry)
+            except PromptTooLarge as e:
+                n += 1
+                attempts.append(_prompt_size_skip(
+                    n, entry, adapter, e, next_entry=i + 1 < len(chain)))
+                exhausted.append(f"{entry.name}/{entry.provider}: {e}")
+                continue
+            except Exception as e:
+                n += 1
+                attempts.append(_attempt(
+                    n, entry, skipped=f"could not build the invocation: {e!r}"))
+                return _Outcome(None, attempts,
+                                f"reviewer {entry.name!r} could not be "
+                                f"invoked: {e!r}")
+
         # Remaining shared admit+bind budget — not a fresh full wait per hop.
         wait_sec = _remaining_admission_sec(admission_deadline)
         provider_ticket: capacity.Ticket | None = None
@@ -621,33 +669,10 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                     prompt_file.write_bytes(prompt)
                     cmd = adapter.build_cmd(prompt_file, entry, d, cwd, contract)
                 except PromptTooLarge as e:
-                    # THIS PROVIDER cannot carry THIS PROMPT — which is what
-                    # `unavailable` means, and what a fallback chain is for. So it
-                    # takes the `unavailable` path below rather than the fatal one:
-                    # an `agy`-headed chain with a `codex` fallback reviews a large
-                    # change instead of dying on it.
-                    #
-                    # Fail-closed is untouched. Nothing becomes trustworthy that
-                    # was not reviewed: this appends an attempt and BREAKS to the
-                    # next entry, and a chain that runs out still returns
-                    # `parsed=None` with a reason that names the size and the
-                    # ceiling (both are in `e`'s message, and on `e.size`/`e.limit`
-                    # for a caller that would rather not read prose).
-                    #
-                    # NOT cached against the provider: `_remember_unavailable` is
-                    # not called, and the category is deliberately not `quota` —
-                    # the only provider-wide-cacheable one. The next, smaller
-                    # prompt will be accepted by the very same CLI.
-                    verdict = ClassifyResult(
-                        "unavailable", PROMPT_TOO_LARGE_CATEGORY, str(e))
-                    next_step = ("trying the next entry" if i + 1 < len(chain)
-                                 else "no entries remain")
-                    _note(f"{entry.name} ({entry.provider}) cannot take this "
-                          f"prompt ({e.size} bytes > {e.limit}); {next_step}")
-                    attempts.append(_attempt(
-                        n, entry,
-                        skipped=f"prompt too large for this provider: {e}",
-                        classification=_classification(verdict),
+                    # Defensive build-time guard uses the same refusal shape.
+                    # Never remember a prompt-size refusal as provider quota.
+                    attempts.append(_prompt_size_skip(
+                        n, entry, adapter, e, next_entry=i + 1 < len(chain),
                         capacity_timing=capacity_timing))
                     exhausted.append(f"{entry.name}/{entry.provider}: {e}")
                     break

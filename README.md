@@ -565,10 +565,24 @@ build and batch plan is sized with it. Two consequences worth knowing:
 
 A prompt that still exceeds an adapter's ceiling — a chain can span providers,
 and one sized for a file-fed head may reach an argv-bound fallback — is
-classified `unavailable` for that entry and **the chain advances** to the next
-one, exactly as a quota outage would. This is still fail-closed: an exhausted
-chain is a `failed`, untrustworthy record naming the prompt size and the
-ceiling, and nothing becomes trustworthy that was not reviewed.
+checked against the actual complete UTF-8 bytes **before provider capacity
+admission, invocation staging, or process launch**. An incompatible candidate
+is skipped with `classification.category=prompt_size`, and the chain advances
+to the next configured entry. The skip's `input_eligibility` records the adapter,
+transport, adapter capability version, exact input bytes, limit, and stable
+`prompt_too_large` reason. It has no execution duration or capacity wait; an
+upstream provider that already ran retains its own attempt and timeout details.
+Capability versions identify the adapter guard, not a newly probed CLI build.
+
+This check runs for each batch and integration prompt as well. It preserves
+strict UTF-8, embedded-NUL, and effort validation; those fatal errors still stop
+the chain. Size refusals never enter provider-wide quota caching: repeated
+unchanged inputs skip admission again, and a smaller prompt remains eligible.
+Unknown transport limits do not imply a model context capacity or an input
+failure. No extra provider is enabled and no evidence is truncated to force a
+fit. If the configured chain is exhausted, the record remains failed and
+untrustworthy, with per-entry reasons and the numeric ceiling. Replan with a
+smaller complete envelope or configure a capable permitted provider.
 
 ### `max_cost_usd`
 
