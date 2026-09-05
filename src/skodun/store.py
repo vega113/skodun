@@ -60,7 +60,9 @@ _REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 16
+from .request_store import RequestStoreMixin, MIGRATION as _MIGRATION_V17
+
+SCHEMA_VERSION = 17
 
 
 class SchemaLifecycleError(ValueError):
@@ -981,6 +983,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (14, _MIGRATION_V14),
     (15, _MIGRATION_V15),
     (16, _MIGRATION_V16),
+    (17, _MIGRATION_V17),
 )
 
 
@@ -1481,7 +1484,7 @@ class Reservation:
     superseded: tuple[dict, ...] = field(default_factory=tuple)
 
 
-class Store:
+class Store(RequestStoreMixin):
     def __init__(self, conn: sqlite3.Connection, path: Path | None = None,
                  *, _snapshot: tempfile.TemporaryDirectory | None = None):
         self._c = conn
@@ -1907,6 +1910,9 @@ class Store:
         is factored out is that the reservation runs it INSIDE its own
         transaction while `save_review` runs it in autocommit.
         """
+        from .requests import bind_review
+        rec = dict(rec)
+        bind_review(self, rec)
         self._c.execute(_INSERT_REVIEW, (rec["id"],) + _review_values(rec))
         self._write_lineage(rec)
 

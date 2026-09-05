@@ -3,6 +3,9 @@
 **A local code-review pipeline that runs through an AI coding CLI you are already
 subscribed to, instead of an API key.**
 
+Foreground calls now carry [durable request identity](docs/review-requests.md),
+including before admission, with explicit idempotency keys for caller retries.
+
 Reviewers are declared in a TOML config (provider, model, effort, role, and an
 optional quota-fallback chain), and the pipeline is built around fail-closed trust
 semantics:

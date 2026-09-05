@@ -656,38 +656,19 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
         call.params, "batch_target_bytes", "review")
     if refusal:
         return _review_result(2, refusal)
+    request_key, refusal = _opt_string_arg(call.params, "request_key", "review")
+    if refusal:
+        return _review_result(2, refusal)
     with call.store_factory() as store:
-        if recover:
-            status, text, metadata = services.svc_review_detailed(
-                store, repo, cancel=call.cancel, reviewer=reviewer,
-                client_family=family, recover=True,
-                max_attempts=max_attempts,
-                max_wall_seconds=max_wall_seconds,
-                reuse_trusted=reuse_trusted, fresh=fresh,
-                batch_target_bytes=batch_target_bytes,
-                stack_manifest=stack_manifest,
-                reuse_client_family=(
-                    family if call.params.get("client_family") is not None
-                    else None))
-        elif reuse_trusted or fresh or stack_manifest is not None:
-            status, text, metadata = services.svc_review_detailed(
-                store, repo, cancel=call.cancel, reviewer=reviewer,
-                client_family=family, reuse_trusted=reuse_trusted,
-                fresh=fresh, batch_target_bytes=batch_target_bytes,
-                stack_manifest=stack_manifest,
-                reuse_client_family=(
-                    family if call.params.get("client_family") is not None
-                    else None))
-        else:
-            status, text = services.svc_review(
-                store, repo, cancel=call.cancel, reviewer=reviewer,
-                client_family=family, reuse_trusted=reuse_trusted,
-                fresh=fresh, batch_target_bytes=batch_target_bytes,
-                stack_manifest=stack_manifest,
-                reuse_client_family=(
-                    family if call.params.get("client_family") is not None
-                    else None))
-            metadata = {}
+        status, text, metadata = services.svc_review_detailed(
+            store, repo, cancel=call.cancel, reviewer=reviewer,
+            client_family=family, recover=recover,
+            max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
+            reuse_trusted=reuse_trusted, fresh=fresh,
+            batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest,
+            request_key=request_key, request_source="mcp",
+            reuse_client_family=(
+                family if call.params.get("client_family") is not None else None))
     return _review_result(status, text, metadata)
 
 
@@ -1064,6 +1045,10 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                     "type": "integer", "minimum": 1, "maximum": 8,
                     "description": "maximum recovery attempts including the "
                                    "first (default 3)"},
+                "request_key": {
+                    "type": "string",
+                    "description": "Idempotency key for this exact worktree request.",
+                },
                 "max_wall_seconds": {
                     "type": "number", "exclusiveMinimum": 0,
                     "description": "maximum recovery wall-clock budget in "
