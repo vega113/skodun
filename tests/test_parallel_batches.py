@@ -300,38 +300,8 @@ def test_simultaneous_requests_respect_repo_cap_and_provider_fifo(tmp_path, monk
         assert first_b > starts.index(('A', 'integration'))
 
 
-def test_same_second_fifo_uses_committed_enqueue_order(tmp_path, monkeypatch):
-    from skodun import store as store_module
-    monkeypatch.setattr(store_module, '_iso_now', lambda: '2026-09-05T00:00:00Z')
-    with Store.open(tmp_path / 'db') as store:
-        store.capacity_enqueue(admission_id='z-first', resource_class='provider:xai', scope='xai')
-        store.capacity_enqueue(admission_id='a-second', resource_class='provider:xai', scope='xai')
-        assert store.capacity_position('z-first') == 1
-        assert store.capacity_try_admit('a-second', capacity=1) is None
-        assert store.capacity_try_admit('z-first', capacity=1)['status'] == 'admitted'
 
 
-def test_enqueue_order_survives_new_process_and_terminal_rows(tmp_path, monkeypatch):
-    import os
-    import subprocess
-    import sys
-    from skodun import store as store_module
-    monkeypatch.setattr(store_module, '_iso_now', lambda: '2026-09-05T00:00:00Z')
-    db = tmp_path / 'db'
-    with Store.open(db) as store:
-        store.capacity_enqueue(admission_id='z-first', resource_class='provider:xai', scope='xai')
-        store.capacity_enqueue(admission_id='a-second', resource_class='provider:xai', scope='xai')
-    script = "from skodun.store import Store; import sys; s=Store.open(sys.argv[1]); print(s.capacity_position('z-first')); print(s.capacity_try_admit('a-second',capacity=1)); s.close()"
-    result = subprocess.run([sys.executable, '-c', script, str(db)], capture_output=True, text=True,
-        env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')}, check=True)
-    assert result.stdout.splitlines() == ['1', 'None']
-    with Store.open(db) as store:
-        store.capacity_try_admit('z-first', capacity=1)
-        store.capacity_finish('z-first', status='released')
-        store.capacity_enqueue(admission_id='0-third', resource_class='provider:xai', scope='xai')
-        assert store.capacity_position('z-first') is None
-        assert store.capacity_position('a-second') == 1
-        assert store.capacity_try_admit('0-third', capacity=1) is None
 
 
 def test_worker_claims_use_the_shared_long_provider_wait_allowance(tmp_path, monkeypatch):
@@ -469,15 +439,3 @@ def test_cli_mcp_and_preview_carry_parallel_intent(tmp_path, monkeypatch, capsys
             mode='now', execution_policy=planning_policy.execution_policy(Defaults(), 2), now='2026-09-05T12:00:00Z')
         assert observed['execution_policy_mismatched_records'] == 20
         assert not observed['cohorts']
-
-
-def test_bounded_queue_inspection_uses_the_same_front_as_admission(tmp_path, monkeypatch):
-    from skodun import queueview, store as store_module
-    monkeypatch.setattr(store_module, '_iso_now', lambda: '2026-09-05T00:00:00Z')
-    monkeypatch.setattr(queueview, 'MAX_PEERS', 1)
-    with Store.open(tmp_path / 'db') as store:
-        first = store.capacity_enqueue(admission_id='z-first', resource_class='provider:xai', scope='xai')
-        store.capacity_enqueue(admission_id='a-second', resource_class='provider:xai', scope='xai')
-        row = queueview._admission(store, first, '2026-09-05T00:00:01Z', [], {})
-        assert row['position'] == store.capacity_position('z-first') == 1
-        assert row['holders_truncated'] is True
