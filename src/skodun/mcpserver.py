@@ -932,6 +932,32 @@ def _handle_feedback_list(call: "HandlerCall") -> "HandlerResult":
     return HandlerResult(status=status, text=text)
 
 
+def _handle_review_plan(call: "HandlerCall") -> "HandlerResult":
+    from contextlib import ExitStack
+    from . import services
+    from .store import Store, SchemaLifecycleError
+    from .cli import _store_path
+    repo, refusal = _repo_arg(call.params, "review_plan")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    options = {key: call.params[key] for key in (
+        "mode", "reviewer", "client_family", "batch_target_bytes", "target_source",
+        "target_latency_seconds", "stack_manifest", "local_ref", "local_oid",
+        "remote_ref", "remote_oid", "review_id") if key in call.params}
+    factory = call.store_factory
+    if factory is default_store_factory:
+        factory = lambda: Store.open_readonly(_store_path())
+    with ExitStack() as stack:
+        store, reason = None, None
+        try:
+            store = stack.enter_context(factory())
+        except SchemaLifecycleError as exc:
+            reason = exc.reason_code
+        status, text = services.svc_review_plan(store, repo, **options,
+            output=call.params.get("output", "text"), history_unavailable_reason=reason)
+    return HandlerResult(status=status, text=text)
+
+
 def _handle_queue(call: "HandlerCall") -> "HandlerResult":
     """Shared request inspection; production opens a migration-free snapshot."""
     from . import services
@@ -1370,6 +1396,28 @@ def default_registry() -> tuple[HandlerSpec, ...]:
             description="Inspect request ownership, queues and observed costs. Same text/JSON as "
                         "skodun queue. Historical waits are observations, not predictions. "
                         "Missing usage is unknown. Read-only; no provider calls or migrations."),
+        HandlerSpec(
+            name="review_plan", long_running=False,
+            input_schema=_schema({
+                **_REPO_PROPERTY,
+                "mode": {"type": "string", "enum": ["now", "prepush"], "description": "Execution scope to preview; defaults to now."},
+                "reviewer": {"type": "string", "description": "Explicit foreground reviewer intent."},
+                "client_family": {"type": "string", "description": "Client family used by existing foreground routing."},
+                "batch_target_bytes": {"type": "integer", "minimum": 0, "maximum": 10000000, "description": "Explicit fixed diff-byte target; overrides measured suggestions."},
+                "target_source": {"type": "string", "enum": ["configured", "measured"], "description": "Configured target or opt-in measured recommendation."},
+                "target_latency_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 86400, "description": "Declared per-call goal required for measured selection."},
+                "stack_manifest": {"type": "string", "description": "Foreground stack annotation manifest path; never overrides the selected base."},
+                "local_ref": {"type": "string", "description": "Pushed local ref for prepush preview."},
+                "local_oid": {"type": "string", "description": "Pushed local object ID for prepush preview."},
+                "remote_ref": {"type": "string", "description": "Remote ref for prepush preview."},
+                "remote_oid": {"type": "string", "description": "Remote object ID, including zero for a new branch."},
+                "review_id": {"type": "string", "description": "Historical prepush record whose stored scope is being explained."},
+                "output": {"type": "string", "enum": ["text", "json"], "description": "Representation of the same plan; defaults to text."},
+            }), handler=_handle_review_plan,
+            description="Preview the shipped review planner without provider calls or store writes. "
+                        "Reports actual base, full diff, per-call/aggregate bytes and conditional paths. "
+                        "Measured targets need sufficient uncensored history and an explicit latency goal; "
+                        "returned fixed targets are application suggestions, not runtime adaptation."),
     )
 
 

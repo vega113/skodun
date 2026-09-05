@@ -203,6 +203,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", dest="json_output",
         help="render the same statistics as machine-readable JSON")
 
+    plan = sub.add_parser("review-plan", help="preview full-scope review inputs without provider calls")
+    plan.add_argument("--repo", type=Path, default=Path("."))
+    plan.add_argument("--mode", choices=("now", "prepush"), default=None)
+    plan.add_argument("--reviewer", default=None)
+    plan.add_argument("--client-family", default=None)
+    plan.add_argument("--batch-target-bytes", type=int, default=None)
+    plan.add_argument("--target-source", choices=("configured", "measured"), default="configured")
+    plan.add_argument("--target-latency-seconds", type=float, default=None)
+    plan.add_argument("--stack-manifest", type=Path, default=None)
+    for name in ("local-ref", "local-oid", "remote-ref", "remote-oid", "review-id"):
+        plan.add_argument("--" + name, default=None)
+    plan.add_argument("--json", action="store_true", dest="json_output")
+
     queue = sub.add_parser("queue", help="inspect request owners, capacity and observed costs")
     queue.add_argument("request_id", nargs="?", default=None)
     queue.add_argument("--repo", type=Path, default=Path("."))
@@ -912,6 +925,25 @@ def _cmd_review(args) -> int:
             continue_compatible=getattr(args, "continue_compatible", False))
     code, text = response[:2]
     return emit_result(text, code, response[2] if len(response) == 3 else None)
+
+
+def _cmd_review_plan(args) -> int:
+    from contextlib import ExitStack
+    from .services import svc_review_plan
+    from .store import Store, SchemaLifecycleError
+    options = {key: getattr(args, key) for key in (
+        "mode", "reviewer", "client_family", "batch_target_bytes", "target_source",
+        "target_latency_seconds", "stack_manifest", "local_ref", "local_oid",
+        "remote_ref", "remote_oid", "review_id")}
+    with ExitStack() as stack:
+        store, reason = None, None
+        try:
+            store = stack.enter_context(Store.open_readonly(_store_path()))
+        except SchemaLifecycleError as exc:
+            reason = exc.reason_code
+        code, text = svc_review_plan(store, args.repo, **options,
+            history_unavailable_reason=reason, output="json" if args.json_output else "text")
+    return _emit(text, code)
 
 
 def _cmd_queue(args) -> int:
@@ -2279,6 +2311,8 @@ def main(argv: list[str] | None = None) -> int:
                     from .review_results import project
                     return _emit(json.dumps(project(130, reason_code='requested_cancel')), 130)
                 return 130
+        if args.command == "review-plan":
+            return _cmd_review_plan(args)
         if args.command == "queue":
             return _cmd_queue(args)
         if args.command == "stats":

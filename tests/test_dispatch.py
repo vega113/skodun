@@ -387,8 +387,8 @@ def test_packing_disabled_yields_valid_evidence_with_no_candidate_hash(tmp_path,
     """`context_pack = false` is a REVIEW setting, not a failure.
 
     A review run with packing off records no context hash, so the candidate has
-    none either: a legacy candidate still suppresses, a context-bearing one
-    cannot.
+    none either: a candidate with the same planning identity can suppress,
+    while an unknown planning identity or a context-bearing candidate cannot.
     """
     repo, base, oid = _oid_repo(tmp_path)
     diff = capture_ref_diff(repo, base, oid)
@@ -398,7 +398,8 @@ def test_packing_disabled_yields_valid_evidence_with_no_candidate_hash(tmp_path,
 
     assert ev.enabled is True and ev.valid is True
     assert ev.candidate_context_hash is None
-    assert evidence_permits_suppression(ABSENT, ev) is True
+    assert evidence_permits_suppression(ABSENT, ev) is False
+    assert evidence_permits_suppression(dict(ABSENT, planning_policy=ev.planning_policy), ev) is True
     assert evidence_permits_suppression(HASHED, ev) is False
     assert evidence_permits_suppression(EMPTY, ev) is False
 
@@ -1363,6 +1364,10 @@ def test_a_suppressed_push_never_touches_an_in_flight_review(tmp_path,
                    context_hash="")
         # `context_hash=""` never suppresses, so give it the candidate's hash.
         rec["context_hash"] = _candidate_hash(repo, tmp_path)
+        from skodun.planning_policy import describe
+        cfg = load_config(repo)
+        from skodun import dispatch, pipeline
+        rec["planning_policy"] = describe(dispatch.effective_defaults(cfg.defaults, cfg.dispatch), pipeline._reviewer_for(cfg, "finder"))
         st.save_review(dict(rec, status="clean"))
         # A DIFFERENT in-flight prepush review of the same branch.
         other = st.reserve_prepush("feat", "f" * 40, "main", "b" * 40,

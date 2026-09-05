@@ -98,8 +98,8 @@ class PassIdentity:
 _IDENTITY_FIELDS = (
     "repo_id", "worktree_root", "branch", "head", "base_ref", "base_sha",
     "diff_hash", "tree_fingerprint", "context_hash", "checklist_hash",
-    "reviewer_hash", "config_hash", "policy_hash", "planner_version",
-    "batch_budget", "batch_count", "boundary_digest",
+    "reviewer_hash", "planning_policy", "batch_budget", "config_hash", "policy_hash", "planner_version",
+    "batch_count", "boundary_digest",
     "integration_plan_digest", "pass_identities",
 )
 
@@ -128,6 +128,7 @@ class OrchestrationIdentity:
     integration_plan_digest: str
     pass_identities: tuple[PassIdentity, ...]
     continuation_source: str | None = None
+    planning_policy: dict | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -151,6 +152,8 @@ class OrchestrationIdentity:
         fields = asdict(self)
         if self.continuation_source is None:
             fields.pop('continuation_source')  # Preserve existing identity bytes.
+        if self.planning_policy is None:
+            fields.pop('planning_policy')  # Unknown legacy plans keep their bytes.
         return json.dumps(fields, ensure_ascii=False, sort_keys=True,
                           separators=(",", ":"), allow_nan=False)
 
@@ -165,6 +168,7 @@ class OrchestrationIdentity:
             raise ValueError(f"invalid orchestration identity JSON: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("orchestration identity JSON must be an object")
+        raw.setdefault("planning_policy", None)
         expected = set(_IDENTITY_FIELDS)
         if 'continuation_source' in raw:
             expected.add('continuation_source')
@@ -198,6 +202,11 @@ def first_mismatch(left: OrchestrationIdentity,
         raise ValueError("first_mismatch requires two OrchestrationIdentity values")
     for field in _IDENTITY_FIELDS:
         if getattr(left, field) != getattr(right, field):
+            if field == "planning_policy":
+                from .planning_policy import mismatch
+                if right.planning_policy is None:
+                    return "planning_identity_missing"
+                return mismatch(left.planning_policy, right.planning_policy)
             return field
     return None
 
