@@ -1809,3 +1809,24 @@ def test_a_malformed_repo_is_refused_rather_than_defaulted_to_the_cwd(
     absent = _tool("gate", db)
     assert absent.status == 2, absent
     assert "repo must be a path" not in absent.text
+
+
+@pytest.mark.parametrize("contributors", [None, [], ["openai"], ["xai", "openai"], ["openai-api"]])
+def test_independence_refusal_has_cli_mcp_parity_and_no_triage_write(tmp_path, monkeypatch, capsys, contributors):
+    from tests.test_cli import RAN
+    from skodun.gate import open_findings
+
+    meta = dict(RAN, contributing_providers=contributors)
+    if contributors is None:
+        meta.pop("contributing_providers")  # A legacy artifact.
+    db = _seeded(tmp_path, _finding(0, _annotation()), extra_passes={"refuter": meta})
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--adopt-refuter", "rev1", "0"],
+                      "adopt_refuter", capsys, review_id="rev1", index=0)
+    assert cli == tool
+    assert cli[0] == 1
+    assert "independent" in cli[1]
+    with Store.open(db) as store:
+        ledger = store.triage_for("feat", "s" * 40)
+        assert ledger == {}
+        assert len(open_findings(store.get_review("rev1"), ledger)) == 1

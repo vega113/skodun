@@ -1835,7 +1835,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     evidence_context=evidence_prompt_context,
                     prepared_plan=prepared_plan,
                     checkpoint_run=checkpoint_run)
-                answering_provider = _answering_provider(rec, finder)
+                contributing_providers = _contributing_providers(rec)
             else:
                 # --- 6b. UNBATCHED: checklist -> context pack -> prompt ----
                 selection = checklist.select(
@@ -2009,9 +2009,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 # fallback the finder's own entry may never have run, and "did a
                 # second provider look at this?" is a question about the
                 # answering provider.
-                answering_provider = (outcome.accepted["provider"]
-                                      if outcome.accepted is not None
-                                      else finder.provider)
+                contributing_providers = ([outcome.accepted.get("provider")]
+                                          if outcome.accepted is not None else None)
 
             # --- 8. THE FINDER SNAPSHOT, taken before any merge -----------
             # The refuter's eligibility, its prompt, and the meaning of every
@@ -2032,7 +2031,6 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 rec["parse_ok"], rec["degraded"], rec["diff_truncated"])
             finder_findings = list(rec["findings"])
             finder_findings_total = rec["findings_total"]
-            finder_provider = answering_provider
 
             # --- 9. the extra passes, still under the lock ----------------
             if hold_for_security:
@@ -2077,12 +2075,12 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 ref_reviewer = _pass_reviewer(cfg, "refuter", finder)
                 rec = _refuter_pass(
                     rec, finder_findings_total,
-                    lambda: passes.refuter_prompt(
+                    lambda selected: passes.refuter_prompt(
                         finder_findings, diff.data, branch, base.ref, base.sha,
                         f"{head} (working tree)",
-                        budget.prompt_budget(d, ref_reviewer)),
+                        budget.prompt_budget(d, selected)),
                     ref_reviewer, cfg, d, root,
-                    store, scratch, finder_provider, cancel=cancel)
+                    store, scratch, contributing_providers, cancel=cancel)
             elif skip_note:
                 # `skip_note` is non-empty for exactly one case: an eligible
                 # review with no refuter configured (`refuter_decision`'s own
@@ -3013,21 +3011,24 @@ def _grow_lock_budget(lock: Lock, seconds: float) -> bool:
         return False
 
 
-def _answering_provider(rec: dict, finder: Reviewer) -> str:
-    """Which provider actually answered a batched aggregate's sub-reviews.
+def _contributing_providers(rec: dict) -> list[str] | None:
+    """All actual aggregate contributors, including clean batches/integration.
 
-    The refuter is only worth its call when a DIFFERENT provider re-examines the
-    findings, so that question has to be asked about whoever answered rather than
-    whoever was configured. For an aggregate there can be several answers: a
-    chain that fell through to a fallback on one batch is a designed, recorded
-    outcome. When they do not agree there is no single answering provider, and
-    the configured finder is the honest fallback — it keeps the comparison
-    conservative (the refuter is more likely to be flagged as same-provider, and
-    a flag is a note, never a demotion).
+    Missing legacy checkpoint provenance cannot borrow the configured finder.
+    A partial/unknown answer makes the complete set unknown.
     """
-    seen = {b.get("provider") for b in (rec.get("batches") or ())
-            if isinstance(b.get("provider"), str) and b.get("provider")}
-    return seen.pop() if len(seen) == 1 else finder.provider
+    from .refuter_policy import contributor_families
+
+    contributors = list(rec.get("batches") or ())
+    integration = rec.get("integration")
+    if integration is not None:
+        contributors.append(integration)
+    providers = [part.get("provider") if isinstance(part, dict)
+                 and part.get("parse_ok") is True else None
+                 for part in contributors]
+    if contributor_families(providers) is None:
+        return None
+    return sorted(set(providers))
 
 
 def usable_output(batches: list | tuple | None,
@@ -4202,6 +4203,8 @@ def _refuter_failed(rec: dict, finder_findings_total: int, note: str,
     other rule.
     """
     prov = dict(provenance or {"provider": None, "model": None, "effort": None})
+    prov["contributing_providers"] = (rec.get("extra_passes", {})
+                                      .get("refuter", {}).get("contributing_providers"))
     if not str(prov.get("note") or "").strip():
         prov["note"] = note
     return passes.merge_refuter_pass(rec, None, prov, finder_findings_total,
@@ -4211,7 +4214,7 @@ def _refuter_failed(rec: dict, finder_findings_total: int, note: str,
 def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
                   reviewer: Reviewer, cfg: Config, d: Defaults, cwd: Path,
                   store: Store, scratch: Path,
-                  finder_provider: str, *,
+                  contributing_providers: list[str] | None, *,
                   cancel: "threading.Event | None" = None) -> dict:
     """Run the refuter pass and annotate `rec`, returning the new record.
 
@@ -4224,16 +4227,36 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
     `build_prompt` is a callable for the same reason it is one in
     `_extra_pass`: the prompt build sits inside the guard, so a prompt that
     will not render is a failed pass rather than an exception that destroys a
-    review already in hand.
+    review already in hand. It receives the filtered head reviewer so prompt
+    sizing uses the provider that will actually be called.
 
     The chain runs under `REFUTER_CONTRACT`, which is what makes every adapter
     request, classify and validate the verdicts shape — and what gives this
     pass Task 7's fallback support for free.
     """
     _checkpoint(cancel, rec, "before the refuter pass")
+    from .refuter_policy import contributor_families, provider_family
+
+    contributors = contributor_families(contributing_providers)
+    eligible = ([entry for entry in _chain_for(cfg, reviewer)
+                 if entry.enabled and provider_family(entry.provider) is not None
+                 and provider_family(entry.provider) not in contributors]
+                if contributors is not None else [])
+    # Promote only within the configured explicit chain. A promoted fallback's
+    # own fallbacks must not introduce an unchecked contributor or provider.
+    if not eligible:
+        note = ("finding contributor provenance is unknown; independent refuter skipped"
+                if contributors is None else
+                "no independent provider remains in the configured refuter chain; "
+                "findings remain unrefuted")
+        return _with_provenance(passes.skipped_refuter_pass(rec, note), "refuter",
+                                {"contributing_providers": contributing_providers})
+    reviewer = replace(eligible[0], fallbacks=tuple(r.name for r in eligible[1:]))
+    rec = _with_provenance(rec, "refuter",
+                           {"contributing_providers": contributing_providers})
     _note("refuter pass (annotation only) ...")
     try:
-        prompt = build_prompt()
+        prompt = build_prompt(reviewer)
     except Exception as e:
         _note(f"refuter prompt build failed; the review keeps its verdict: {e!r}")
         return _refuter_failed(
@@ -4263,6 +4286,7 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
                                notes=notes)
 
     prov = _provenance(outcome)
+    prov["contributing_providers"] = contributing_providers
     p = outcome.parsed
     if p is None or not p.parse_ok or not isinstance(p.payload, dict):
         _note("the refuter produced no usable verdicts; the review is "
@@ -4272,6 +4296,16 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
             outcome.failure_reason or "the refuter produced no usable verdicts",
             prov, partial_coverage=prompt.diff_truncated, notes=notes)
 
+    actual_provider = (outcome.accepted.get("provider")
+                       if isinstance(outcome.accepted, dict) else None)
+    if (provider_family(actual_provider) is None
+            or provider_family(actual_provider) in contributors
+            or actual_provider not in {entry.provider for entry in eligible}):
+        return _refuter_failed(
+            rec, finder_findings_total,
+            "the refuter answer lacks independent accepted-provider provenance",
+            prov, partial_coverage=prompt.diff_truncated, notes=notes)
+
     if p.degraded:
         notes.append("the refuter run was degraded: %s"
                      % (p.degraded_reason or "no reason given"))
@@ -4279,14 +4313,4 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
         rec, p.payload, prov, finder_findings_total, degraded=p.degraded,
         partial_coverage=prompt.diff_truncated, notes=notes)
 
-    # The entire point of this pass is that a DIFFERENT provider looks at the
-    # findings; a model asked to check its own work is agreeable about it. A
-    # config may still put the refuter on the finder's provider — that is the
-    # operator's call, and it is better than no re-examination — but the record
-    # says so, because that is exactly what makes a verdict less worth
-    # adopting. Compared on the answering providers, not the configured ones:
-    # either side may have fallen through to a different entry.
-    if prov.get("provider") is not None and prov["provider"] == finder_provider:
-        merged = _with_provenance(merged, "refuter",
-                                  {"same_provider_as_finder": True})
     return merged

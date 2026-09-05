@@ -1184,7 +1184,7 @@ def svc_adopt_refuter(store, review_id, index) -> tuple[int, str]:
 
     from .store import _TS_FORMAT
     from .triage import (ArtifactError, FindingNotFound, TriageError,
-                         adopt_refuter, refuter_same_provider_as_finder)
+                         adopt_refuter)
 
     if index is None:
         # Before the load, matching the CLI's own order: a call with no finding
@@ -1210,18 +1210,6 @@ def svc_adopt_refuter(store, review_id, index) -> tuple[int, str]:
         return 2, f"skodun triage: could not record the dismissal: {e!r}"
 
     lines = []
-    # The refuter exists so that a DIFFERENT provider examines the findings; a
-    # model asked to check its own work is agreeable about it. A config may still
-    # put the refuter on the finder's provider — the operator's call, and better
-    # than no re-examination — and the pass records that it happened. This is the
-    # one moment where that fact has consequences, so it is said out loud here
-    # rather than left in the artifact for nobody to read. A WARNING and not a
-    # refusal: adoption is an explicit human act, and the human is the authority
-    # this path exists to consult.
-    if refuter_same_provider_as_finder(review):
-        lines.append("skodun triage: WARNING the refuter answered from the same "
-                     "provider as the finder, so this verdict is a model "
-                     "re-examining its own work")
     lines.append(f"skodun triage: adopted the refuter's dismissal of finding "
                  f"{index} on review {review_id}")
     return 0, "\n".join(lines)
