@@ -227,7 +227,7 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
     advisory = {'stack_context': stack_context, 'stack_context_truncated': stack_truncated,
         'lineage_context': lineage, 'lineage_context_truncated': lineage_truncated,
         'evidence_context': pipeline._evidence_prompt_context(store, root, base.sha, head, gitio.diff_identity(diff.data))}
-    data = operational_targets.read_evidence(store, reviewer=finder, mode=mode, context_pack=defaults.context_pack, now=now)
+    data = operational_targets.read_evidence(store, reviewer=finder, mode=mode, execution_policy=planning_policy.execution_policy(defaults), context_pack=defaults.context_pack, now=now)
     selected = None
     reason = 'configured_target'
     if diff.truncated_untracked:
@@ -237,7 +237,7 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
                   if target_latency_seconds is None else 'route_not_stable'
                   if mode == 'now' and reviewer is None and cfg.routing.mode == 'auto' else 'insufficient_matching_evidence')
         if reason == 'insufficient_matching_evidence':
-            ceiling = planning_policy.effective_diff_budget(defaults, finder)
+            ceiling = planning_policy.diff_budget(defaults, finder)
             for cohort in operational_targets.candidates(data, latency_seconds=target_latency_seconds,
                     hard_diff_ceiling=ceiling, diff_bytes=len(diff.data)):
                 proposed = replace(defaults, batch_target_bytes=cohort['target_bytes'])
@@ -268,7 +268,7 @@ def preview(store, repo, *, reviewer=None, client_family=None, mode=None, batch_
         if candidate.name != finder.name and pipeline.batch_plan(diff.data, defaults, candidate) is None:
             finder, route = candidate, candidate_route
             data = operational_targets.read_evidence(store, reviewer=finder, mode=mode,
-                context_pack=defaults.context_pack, now=now)
+                execution_policy=planning_policy.execution_policy(defaults), context_pack=defaults.context_pack, now=now)
             calls, batches, prepared = _prepare(diff, root=root, cfg=cfg, defaults=defaults, finder=finder,
                 branch=branch, base=base, head=head, mode=mode, advisory=advisory)
     for call in calls:

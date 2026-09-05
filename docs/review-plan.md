@@ -63,20 +63,24 @@ Conflicting identities, missing sizes or
 planning provenance, and bounded-query truncation prevent qualification.
 
 Cohorts preserve provider/model/effort, foreground versus prepush mode,
-primary versus batch kind, planning/capability version, context policy and observed
-context/input ranges. The report includes scanned counts, sample IDs/digest,
+primary versus batch kind, planning/capability version, context policy, maximum
+turns, a bounded hash of the denied-tools policy, and observed context/input ranges. The report includes scanned counts, sample IDs/digest,
 request count, failure/censoring counts, nearest-rank historical quantiles and
 provenance limitations. Provider executable versions are often unavailable;
 preview does not launch a version probe to fill that gap.
 
 The largest qualifying observed diff target meeting the historical p90 objective
-is considered below the configured sizing ceiling. The shipped planner checks
+is considered below the hard provider prompt/diff envelope. In explicitly
+requested measured mode, a qualifying target may replace a smaller soft
+configured batch target; the configured value remains the fallback when evidence
+is insufficient. The shipped planner checks
 the entire candidate, including integration's structural floor and every required
 input. Its largest primary/batch prompt and context size must fit the observed
 ranges, and observed timeout caps must not exceed the applicable execution cap.
 Smaller remainder batches outside those ranges retain unknown timings.
 Insufficient, stale, mismatched, missing, censored or failed evidence retains the
-configured target with a reason. A positive explicit `--batch-target-bytes` always wins; zero retains the shipped
+configured target with a reason. A positive explicit `--batch-target-bytes` always
+wins; zero retains the shipped
 meaning of using the configured/default planner.
 Unpinned automatic foreground routing does not select a measured target.
 

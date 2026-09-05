@@ -35,11 +35,18 @@ def capability(reviewer):
             'limit_bytes': adapter.prompt_limit()}
 
 
+def execution_policy(defaults):
+    """Bounded execution knobs; tool configuration is represented only by hash."""
+    return {'max_turns': defaults.max_turns,
+            'deny_tools_hash': hashlib.sha256(defaults.deny_tools.encode()).hexdigest()}
+
+
 def describe(defaults, reviewer=None):
     payload = {'version': VERSION, 'target_bytes': defaults.batch_target_bytes,
                'effective_diff_budget': effective_diff_budget(defaults, reviewer),
                'prompt_envelope': budget.prompt_budget(defaults, reviewer),
-               'context_pack': defaults.context_pack, 'capability': capability(reviewer)}
+               'context_pack': defaults.context_pack, 'capability': capability(reviewer),
+               'execution_policy': execution_policy(defaults)}
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     return {**payload, 'digest': digest}
 
@@ -60,12 +67,18 @@ def validate(value):
     """Validate persisted v1 policy shape and digest; retain None as unknown."""
     if value is None:
         return
-    keys = {'version', 'target_bytes', 'effective_diff_budget', 'prompt_envelope', 'context_pack', 'capability', 'digest'}
+    keys = {'version', 'target_bytes', 'effective_diff_budget', 'prompt_envelope', 'context_pack', 'capability', 'execution_policy', 'digest'}
     if not isinstance(value, dict) or set(value) != keys or value['version'] != VERSION:
         raise ValueError('invalid planning policy fields/version')
     if any(type(value[key]) is not int or value[key] < minimum for key, minimum in (
             ('target_bytes', 0), ('effective_diff_budget', 1), ('prompt_envelope', 1))) or type(value['context_pack']) is not bool:
         raise ValueError('invalid planning policy sizing types')
+    execution = value['execution_policy']
+    if (not isinstance(execution, dict) or set(execution) != {'max_turns', 'deny_tools_hash'}
+            or type(execution['max_turns']) is not int or execution['max_turns'] < 1
+            or not isinstance(execution['deny_tools_hash'], str) or len(execution['deny_tools_hash']) != 64
+            or any(char not in '0123456789abcdef' for char in execution['deny_tools_hash'])):
+        raise ValueError('invalid planning execution policy')
     cap = value['capability']
     if cap is not None:
         if (not isinstance(cap, dict) or set(cap) != {'provider', 'version', 'transport', 'limit_bytes'}

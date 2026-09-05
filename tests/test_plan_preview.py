@@ -2,7 +2,7 @@
 from dataclasses import replace
 import json
 
-from skodun import services
+from skodun import services, planning_policy
 from skodun.config import Config, Defaults, Reviewer
 from skodun.store import Store
 from tests.test_requests import _ready_repo
@@ -47,14 +47,14 @@ def history_records(*, failure=False, request_count=5):
 def test_measured_target_needs_complete_uncensored_multi_request_cohort():
     from skodun.operational_targets import evidence
     reviewer = Reviewer(name='finder', provider='xai', model='test', role='finder')
-    good = evidence(history_records(), reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
+    good = evidence(history_records(), execution_policy=planning_policy.execution_policy(Defaults()), reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
     assert good['cohorts'][0]['qualified'] is True
     assert good['cohorts'][0]['request_count'] == 5
     assert good['cohorts'][0]['target_bytes'] == 8000
-    bad = evidence(history_records(failure=True), reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
+    bad = evidence(history_records(failure=True), execution_policy=planning_policy.execution_policy(Defaults()), reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
     assert bad['cohorts'][0]['qualified'] is False
     assert bad['cohorts'][0]['censored_count'] == 1
-    single = evidence(history_records(request_count=1), reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
+    single = evidence(history_records(request_count=1), execution_policy=planning_policy.execution_policy(Defaults()), reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
     assert single['cohorts'][0]['qualified'] is False
 
 
@@ -250,11 +250,11 @@ def test_cohort_missing_size_outcome_and_duplicate_identity_are_not_cherry_picke
     from skodun.operational_targets import evidence
     reviewer = Reviewer(name='finder', provider='xai', model='test', role='finder')
     records = history_records()
-    duplicate = evidence(records + records, reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
+    duplicate = evidence(records + records, execution_policy=planning_policy.execution_policy(Defaults()), reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
     assert duplicate['cohorts'][0]['sample_count'] == 20
     assert duplicate['duplicate_rows'] == 20
     records[0]['batches'][0]['attempts'][0]['input_bytes'] = None
-    missing = evidence(records, reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
+    missing = evidence(records, execution_policy=planning_policy.execution_policy(Defaults()), reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
     assert missing['incomplete_rows'] == 1
     assert not any(cohort['qualified'] for cohort in missing['cohorts'])
 
@@ -302,10 +302,10 @@ def test_missing_or_mismatched_context_history_never_qualifies():
     reviewer = Reviewer(name='finder', provider='xai', model='test', role='finder')
     records = history_records()
     records[0].pop('planning_policy')
-    missing = evidence(records, reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
+    missing = evidence(records, execution_policy=planning_policy.execution_policy(Defaults()), reviewer=reviewer, mode='now', now='2026-09-05T12:00:00Z')
     assert missing['incomplete_rows'] == 1
     assert not any(c['qualified'] for c in missing['cohorts'])
-    different = evidence(history_records(), reviewer=reviewer, mode='now', context_pack=True, now='2026-09-05T12:00:00Z')
+    different = evidence(history_records(), execution_policy=planning_policy.execution_policy(Defaults()), reviewer=reviewer, mode='now', context_pack=True, now='2026-09-05T12:00:00Z')
     assert different['cohorts'] == []
 
 
@@ -412,15 +412,15 @@ def test_evidence_scopes_running_and_unsupported_rows_before_qualification():
     unrelated['status'] = 'running'
     unrelated['planning_policy'] = planning_policy.describe(Defaults(context_pack=False),
         Reviewer(name='other', provider='google', model='other', role='finder'))
-    good = targets.evidence(history_records() + [unrelated], **kwargs)
+    good = targets.evidence(history_records() + [unrelated], execution_policy=planning_policy.execution_policy(Defaults()), **kwargs)
     assert good['cohorts'][0]['qualified']
     matching = deepcopy(history_records()[0])
     matching['status'] = 'running'
-    bad = targets.evidence(history_records() + [matching], **kwargs)
+    bad = targets.evidence(history_records() + [matching], execution_policy=planning_policy.execution_policy(Defaults()), **kwargs)
     assert not bad['cohorts'][0]['qualified']
     legacy = deepcopy(history_records()[0])
     legacy['planning_policy']['version'] = 'review-planning/v0'
-    old = targets.evidence(history_records() + [legacy], **kwargs)
+    old = targets.evidence(history_records() + [legacy], execution_policy=planning_policy.execution_policy(Defaults()), **kwargs)
     assert old['cohorts'][0]['qualified']
     assert old['unsupported_policy_records'] == 1
 
@@ -432,12 +432,12 @@ def test_missing_attempt_attribution_is_incomplete_but_known_other_provider_is_n
     for malformed in (None, {}, {'provider': 'xai'}, {'provider': 'xai', 'model': 'test'}):
         records = history_records()
         records[0]['batches'][0]['attempts'].append(malformed)
-        result = evidence(records, **kwargs)
+        result = evidence(records, execution_policy=planning_policy.execution_policy(Defaults()), **kwargs)
         assert result['incomplete_rows'] >= 1
         assert not any(c['qualified'] for c in result['cohorts'])
     records = history_records()
     records[0]['batches'][0]['attempts'].append({'provider': 'google'})
-    assert evidence(records, **kwargs)['cohorts'][0]['qualified']
+    assert evidence(records, execution_policy=planning_policy.execution_policy(Defaults()), **kwargs)['cohorts'][0]['qualified']
 
 
 def test_checkpoint_copy_request_ids_do_not_inflate_or_conflict():
@@ -448,7 +448,7 @@ def test_checkpoint_copy_request_ids_do_not_inflate_or_conflict():
     for item in copies:
         item['request_id'] += '-copy'
         item['skodun_commit'] = 'copying-build'
-    result = evidence(copies + records, reviewer=Reviewer(name='finder', provider='xai', model='test', role='finder'),
+    result = evidence(copies + records, execution_policy=planning_policy.execution_policy(Defaults()), reviewer=Reviewer(name='finder', provider='xai', model='test', role='finder'),
         mode='now', now='2026-09-05T12:00:00Z')
     assert result['conflicting_attempt_ids'] == 0
     assert result['cohorts'][0]['sample_count'] == 20
@@ -576,3 +576,57 @@ def test_untracked_capture_limit_reports_incomplete_scope_and_no_application(tmp
     assert not plan['all_diff_bytes_preserved']
     assert plan['selection']['reason'] == 'incomplete_scope_capture'
     assert plan['selection']['application'] is None
+
+
+def test_measured_mode_can_replace_soft_target_but_keeps_override_and_fallback(tmp_path, monkeypatch):
+    from skodun import config
+    from tests.test_cli import _round
+    repo = _ready_repo(tmp_path, monkeypatch)
+    for index in range(30):
+        (repo / f'diff-{index}.txt').write_text('content\n' * 100)
+    finder = Reviewer(name='finder', provider='xai', model='test', role='finder')
+    cfg = Config(defaults=Defaults(context_pack=False, max_diff_bytes=100000, batch_target_bytes=4000), reviewers=(finder,))
+    monkeypatch.setattr(config, 'load_config', lambda _root: cfg)
+    options = dict(reviewer='finder', target_source='measured', target_latency_seconds=6,
+                   now='2026-09-05T12:00:00Z', output='json')
+    with Store.open(tmp_path / 's.db') as store:
+        _, missing = services.svc_review_plan(store, repo, **options)
+        assert json.loads(missing)['selection']['target_bytes'] == 4000
+        for item in history_records():
+            store.save_review(_round(**item))
+        code, text = services.svc_review_plan(store, repo, **options)
+        assert code == 0
+        assert json.loads(text)['selection']['target_bytes'] == 8000
+        assert json.loads(text)['selection']['target_source'] == 'measured'
+        _, explicit = services.svc_review_plan(store, repo, batch_target_bytes=2000, **options)
+        assert json.loads(explicit)['selection']['target_bytes'] == 2000
+        assert json.loads(explicit)['selection']['reason'] == 'explicit_override'
+
+
+def test_measured_history_matches_turn_limit_and_tool_policy(tmp_path, monkeypatch):
+    from skodun import config, planning_policy
+    from tests.test_cli import _round
+    repo = _ready_repo(tmp_path, monkeypatch)
+    for index in range(30):
+        (repo / f'diff-{index}.txt').write_text('content\n' * 100)
+    finder = Reviewer(name='finder', provider='xai', model='test', role='finder')
+    current = Defaults(context_pack=False, max_diff_bytes=100000, batch_target_bytes=4000, max_turns=40)
+    cfg = Config(defaults=current, reviewers=(finder,))
+    monkeypatch.setattr(config, 'load_config', lambda _root: cfg)
+    options = dict(reviewer='finder', target_source='measured', target_latency_seconds=6,
+                   now='2026-09-05T12:00:00Z', output='json')
+    with Store.open(tmp_path / 's.db') as store:
+        for old in (replace(current, max_turns=1), replace(current, deny_tools='different-tool-policy')):
+            for item in history_records():
+                item['planning_policy'] = planning_policy.describe(old, finder)
+                store.save_review(_round(**item))
+            code, text = services.svc_review_plan(store, repo, **options)
+            assert code == 0
+            plan = json.loads(text)
+            assert plan['selection']['target_source'] == 'configured'
+            assert plan['selection']['target_bytes'] == 4000
+            assert plan['measurements']['execution_policy_mismatched_records'] == 20
+        policy = planning_policy.describe(current, finder)
+        assert policy['execution_policy']['max_turns'] == 40
+        assert len(policy['execution_policy']['deny_tools_hash']) == 64
+        assert 'different-tool-policy' not in json.dumps(policy)

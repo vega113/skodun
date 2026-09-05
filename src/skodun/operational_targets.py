@@ -60,7 +60,7 @@ def _attempt_matches(item, reviewer):
     return (item['provider'], item['model'], item['effort']) == (reviewer.provider, reviewer.model, reviewer.effort)
 
 
-def evidence(records, *, reviewer, mode, context_pack=False, now=None):
+def evidence(records, *, reviewer, mode, execution_policy, context_pack=False, now=None):
     now = now or datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     if not _is_canonical_ts(now):
         raise ValueError('now must be canonical UTC')
@@ -75,7 +75,7 @@ def evidence(records, *, reviewer, mode, context_pack=False, now=None):
     def join_requests(left, right):
         left, right = request_root(left), request_root(right)
         request_parents[max(left, right)] = min(left, right)
-    unsupported = 0
+    unsupported = execution_mismatched = 0
     invalid = skipped = duplicates = conflicts = scanned = unfinished = 0
     for record in rows[:RECORD_LIMIT]:
         if not isinstance(record, dict):
@@ -98,6 +98,9 @@ def evidence(records, *, reviewer, mode, context_pack=False, now=None):
             invalid += 1
             continue
         if policy['capability'] != capability(reviewer) or policy['context_pack'] != context_pack:
+            continue
+        if policy['execution_policy'] != execution_policy:
+            execution_mismatched += 1
             continue
         if not _is_canonical_ts(at):
             invalid += 1
@@ -234,13 +237,14 @@ def evidence(records, *, reviewer, mode, context_pack=False, now=None):
         'records_scanned': min(len(rows), RECORD_LIMIT), 'attempts_scanned': min(scanned, ATTEMPT_LIMIT),
         'truncated': truncated, 'incomplete_rows': invalid, 'duplicate_rows': duplicates,
         'unsupported_policy_records': unsupported,
+        'execution_policy': execution_policy, 'execution_policy_mismatched_records': execution_mismatched,
         'conflicting_attempt_ids': conflicts, 'candidate_skips': skipped, 'unfinished_records_excluded': unfinished, 'cohorts': cohorts,
         'note': 'Advisory observations; thresholds are not confidence guarantees and ranges are not forecasts.'}
 
 
-def read_evidence(store, *, reviewer, mode, context_pack=False, now=None):
+def read_evidence(store, *, reviewer, mode, execution_policy, context_pack=False, now=None):
     if store is None:
-        result = evidence([], reviewer=reviewer, mode=mode, context_pack=context_pack, now=now)
+        result = evidence([], reviewer=reviewer, mode=mode, execution_policy=execution_policy, context_pack=context_pack, now=now)
         return {**result, 'status': 'unavailable'}
     try:
         rows = store._c.execute('SELECT artifact_json FROM reviews ORDER BY rowid DESC LIMIT ?',
@@ -251,9 +255,9 @@ def read_evidence(store, *, reviewer, mode, context_pack=False, now=None):
                 records.append(json.loads(row['artifact_json']))
             except (TypeError, ValueError):
                 records.append(None)
-        return {**evidence(records, reviewer=reviewer, mode=mode, context_pack=context_pack, now=now), 'status': 'available'}
+        return {**evidence(records, reviewer=reviewer, mode=mode, execution_policy=execution_policy, context_pack=context_pack, now=now), 'status': 'available'}
     except Exception as exc:
-        return {**evidence([], reviewer=reviewer, mode=mode, context_pack=context_pack, now=now),
+        return {**evidence([], reviewer=reviewer, mode=mode, execution_policy=execution_policy, context_pack=context_pack, now=now),
                 'status': 'unavailable', 'reason_code': type(exc).__name__}
 
 
