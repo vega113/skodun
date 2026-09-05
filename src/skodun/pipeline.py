@@ -1303,6 +1303,8 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
       availability alone. It is a HINT worth one tie-break, never a filter: see
       `routing.pick_finder`.
     """
+    if isinstance(mode, str):
+        mode = mode.strip()
     repo = Path(repo)
     d = cfg.defaults
     if progress_sink is not None:
@@ -3309,7 +3311,7 @@ def _checkpointed_sub(
     # for large prompts. Keeping the calculation at the claim boundary makes
     # the lease cover retries plus grace, rather than a stale pre-escalation
     # default.
-    lease_seconds = _checkpoint_lease_seconds(d, width)
+    lease_seconds = _checkpoint_lease_seconds(d, width, store=store)
     try:
         claim = store.claim_checkpoint(
             checkpoint_run.orchestration_id, pass_identity,
@@ -3392,10 +3394,13 @@ def _checkpointed_sub(
         raise
 
 
-def _checkpoint_lease_seconds(d: Defaults, chain_width: int) -> float:
-    """Cover one pass's retries plus its configured provider admission wait."""
-    return (budget.worst_runtime(d, chain_width, 0)
-            + capacity.admission_wait_from_env(30.0))
+def _checkpoint_lease_seconds(d: Defaults, chain_width: int, *, store=None) -> float:
+    """Cover retries and the same store-owned provider wait used by the chain."""
+    from . import budgets
+    controller = budgets.current(store) if store is not None else None
+    provider_wait = (controller.limits.provider_wait if controller is not None
+                     else capacity.admission_wait_from_env(30.0))
+    return budget.worst_runtime(d, chain_width, 0) + provider_wait
 
 
 def _milliseconds_to_seconds(value: object) -> float | None:
@@ -4281,6 +4286,10 @@ def _required_followup(checkpoint_run, scheduled, rec, name, build_prompt,
     except Exception as exc:
         raise PersistenceFailed(f"could not bind {name} checkpoint: {exc!r}") from exc
     if not scheduled:
+        row = next(r for r in store.list_checkpoints(checkpoint_run.orchestration_id) if r['pass_kind'] == name)
+        if row.get('invalidation_reason'):
+            rec = {**rec, 'followup_decisions': {**(rec.get('followup_decisions') or {}),
+                name: {'scheduled': False, 'reason': row['invalidation_reason']}}}
         return rec
     sub = _checkpointed_sub(checkpoint_run, identity, reviewer=reviewer, cfg=cfg, d=d,
         prompt=prompt, root=cwd, store=store, scratch=scratch, tag=name,

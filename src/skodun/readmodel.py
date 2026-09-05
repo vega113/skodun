@@ -263,7 +263,8 @@ def project_review(rec: Mapping, *, orchestration: Mapping | None = None,
             next_pass = (row.get("pass_index") if row.get("pass_kind") == "batch"
                          else batch_count + {'integration': 1, 'security': 2, 'skeptic': 3}.get(row.get('pass_kind'), 1))
             break
-    required_fail = any(passes[k] == "failed" for k in ("integration", "security", "skeptic"))
+    required_fail = (passes["integration"] == "failed" or
+                     any(passes[k] in {"failed", "degraded"} for k in ("security", "skeptic")))
     eligible = coverage_state == "complete" and rec.get("trustworthy") is True and not required_fail
     reason = "eligible" if eligible else (
         "coverage_incomplete" if coverage_state != "complete" else

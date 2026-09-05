@@ -192,5 +192,19 @@ class FollowupStoreMixin:
                 metadata = (rec.get('extra_passes') or {}).get(row['pass_kind']) or {}
                 if metadata.get('followup_output_hash') != canonical_digest(followups.semantic_payload(payload)):
                     raise ValueError('follow-up publication output changed')
+                value = payload.as_dict()
+                expected = ({'parse_ok': True, 'degraded': value['degraded'],
+                             'diff_truncated': value['diff_truncated'],
+                             'findings_total': len(value['findings'])}
+                            if value['parse_ok'] else {'failed': True})
+                expected.update({'pass': row['pass_kind'], 'ran': value['parse_ok']})
+                expected.update({key: value['provenance'].get(key)
+                                 for key in ('provider', 'model', 'effort')})
+                if ((value['parse_ok'] and metadata.get('failed') is True)
+                        or any(type(metadata.get(key)) is not type(expected_value)
+                        or metadata.get(key) != expected_value
+                        for key, expected_value in expected.items())
+                        or metadata.get('attempts') != value['attempts']):
+                    raise ValueError('follow-up publication metadata changed')
                 if rec['trustworthy'] and not followups.usable(payload):
                     raise ValueError('required follow-up checkpoint unusable')

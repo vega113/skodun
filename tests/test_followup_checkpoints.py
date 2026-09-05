@@ -393,11 +393,10 @@ def test_queue_counts_reused_base_integration_and_security_once(lane):
 def test_degraded_required_checkpoint_is_next_but_capped_success_is_not(lane):
     from skodun.readmodel import project_review
     repo, store, _, failures = lane
-    failures.add('skeptic')
     _, _, result = services.svc_review_detailed(store, repo)
     _, orchestration, rows = _source(store, result)
     rec = store.get_review(orchestration['final_review_id'])
-    assert project_review(rec, orchestration=orchestration, checkpoints=rows).next_resumable_pass == 7
+    assert project_review(rec, orchestration=orchestration, checkpoints=rows).next_resumable_pass is None
     security = next(row for row in rows if row['pass_kind'] == 'security')
     payload = json.loads(security['payload_json'])
     assert payload['diff_truncated'] is True and payload['degraded'] is False
@@ -406,3 +405,156 @@ def test_degraded_required_checkpoint_is_next_but_capped_success_is_not(lane):
     projection = project_review(rec, orchestration=orchestration, checkpoints=rows)
     assert projection.passes['security'] == 'degraded'
     assert projection.next_resumable_pass == 6
+    assert projection.gate_eligible is False
+
+
+def test_request_provider_wait_keeps_base_and_required_claims_live(lane, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from skodun import budget, pipeline
+    from skodun.config import load_config
+    repo, store, calls, _ = lane
+    monkeypatch.delenv('SKODUN_ADMISSION_WAIT_SECONDS', raising=False)
+    path = repo / '.skodun.toml'
+    path.write_text(path.read_text().replace('max_diff_bytes=4000', 'max_diff_bytes=4000\ntimeout_sec=1'))
+    defaults = load_config(repo).defaults
+    old_wait_expiry = budget.worst_runtime(defaults, 1, 0) + 30.0 + 1
+    claim = store.claim_checkpoint
+    db = Path(store._c.execute('PRAGMA database_list').fetchone()[2])
+    observed = []
+    def inspect(oid, identity, **kwargs):
+        result = claim(oid, identity, **kwargs)
+        if (identity.kind, identity.index) in (('batch', 1), ('security', 0)):
+            now = datetime.strptime(kwargs['now'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+            peer_now = (now + timedelta(seconds=old_wait_expiry)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            before_calls = list(calls)
+            with Store.open(db) as peer:
+                assert pipeline._checkpoint_lease_seconds(defaults, 1) == old_wait_expiry - 1
+                assert pipeline._checkpoint_lease_seconds(defaults, 1, store=peer) == old_wait_expiry - 1
+                other = peer.claim_checkpoint(oid, identity, **{**kwargs, 'owner': 'peer', 'now': peer_now,
+                    'lease_expires_at': (now + timedelta(seconds=2000)).strftime('%Y-%m-%dT%H:%M:%SZ')})
+            assert other['decision'] == 'in_flight'
+            assert calls == before_calls
+            observed.append(identity.kind)
+        return result
+    monkeypatch.setattr(store, 'claim_checkpoint', inspect)
+    code, text, _ = services.svc_review_detailed(store, repo, max_provider_wait_seconds=1000)
+    assert code == 0, text
+    assert observed == ['batch', 'security']
+    assert len(calls) == 7
+
+
+def _valid_binding_fixture():
+    return {'version': 'followup-input/v1', 'kind': 'security', 'content_hash': 'a' * 64,
+        'aggregate_hash': 'b' * 64, 'decision': {'scheduled': True, 'required': True, 'reason': 'scheduled'},
+        'prompt_identity': {'hash': 'c' * 40, 'bytes': 10, 'diff_truncated': False},
+        'dependencies': [{'pass_kind': 'batch', 'pass_index': 1, 'diff_hash': 'd' * 40,
+            'boundary_hash': 'e' * 64, 'prompt_hash': 'f' * 64, 'output_hash': '1' * 64,
+            'binding_hash': None, 'provenance_known': True}]}
+
+
+@pytest.mark.parametrize('field', ['diff_hash', 'boundary_hash', 'prompt_hash', 'output_hash', 'binding_hash'])
+@pytest.mark.parametrize('value', [True, [], {}, 'not-a-digest'])
+def test_persisted_followup_dependency_digests_are_strict(field, value):
+    from skodun.followups import decode_binding
+    body = _valid_binding_fixture()
+    assert decode_binding(json.dumps(body)) == body
+    body['dependencies'][0][field] = value
+    with pytest.raises(ValueError):
+        decode_binding(json.dumps(body))
+
+
+@pytest.mark.parametrize('kind', ['security', 'skeptic'])
+def test_migration_blockers_include_live_required_claims(lane, kind):
+    from skodun.store import migration_blockers
+    repo, store, _, _ = lane
+    _, _, result = services.svc_review_detailed(store, repo)
+    oid, _, _ = _source(store, result)
+    db = Path(store._c.execute('PRAGMA database_list').fetchone()[2])
+    store._c.execute("UPDATE review_followup_checkpoints SET state='running',lease_expires_at='2099-01-01T00:00:00Z' WHERE orchestration_id=? AND pass_kind=?", (oid, kind))
+    before = db.read_bytes()
+    assert 'active_checkpoint_claim' in migration_blockers(db)
+    assert db.read_bytes() == before
+    store._c.execute("UPDATE review_followup_checkpoints SET lease_expires_at='2020-01-01T00:00:00Z' WHERE orchestration_id=? AND pass_kind=?", (oid, kind))
+    assert 'active_checkpoint_claim' not in migration_blockers(db)
+
+
+def test_padded_foreground_mode_has_required_pass_identities(lane):
+    from skodun import pipeline
+    from skodun.config import load_config
+    repo, store, calls, _ = lane
+    rec = pipeline.run_review(repo, load_config(repo), store, mode=' now ')
+    assert rec['mode'] == 'now' and rec['trustworthy'] is True
+    assert calls[-2:] == ['security', 'skeptic']
+
+
+@pytest.mark.parametrize('field, value', [('followup_output_hash', 'wrong'), ('parse_ok', False), ('provider', 'changed'), ('ran', False), ('failed', True)])
+def test_final_followup_publication_validates_after_annotation(lane, monkeypatch, field, value):
+    repo, store, _, _ = lane
+    original = store.save_checkpointed_review
+    replacement = value
+    def annotate(rec, **kwargs):
+        def corrupt(_store, value):
+            value['extra_passes']['security'][field] = replacement
+        return original(rec, lineage_annotator=corrupt)
+    monkeypatch.setattr(store, 'save_checkpointed_review', annotate)
+    assert services.svc_review_detailed(store, repo)[0] == 4
+    assert store._c.execute('SELECT COUNT(*) FROM reviews WHERE trustworthy=1').fetchone()[0] == 0
+
+
+def test_newly_unscheduled_candidate_retains_invalidation_without_a_call(lane, monkeypatch):
+    import threading
+    from skodun import passes
+    from skodun.request_cancel import mark_event
+    repo, store, calls, _ = lane
+    cancel = threading.Event()
+    complete = store.complete_checkpoint
+    def cancel_after_skeptic(oid, kind, index, **kwargs):
+        result = complete(oid, kind, index, **kwargs)
+        if kind == 'skeptic':
+            mark_event(cancel, 'requested_cancel')
+        return result
+    monkeypatch.setattr(store, 'complete_checkpoint', cancel_after_skeptic)
+    assert services.svc_review_detailed(store, repo, cancel=cancel)[0] == 4
+    monkeypatch.setattr(store, 'complete_checkpoint', complete)
+    original_prompt = passes.security_prompt
+    def revised_prompt(*args, **kwargs):
+        prompt = original_prompt(*args, **kwargs)
+        extra = b'\nupdated security prompt version\n'
+        return replace(prompt, text=prompt.text + extra, prompt_bytes=prompt.prompt_bytes + len(extra))
+    monkeypatch.setattr(passes, 'security_prompt', revised_prompt)
+    original_runner = runner.run_with_watchdog
+    def finding(*args, **kwargs):
+        result = original_runner(*args, **kwargs)
+        name = Path(args[0][args[0].index('--prompt-file') + 1]).name
+        if name.startswith('security.'):
+            args[3].write_bytes(b'{"structuredOutput":{"summary":"issue","findings":[{"file":"auth/f0.txt","line":1,"severity":"high","category":"bug","title":"Bad edge","detail":"The edge is not handled."}]},"stopReason":"EndTurn"}')
+        return result
+    monkeypatch.setattr(runner, 'run_with_watchdog', finding)
+    calls.clear()
+    code, _, result = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert code == 1 and calls == ['security']
+    assert result['continuation']['skipped_passes'] == [
+        {'kind': 'skeptic', 'index': 0, 'reason': 'followup_upstream_changed'}]
+    assert result['continuation']['counts'] == {'reused': 5, 'executed': 1, 'failed': 0}
+
+
+@pytest.mark.parametrize('mutation', ['duplicate', 'executed_too', 'bad_reason', 'boolean_index', 'unknown_field'])
+def test_skipped_invalidation_receipt_remains_bounded_and_closed(mutation):
+    from skodun.continuation import valid_receipt
+    value = {'policy': 'compatible', 'status': 'continued', 'source_orchestration_id': 'source',
+        'orchestration_id': 'child', 'first_mismatch': None, 'passes': [],
+        'counts': {'reused': 0, 'executed': 0, 'failed': 0}, 'passes_truncated': False,
+        'skipped_passes': [{'kind': 'skeptic', 'index': 0, 'reason': 'followup_upstream_changed'}]}
+    assert valid_receipt(value)
+    if mutation == 'duplicate':
+        value['skipped_passes'] *= 2
+    elif mutation == 'executed_too':
+        value['passes'] = [{'kind': 'skeptic', 'index': 0, 'action': 'executed'}]
+        value['counts']['executed'] = 1
+    elif mutation == 'bad_reason':
+        value['skipped_passes'][0]['reason'] = 'arbitrary'
+    elif mutation == 'boolean_index':
+        value['skipped_passes'][0]['index'] = False
+    else:
+        value['skipped_passes'][0]['executed'] = False
+    assert valid_receipt(value) is False

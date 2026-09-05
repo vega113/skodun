@@ -364,7 +364,7 @@ def _reused_pass_observations(reviews):
             if action != 'reused' and part.get('reused') is not True:
                 continue
             if (not isinstance(generation, str) or not generation
-                    or type(index) is not int or index < 0):
+                    or type(index) is not int or index < (1 if kind == 'batch' else 0)):
                 unidentified += 1
                 continue
             observed.add((generation, kind, index))

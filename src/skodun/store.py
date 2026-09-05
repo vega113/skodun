@@ -453,19 +453,22 @@ def migration_blockers(path: Path) -> tuple[str, ...]:
                         break
             if live_review:
                 blockers.append("active_review")
-        if "review_checkpoints" in tables:
-            columns = _table_columns(conn, "review_checkpoints")
+        for checkpoint_table in ('review_checkpoints', 'review_followup_checkpoints'):
+            if checkpoint_table not in tables:
+                continue
+            columns = _table_columns(conn, checkpoint_table)
             if "lease_expires_at" in columns:
                 live = conn.execute(
-                    "SELECT 1 FROM review_checkpoints WHERE state='running' "
+                    f"SELECT 1 FROM {checkpoint_table} WHERE state='running' "
                     "AND lease_expires_at IS NOT NULL AND lease_expires_at > ? "
                     "LIMIT 1", (now,)).fetchone()
             else:
                 live = conn.execute(
-                    "SELECT 1 FROM review_checkpoints WHERE state='running' "
+                    f"SELECT 1 FROM {checkpoint_table} WHERE state='running' "
                     "LIMIT 1").fetchone()
             if live:
                 blockers.append("active_checkpoint_claim")
+                break
         if "capacity_admissions" in tables:
             from .capacity import DEFAULT_STALE_SEC, should_reclaim_admission
             rows = conn.execute(
@@ -1853,11 +1856,11 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
         try:
             self._require_complete_orchestration(
                 orchestration_id, identity_digest)
-            self._require_followup_publication(orchestration_id, rec=normalized)
             if lineage_annotator is not None:
                 lineage_annotator(self, normalized)
                 normalized = _normalize_record(
                     normalized, label="save_checkpointed_review")
+            self._require_followup_publication(orchestration_id, rec=normalized)
             self._write_review(normalized)
             persisted = self.get_review(normalized["id"])
             if persisted is None:

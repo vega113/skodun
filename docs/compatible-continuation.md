@@ -87,12 +87,17 @@ Schema 20 adds follow-up checkpoint rows under the same orchestration authority.
 Inspection never migrates the store. A continuation child initially holds prior
 follow-up results only as candidates; a rebuilt matching binding promotes them.
 Changed upstream evidence invalidates dependent candidates with a bounded reason
-in their pass receipt. Global configuration/policy changes still refuse the whole
+in their pass receipt. If a changed input makes a prior candidate unnecessary,
+`skipped_passes` retains its bounded invalidation reason without incrementing
+provider execution counts. Global configuration/policy changes still refuse the whole
 continuation with the existing first-mismatch field. Sources from the earlier
 batch-only planner require a fresh review; existing published reviews stay readable.
 
 Claims, completion and atomic publication validate the binding and final output
-identity. Lost or pending output cannot become gate coverage. Fences prevent
+identity. Claim leases include the active request provider-wait allowance used
+by the provider chain; direct calls retain their legacy environment fallback.
+Live follow-up claims also block schema maintenance. Publication validates final
+required-pass metadata after lineage annotation. Lost or pending output cannot become gate coverage. Fences prevent
 concurrent duplicate calls; a crash after a provider answers but before durable
 completion can require a new measured call because CLI providers supply no
 idempotent receipt for recovering that lost output.

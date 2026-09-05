@@ -5,6 +5,7 @@ attempt timing annotations cannot change semantic evidence identity.
 """
 from dataclasses import asdict
 import json
+import re
 
 from .checkpoints import CheckpointPayload, canonical_digest
 
@@ -73,6 +74,14 @@ def build_binding(identity, kind, rows, aggregate, *, scheduled, reason, prompt)
     return validate_binding(body)
 
 
+def _digest(value, *, lengths=(64,), optional=False):
+    if optional and value is None:
+        return
+    if (not isinstance(value, str) or len(value) not in lengths
+            or re.fullmatch(r'[0-9a-f]+', value) is None):
+        raise ValueError('invalid canonical follow-up digest')
+
+
 def validate_binding(body):
     if not isinstance(body, dict) or set(body) != {
             'version', 'kind', 'content_hash', 'dependencies', 'aggregate_hash', 'decision', 'prompt_identity'}:
@@ -87,8 +96,7 @@ def validate_binding(body):
     if decision['scheduled'] != (decision['reason'] in ('scheduled', 'preparation_failed')):
         raise ValueError('inconsistent follow-up decision')
     for key in ('content_hash', 'aggregate_hash'):
-        if not isinstance(body[key], str) or len(body[key]) != 64:
-            raise ValueError('invalid follow-up digest')
+        _digest(body[key])
     deps = body['dependencies']
     if not isinstance(deps, list) or len(deps) > 10000:
         raise ValueError('invalid follow-up dependencies')
@@ -106,12 +114,19 @@ def validate_binding(body):
         if (kind, index) in seen:
             raise ValueError('duplicate follow-up dependency')
         seen.add((kind, index))
+        _digest(dep['diff_hash'], lengths=(40, 64))
+        _digest(dep['boundary_hash'])
+        _digest(dep['prompt_hash'], lengths=(40, 64), optional=True)
+        _digest(dep['output_hash'])
+        _digest(dep['binding_hash'], optional=True)
     prompt = body['prompt_identity']
     if prompt is not None and (not isinstance(prompt, dict) or set(prompt) != {
             'hash', 'bytes', 'diff_truncated'} or not isinstance(prompt['hash'], str)
             or type(prompt['bytes']) is not int or prompt['bytes'] < 0
             or type(prompt['diff_truncated']) is not bool):
         raise ValueError('invalid follow-up prompt identity')
+    if prompt is not None:
+        _digest(prompt['hash'], lengths=(40, 64))
     if not decision['scheduled'] and prompt is not None:
         raise ValueError('unscheduled follow-up has prompt identity')
     if decision['scheduled'] and prompt is None and decision['reason'] != 'preparation_failed':

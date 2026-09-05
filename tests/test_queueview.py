@@ -284,10 +284,10 @@ def test_resumed_request_deduplicates_checkpoint_calls_and_execution_wall_time(t
         new = {**old, 'attempt_id': 'new-call', 'input_bytes': 20,
             'capacity_timing': {'started_at': '2026-09-05T12:00:22Z', 'ended_at': NOW}}
         for rec in (_round(id='first', request_id=rid, batch_orchestration_id='batch',
-                          batches=[{'index': 0, 'attempts': [old]}]),
+                          batches=[{'index': 1, 'attempts': [old]}]),
                     _round(id='second', request_id=rid, batch_orchestration_id='batch',
-                          batches=[{'index': 0, 'attempts': [old], 'reused': True},
-                                   {'index': 1, 'attempts': [new]}])):
+                          batches=[{'index': 1, 'attempts': [old], 'reused': True},
+                                   {'index': 2, 'attempts': [new]}])):
             store.save_review(rec)
             store.link_request(rid, 'review', rec['id'])
         store.finish_request(rid, owner_token=rid, state='finished', reason_code='complete', result=None, now=NOW)
@@ -502,3 +502,11 @@ def test_reused_pass_observations_deduplicate_generations_and_keep_unknown_ids()
     assert result['reused_passes'] is None
     assert result['reported_reused_passes'] == 4
     assert result['reuse_identity_missing'] == 1
+
+
+def test_zero_based_batch_reuse_is_an_unknown_identity():
+    from skodun.queueview import _reused_pass_observations
+    value = _reused_pass_observations([{'batch_orchestration_id': 'generation',
+        'batches': [{'index': 0, 'continuation_action': 'reused'}]}])
+    assert value['reused_passes'] is None
+    assert value['reported_reused_passes'] == 0 and value['reuse_identity_missing'] == 1
