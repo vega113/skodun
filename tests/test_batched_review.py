@@ -1939,3 +1939,67 @@ def test_oracle_batch_prompt_labels_and_the_sole_batch_checklist_mode():
     assert 'if [ "$BATCH_COUNT" -eq 1 ]; then _bcl_mode=full; else _bcl_mode=batch; fi' in src
     assert '"$GR_BRANCH (batch $_i/$BATCH_COUNT)"' in src
     assert '"$GR_HEAD -- batch $_i of $BATCH_COUNT; files: $_bfilelist"' in src
+
+
+def test_batch_and_integration_fallbacks_check_their_actual_input(tmp_path,
+                                                                monkeypatch):
+    """Each complete sub-review prompt is checked before a bounded fallback."""
+    from skodun.adapters.agy import AgyAdapter
+
+    _fake_grok(tmp_path, _emit(CLEAN))
+    monkeypatch.setenv("SKODUN_AGY_BIN", "/bin/sh")
+    # A deliberately tiny transport makes both batch and integration payloads
+    # incompatible without changing the head's complete coverage plan.
+    monkeypatch.setattr(AgyAdapter, "prompt_limit", lambda self: 1)
+    repo = _oversized(tmp_path)
+    config_file = repo / ".skodun.toml"
+    config_file.write_text(config_file.read_text().replace(
+        'role = "finder"',
+        'role = "finder"\nfallbacks = ["small", "capable"]') + '''
+[[reviewers]]
+name = "small"
+provider = "google"
+model = "small-model"
+role = "finder"
+[[reviewers]]
+name = "capable"
+provider = "xai"
+model = "capable-model"
+role = "finder"
+''')
+    admitted = []
+    input_sizes = []
+    acquire = chain._acquire_provider_slot
+
+    def track_admission(store, provider, **kwargs):
+        admitted.append(provider)
+        return acquire(store, provider, **kwargs)
+
+    def answer(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        if "capable-model" not in cmd:
+            prompt_file = Path(cmd[cmd.index("--prompt-file") + 1])
+            input_sizes.append(len(prompt_file.read_bytes()))
+            return runner.RunResult(rc=124, timed_out=True, duration_sec=420,
+                                    first_output_sec=None)
+        out.write_text(CLEAN)
+        return runner.RunResult(rc=0, timed_out=False, duration_sec=0.1,
+                                first_output_sec=0.05)
+
+    monkeypatch.setattr(chain, "_acquire_provider_slot", track_admission)
+    monkeypatch.setattr(runner, "run_with_watchdog", answer)
+    with _store(tmp_path) as store:
+        rec = _run(repo, store)
+        assert store.get_review(rec["id"]) == rec
+    assert rec["batched"] and rec["batch_count"] >= 2
+    assert rec["trustworthy"] and not rec["diff_truncated"]
+    subreviews = [*rec["batches"], rec["integration"]]
+    assert len(input_sizes) == len(subreviews)
+    assert admitted == ["xai", "xai"] * len(subreviews)
+    for subreview, size in zip(subreviews, input_sizes, strict=True):
+        primary, skipped, accepted = subreview["attempts"]
+        assert primary["timed_out"] is True
+        assert skipped["input_eligibility"]["input_bytes"] == size
+        assert skipped["input_eligibility"]["limit_bytes"] == 1
+        assert "capacity_timing" not in skipped and skipped["rc"] is None
+        assert accepted["model"] == "capable-model"
+    assert load_valid_artifact(rec) is rec
