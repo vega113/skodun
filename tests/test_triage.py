@@ -504,7 +504,7 @@ SYNTHESIZED = f"refuter(openai/model-x): {REASONING}"
 #: forged before writing its own. See `triage.refuter_pass_ran`.
 RAN = {"pass": REFUTER_KEY, "ran": True, "status": "ran", "degraded": False,
        "verdicts_total": 1, "annotated": 1, "dropped": 0,
-       "provider": "openai", "model": "model-x", "effort": None, "note": ""}
+       "provider": "openai", "model": "model-x", "effort": None, "note": "", "contributing_providers": ["xai"]}
 
 
 def _annotated(verdict=ADOPTABLE_VERDICT, reasoning=REASONING, provider="openai",
@@ -517,7 +517,7 @@ def _annotated(verdict=ADOPTABLE_VERDICT, reasoning=REASONING, provider="openai"
         ann.pop(key, None)
     art = dict(GOOD, findings=[dict(GOOD["findings"][0], **{REFUTER_KEY: ann})])
     if _meta is not None:
-        art["extra_passes"] = {REFUTER_KEY: dict(_meta)}
+        art["extra_passes"] = {REFUTER_KEY: dict(_meta, provider=provider, model=model)}
     return art
 
 
@@ -741,22 +741,21 @@ def test_a_missing_attribution_field_is_refused(tmp_path, field):
     assert _triaged(st) == {}
 
 
-def test_an_attribution_carrying_newlines_cannot_forge_a_second_record(tmp_path):
+@pytest.mark.parametrize("provider", ["openai\nrefuter(anthropic", "p" * 10_000])
+def test_unknown_attribution_cannot_establish_independence(tmp_path, provider):
     st = Store.open(tmp_path / "s.db")
-    rec = adopt_refuter(st, _annotated(provider="openai\nrefuter(anthropic",
-                                       model="m\r\n2"), 0,
+    with pytest.raises(TriageError, match="provenance"):
+        adopt_refuter(st, _annotated(provider=provider), 0,
+                      now="2026-07-27T10:00:00Z")
+    assert _triaged(st) == {}
+
+
+def test_a_model_attribution_cannot_forge_a_second_record(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    rec = adopt_refuter(st, _annotated(model="m\r\n2"), 0,
                         now="2026-07-27T10:00:00Z")
     assert "\n" not in rec["dismissed_reason"]
     assert "\r" not in rec["dismissed_reason"]
-
-
-def test_a_huge_attribution_still_only_ever_adds_to_the_reason(tmp_path):
-    # 10k characters of provider name is a nuisance, not a bypass: the RAW
-    # reasoning was already validated on its own before any of it was seen.
-    st = Store.open(tmp_path / "s.db")
-    rec = adopt_refuter(st, _annotated(provider="p" * 10_000), 0,
-                        now="2026-07-27T10:00:00Z")
-    assert rec["dismissed_reason"].endswith(REASONING)
 
 
 def test_the_attribution_prefix_preserves_case(tmp_path):
@@ -1449,3 +1448,33 @@ def test_status_token_never_raises_and_never_trusts_a_stored_timestamp():
     for junk in [{"event": 5}, {"event": None}, [], "x", 7,
                  {"event": "reopen", "reopened_at": ["x"], "dismissed_at": {}}]:
         assert isinstance(status_token(junk), str), junk
+
+
+@pytest.mark.parametrize("contributors", [None, [], ["openai"], ["xai", "openai"], ["openai-api"], ["xai", None]])
+def test_adoption_refuses_missing_or_overlapping_contributors_without_write(tmp_path, contributors):
+    st = Store.open(tmp_path / "s.db")
+    art = _annotated(_meta=dict(RAN, contributing_providers=contributors))
+    with pytest.raises(TriageError, match="independent|provenance|same provider"):
+        adopt_refuter(st, art, 0, now="2026-07-27T10:00:00Z")
+    assert _triaged(st) == {}
+    assert len(open_findings(art, _triaged(st))) == 1
+
+
+@pytest.mark.parametrize("changed", [{"provider": "google"}, {"provider": "openai-api"}, {"model": "different-model"}])
+def test_annotation_must_match_actual_refuter_pass_before_adoption(tmp_path, changed):
+    st = Store.open(tmp_path / "s.db")
+    art = _annotated()
+    art["findings"][0][REFUTER_KEY].update(changed)
+    with pytest.raises(TriageError, match="does not match"):
+        adopt_refuter(st, art, 0, now="2026-07-27T10:00:00Z")
+    assert _triaged(st) == {}
+
+
+def test_legacy_refutation_still_allows_explicit_manual_audited_dismissal(tmp_path):
+    st = Store.open(tmp_path / "s.db")
+    art = _annotated(_meta={key: value for key, value in RAN.items()
+                            if key != "contributing_providers"})
+    with pytest.raises(TriageError, match="provenance"):
+        adopt_refuter(st, art, 0, now="2026-07-27T10:00:00Z")
+    dismiss(st, art, 0, REASONING, now="2026-07-27T10:00:00Z")
+    assert open_findings(art, _triaged(st)) == []

@@ -645,7 +645,9 @@ def adopt_refuter(store: Store, review: dict, index: int, now: str) -> dict:
     driven by a human naming one finding. Nothing here is automatic and there
     is deliberately no bulk form.
 
-    Refuses, each as a `TriageError`: a finding with no usable annotation; a
+    Refuses, each as a `TriageError`: missing or overlapping contributor
+    provenance; mismatched pass/annotation attribution; a finding with no usable
+    annotation; a
     verdict that is not `refuted` (named in the message, because "your model
     said `confirmed`" is the actionable fact); an annotation the pass marked
     `thin_reasoning`; a `reasoning` that is not a string; and an annotation
@@ -736,4 +738,9 @@ def adopt_refuter(store: Store, review: dict, index: int, now: str) -> dict:
     reason = "%s(%s/%s): %s" % (REFUTER_KEY, _attribution(annotation, "provider"),
                                 _attribution(annotation, "model"), reasoning)
     validate_reason(reason)             # then on exactly what gets persisted
+    from .refuter_policy import adoption_refusal
+
+    refusal = adoption_refusal(review["extra_passes"][REFUTER_KEY], annotation)
+    if refusal is not None:
+        raise TriageError(refusal)
     return dismiss(store, review, index, reason, now)

@@ -159,7 +159,7 @@ def _annotation(verdict="refuted", reasoning=REASONING, provider="openai",
 #: `triage.refuter_pass_ran`.
 RAN = {"pass": "refuter", "ran": True, "status": "ran", "degraded": False,
        "verdicts_total": 1, "annotated": 1, "dropped": 0, "provider": "openai",
-       "model": "model-x", "effort": None, "note": ""}
+       "model": "model-x", "effort": None, "note": "", "contributing_providers": ["xai"]}
 
 
 def _artifact(findings, review_id="rev1", **extra):
@@ -246,20 +246,15 @@ def test_adopt_refuter_flips_open_findings_empty(tmp_path, monkeypatch, capsys):
     assert open_findings(art, st.triage_for("feat", "s" * 40)) == []
 
 
-def test_adopt_refuter_warns_when_the_refuter_was_the_finders_own_provider(
+def test_adopt_refuter_refuses_same_provider_before_writing(
         tmp_path, monkeypatch, capsys):
-    """Cross-provider refutation is the whole point of the pass. A config may
-    still put the refuter on the finder's provider -- the operator's call --
-    but the one moment that matters is the moment a human turns that verdict
-    into a dismissal, so it is said out loud there. It is a warning, not a
-    refusal: the human is the authority the adoption path exists to consult."""
     st = _store(tmp_path, _finding(0, _annotation()), monkeypatch=monkeypatch,
                 extra_passes={"refuter": dict(RAN,
                                               same_provider_as_finder=True)})
-    assert main(["triage", "--adopt-refuter", "rev1", "0"]) == 0
+    assert main(["triage", "--adopt-refuter", "rev1", "0"]) == 1
     out = capsys.readouterr().out
     assert "same provider" in out.lower()
-    assert st.triage_for("feat", "s" * 40), "the dismissal is still recorded"
+    assert st.triage_for("feat", "s" * 40) == {}
 
 
 def test_adopt_refuter_is_silent_about_provenance_when_it_was_cross_provider(

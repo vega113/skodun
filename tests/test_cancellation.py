@@ -762,9 +762,10 @@ def test_refuter_pass_lets_a_cancellation_through_instead_of_annotating(
     cfg = Config(defaults=Defaults(), reviewers=(reviewer,))
     with Store.open(tmp_path / "s.db") as store:
         with pytest.raises(ReviewCancelled):
-            pipeline._refuter_pass(_bare_rec(), 1, _prompt, reviewer, cfg,
+            pipeline._refuter_pass(_bare_rec(), 1, lambda selected: _prompt(),
+                                   reviewer, cfg,
                                    cfg.defaults, tmp_path, store, tmp_path,
-                                   "openai")
+                                   ["openai"])
 
 
 def test_a_pass_that_fails_for_any_other_reason_still_demotes_rather_than_raises(
@@ -783,9 +784,10 @@ def test_a_pass_that_fails_for_any_other_reason_still_demotes_rather_than_raises
         merged = pipeline._extra_pass(_bare_rec(), "skeptic", _prompt, reviewer,
                                       cfg, cfg.defaults, tmp_path, store,
                                       tmp_path)
-        annotated = pipeline._refuter_pass(_bare_rec(), 1, _prompt, reviewer, cfg,
+        annotated = pipeline._refuter_pass(_bare_rec(), 1, lambda selected: _prompt(),
+                                   reviewer, cfg,
                                            cfg.defaults, tmp_path, store,
-                                           tmp_path, "openai")
+                                           tmp_path, ["openai"])
     assert merged["extra_passes"]["skeptic"]["failed"] is True
     assert merged["parse_ok"] is False, "an exploded extra pass must demote"
     assert annotated["parse_ok"] is True, "the refuter demotes nothing, ever"

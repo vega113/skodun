@@ -536,6 +536,24 @@ positive" is refused exactly like a human typing the same words, and a verdict
 other than `refuted` (`confirmed`, `uncertain`) or reasoning the pass already
 flagged as too thin is refused before anything is written.
 
+Adoption now requires recorded independent provider provenance before any triage
+write. The pipeline compares the refuter against every actual finder contributor:
+the accepted provider after fallback, or all accepted batch and integration
+providers (including clean contributors). It filters the entire configured refuter
+chain, including fallbacks. If none remains, or contributor provenance is unknown,
+it records why the refuter was skipped and leaves the findings unrefuted without
+changing review trust. No provider outside that explicit chain is introduced.
+
+The comparison uses provider families: `openai` and `openai-api` are one family;
+`xai`, `google`, and `junie` each retain their adapter provider ID. This is only a
+proxy for independence, not proof of independent models or reasoning (an adapter
+may offer models from multiple vendors). Routing's cross-model preference is not
+used as evidence. Legacy annotations lacking the complete contributor set, or
+annotations whose provider/model differs from the recorded pass, cannot be
+adopted. This intentionally replaces the old same-provider warning after adoption.
+There is no compatibility override: re-review with an independent provider, or
+explicitly dismiss the individual finding with your own valid audited reason.
+
 The refuter pass, like the security and skeptic passes, has an env kill switch:
 `SKODUN_SECURITY_PASS=0`, `SKODUN_SKEPTIC_PASS=0`, `SKODUN_REFUTER_PASS=0`
 disable the respective pass (any other value, or leaving the variable unset,
