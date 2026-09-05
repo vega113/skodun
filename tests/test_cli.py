@@ -1,3 +1,10 @@
+"""Exercise shipped CLI commands and their observable contracts.
+
+Hermetic stores and provider fixtures cover exit codes, safe output, audited
+per-finding triage, and gate behavior through main() and module invocation.
+Refuter adoption must refuse insufficient provenance before any triage write.
+"""
+
 import io
 import json
 import os

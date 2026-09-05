@@ -4304,7 +4304,7 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
         return _refuter_failed(
             rec, finder_findings_total,
             "the refuter answer lacks independent accepted-provider provenance",
-            partial_coverage=prompt.diff_truncated, notes=notes)
+            prov, partial_coverage=prompt.diff_truncated, notes=notes)
 
     if p.degraded:
         notes.append("the refuter run was degraded: %s"

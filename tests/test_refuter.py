@@ -1192,11 +1192,22 @@ def test_refuter_requires_actual_accepted_independent_provenance(tmp_path, monke
     monkeypatch.setattr(pipeline, "_run_chain", inconsistent)
     _fake_cli(tmp_path, "grok", _emit(DIRTY))
     _fake_cli(tmp_path, "codex", _emit(_codex_stream(REFUTED_ONE)))
-    rec = _run(_repo(tmp_path, CFG_FINDER_XAI + CFG_REFUTER_OPENAI), _store(tmp_path))
+    store = _store(tmp_path)
+    rec = _run(_repo(tmp_path, CFG_FINDER_XAI + CFG_REFUTER_OPENAI), store)
     assert rec["extra_passes"]["refuter"]["status"] == "failed"
     assert "provenance" in rec["extra_passes"]["refuter"]["note"]
     assert "refuter" not in rec["findings"][0]
     assert rec["trustworthy"] is True
+
+    meta = rec["extra_passes"]["refuter"]
+    assert meta["provider"] == (accepted["provider"] if accepted else "openai")
+    assert meta["model"] == (accepted["model"] if accepted else FAKE_OPENAI_MODEL)
+    assert meta["contributing_providers"] == ["xai"]
+    assert meta["ran"] is False
+    from skodun.services import svc_adopt_refuter
+
+    assert svc_adopt_refuter(store, rec["id"], 0)[0] == 1
+    assert store.triage_for(rec["branch"], rec["base_sha"]) == {}
 
 
 def test_refuter_compares_actual_finder_fallback_instead_of_configured_head(tmp_path, monkeypatch):
@@ -1212,3 +1223,16 @@ def test_refuter_compares_actual_finder_fallback_instead_of_configured_head(tmp_
     meta = rec["extra_passes"]["refuter"]
     assert meta["contributing_providers"] == ["openai"]
     assert meta["provider"] == "xai" and meta["status"] == "ran"
+
+
+def test_promoted_refuter_never_expands_its_own_contributor_fallback(tmp_path):
+    _fake_cli(tmp_path, "grok", _emit(DIRTY))
+    _fake_cli(tmp_path, "codex", 'echo "usage limit reached" >&2\nexit 1\n')
+    cfg = CFG_FINDER_XAI + CFG_REFUTER_XAI + '\nfallbacks = ["independent"]\n'
+    cfg += CFG_REFUTER_OPENAI.replace('second-opinion', 'independent')
+    cfg += '\nfallbacks = ["finder"]\n'
+    rec = _run(_repo(tmp_path, cfg), _store(tmp_path))
+    assert _calls(tmp_path) == ["grok", "codex"]
+    assert rec["extra_passes"]["refuter"]["status"] == "failed"
+    assert "refuter" not in rec["findings"][0]
+    assert rec["trustworthy"] is True
