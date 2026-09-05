@@ -2017,84 +2017,142 @@ class Store:
     def lineage_finding_candidates_with_meta(
             self, repository_id: str, *, before_reviewed_at: str | None = None,
             limit: int = 200) -> tuple[list[dict], bool]:
-        """Return bounded prior findings for one repository, newest first.
+        """Compatibility wrapper for bounded, validated recent findings."""
+        rows, meta = self.lineage_candidates_with_diagnostics(
+            repository_id, before_reviewed_at=before_reviewed_at, limit=limit)
+        return rows, meta["truncated"]
 
-        The limit is a flattened finding count, not a predecessor review count.
-        Pages of `limit + 1` raw rows skip unreadable or invalid indexes so a
-        ghost row cannot starve older valid predecessors. A raw-scan cap keeps
-        the terminal writer transaction bounded.
+    def lineage_candidates_with_diagnostics(
+            self, repository_id: str, *, before_reviewed_at: str | None = None,
+            limit: int = 200, fingerprint: str | None = None,
+            scan_limit: int = 1024) -> tuple[list[dict], dict]:
+        """Read bounded candidates using the existing exact or recency index.
+
+        Raw scans include invalid rows. Artifact provenance and digest must
+        agree with the projection; legacy/corrupt rows cannot forge matches.
+        Rowid breaks timestamp ties in index order, avoiding a temporary sort
+        of an arbitrarily large review. No schema change or inspection write.
         """
+        from .fingerprint import VERSION, finding_fingerprint
+
         repository_id = _require_text("repository_id", repository_id)
-        if type(limit) is not int or limit <= 0:
-            raise ValueError("lineage candidate limit must be a positive int")
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("lineage candidate limit must be an int in 1..200")
+        if type(scan_limit) is not int or not 1 <= scan_limit <= 1024:
+            raise ValueError("lineage scan limit must be an int in 1..1024")
         if before_reviewed_at is not None:
-            before_reviewed_at = _require_ts(
-                "before_reviewed_at", before_reviewed_at)
+            before_reviewed_at = _require_ts("before_reviewed_at", before_reviewed_at)
+        if fingerprint is not None and (
+                not isinstance(fingerprint, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint) is None):
+            raise ValueError("invalid lineage fingerprint")
         want = limit + 1
-        scan_cap = min(want * 4, 1024)
+        scan_cap = min(want * 4, scan_limit)
         findings: list[dict] = []
         cache: dict[str, dict | None] = {}
         examined = 0
-        cursor: tuple[str, str, int] | None = None
+        cursor = None
         exhausted = False
         while len(findings) < want and examined < scan_cap:
             where = "repository_id=?"
             params: list[object] = [repository_id]
+            if fingerprint is not None:
+                where += " AND fingerprint_version=? AND fingerprint=?"
+                params.extend([VERSION, fingerprint])
+                order = "created_at DESC, rowid DESC"
+                columns = "(created_at, rowid)"
+            else:
+                order = "created_at DESC, review_id DESC, rowid DESC"
+                columns = "(created_at, review_id, rowid)"
             if before_reviewed_at is not None:
                 where += " AND created_at < ?"
                 params.append(before_reviewed_at)
             if cursor is not None:
-                created_at, review_id, finding_index = cursor
-                where += (
-                    " AND (created_at < ? OR (created_at = ? AND review_id < ?)"
-                    " OR (created_at = ? AND review_id = ? AND finding_index < ?))"
-                )
-                params.extend([created_at, created_at, review_id,
-                               created_at, review_id, finding_index])
+                where += f" AND {columns} < ({','.join('?' for _ in cursor)})"
+                params.extend(cursor)
             batch = min(want, scan_cap - examined)
             rows = self._c.execute(
-                f"""SELECT review_id, finding_index, created_at
-                      FROM finding_lineage WHERE {where}
-                     ORDER BY created_at DESC, review_id DESC, finding_index DESC
-                     LIMIT ?""",
-                tuple(params) + (batch,)).fetchall()
+                f"SELECT rowid AS serial, * FROM finding_lineage WHERE {where} "
+                f"ORDER BY {order} LIMIT ?", tuple(params) + (batch,)).fetchall()
             examined += len(rows)
-            if len(rows) < batch:
-                exhausted = True
+            exhausted = len(rows) < batch
             if not rows:
                 break
-            cursor = (rows[-1]["created_at"], rows[-1]["review_id"],
-                      rows[-1]["finding_index"])
+            last = rows[-1]
+            cursor = ((last["created_at"], last["serial"]) if fingerprint is not None
+                      else (last["created_at"], last["review_id"], last["serial"]))
             for row in rows:
                 review_id = row["review_id"]
                 if review_id not in cache:
-                    artifact = self.get_review(review_id)
+                    try:
+                        artifact = self.get_review(review_id)
+                    except (ValueError, TypeError):
+                        artifact = None
                     if (not isinstance(artifact, dict)
-                            or artifact.get("status") == RUNNING):
-                        cache[review_id] = None
-                    else:
-                        cache[review_id] = artifact
+                            or artifact.get("id") != review_id
+                            or artifact.get("status") == RUNNING
+                            or (artifact.get("lineage_repository_id") or "unknown") != repository_id):
+                        artifact = None
+                    cache[review_id] = artifact
                 artifact = cache[review_id]
-                if artifact is None:
+                if artifact is None or artifact.get("reviewed_at") != row["created_at"]:
                     continue
                 index = row["finding_index"]
-                stored = artifact.get("findings") or ()
-                if not isinstance(index, int) or index < 0 or index >= len(stored):
+                stored = artifact.get("findings")
+                if (not isinstance(stored, list) or type(index) is not int
+                        or not 0 <= index < len(stored) or not isinstance(stored[index], dict)
+                        or row["fingerprint_version"] != VERSION):
                     continue
-                previous_finding = stored[index]
-                if not isinstance(previous_finding, dict):
+                previous = stored[index]
+                try:
+                    digest = finding_fingerprint(previous)
+                except (ValueError, TypeError, UnicodeError):
                     continue
-                enriched = dict(previous_finding)
-                enriched["_lineage_review_id"] = review_id
-                enriched["_lineage_finding_index"] = index
-                enriched["_lineage_reviewed_at"] = artifact.get("reviewed_at")
+                if digest != row["fingerprint"] or previous.get("finding_fingerprint_v2") != digest:
+                    continue
+                enriched = dict(previous)
+                enriched.update(_lineage_review_id=review_id,
+                                _lineage_finding_index=index,
+                                _lineage_reviewed_at=artifact.get("reviewed_at"))
                 findings.append(enriched)
                 if len(findings) >= want:
                     break
             if exhausted:
                 break
         truncated = len(findings) > limit or not exhausted
-        return findings[:limit], truncated
+        return findings[:limit], {
+            "scanned_count": examined, "matched_count": len(findings[:limit]),
+            "truncated": truncated, "scan_limit": scan_cap,
+            "scan_truncated": not exhausted and examined >= scan_cap,
+            "candidate_truncated": len(findings) > limit,
+        }
+
+    def lineage_prompt_candidates(
+            self, repository_id: str, *, before_reviewed_at: str | None = None,
+            limit: int = 200) -> tuple[list[dict], dict]:
+        """Attach bounded prior dispositions, never reasons or triage actions.
+
+        The event stream's primary key bounds this optional read to 1025 rows.
+        Match the original review plus finding identity to preserve repository
+        provenance. Missing history after the scan cap is explicitly unknown.
+        """
+        from .textnorm import finding_key
+
+        rows, meta = self.lineage_candidates_with_diagnostics(
+            repository_id, before_reviewed_at=before_reviewed_at, limit=limit)
+        events = self._c.execute(
+            "SELECT review_id, finding_key, event FROM triage_events "
+            "ORDER BY seq DESC LIMIT 1025").fetchall() if rows else []
+        dispositions = {}
+        for event in events[:1024]:
+            dispositions.setdefault((event["review_id"], event["finding_key"]), event["event"])
+        for row in rows:
+            key = (row["_lineage_review_id"], finding_key(row.get("file", ""), row.get("title", "")))
+            row["_lineage_disposition"] = dispositions.get(
+                key, "unknown" if len(events) > 1024 else "open")
+        meta["disposition_scanned_count"] = min(len(events), 1024)
+        meta["disposition_truncated"] = len(events) > 1024
+        return rows, meta
 
     def lineage_review_candidates(self, repository_id: str) -> list[dict]:
         """Compatibility wrapper for the bounded lineage candidate read."""

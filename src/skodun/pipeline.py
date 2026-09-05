@@ -1623,8 +1623,11 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     gitio.canonical_repository_identity(root) or "unknown")
             except Exception:
                 lineage_repository_id = "unknown"
+        lineage_context_diagnostics: dict = {}
         lineage_prompt_context, lineage_prompt_truncated = _lineage_prompt_context(
-            store, lineage_repository_id, before=review_started_at)
+            store, lineage_repository_id, before=review_started_at,
+            changed_paths=diff.files, owner_ids=_lineage_owner_ids(stack_validation),
+            diagnostics=lineage_context_diagnostics)
         evidence_prompt_context = _evidence_prompt_context(
             store, root, base.sha, head, diff_hash)
         common = dict(
@@ -1681,6 +1684,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             stack_context_bytes=len(stack_prompt_context),
             stack_context_truncated=stack_prompt_truncated,
             lineage_context_bytes=len(lineage_prompt_context),
+            lineage_context_diagnostics=lineage_context_diagnostics,
             lineage_context_truncated=lineage_prompt_truncated,
             worktree_root=str(root),
             # Process identity for cancel-by-id (S1). Background workers already
@@ -2395,8 +2399,10 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
     reserved = store.get_review(record_id) or {}
     review_started_at = (
         reserved.get("review_started_at") or reserved.get("reviewed_at"))
+    lineage_context_diagnostics: dict = {}
     lineage_prompt_context, lineage_prompt_truncated = _lineage_prompt_context(
-        store, lineage_repository_id, before=review_started_at)
+        store, lineage_repository_id, before=review_started_at,
+        changed_paths=diff.files, diagnostics=lineage_context_diagnostics)
     diff_hash = gitio.diff_identity(diff.data)
     evidence_prompt_context = _evidence_prompt_context(
         store, root, base.sha, local_oid, diff_hash)
@@ -2423,6 +2429,7 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
         repo_id=reserved.get("repo_id") or reserved.get("repo"),
         lineage_repository_id=lineage_repository_id,
         lineage_context_bytes=len(lineage_prompt_context),
+        lineage_context_diagnostics=lineage_context_diagnostics,
         lineage_context_truncated=lineage_prompt_truncated,
         worktree_root=str(root),
         review_started_at=review_started_at,
@@ -2734,21 +2741,55 @@ def _flatten_lineage_candidates(
 
 
 def _lineage_prompt_context(
-        store, repository_id: str, *, before: str | None
+        store, repository_id: str, *, before: str | None,
+        changed_paths=(), owner_ids=(), diagnostics: dict | None = None
         ) -> tuple[bytes, bool]:
-    """Bounded prior-fingerprint bytes for provider prompts. Advisory only."""
+    """Bounded relevant hints with independent retrieval and byte budgets."""
+    meta = diagnostics if diagnostics is not None else {}
+    meta.clear()
+    meta.update(status="unknown", candidate_count=0, scanned_count=0,
+                matched_count=0, selected_count=0, candidate_truncated=False,
+                prompt_bytes_truncated=False)
     if not repository_id or repository_id == "unknown" or store is None:
         return b"", False
     try:
-        from .fingerprint import CANDIDATE_LIMIT, render_prompt_context
-        if not hasattr(store, "lineage_finding_candidates_with_meta"):
+        from .fingerprint import (CANDIDATE_LIMIT, rank_prompt_candidates,
+                                  render_prompt_context)
+        if hasattr(store, "lineage_prompt_candidates"):
+            rows, retrieval = store.lineage_prompt_candidates(
+                repository_id, before_reviewed_at=before, limit=CANDIDATE_LIMIT)
+            truncated = retrieval["truncated"]
+            meta.update(scanned_count=retrieval["scanned_count"],
+                        scan_truncated=retrieval["scan_truncated"],
+                        disposition_scanned_count=retrieval["disposition_scanned_count"],
+                        disposition_truncated=retrieval["disposition_truncated"])
+        elif hasattr(store, "lineage_finding_candidates_with_meta"):
+            rows, truncated = store.lineage_finding_candidates_with_meta(
+                repository_id, before_reviewed_at=before, limit=CANDIDATE_LIMIT)
+            meta["scanned_count"] = None  # legacy doubles cannot measure scans
+        else:
             return b"", False
-        rows, truncated = store.lineage_finding_candidates_with_meta(
-            repository_id, before_reviewed_at=before, limit=CANDIDATE_LIMIT)
-        text, text_truncated = render_prompt_context(rows)
+        selected, matched = rank_prompt_candidates(
+            rows, changed_paths=changed_paths, owner_ids=owner_ids)
+        text, text_truncated = render_prompt_context(selected)
+        meta.update(status="partial" if (truncated or text_truncated) else "complete",
+                    candidate_count=len(rows), matched_count=matched,
+                    selected_count=len(selected), candidate_truncated=bool(truncated),
+                    prompt_bytes_truncated=text_truncated)
         return text, bool(truncated) or text_truncated
-    except Exception:
+    except Exception as exc:
+        meta.update(status="unavailable", error=type(exc).__name__)
         return b"", False
+
+
+def _lineage_owner_ids(stack_validation) -> tuple[str, ...]:
+    """Only validated stack identities may influence advisory ranking."""
+    if (stack_validation is None or stack_validation.status != "valid"
+            or stack_validation.manifest is None):
+        return ()
+    manifest = stack_validation.manifest
+    return (manifest.current_slice.slice_id,
+            *(item.slice_id for item in manifest.dependencies))
 
 
 def _evidence_prompt_context(store, root: Path, certification_base: str,
@@ -2782,15 +2823,64 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
     authoritative trust or gate axes.
     """
     try:
-        from .fingerprint import CANDIDATE_LIMIT, annotate_findings
+        from .fingerprint import CANDIDATE_LIMIT, annotate_findings, finding_fingerprint
         repository_id = rec.get("lineage_repository_id") or "unknown"
         previous: list[dict] = []
         # An unknown canonical remote is deliberately not a lineage scope:
         # linking two unrelated local clones would be worse than a false
         # negative.  Stack manifests and normal remotes provide this value.
         truncated = False
+        diagnostics = dict(status="unknown", exact_scanned=0, exact_matched=0,
+                           exact_truncated=False, exact_scan_truncated=False,
+                           exact_candidate_truncated=False, exact_key_truncated=False,
+                           fallback_scanned=0, fallback_scan_truncated=False,
+                           fallback_truncated=False, fallback_state="unknown",
+                           exact_state="unknown", exact_key_limit=CANDIDATE_LIMIT,
+                           exact_candidate_limit=2 * CANDIDATE_LIMIT,
+                           fallback_candidate_limit=CANDIDATE_LIMIT,
+                           raw_scan_limit=1024 + min((CANDIDATE_LIMIT + 1) * 4, 1024))
+        exact = []
         if repository_id != "unknown":
-            if hasattr(store, "lineage_finding_candidates_with_meta"):
+            if hasattr(store, "lineage_candidates_with_diagnostics"):
+                diagnostics["exact_state"] = "indexed"
+                digests = list(dict.fromkeys(
+                    finding_fingerprint(item) for item in rec.get("findings") or ()
+                    if isinstance(item, dict)))
+                diagnostics["exact_key_truncated"] = len(digests) > CANDIDATE_LIMIT
+                diagnostics["exact_truncated"] = diagnostics["exact_key_truncated"]
+                for digest in digests[:CANDIDATE_LIMIT]:
+                    remaining = 1024 - diagnostics["exact_scanned"]
+                    if remaining <= 0:
+                        diagnostics["exact_truncated"] = True
+                        diagnostics["exact_scan_truncated"] = True
+                        break
+                    matches, meta = store.lineage_candidates_with_diagnostics(
+                        repository_id, before_reviewed_at=rec.get("reviewed_at"),
+                        fingerprint=digest, limit=2, scan_limit=remaining)
+                    exact.extend(matches)
+                    diagnostics["exact_scanned"] += meta["scanned_count"]
+                    diagnostics["exact_truncated"] |= meta["truncated"]
+                    diagnostics["exact_scan_truncated"] |= meta["scan_truncated"]
+                    diagnostics["exact_candidate_truncated"] |= meta["candidate_truncated"]
+                diagnostics["exact_matched"] = len(exact)
+                previous, meta = store.lineage_candidates_with_diagnostics(
+                    repository_id, before_reviewed_at=rec.get("reviewed_at"),
+                    limit=CANDIDATE_LIMIT)
+                diagnostics.update(fallback_scanned=meta["scanned_count"],
+                                   fallback_truncated=meta["truncated"],
+                                   fallback_scan_truncated=meta["scan_truncated"],
+                                   fallback_state="bounded_recency")
+                truncated = meta["truncated"] or diagnostics["exact_truncated"]
+                diagnostics["status"] = "partial" if truncated else "complete"
+                # Only duplicate provenance rows are collapsed here. Distinct
+                # occurrences retain the existing conservative ambiguity rule.
+                unique = {}
+                for item in exact + previous:
+                    if item.get("_lineage_review_id") != rec.get("id"):
+                        key = (item["_lineage_review_id"], item["_lineage_finding_index"])
+                        unique.setdefault(key, item)
+                previous = list(unique.values())
+            elif hasattr(store, "lineage_finding_candidates_with_meta"):
                 previous, truncated = store.lineage_finding_candidates_with_meta(
                     repository_id,
                     before_reviewed_at=rec.get("reviewed_at"),
@@ -2812,6 +2902,11 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
                     rec, candidates, False, CANDIDATE_LIMIT)
         rec["findings"] = annotate_findings(rec.get("findings") or (), previous)
         rec["fingerprint_status"] = "complete"
+        diagnostics["candidate_count"] = len(previous)
+        diagnostics["matched_count"] = sum(
+            isinstance(item, dict) and item.get("finding_lineage_v2", {}).get(
+                "match_reason") != "new" for item in rec["findings"])
+        rec["fingerprint_diagnostics"] = diagnostics
         rec["fingerprint_candidate_limit"] = CANDIDATE_LIMIT
         rec["fingerprint_candidate_count"] = len(previous)
         rec["fingerprint_candidates_truncated"] = bool(truncated)
@@ -2821,6 +2916,7 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
         # block persistence of the authoritative artifact.  Persist only the
         # bounded exception type, never provider output or local paths.
         rec["fingerprint_status"] = "unavailable"
+        rec["fingerprint_diagnostics"] = {"status": "unavailable"}
         rec["fingerprint_error"] = type(exc).__name__
     return rec
 

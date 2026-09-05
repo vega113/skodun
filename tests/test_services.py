@@ -152,6 +152,9 @@ def test_status_line_exposes_lineage_context_and_truncation():
 def test_review_status_json_exposes_lineage_context_telemetry(tmp_path):
     db = _db(tmp_path, _round(
         lineage_context_bytes=256, lineage_context_truncated=True,
+        lineage_context_diagnostics={"candidate_truncated": False,
+                                     "prompt_bytes_truncated": True},
+        fingerprint_diagnostics={"exact_matched": 1, "fallback_truncated": True},
         fingerprint_status="complete", fingerprint_candidate_count=12,
         fingerprint_candidate_limit=200,
         fingerprint_candidates_truncated=True))
@@ -162,6 +165,10 @@ def test_review_status_json_exposes_lineage_context_telemetry(tmp_path):
     assert code == 0
     assert payload["lineage_context_bytes"] == 256
     assert payload["lineage_context_truncated"] is True
+    assert payload["lineage_context_diagnostics"] == {
+        "candidate_truncated": False, "prompt_bytes_truncated": True}
+    assert payload["fingerprint_diagnostics"] == {
+        "exact_matched": 1, "fallback_truncated": True}
     assert payload["fingerprint_status"] == "complete"
     assert payload["fingerprint_candidate_count"] == 12
     assert payload["fingerprint_candidate_limit"] == 200
