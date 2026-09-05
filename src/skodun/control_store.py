@@ -105,6 +105,15 @@ class ControlStoreMixin:
             record = json.loads(row[0]) if row else {}
             if not owner.matches(record):
                 raise ValueError('worker cancellation observation ownership changed')
+            if record.get('status') != 'running' and record.get('trustworthy') is True:
+                # A committed observed receipt must never coexist with the
+                # terminal coverage this same owner is cancelling. Reuse the
+                # established demotion inside this audit transaction.
+                self._mark_cancelled_in_transaction(owner.record_id,
+                    'cancelled during finalization: worker observed cancellation')
+                updated = self.get_review(owner.record_id) or {}
+                if updated.get('trustworthy') is not False:
+                    raise ValueError('owner cancellation could not revoke terminal coverage')
             cur = self._c.execute(
                 """INSERT INTO cancellation_audit(target_id,identity_json,actor,
                    source,caller_pid,caller_worktree,created_at,reason,cause,outcome)

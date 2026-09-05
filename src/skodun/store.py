@@ -2838,36 +2838,43 @@ class Store(RequestStoreMixin, ControlStoreMixin):
         """
         self._c.execute("BEGIN IMMEDIATE")
         try:
-            cur = self._c.execute(
-                """UPDATE reviews SET status='failed', degraded=1, trustworthy=0,
-                     artifact_json=json_set(artifact_json,
-                       '$.status', 'failed',
-                       '$.degraded', json('true'),
-                       '$.degraded_reason', ?,
-                       '$.failure_reason', ?,
-                       '$.trustworthy', json('false'))
-                   WHERE id=? AND trustworthy=1""",
-                (reason, reason, review_id))
-            if cur.rowcount == 1:
-                row = self._c.execute(
-                    "SELECT json_extract(artifact_json, '$.batch_orchestration_id') AS oid "
-                    "FROM reviews WHERE id=?", (review_id,)).fetchone()
-                if row is not None and row["oid"]:
-                    self._c.execute(
-                        """UPDATE review_orchestrations
-                              SET state='failed', final_review_id=NULL,
-                                  updated_at=?, terminal_reason=?
-                            WHERE id=? AND state='consumed'
-                              AND final_review_id=?""",
-                        (_iso_now(), reason, row["oid"], review_id))
+            applied = self._mark_cancelled_in_transaction(review_id, reason)
             self._c.execute("COMMIT")
-            return cur.rowcount == 1
+            return applied
         except BaseException:
             try:
                 self._c.execute("ROLLBACK")
             except BaseException:
                 pass
             raise
+
+    def _mark_cancelled_in_transaction(self, review_id: str, reason: str) -> bool:
+        """Existing cancellation update, shared with atomic owner observation."""
+        if not self._c.in_transaction:
+            raise RuntimeError('cancellation demotion requires a transaction')
+        cur = self._c.execute(
+            """UPDATE reviews SET status='failed', degraded=1, trustworthy=0,
+                 artifact_json=json_set(artifact_json,
+                   '$.status', 'failed',
+                   '$.degraded', json('true'),
+                   '$.degraded_reason', ?,
+                   '$.failure_reason', ?,
+                   '$.trustworthy', json('false'))
+               WHERE id=? AND trustworthy=1""",
+            (reason, reason, review_id))
+        if cur.rowcount == 1:
+            row = self._c.execute(
+                "SELECT json_extract(artifact_json, '$.batch_orchestration_id') AS oid "
+                "FROM reviews WHERE id=?", (review_id,)).fetchone()
+            if row is not None and row["oid"]:
+                self._c.execute(
+                    """UPDATE review_orchestrations
+                          SET state='failed', final_review_id=NULL,
+                              updated_at=?, terminal_reason=?
+                        WHERE id=? AND state='consumed'
+                          AND final_review_id=?""",
+                    (_iso_now(), reason, row["oid"], review_id))
+        return cur.rowcount == 1
 
     def fail_if_running(self, review_id: str, reason: str) -> bool:
         """`mark_failed`, but only while the record is still `running`.

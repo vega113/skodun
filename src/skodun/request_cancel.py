@@ -93,7 +93,8 @@ class RecordOwner:
         pid = os.getpid()
         if (record.get('status') != 'running' or record.get('mode') != 'prepush'
                 or record.get('cancellation_protocol') != RECORD_CANCEL_PROTOCOL
-                or record.get('pid') not in (None,pid)):
+                or (record.get('pid') is not None and
+                    (type(record.get('pid')) is not int or record.get('pid') != pid))):
             raise ValueError('cannot capture cancellation observation for an unowned worker')
         fields = ('id','branch','head','base_ref','base_sha','diff_hash','repo')
         return cls(record['id'], pid, tuple((key,record.get(key)) for key in fields),
@@ -101,7 +102,8 @@ class RecordOwner:
 
     def matches(self, record):
         return (os.getpid() == self.pid and record.get('mode') == 'prepush'
-                and record.get('pid') in (None,self.pid)
+                and (record.get('pid') is None or
+                     (type(record.get('pid')) is int and record.get('pid') == self.pid))
                 and all(record.get(key) == value for key,value in self.identity))
 
 
@@ -115,26 +117,46 @@ class RecordCancel:
         self.store, self.record_id, self.upstream = store, record_id, upstream
         self.owner = RecordOwner.capture(store.get_review(record_id) or {}, worktree_root)
         self._audited = False
+        self.cancel_latched = False
+        self.audit_error = None
+        self.finalization_error = False
         self._local = threading.Event()
         self.reason_code = None
 
     def set(self):
         self._local.set()
 
+    def flush_audit(self):
+        """Bounded explicit retry after cleanup; never alter cancellation truth."""
+        if not self.cancel_latched or self._audited:
+            return True
+        from .requests import now
+        try:
+            self.store.observe_worker_cancellation(self.owner, cause=self.reason_code, now=now())
+        except BaseException as exc:
+            self.audit_error = exc
+            return False
+        self._audited = True
+        self.audit_error = None
+        return True
+
     def is_set(self):
-        if self._audited:
+        if self.cancel_latched:
             return True
         if self._local.is_set() or self.upstream.is_set():
-            from .requests import now
             cause = getattr(self.upstream, 'reason_code', None) or self.reason_code
             self.reason_code = cause if cause in CAUSES else 'unknown_cancel_token'
-            self.store.observe_worker_cancellation(self.owner, cause=self.reason_code, now=now())
-            self._audited = True
+            # Latch BEFORE optional persistence. runner's defensive Event guard
+            # must never turn a known signal into "not cancelled" on write error.
+            self.cancel_latched = True
+            self._local.set()
+            self.flush_audit()
             return True
         for event in self.store.cancellation_events(self.record_id):
             if event['target_id'] == self.record_id and event['request_id'] is None and event['outcome'] in ('requested','observed'):
                 self.reason_code = event['cause']
                 self._audited = True
+                self.cancel_latched = True
                 self._local.set()
                 return True
         return False
