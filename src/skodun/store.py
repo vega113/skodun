@@ -69,7 +69,7 @@ from .request_store import RequestStoreMixin, MIGRATION as _MIGRATION_V17
 from .control_store import ControlStoreMixin, MIGRATION as _MIGRATION_V18
 from .budget_store import BudgetStoreMixin, MIGRATION as _MIGRATION_V19
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 
 class SchemaLifecycleError(ValueError):
@@ -1151,6 +1151,7 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (18, _MIGRATION_V18),
     (19, _MIGRATION_V19),
     (20, MIGRATION_V20),
+    (21, ("ALTER TABLE capacity_admissions ADD COLUMN owner_start TEXT",)),
 )
 
 
@@ -4039,11 +4040,15 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
         resource_class = _require_text("resource_class", resource_class)
         scope = _require_text("scope", scope)
         queued_at = _iso_now()
+        owner_start = None
+        if resource_class == "review-machine" and pid:
+            from .capacity import process_birth_token
+            owner_start = process_birth_token(int(pid))
         self._c.execute(
             """INSERT INTO capacity_admissions
-                 (id, resource_class, scope, status, queued_at, pid)
-               VALUES (?,?,?,?,?,?)""",
-            (admission_id, resource_class, scope, "queued", queued_at, pid))
+                 (id, resource_class, scope, status, queued_at, pid, owner_start)
+               VALUES (?,?,?,?,?,?,?)""",
+            (admission_id, resource_class, scope, "queued", queued_at, pid, owner_start))
         row = self.capacity_get(admission_id)
         assert row is not None
         return row
@@ -4167,22 +4172,20 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                 (resource_class, scope, *self._CAPACITY_ACTIVE)).fetchall()
             ended_at = _iso_now()
             for row in rows:
-                # Machine holders have no cross-repo legacy lock as a backstop.
-                # A live owner retains its slot until release; age is not proof
-                # that its bounded runner and descendants have finished.
+                reason = None
                 if resource_class == "review-machine" and row["pid"]:
-                    from .capacity import pid_alive
+                    from .capacity import pid_alive, process_birth_token, REASON_STALE_PID
                     alive = pid_alive if pid_alive_fn is None else pid_alive_fn
                     if alive(int(row["pid"])):
-                        continue
-                reason = should_reclaim_admission(
-                    status=row["status"],
-                    pid=row["pid"],
-                    queued_at=row["queued_at"],
-                    stale_sec=stale_sec,
-                    now_epoch=now_epoch,
-                    pid_alive_fn=pid_alive_fn,
-                )
+                        observed = process_birth_token(int(row["pid"]))
+                        if not row["owner_start"] or not observed or observed == row["owner_start"]:
+                            continue  # Same owner or insufficient evidence: retain.
+                        reason = REASON_STALE_PID  # Proven PID reuse, never signal it.
+                if reason is None:
+                    reason = should_reclaim_admission(
+                        status=row["status"], pid=row["pid"],
+                        queued_at=row["queued_at"], stale_sec=stale_sec,
+                        now_epoch=now_epoch, pid_alive_fn=pid_alive_fn)
                 if reason is None:
                     continue
                 queue_wait_ms, run_ms, total_admission_ms = _capacity_metrics(

@@ -29,6 +29,8 @@ from __future__ import annotations
 import os
 import time
 import math
+import sqlite3
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -479,14 +481,42 @@ def finish(store: "Store", ticket: Ticket, *, status: str = STATUS_RELEASED,
     If this ticket holds a machine-wide parent, the parent is finished with
     the same status so two repos cannot leak the outer slot.
     """
-    parent = ticket.parent
-    row = store.capacity_finish(
-        ticket.id, status=status, expire_reason=expire_reason)
-    _apply_row(ticket, row)
-    if parent is not None:
-        finish(store, parent, status=status, expire_reason=expire_reason)
-        ticket.parent = None
-    return ticket
+    for attempt in range(3):
+        try:
+            parent = ticket.parent
+            row = store.capacity_finish(
+                ticket.id, status=status, expire_reason=expire_reason)
+            _apply_row(ticket, row)
+            if parent is not None:
+                row = store.capacity_finish(
+                    parent.id, status=status, expire_reason=expire_reason)
+                _apply_row(parent, row)
+                ticket.parent = None
+            return ticket
+        except sqlite3.OperationalError:
+            if attempt == 2:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+def process_birth_token(pid: int) -> str | None:
+    """Observe process creation identity; missing evidence never proves reuse."""
+    if pid <= 0:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True,
+            text=True, timeout=1, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+        token = " ".join(proc.stdout.split())
+        if proc.returncode or not token:
+            return None
+        # Reject diagnostics or malformed output rather than treating them as
+        # a new process incarnation. ps supplies stable wall-clock start time.
+        time.strptime(token, "%a %b %d %H:%M:%S %Y")
+        return token
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
 
 
 def _cancelled(cancel: "threading.Event | None") -> bool:

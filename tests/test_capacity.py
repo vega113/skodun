@@ -913,3 +913,26 @@ def test_finish_keeps_machine_parent_retryable_on_store_failure(store, monkeypat
     finish(store, ticket)
     assert ticket.parent is None
     assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, capacity.MACHINE_SCOPE) == 0
+
+
+def test_machine_holder_reclaims_proven_recycled_pid_but_retains_unknown(store, monkeypatch):
+    monkeypatch.setattr(capacity, 'process_birth_token', lambda pid: 'original-start')
+    ticket = acquire_for_fg(store, scope='/repo', capacity=1, machine_capacity=1,
+                            wait_sec=.1, poll_sec=.01)
+    assert store.capacity_get(ticket.parent.id)['owner_start'] == 'original-start'
+    monkeypatch.setattr(capacity, 'process_birth_token', lambda pid: None)
+    assert capacity.reclaim_stale(store, scope=capacity.MACHINE_SCOPE,
+        resource_class=capacity.RESOURCE_REVIEW_MACHINE, stale_sec=0,
+        pid_alive_fn=lambda pid: True) == []
+    monkeypatch.setattr(capacity, 'process_birth_token', lambda pid: 'different-start')
+    assert capacity.reclaim_stale(store, scope=capacity.MACHINE_SCOPE,
+        resource_class=capacity.RESOURCE_REVIEW_MACHINE, stale_sec=0,
+        pid_alive_fn=lambda pid: True) == [ticket.parent.id]
+    finish(store, ticket)
+
+
+def test_process_birth_token_is_stable_for_this_process():
+    import os
+    first = capacity.process_birth_token(os.getpid())
+    assert first is not None
+    assert capacity.process_birth_token(os.getpid()) == first

@@ -18,7 +18,7 @@ that shares the default store, while today’s per-repo `review-fg` stays an
 | Topic | Decision | Why |
 |---|---|---|
 | Default store | Still one file per machine (`~/.local/share/skodun/skodun.db`) | Fragmenting per repo would defeat the cap |
-| Outer resource | `review-machine` in `capacity_admissions`, scope `*` | Existing table; no schema bump; does not mix with per-repo `review-fg` rows |
+| Outer resource | `review-machine` in `capacity_admissions`, scope `*` | Existing admission table; does not mix with per-repo `review-fg` rows |
 | Outer default | **1** (`SKODUN_REVIEW_MACHINE_CAPACITY`) | Conservative; owner can raise. Junk / missing → 1 |
 | Inner limit | Today’s `review-fg` per `git_common_dir` | S3/S4 and the legacy FG lock stay intact |
 | Binding rule | `effective_fg = min(machine, repo_fg)` and the outer ticket still binds | A repo env `SKODUN_REVIEW_FG_CAPACITY=8` cannot exceed the machine cap |
@@ -29,7 +29,7 @@ that shares the default store, while today’s per-repo `review-fg` stays an
 | Config | Env + optional `[capacity]` in `~/.config/skodun/config.toml`; repo `.skodun.toml` may only **tighten** | Global / env set the machine ceiling |
 | Surfaces | CLI `review`, pre-push `dispatch`, every `skodun mcp` via `run_review` → `acquire_for_fg` | One admit path |
 | Diagnostics | `skodun stats` and `skodun doctor` show machine cap, holders by repo, holders by provider | Operator-visible |
-| Schema | No `SCHEMA_VERSION` bump | Reuse `capacity_admissions` |
+| Schema | Additive v21 owner_start column | Detect recycled machine-owner PIDs |
 
 ## Knobs
 
@@ -81,7 +81,7 @@ via the store (same bounded `SKODUN_ADMISSION_WAIT_SECONDS` as today).
 - Making the machine cap a new store enum / trust axis.
 - Queuing non-review MCP tools.
 - Default 2: owner can set 2; shipping 1 is the conservative pick.
-- Schema migration: unused `resource_class` values are already legal.
+- New resource tables: reuse `capacity_admissions`; v21 adds nullable process ownership.
 
 ## Verification
 
@@ -105,3 +105,9 @@ current declared schema and at least one review; older, partial, or failed
 recoveries remain quarantined for manual restoration. Every observed failed
 integrity check is invalid. Normal inspection for opens omits the full scan
 unless the torn-WAL signature is present; doctor requests a full check.
+
+The v21 migration adds nullable `owner_start` to admission rows. New machine
+tickets record process birth identity; a live PID with a different observed
+identity is reclaimable without signalling that process. Missing identity
+evidence retains the ticket conservatively. Terminal cleanup retries transient
+SQLite operational failures three times with bounded backoff.
