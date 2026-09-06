@@ -1479,13 +1479,36 @@ def _apply_open_durability(conn: sqlite3.Connection) -> None:
 
 
 def _quarantine_path(path: Path) -> Path:
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    dest = Path(str(path) + f".malformed-{stamp}")
-    n = 0
-    while dest.exists() or Path(str(dest) + "-wal").exists():
-        n += 1
-        dest = Path(str(path) + f".malformed-{stamp}-{n}")
-    return dest
+    """One source-stamped quarantine for an unchanged database/WAL image."""
+    state = _inspection_source_state(path)
+    if state is None or state[0] is None:
+        raise SchemaLifecycleError("store_changed", "cannot identify quarantine source", version=None)
+    # SHM is a reconstructible cache; reader activity there is not a new DB image.
+    identity = hashlib.sha256(json.dumps(state[:2]).encode("ascii")).hexdigest()[:24]
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(state[0][4] // 1_000_000_000))
+    return Path(str(path) + f".malformed-{stamp}-{identity}")
+
+
+def _quarantine_image_digest(path: Path, *, private: bool = False) -> tuple:
+    """Verify authoritative bytes through regular-file descriptors before reuse."""
+    digests = []
+    for suffix in ("", "-wal"):
+        source = Path(str(path) + suffix)
+        fd, error = _open_regular_file(source)
+        if error is not None:
+            if suffix and error.state == "missing":
+                digests.append(None)
+                continue
+            raise SchemaLifecycleError(error.reason_code or "missing",
+                                       f"unsafe quarantine image: {source}", version=None)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if private and (info.st_uid != os.geteuid() or info.st_mode & 0o077):
+                raise SchemaLifecycleError("unsafe_quarantine",
+                    f"quarantine must be owned by this user with private permissions: {source}",
+                    version=None)
+            digests.append(hashlib.file_digest(stream, "sha256").hexdigest())
+    return tuple(digests)
 
 
 def _copy_store_image(src: Path, dest: Path, *, expected: os.stat_result | None = None) -> None:
@@ -1537,7 +1560,8 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
     """Replay ``sqlite3 .recover`` into ``dest``. False if unusable."""
     try:
         proc = subprocess.run(
-            ["sqlite3", str(src.absolute()), ".recover"],
+            ["sqlite3", "-readonly",
+             f"file:{quote(str(src.absolute()))}?mode=ro&immutable=1", ".recover"],
             capture_output=True, text=True, timeout=300,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1556,6 +1580,9 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
     os.close(fd)
     conn = sqlite3.connect(dest)
     try:
+        # Recovery SQL may define the new image, never attach another authority.
+        conn.set_authorizer(lambda action, *_:
+            sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_ATTACH else sqlite3.SQLITE_OK)
         conn.executescript(sql)
         check = conn.execute("PRAGMA integrity_check").fetchone()
         integrity = str(check[0]) if check else "unknown"
@@ -1618,7 +1645,15 @@ def _repair_malformed_store(path: Path, info: SchemaInfo) -> None:
                                        f"store recovery refused: {path}", version=None)
         original = path.lstat()
         quarantine = _quarantine_path(path)
-        _copy_store_image(path, quarantine, expected=original)
+        try:
+            quarantine.lstat()
+        except FileNotFoundError:
+            _copy_store_image(path, quarantine, expected=original)
+        else:
+            if _quarantine_image_digest(path) != _quarantine_image_digest(quarantine, private=True):
+                raise SchemaLifecycleError("quarantine_conflict",
+                    f"existing quarantine differs from source: {quarantine}; preserved both images",
+                    version=None)
         if not _live_image_is_corrupt(quarantine):
             raise SchemaLifecycleError("store_changed", "quarantine does not confirm corruption",
                                        version=None)
@@ -4363,7 +4398,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
 
     def capacity_mark_started(self, admission_id: str,
                               review_id: str | None = None) -> dict:
-        """``admitted`` (or ``queued``) → ``running``; set ``started_at``."""
+        """Start once; repeated calls can attach review_id without resetting timing."""
         admission_id = _require_text("admission_id", admission_id)
         started_at = _iso_now()
         self._c.execute("BEGIN IMMEDIATE")
@@ -4380,7 +4415,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
             admitted_at = row["admitted_at"] or started_at
             self._c.execute(
                 """UPDATE capacity_admissions
-                   SET status='running', admitted_at=?, started_at=?,
+                   SET status='running', admitted_at=?, started_at=COALESCE(started_at,?),
                        review_id=COALESCE(?, review_id)
                    WHERE id=?""",
                 (admitted_at, started_at, review_id, admission_id))

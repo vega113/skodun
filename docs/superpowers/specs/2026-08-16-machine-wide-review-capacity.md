@@ -142,3 +142,9 @@ remain their inner coordination mechanism; they do not acquire foreground locks.
 Process observations include zombie state. A proven exited owner is reclaimable
 even while its PID and birth token remain visible; missing observation evidence
 remains conservative. Identity and state are read together.
+
+Failed recovery reuses a deterministic source-stamped quarantine while the
+database/WAL identity is unchanged. Reuse verifies content and private ownership
+and permissions; a conflicting copy is preserved and refused. SQLite reads the
+quarantine immutably, and recovery SQL cannot attach another database. Linking
+a review ID to an admission preserves its original start time.

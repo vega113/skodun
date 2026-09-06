@@ -296,7 +296,8 @@ def test_recovery_uses_absolute_path_for_leading_dash(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(argv, 1, stdout="")
     monkeypatch.setattr(mod.subprocess, "run", run)
     assert not mod._recover_sqlite_image(Path("-unsafe.db"), tmp_path / "out")
-    assert calls[0][1] == str(tmp_path / "-unsafe.db")
+    assert calls[0][1] == "-readonly"
+    assert calls[0][2] == f"file:{tmp_path}/-unsafe.db?mode=ro&immutable=1"
 
 
 @pytest.mark.parametrize("kind", ["symlink", "fifo"])
@@ -467,3 +468,77 @@ def test_doctor_torn_wal_guidance_does_not_promise_every_open_will_recover(tmp_p
     assert 'may attempt quarantined recovery' in check.detail
     assert 'next writable' not in check.detail
     assert db.read_bytes() == original
+
+
+def test_failed_recovery_reuses_one_unchanged_quarantine(tmp_path, monkeypatch):
+    import skodun.store as mod
+    db = tmp_path / 'broken.db'
+    original = _make_torn_wal(db)
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError('sqlite3 unavailable')
+    monkeypatch.setattr(mod.subprocess, 'run', unavailable)
+    for _ in range(3):
+        with pytest.raises(SchemaLifecycleError):
+            Store.open(db)
+    copies = _quarantines(db)
+    assert len(copies) == 1
+    assert copies[0].read_bytes() == original
+    assert db.read_bytes() == original
+
+
+def test_changed_corrupt_image_gets_a_separate_quarantine(tmp_path, monkeypatch):
+    import skodun.store as mod
+    db = tmp_path / 'broken.db'
+    original = _make_torn_wal(db)
+    monkeypatch.setattr(mod, '_recover_sqlite_image', lambda *args: False)
+    with pytest.raises(SchemaLifecycleError):
+        Store.open(db)
+    changed = bytearray(original)
+    changed[-1] ^= 1
+    db.write_bytes(changed)
+    with pytest.raises(SchemaLifecycleError):
+        Store.open(db)
+    assert len(_quarantines(db)) == 2
+    assert {p.read_bytes() for p in _quarantines(db)} == {original, bytes(changed)}
+
+
+def test_conflicting_cached_quarantine_is_preserved_and_refused(tmp_path, monkeypatch):
+    import skodun.store as mod
+    db = tmp_path / 'broken.db'
+    original = _make_torn_wal(db)
+    monkeypatch.setattr(mod, '_recover_sqlite_image', lambda *args: False)
+    with pytest.raises(SchemaLifecycleError):
+        Store.open(db)
+    quarantine = _quarantines(db)[0]
+    quarantine.write_bytes(b'preserve this conflicting image')
+    with pytest.raises(SchemaLifecycleError, match='preserved both images'):
+        Store.open(db)
+    assert len(_quarantines(db)) == 1
+    assert quarantine.read_bytes() == b'preserve this conflicting image'
+    assert db.read_bytes() == original
+
+
+def test_nonprivate_cached_quarantine_is_not_reused(tmp_path, monkeypatch):
+    import skodun.store as mod
+    db = tmp_path / 'broken.db'
+    original = _make_torn_wal(db)
+    monkeypatch.setattr(mod, '_recover_sqlite_image', lambda *args: False)
+    with pytest.raises(SchemaLifecycleError):
+        Store.open(db)
+    quarantine = _quarantines(db)[0]
+    quarantine.chmod(0o666)
+    with pytest.raises(SchemaLifecycleError, match='private permissions'):
+        Store.open(db)
+    assert db.read_bytes() == original
+    assert len(_quarantines(db)) == 1
+
+
+def test_recovery_sql_cannot_attach_another_database(tmp_path, monkeypatch):
+    import skodun.store as mod
+    outside = tmp_path / 'outside.db'
+    literal = str(outside).replace("'", "''")
+    sql = f"ATTACH DATABASE '{literal}' AS escaped; CREATE TABLE escaped.wrong(x);"
+    monkeypatch.setattr(mod.subprocess, 'run', lambda *a, **k:
+                        subprocess.CompletedProcess(a, 0, stdout=sql))
+    assert not mod._recover_sqlite_image(tmp_path / 'source', tmp_path / 'dest')
+    assert not outside.exists()

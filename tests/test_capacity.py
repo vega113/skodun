@@ -1096,3 +1096,21 @@ def test_real_unreaped_linux_child_cannot_keep_machine_capacity(store):
         if writer >= 0:
             os.close(writer)
         os.waitpid(pid, 0)
+
+
+def test_attaching_review_id_preserves_first_start_and_full_run_time(store, monkeypatch):
+    from skodun import store as mod
+    from tests.test_store import REC
+    store.save_review({**REC, 'id': 'attached-review'})
+    at = ['2026-09-06T00:00:00Z']
+    monkeypatch.setattr(mod, '_iso_now', lambda: at[0])
+    ticket = acquire(store, scope='*', resource_class='review-machine', capacity=1,
+                     wait_sec=.1, poll_sec=.01)
+    at[0] = '2026-09-06T00:00:10Z'
+    capacity.mark_started(store, ticket, review_id='attached-review')
+    assert ticket.started_at == '2026-09-06T00:00:00Z'
+    at[0] = '2026-09-06T00:00:20Z'
+    finish(store, ticket)
+    row = store.capacity_get(ticket.id)
+    assert row['review_id'] == 'attached-review'
+    assert row['run_ms'] == 20000
