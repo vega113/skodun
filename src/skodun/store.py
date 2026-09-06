@@ -1593,8 +1593,10 @@ def _recovered_schema_valid(conn: sqlite3.Connection) -> bool:
         return actual == schema(expected)
 
 
-def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
-    """Check artifacts and their indexed projections without rewriting history."""
+def _recovery_json_object(text):
+    """Strict object decoding for every persisted JSON payload."""
+    if not isinstance(text, str):
+        raise ValueError("recovered JSON must be text")
     def unique_object(pairs):
         value = {}
         for key, item in pairs:
@@ -1605,7 +1607,14 @@ def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
 
     def reject_constant(value):
         raise ValueError("non-JSON numeric constant")
+    value = json.loads(text, object_pairs_hook=unique_object, parse_constant=reject_constant)
+    if not isinstance(value, dict):
+        raise ValueError("recovered JSON must be an object")
+    return value
 
+
+def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
+    """Check artifacts and their indexed projections without rewriting history."""
     missing = object()
     names = ("id", *_REVIEW_COLUMNS)
     count = 0
@@ -1617,8 +1626,7 @@ def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
             row = dict(zip(names, values))
             if not isinstance(row["artifact_json"], str):
                 return False
-            artifact = json.loads(row["artifact_json"], object_pairs_hook=unique_object,
-                                  parse_constant=reject_constant)
+            artifact = _recovery_json_object(row["artifact_json"])
             if (not isinstance(artifact, dict) or not isinstance(artifact.get("id"), str)
                     or not artifact["id"].strip() or artifact["id"] != row["id"]):
                 return False
@@ -1645,6 +1653,90 @@ def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
     except (ValueError, TypeError, AttributeError, OverflowError, RecursionError):
         return False
     return count > 0 and time.monotonic() < deadline
+
+
+def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool:
+    """Validate JSON-bearing control/checkpoint tables using their existing doors."""
+    from dataclasses import asdict
+    from . import request_store, checkpoints, followups
+    from .evidence import parse_receipt
+    from .followup_store import _decode_candidate
+    from .review_results import valid_replay
+
+    # Borrow a read-only validator view; the recovery caller owns this connection.
+    view = Store(conn)
+    try:
+        tables = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        for table in tables:
+            if table == "reviews":
+                continue
+            columns = {row[1]: bool(row[3]) for row in conn.execute(f'PRAGMA table_info("{table}")')
+                       if row[1].endswith("_json")}
+            if not columns:
+                continue
+            for row in conn.execute(f'SELECT * FROM "{table}"'):
+                if time.monotonic() >= deadline:
+                    return False
+                decoded = {}
+                for column, required in columns.items():
+                    if row[column] is None and not required:
+                        continue
+                    decoded[column] = _recovery_json_object(row[column])
+                if table == "review_requests":
+                    for field in ("id", "scope", "owner_token", "source"):
+                        request_store._text(field, row[field])
+                    if row["request_key"] is not None:
+                        request_store._text("request_key", row["request_key"], 128)
+                    if type(row["pid"]) is not int or row["pid"] <= 0:
+                        return False
+                    for field in ("created_at", "updated_at", "expires_at"):
+                        _require_ts(field, row[field])
+                    if request_store._identity_json(row["scope"], decoded["identity_json"]) != row["identity_json"]:
+                        return False
+                    execution = conn.execute(
+                        "SELECT request_id,pid,source,status FROM request_executions WHERE owner_token=?",
+                        (row["owner_token"],)).fetchone()
+                    if (execution is None or execution["request_id"] != row["id"]
+                            or execution["pid"] != row["pid"] or execution["source"] != row["source"]):
+                        return False
+                    result = decoded.get("result_json")
+                    if result is not None and (
+                            row["state"] in ("accepted", "queued", "running")
+                            or not valid_replay(result) or execution["status"] != result["status"]):
+                        return False
+                elif table == "review_orchestrations":
+                    identity = checkpoints.OrchestrationIdentity.from_json(row["identity_json"])
+                    if identity.digest() != row["identity_digest"]:
+                        return False
+                    if any(row[key] != value for key, value in asdict(identity).items() if key in row.keys()):
+                        return False
+                elif table in ("review_checkpoints", "review_followup_checkpoints"):
+                    if row["state"] == "complete" and row["payload_json"] is None:
+                        return False
+                    if "payload_json" in decoded:
+                        checkpoints.CheckpointPayload.from_mapping(decoded["payload_json"])
+                    if table == "review_followup_checkpoints":
+                        if (row["binding_json"] is None) != (row["binding_hash"] is None):
+                            return False
+                        if "binding_json" in decoded:
+                            binding = followups.validate_binding(decoded["binding_json"])
+                            if (binding["kind"] != row["pass_kind"] or
+                                    checkpoints.canonical_digest(binding) != row["binding_hash"]):
+                                return False
+                        if "candidate_json" in decoded:
+                            _decode_candidate(row["candidate_json"])
+                elif table == "request_budget_snapshots":
+                    view._read_request_budget(row)
+                elif table in ("evidence_receipts", "evidence_receipt_conflicts"):
+                    receipt = parse_receipt(row["receipt_json"])
+                    if (receipt.canonical_json != row["receipt_json"]
+                            or any(getattr(receipt, field) != row[field]
+                                   for field in ("receipt_digest", "nonce", "evidence_kind", "terminal_state"))):
+                        return False
+        return time.monotonic() < deadline
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
+        return False
 
 
 _RECOVERY_STATEMENT_LIMIT = 16 * 1024 * 1024
@@ -1691,6 +1783,7 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
             valid = False
             try:
                 conn = sqlite3.connect(dest, isolation_level=None)
+                conn.row_factory = sqlite3.Row
                 # Native dumps may emit children before parents; validate all
                 # relationships after replay instead of depending on order.
                 conn.execute("PRAGMA foreign_keys=OFF")
@@ -1704,7 +1797,8 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
                 valid = (check is not None and check[0] == "ok"
                          and _recovered_schema_valid(conn)
                          and conn.execute("PRAGMA foreign_key_check").fetchone() is None
-                         and _recovered_reviews_valid(conn, deadline))
+                         and _recovered_reviews_valid(conn, deadline)
+                         and _recovered_payloads_valid(conn, deadline))
                 return valid
             except (sqlite3.DatabaseError, OSError, ValueError):
                 return False

@@ -174,3 +174,8 @@ triggers/tables or altered constraint literals cannot become authoritative.
 Each recovered review must have a valid object artifact, unambiguous JSON,
 valid store trust fields, and indexed values matching the writer projection.
 Legacy absent/null additive metadata remains valid without rewriting history.
+
+Recovery checks every declared JSON-bearing payload column. Request identity
+uses the same canonical scope/size validation as request creation; owner and
+execution projections and replayable results must agree. Existing checkpoint,
+follow-up, budget, and evidence validators guard their recovered payloads.

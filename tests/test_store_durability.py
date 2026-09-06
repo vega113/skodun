@@ -845,3 +845,89 @@ def test_recovery_preserves_valid_legacy_nullable_projections(tmp_path, monkeypa
     assert mod._recover_sqlite_image(source, dest)
     with Store.open(dest) as restored:
         assert restored.get_review('kept') == artifact
+
+
+def _recovery_control_fixture(source):
+    import json
+    from tests.test_budget_store import begin, snapshot, NOW as budget_now
+    from tests.test_checkpoints import _created, _identity, _payload, NOW, LATER
+    from tests.test_evidence import identity, policy, receipt_mapping
+    from skodun.checkpoints import CheckpointPayload
+    from skodun.evidence import parse_receipt
+    with Store.open(source) as store:
+        store.save_review({**REC, 'id': 'kept'})
+        _created(store)
+        claim = store.claim_checkpoint('orch-1', _identity().pass_identities[0],
+                                       owner='worker', now=NOW, lease_expires_at=LATER)
+        assert store.complete_checkpoint('orch-1', 'batch', 1, owner='worker',
+            claim_token=claim['claim_token'], fence=claim['fence'],
+            payload=CheckpointPayload.from_mapping(_payload()), completed_at=NOW)
+        rid, seq = begin(store)
+        assert store.save_request_budget(rid, seq, 'private-owner', snapshot(rid, seq))
+        request = store.get_request(rid)
+        store.record_cancellation(target_id=rid, request=request, identity=request['identity'],
+            actor='test', source='test', caller_pid=123, caller_worktree='/work',
+            reason='recovery fixture audit', cause='requested_cancel', now=budget_now)
+        assert store.finish_request(rid, owner_token='private-owner', state='failed',
+            reason_code='test_failed', result={'status':4, 'text':'failed', 'metadata':{}}, now=budget_now)
+        store.save_evidence_receipt(identity(), policy(),
+            parse_receipt(json.dumps(receipt_mapping())).canonical_json, '2026-08-13T16:00:03Z')
+        store.save_evidence_receipt(identity(), policy(),
+            parse_receipt(json.dumps(receipt_mapping(counters={'checks':4}))).canonical_json,
+            '2026-08-13T16:00:04Z')
+    return rid
+
+
+def test_recovery_preserves_readable_request_and_control_payloads(tmp_path, monkeypatch):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    rid = _recovery_control_fixture(source)
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest)
+    with Store.open(dest) as store:
+        request = store.get_request(rid)
+        assert request['identity']['worktree_root'] == '/work'
+        assert request['result']['status'] == 4
+        assert request['cancellation']
+        assert store.request_budget(rid)['timing']['total_ms'] == 10000
+
+
+@pytest.mark.parametrize('table,column', [
+    ('review_requests','identity_json'), ('review_requests','result_json'),
+    ('review_orchestrations','identity_json'), ('review_checkpoints','payload_json'),
+    ('cancellation_audit','identity_json'), ('request_budget_snapshots','snapshot_json'),
+    ('evidence_receipts','receipt_json'), ('evidence_receipt_conflicts','receipt_json'),
+])
+def test_recovery_rejects_malformed_payloads_across_store_surfaces(tmp_path, monkeypatch, table, column):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_control_fixture(source)
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute(f'UPDATE {table} SET {column}=?', ('{',))
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('damage', ['scope', 'pid', 'execution', 'result_shape', 'orchestration_shape', 'checkpoint_shape'])
+def test_recovery_rejects_invalid_request_and_checkpoint_invariants(tmp_path, monkeypatch, damage):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_control_fixture(source)
+    with closing(sqlite3.connect(source)) as raw:
+        if damage == 'scope':
+            raw.execute("UPDATE review_requests SET identity_json='{\"worktree_root\":\"/wrong\"}'")
+        elif damage == 'pid':
+            raw.execute('UPDATE review_requests SET pid=0')
+        elif damage == 'execution':
+            raw.execute("UPDATE request_executions SET owner_token='different-owner'")
+        elif damage == 'result_shape':
+            raw.execute("UPDATE review_requests SET result_json='{}'")
+        elif damage == 'orchestration_shape':
+            raw.execute("UPDATE review_orchestrations SET identity_json='{}'")
+        else:
+            raw.execute("UPDATE review_checkpoints SET payload_json='{}' WHERE state='complete'")
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')

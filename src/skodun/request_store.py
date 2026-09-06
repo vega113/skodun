@@ -58,6 +58,18 @@ def _text(label, value, limit=4096):
     return value
 
 
+def _identity_json(scope, identity):
+    """Canonical request identity validation shared with recovery inspection."""
+    if not isinstance(identity, dict):
+        raise ValueError('request identity must be an object')
+    encoded = _json(identity)
+    if identity.get('worktree_root') != scope:
+        raise ValueError('request scope must match its worktree identity')
+    if len(encoded.encode('utf-8')) > 65536:
+        raise ValueError('request identity exceeds 64 KiB')
+    return encoded
+
+
 class RequestStoreMixin:
     """Validated methods composed into Store, never another database handle."""
 
@@ -81,11 +93,7 @@ class RequestStoreMixin:
         if actor is not None:
             from .control import audit_text
             actor = audit_text(actor, 'actor', 120)
-        encoded = _json(identity)
-        if identity.get('worktree_root') != scope:
-            raise ValueError('request scope must match its worktree identity')
-        if len(encoded.encode('utf-8')) > 65536:
-            raise ValueError('request identity exceeds 64 KiB')
+        encoded = _identity_json(scope, identity)
         if type(allow_consumed) is not bool:
             raise ValueError('allow_consumed must be bool')
         digest = hashlib.sha256(_json(intent).encode()).hexdigest()
