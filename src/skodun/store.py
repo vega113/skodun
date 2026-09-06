@@ -1800,6 +1800,58 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
         return False
 
 
+def _recovered_triage_valid(conn: sqlite3.Connection, deadline: float) -> bool:
+    """Validate clearing decisions and restore only mechanically derived ledger keys."""
+    from .triage import validate_reason, validate_tracking_ref
+    from .textnorm import finding_key, ledger_key
+    valid = False
+    conn.execute("SAVEPOINT recovered_triage")
+    try:
+        for table in ("triage", "triage_events"):
+            for row in conn.execute(f'SELECT rowid AS recovery_rowid,* FROM "{table}"'):
+                if time.monotonic() >= deadline:
+                    return False
+                event = row["event"] if table == "triage_events" else "dismiss"
+                if event not in ("dismiss", "defer", "reopen"):
+                    return False
+                reason = row["reason"] if table == "triage_events" else row["dismissed_reason"]
+                if not isinstance(reason, str):
+                    return False
+                validate_reason(reason)
+                if event == "defer":
+                    if validate_tracking_ref(row["tracking_ref"]) != row["tracking_ref"]:
+                        return False
+                elif table == "triage_events" and row["tracking_ref"] is not None:
+                    return False
+                if event in ("defer", "reopen"):
+                    _require_ts("triage at", row["at"])
+                if not isinstance(row["branch"], str) or not isinstance(row["base_sha"], str):
+                    return False
+                key = finding_key(row["file"], row["title"])
+                if row["finding_key"] != key:
+                    return False
+                expected = ledger_key(row["branch"], row["base_sha"], key)
+                if row["ledger_key"] != expected:
+                    # SQLite's CLI dump/recover truncates text at embedded NUL.
+                    # The key is derived; decision, reason and scope are not.
+                    if row["ledger_key"] != expected.split("\0", 1)[0]:
+                        return False
+                    conn.execute(f'UPDATE "{table}" SET ledger_key=? WHERE rowid=?',
+                                 (expected, row["recovery_rowid"]))
+                review = conn.execute("SELECT branch,base_sha FROM reviews WHERE id=?",
+                                      (row["review_id"],)).fetchone()
+                if review is not None and (review[0], review[1]) != (row["branch"], row["base_sha"]):
+                    return False
+        valid = True
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+    finally:
+        if not valid:
+            conn.execute("ROLLBACK TO recovered_triage")
+        conn.execute("RELEASE recovered_triage")
+
+
 _RECOVERY_STATEMENT_LIMIT = 16 * 1024 * 1024
 
 
@@ -1859,7 +1911,8 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
                          and _recovered_schema_valid(conn)
                          and conn.execute("PRAGMA foreign_key_check").fetchone() is None
                          and _recovered_reviews_valid(conn, deadline)
-                         and _recovered_payloads_valid(conn, deadline))
+                         and _recovered_payloads_valid(conn, deadline)
+                         and _recovered_triage_valid(conn, deadline))
                 return valid
             except (sqlite3.DatabaseError, OSError, ValueError):
                 return False

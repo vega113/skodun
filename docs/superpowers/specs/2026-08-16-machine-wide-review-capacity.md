@@ -188,3 +188,8 @@ invariants without inventing unavailable historical policy proof.
 Recovered orchestration checkpoint keys and fixed identities must match the
 declared pass plan. Runtime-bound integration prompts remain supported, and
 expired checkpoint envelopes may retain their intentionally cleared payloads.
+
+Recovered triage decisions must satisfy the existing audit-reason and filed-ref
+floors and retain consistent finding/scope keys. Only the mechanically derived
+ledger-key NUL separators truncated by SQLite's dump format are reconstructed;
+decisions, reasons, references, and scope are never invented.

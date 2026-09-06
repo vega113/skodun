@@ -1068,3 +1068,51 @@ def test_recovery_accepts_runtime_bound_integration_prompt(tmp_path, monkeypatch
                                owner='integrator', now=NOW, lease_expires_at=LATER)
     _stream_source_dump(monkeypatch, source)
     assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+def _recovery_triage_fixture(source, event='defer'):
+    from skodun import triage
+    from tests.test_store import _a_finding
+    with Store.open(source) as store:
+        store.save_review({**REC, 'id':'kept', 'status':'findings', 'findings_total':1,
+                           'findings':[_a_finding()], 'severity':{'high':1,'medium':0,'low':0}})
+        record = store.get_review('kept')
+        reason = 'This finding is tracked in a separate reviewed change.'
+        if event == 'defer':
+            decision = triage.defer(store, record, 0, '#42', reason, '2026-09-06T00:00:00Z')
+        else:
+            decision = triage.dismiss(store, record, 0, reason, 'legacy timestamp')
+    return decision
+
+
+@pytest.mark.parametrize('damage', ['missing_ref', 'placeholder_ref', 'short_reason', 'missing_reason', 'key', 'scope'])
+def test_recovery_rejects_unauditable_triage_decisions(tmp_path, monkeypatch, damage):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_triage_fixture(source)
+    with closing(sqlite3.connect(source)) as raw:
+        sql = {
+            'missing_ref': 'UPDATE triage_events SET tracking_ref=NULL',
+            'placeholder_ref': "UPDATE triage_events SET tracking_ref='#'",
+            'short_reason': "UPDATE triage_events SET reason='TODO'",
+            'missing_reason': 'UPDATE triage_events SET reason=NULL',
+            'key': "UPDATE triage_events SET finding_key='wrong'",
+            'scope': "UPDATE triage_events SET base_sha='wrong'",
+        }[damage]
+        raw.execute(sql)
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('event', ['dismiss', 'defer'])
+def test_recovery_preserves_valid_triage_and_its_audit_history(tmp_path, monkeypatch, event):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    decision = _recovery_triage_fixture(source, event)
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest)
+    with Store.open(dest) as store:
+        assert len(store.triage_for(REC['branch'], REC['base_sha'])) == 1
+        assert len(store.triage_history(decision['ledger_key'])) == 1
