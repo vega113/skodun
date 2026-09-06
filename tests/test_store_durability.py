@@ -542,3 +542,88 @@ def test_recovery_sql_cannot_attach_another_database(tmp_path, monkeypatch):
                         subprocess.CompletedProcess(a, 0, stdout=sql))
     assert not mod._recover_sqlite_image(tmp_path / 'source', tmp_path / 'dest')
     assert not outside.exists()
+
+
+@pytest.mark.parametrize('fail_on', [1, 2])
+def test_failed_copy_removes_its_partial_files_and_retry_can_recover(tmp_path, monkeypatch, fail_on):
+    import errno
+    import skodun.store as mod
+    db = tmp_path / 'broken.db'
+    original = _make_torn_wal(db)
+    copy_image = mod._copy_store_image
+    copy_bytes = mod.shutil.copyfileobj
+    calls = []
+    def failing_bytes(source, target, **kwargs):
+        calls.append(1)
+        target.write(source.read(128))
+        if len(calls) == fail_on:
+            raise OSError(errno.ENOSPC, 'injected full disk')
+        return copy_bytes(source, target, **kwargs)
+    def failing_image(*args, **kwargs):
+        with monkeypatch.context() as patch:
+            patch.setattr(mod.shutil, 'copyfileobj', failing_bytes)
+            return copy_image(*args, **kwargs)
+    monkeypatch.setattr(mod, '_copy_store_image', failing_image)
+    with pytest.raises(OSError):
+        Store.open(db)
+    assert len(calls) == fail_on
+    assert not _quarantines(db)
+    assert not list(tmp_path.glob(db.name + '.malformed-*'))
+    assert db.read_bytes() == original
+    monkeypatch.setattr(mod, '_copy_store_image', copy_image)
+    recoveries = []
+    def unavailable(*args):
+        recoveries.append(1)
+        return False
+    monkeypatch.setattr(mod, '_recover_sqlite_image', unavailable)
+    with pytest.raises(SchemaLifecycleError):
+        Store.open(db)
+    assert recoveries == [1]
+    assert len(_quarantines(db)) == 1
+    assert _quarantines(db)[0].read_bytes() == original
+
+
+def test_failed_copy_does_not_remove_a_preexisting_sidecar(tmp_path):
+    import skodun.store as mod
+    src, dest = tmp_path / 'source', tmp_path / 'quarantine'
+    src.write_bytes(b'original')
+    Path(str(src) + '-wal').write_bytes(b'wal')
+    existing = Path(str(dest) + '-wal')
+    existing.write_bytes(b'preexisting')
+    with pytest.raises(FileExistsError):
+        mod._copy_store_image(src, dest)
+    assert not dest.exists()
+    assert existing.read_bytes() == b'preexisting'
+
+
+def test_failed_copy_preserves_a_replacement_at_the_created_path(tmp_path, monkeypatch):
+    import skodun.store as mod
+    src, dest = tmp_path / 'source', tmp_path / 'quarantine'
+    src.write_bytes(b'original')
+    def replace_then_fail(source, target, **kwargs):
+        replacement = tmp_path / 'replacement'
+        replacement.write_bytes(b'preserve replacement')
+        os.replace(replacement, dest)
+        raise OSError('injected failure after replacement')
+    monkeypatch.setattr(mod.shutil, 'copyfileobj', replace_then_fail)
+    with pytest.raises(OSError):
+        mod._copy_store_image(src, dest)
+    assert dest.read_bytes() == b'preserve replacement'
+
+
+@pytest.mark.parametrize('remove_source', [False, True])
+def test_failed_copy_keeps_evidence_if_the_source_changed(tmp_path, monkeypatch, remove_source):
+    import skodun.store as mod
+    src, dest = tmp_path / 'source', tmp_path / 'quarantine'
+    src.write_bytes(b'original evidence')
+    def change_then_fail(source, target, **kwargs):
+        target.write(source.read())
+        if remove_source:
+            src.unlink()
+        else:
+            src.write_bytes(b'new source')
+        raise OSError('source changed during failure')
+    monkeypatch.setattr(mod.shutil, 'copyfileobj', change_then_fail)
+    with pytest.raises(OSError):
+        mod._copy_store_image(src, dest)
+    assert dest.read_bytes() == b'original evidence'

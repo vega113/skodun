@@ -1512,28 +1512,52 @@ def _quarantine_image_digest(path: Path, *, private: bool = False) -> tuple:
 
 
 def _copy_store_image(src: Path, dest: Path, *, expected: os.stat_result | None = None) -> None:
-    """Copy only regular files to exclusive, private quarantine destinations."""
-    for suffix in ("", "-wal", "-shm"):
-        source = Path(str(src) + suffix)
-        fd, error = _open_regular_file(source)
-        if error is not None:
-            if suffix and error.state == "missing":
-                continue
-            raise SchemaLifecycleError(error.reason_code or "missing",
-                                       f"unsafe quarantine source: {source}", version=None)
-        with os.fdopen(fd, "rb") as stream:
-            observed = os.fstat(stream.fileno())
-            if not suffix and expected is not None and (
-                    observed.st_dev, observed.st_ino, observed.st_mtime_ns, observed.st_size) != (
-                    expected.st_dev, expected.st_ino, expected.st_mtime_ns, expected.st_size):
-                raise SchemaLifecycleError("store_changed", "store changed before quarantine",
-                                           version=None)
-            out = os.open(Path(str(dest) + suffix),
-                          os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            with os.fdopen(out, "wb") as target:
-                shutil.copyfileobj(stream, target, length=1024 * 1024)
-                target.flush()
-                os.fsync(target.fileno())
+    """Copy regular files privately; failed attempts remove only their own files."""
+    created: list[tuple[Path, int]] = []
+    before = _inspection_source_state(src)
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            source = Path(str(src) + suffix)
+            fd, error = _open_regular_file(source)
+            if error is not None:
+                if suffix and error.state == "missing":
+                    continue
+                raise SchemaLifecycleError(error.reason_code or "missing",
+                                           f"unsafe quarantine source: {source}", version=None)
+            with os.fdopen(fd, "rb") as stream:
+                observed = os.fstat(stream.fileno())
+                if not suffix and expected is not None and (
+                        observed.st_dev, observed.st_ino, observed.st_mtime_ns, observed.st_size) != (
+                        expected.st_dev, expected.st_ino, expected.st_mtime_ns, expected.st_size):
+                    raise SchemaLifecycleError("store_changed", "store changed before quarantine",
+                                               version=None)
+                destination = Path(str(dest) + suffix)
+                out = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                created.append((destination, out))
+                # Retain the descriptor until cleanup finishes so an unlinked
+                # inode cannot be recycled underneath the ownership check.
+                with os.fdopen(out, "wb", closefd=False) as target:
+                    shutil.copyfileobj(stream, target, length=1024 * 1024)
+                    target.flush()
+                    os.fsync(target.fileno())
+    except BaseException:
+        after = _inspection_source_state(src)
+        # Preserve potentially unique evidence if the source itself disappeared
+        # or changed while copying. Ordinary destination I/O failures can retry.
+        if before is not None and after is not None and before[:2] == after[:2]:
+            for destination, descriptor in reversed(created):
+                try:
+                    current = destination.lstat()
+                    owned = os.fstat(descriptor)
+                    if (stat.S_ISREG(current.st_mode)
+                            and (current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino)):
+                        destination.unlink()
+                except OSError:
+                    pass  # Uncertain or failed cleanup preserves the file.
+        raise
+    finally:
+        for _, descriptor in created:
+            os.close(descriptor)
 
 
 def _recovered_schema_valid(conn: sqlite3.Connection) -> bool:

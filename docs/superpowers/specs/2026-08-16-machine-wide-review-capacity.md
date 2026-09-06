@@ -152,3 +152,8 @@ a review ID to an admission preserves its original start time.
 Capacity diagnostics remain advisory: malformed configuration must not discard
 readable statistics. Stats renders the store data with an unknown capacity and
 a configuration warning; doctor likewise marks an unresolved cap unknown.
+
+Copy failures clean up only files created by that attempt, verified through
+retained file descriptors. Pre-existing or replaced paths are preserved. If
+the authoritative source changed or disappeared, copied evidence is retained
+instead of being deleted.
