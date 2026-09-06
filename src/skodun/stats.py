@@ -61,10 +61,13 @@ def render(data: Mapping, *, fmt: str = "text") -> str:
             f"{h.get('resource_class')}@{h.get('scope')}={h.get('n')}"
             for h in (live.get("by_provider") or []) if isinstance(h, Mapping)
         ) or "none"
+        machine_cap = live.get('machine_cap')
         lines.append(
-            f"machine_cap={live.get('machine_cap')} "
+            f"machine_cap={machine_cap if machine_cap is not None else 'unknown'} "
             f"machine_holders={live.get('machine_holders')} "
             f"by_repo={repo_bit} by_provider={prov_bit}")
+        if live.get('config_error'):
+            lines.append(f"capacity_config_error={live['config_error']}")
     if 'audit_denominators' in data:
         lines.append('audit_denominators=' + json.dumps(data['audit_denominators'], sort_keys=True))
         lines.append('call_observations=' + json.dumps(data['call_observations'], sort_keys=True))

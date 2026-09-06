@@ -980,7 +980,7 @@ def _cmd_stats(args) -> int:
     with store:
         try:
             repo = _repo_root(Path.cwd())
-        except gitio.GitError:
+        except (gitio.GitError, OSError):
             repo = None
         code, text = svc_stats(
             store, getattr(args, "since_days", 7),

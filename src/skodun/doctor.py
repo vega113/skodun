@@ -51,9 +51,13 @@ def _format_sidecar(nbytes: int | None) -> str:
     return f"{int(nbytes)}B"
 
 
-def _capacity_env_clause(cfg: Any = None) -> str:
+def _machine_capacity_display(cfg: Any) -> int | str:
     from . import capacity as capmod
-    return (f"machine_cap={capmod.resolved_machine_capacity(cfg)} "
+    return "unknown" if cfg is None else capmod.resolved_machine_capacity(cfg)
+
+
+def _capacity_env_clause(cfg: Any = None) -> str:
+    return (f"machine_cap={_machine_capacity_display(cfg)} "
             f"machine_holders=unknown by_repo=unknown by_provider=unknown")
 
 
@@ -226,7 +230,7 @@ def run_doctor(
                 for h in by_provider) or "none"
             report.add(
                 "capacity", True,
-                f"machine_cap={capmod.resolved_machine_capacity(cfg)} "
+                f"machine_cap={_machine_capacity_display(cfg)} "
                 f"machine_holders={machine_holders} "
                 f"by_repo={repo_bit} by_provider={prov_bit}")
             report.add("worker_logs", True, "not created by read-only doctor")

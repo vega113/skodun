@@ -1083,14 +1083,22 @@ def svc_stats(store, since_days=7, fmt="text", *, repo=None) -> tuple[int, str]:
         data = store.telemetry_stats(since_iso=lower)
         from . import capacity as capmod
         from .config import load_config
+        config_error = None
+        try:
+            machine_cap = capmod.resolved_machine_capacity(load_config(repo))
+        except (ValueError, TypeError, OSError) as exc:
+            machine_cap = None
+            config_error = f"{type(exc).__name__}: run skodun doctor to inspect capacity configuration"
         live = {
-            "machine_cap": capmod.resolved_machine_capacity(load_config(repo)),
+            "machine_cap": machine_cap,
             "machine_holders": store.capacity_holder_count(
                 capmod.RESOURCE_REVIEW_MACHINE, capmod.MACHINE_SCOPE),
             "by_repo": store.capacity_live_holders(capmod.RESOURCE_REVIEW_FG),
             "by_provider": store.capacity_live_holders_prefix(
                 capmod.PROVIDER_CLASS_PREFIX),
         }
+        if config_error is not None:
+            live["config_error"] = config_error
         data = dict(data)
         data["live_capacity"] = live
         from .queueview import augment_stats

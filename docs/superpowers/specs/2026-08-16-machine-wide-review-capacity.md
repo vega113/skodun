@@ -148,3 +148,7 @@ database/WAL identity is unchanged. Reuse verifies content and private ownership
 and permissions; a conflicting copy is preserved and refused. SQLite reads the
 quarantine immutably, and recovery SQL cannot attach another database. Linking
 a review ID to an admission preserves its original start time.
+
+Capacity diagnostics remain advisory: malformed configuration must not discard
+readable statistics. Stats renders the store data with an unknown capacity and
+a configuration warning; doctor likewise marks an unresolved cap unknown.
