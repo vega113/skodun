@@ -1565,6 +1565,14 @@ def _copy_store_image(src: Path, dest: Path, *, expected: os.stat_result | None 
             os.close(descriptor)
 
 
+def _schema_sql_signature(sql: str) -> tuple[str, ...]:
+    """Ignore layout/keyword case while preserving quoted SQL values exactly."""
+    pattern = r"--[^\r\n]*|/\*.*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^]]*\]|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[^\s]"
+    tokens = re.findall(pattern, sql, flags=re.DOTALL)
+    return tuple(token if token[0] in "'\"`[" else token.lower()
+                 for token in tokens if not token.startswith(("--", "/*")))
+
+
 def _recovered_schema_valid(conn: sqlite3.Connection) -> bool:
     """Require the complete declared schema, including columns and indexes."""
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -1578,11 +1586,11 @@ def _recovered_schema_valid(conn: sqlite3.Connection) -> bool:
             else:
                 _apply_atomic(expected, target, delta)
         def schema(db):
-            return {(kind, name): " ".join(sql.split()).lower()
+            return {(kind, name): _schema_sql_signature(sql)
                     for kind, name, sql in db.execute(
                         "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL")}
         actual = schema(conn)
-        return all(actual.get(key) == sql for key, sql in schema(expected).items())
+        return actual == schema(expected)
 
 
 _RECOVERY_STATEMENT_LIMIT = 16 * 1024 * 1024

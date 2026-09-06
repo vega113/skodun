@@ -166,3 +166,7 @@ and failed validation refuse replacement while preserving original evidence.
 Recovery validates foreign-key relationships after replay, so child-before-parent
 dump order is supported but orphaned checkpoints or evidence cannot replace the
 authority even when SQLite physical integrity reports ok.
+
+Recovered schema objects must match the declared object set exactly. Comparison
+ignores SQL layout and keyword case while preserving quoted values, so extra
+triggers/tables or altered constraint literals cannot become authoritative.

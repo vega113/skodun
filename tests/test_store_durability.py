@@ -755,3 +755,36 @@ def test_recovery_accepts_complete_parent_and_child_relationships(tmp_path, monk
     with closing(sqlite3.connect(dest)) as restored:
         assert restored.execute('PRAGMA foreign_key_check').fetchone() is None
         assert restored.execute('SELECT COUNT(*) FROM review_checkpoints').fetchone()[0] == 2
+
+
+@pytest.mark.parametrize('extra', ['trigger', 'table'])
+def test_recovery_rejects_undeclared_schema_objects(tmp_path, monkeypatch, extra):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with closing(sqlite3.connect(source)) as raw:
+        if extra == 'trigger':
+            raw.execute("CREATE TRIGGER deny_review BEFORE INSERT ON reviews "
+                        "BEGIN SELECT RAISE(ABORT, 'blocked'); END")
+        else:
+            raw.execute('CREATE TABLE undeclared(value TEXT)')
+        raw.commit()
+        assert raw.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+        assert raw.execute('PRAGMA foreign_key_check').fetchone() is None
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert not mod._recover_sqlite_image(source, dest)
+    assert not dest.exists()
+
+
+def test_recovery_schema_comparison_preserves_constraint_literal_case(tmp_path, monkeypatch):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute('PRAGMA writable_schema=ON')
+        raw.execute("UPDATE sqlite_master SET sql=replace(sql, ?, ?) WHERE name='review_orchestrations'",
+                    ("'active'", "'ACTIVE'"))
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
