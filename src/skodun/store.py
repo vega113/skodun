@@ -1629,6 +1629,9 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
             valid = False
             try:
                 conn = sqlite3.connect(dest, isolation_level=None)
+                # Native dumps may emit children before parents; validate all
+                # relationships after replay instead of depending on order.
+                conn.execute("PRAGMA foreign_keys=OFF")
                 conn.set_authorizer(lambda action, *_:
                     sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_ATTACH else sqlite3.SQLITE_OK)
                 deadline = time.monotonic() + 300
@@ -1638,6 +1641,7 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
                 check = conn.execute("PRAGMA integrity_check").fetchone()
                 valid = (check is not None and check[0] == "ok"
                          and _recovered_schema_valid(conn)
+                         and conn.execute("PRAGMA foreign_key_check").fetchone() is None
                          and conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] > 0)
                 return valid
             except (sqlite3.DatabaseError, OSError, ValueError):

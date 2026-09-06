@@ -162,3 +162,7 @@ Recovery output is written to private temporary files and replayed one native
 SQL statement at a time. Replay limits statements to 16 Mi characters and has
 a 300-second execution budget. Oversized statements, unfinished transactions,
 and failed validation refuse replacement while preserving original evidence.
+
+Recovery validates foreign-key relationships after replay, so child-before-parent
+dump order is supported but orphaned checkpoints or evidence cannot replace the
+authority even when SQLite physical integrity reports ok.

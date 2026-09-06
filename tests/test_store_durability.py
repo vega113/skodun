@@ -720,3 +720,38 @@ def test_changed_snapshot_version_is_retried_before_refusing_migration(tmp_path,
     with Store.open(db) as store:
         assert store._c.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
     assert len(copies) == 2
+
+
+def test_recovery_rejects_orphaned_checkpoint_rows(tmp_path, monkeypatch):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute('PRAGMA foreign_keys=OFF')
+        raw.execute("INSERT INTO review_checkpoints "
+                    "(orchestration_id,pass_kind,pass_index,state,diff_hash,boundary_hash) "
+                    "VALUES ('missing-parent','batch',1,'pending','d','b')")
+        raw.commit()
+        assert raw.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+        assert raw.execute('PRAGMA foreign_key_check').fetchone() is not None
+    before = source.read_bytes()
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert not mod._recover_sqlite_image(source, dest)
+    assert not dest.exists()
+    assert source.read_bytes() == before
+
+
+def test_recovery_accepts_complete_parent_and_child_relationships(tmp_path, monkeypatch):
+    import skodun.store as mod
+    from tests.test_checkpoints import _created
+    source = tmp_path / 'source.db'
+    with Store.open(source) as store:
+        store.save_review({**REC, 'id': 'kept'})
+        _created(store)
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest)
+    with closing(sqlite3.connect(dest)) as restored:
+        assert restored.execute('PRAGMA foreign_key_check').fetchone() is None
+        assert restored.execute('SELECT COUNT(*) FROM review_checkpoints').fetchone()[0] == 2
