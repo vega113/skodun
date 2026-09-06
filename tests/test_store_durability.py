@@ -695,3 +695,28 @@ def test_recovery_refuses_a_dump_with_an_unfinished_transaction(tmp_path, monkey
     dest = tmp_path / 'refused.db'
     assert not mod._recover_sqlite_image(source, dest)
     assert not dest.exists()
+
+
+def test_changed_snapshot_version_is_retried_before_refusing_migration(tmp_path, monkeypatch):
+    import skodun.store as mod
+    db = tmp_path / 'current.db'
+    _write_review(db, 'kept')
+    real = mod._snapshot_database
+    copies = []
+    def racing_snapshot(path):
+        result = real(path)
+        _owner, image, error = result
+        copies.append(image)
+        if error is None and len(copies) == 1:
+            # Model a copied v0 main header paired with a WAL checkpointed
+            # after that copy. The live source is already at the current schema.
+            with closing(sqlite3.connect(image)) as copied:
+                copied.execute('PRAGMA user_version=0')
+            with closing(sqlite3.connect(db)) as writer:
+                writer.execute("UPDATE reviews SET summary='checkpoint completed' WHERE id='kept'")
+                writer.commit()
+        return result
+    monkeypatch.setattr(mod, '_snapshot_database', racing_snapshot)
+    with Store.open(db) as store:
+        assert store._c.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
+    assert len(copies) == 2

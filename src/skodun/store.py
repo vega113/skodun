@@ -396,6 +396,10 @@ def _inspect_schema_once(path: Path, *, full_integrity: bool) -> SchemaInfo:
                         detail=f"integrity_check={integrity}; repairable "
                                f"(do not replace with an empty store)",
                         **extra)
+                if version != SCHEMA_VERSION:
+                    unstable = changed_source()
+                    if unstable is not None:
+                        return unstable
                 state = ("current" if version == SCHEMA_VERSION else
                          "older" if version < SCHEMA_VERSION else "newer")
                 return SchemaInfo(state, str(path), version, SCHEMA_VERSION,
