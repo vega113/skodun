@@ -216,11 +216,10 @@ reviewed unbatched.
 **Its own record shape.** The pass does not go through `merge_extra_pass`:
 there is no "primary" to fold into, only an aggregate assembled from every
 batch. `integration_meta` is the one shape its outcome persists as (oracle A8's
-`integration{}`), and it carries `attempts` where `extra_passes[<name>]`
-deliberately does not — for the extra passes the attempt list was telemetry
-about an optional opinion, here it is the audit trail of a trust axis. How
-those fields JOIN the aggregate's axes is the aggregation step's, not this
-module's.
+`integration{}`), and it carries `attempts` directly. For extra passes, the
+pipeline attaches runtime attempts after this module's pure merge. These are
+execution observations; how pass outcomes JOIN the aggregate's trust axes is
+the aggregation step's, not this module's.
 
 DIVERGENCES from the oracle
 ---------------------------
@@ -1221,10 +1220,9 @@ def integration_meta(
     `status` is checked against `INTEGRATION_STATUSES` because this is the field
     a human reads first, and a typo in it would be invisible in an artifact.
 
-    `attempts` is carried, unlike in `extra_passes[<name>]`, whose meta object
-    deliberately drops it (see `pipeline._extra_pass`): there the attempt list
-    was telemetry about an optional opinion, here the pass is a trust axis of
-    the aggregate and its attempts are the audit trail for that verdict.
+    `attempts` is carried directly here. For `extra_passes[<name>]`, the
+    pipeline attaches runtime attempts after the pure merge; this module
+    keeps its merge schema and trust behavior independent of those observations.
 
     `stop_reason` is carried for a narrower but equally concrete reason: this
     pass is one of the terms `pipeline._aggregate_stop_reason` reads, and it was
