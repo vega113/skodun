@@ -311,9 +311,45 @@ def _durability_fields(path: Path, *, journal_mode: str | None = None,
     }
 
 
+def _inspection_source_state(path: Path) -> tuple | None:
+    """Observe file identities and write metadata without opening live SQLite."""
+    parts = []
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            st = Path(str(path) + suffix).lstat()
+        except FileNotFoundError:
+            parts.append(None)
+            continue
+        except OSError:
+            return None
+        parts.append((st.st_dev, st.st_ino, st.st_mode, st.st_size,
+                      st.st_mtime_ns, st.st_ctime_ns))
+    return tuple(parts)
+
+
 def inspect_schema(path: Path, *, full_integrity: bool = True) -> SchemaInfo:
+    """Retry failed raw-copy checks when the source changed during inspection."""
+    for attempt in range(3):
+        info = _inspect_schema_once(path, full_integrity=full_integrity)
+        if info.reason_code != "busy" or info.detail != "source_changed":
+            return info
+        if attempt < 2:
+            time.sleep(0.05 * (attempt + 1))
+    return info
+
+
+def _inspect_schema_once(path: Path, *, full_integrity: bool) -> SchemaInfo:
     """Inspect a database without creating or mutating filesystem state."""
     path = Path(path)
+    source_state = _inspection_source_state(path)
+
+    def changed_source():
+        if source_state is not None and _inspection_source_state(path) == source_state:
+            return None
+        return SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
+                          reason_code="busy", detail="source_changed",
+                          **_durability_fields(path))
+
     snapshot, db_path, error = _snapshot_database(path)
     if error is not None:
         extra = _durability_fields(path) if path.exists() else {}
@@ -344,6 +380,9 @@ def inspect_schema(path: Path, *, full_integrity: bool = True) -> SchemaInfo:
                 # torn. Only an empty/missing -wal plus a bad check is the
                 # incident shape; that is safe to fail closed on.
                 if integrity is not None and integrity != "ok":
+                    unstable = changed_source()
+                    if unstable is not None:
+                        return unstable
                     return SchemaInfo(
                         "invalid", str(path), None, SCHEMA_VERSION,
                         reason_code=("torn_wal" if _torn_wal_signature(path)
@@ -356,6 +395,9 @@ def inspect_schema(path: Path, *, full_integrity: bool = True) -> SchemaInfo:
                 return SchemaInfo(state, str(path), version, SCHEMA_VERSION,
                                   **extra)
             except sqlite3.OperationalError as exc:
+                unstable = changed_source()
+                if unstable is not None:
+                    return unstable
                 last_exc = exc
                 if conn is not None:
                     conn.close()
@@ -379,6 +421,9 @@ def inspect_schema(path: Path, *, full_integrity: bool = True) -> SchemaInfo:
                     "invalid", str(path), None, SCHEMA_VERSION,
                     reason_code="invalid_sqlite", detail=repr(exc), **extra)
             except sqlite3.DatabaseError as exc:
+                unstable = changed_source()
+                if unstable is not None:
+                    return unstable
                 extra = _durability_fields(path)
                 if _is_busy_error(exc):
                     return SchemaInfo(

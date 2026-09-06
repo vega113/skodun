@@ -118,3 +118,9 @@ Each admitted machine ticket persists its requested capacity limit. Admission
 uses the minimum of the incoming limit and every active machine holder limit
 inside the same write transaction. A repo's tighter limit remains binding until
 its ticket is released; later clients cannot raise it while that holder runs.
+
+A failed check on a copied image is not classified as corruption when source
+file identity or write metadata changed during inspection. Inspection retries
+with fresh snapshots up to three times, then reports busy if the source keeps
+moving. Genuine unchanged corruption still follows the existing refusal or
+quarantine path.

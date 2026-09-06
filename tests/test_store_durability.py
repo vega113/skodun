@@ -412,3 +412,42 @@ def test_doctor_other_corruption_directs_manual_restore(tmp_path, monkeypatch):
     assert not check.ok
     assert 'restore manually' in check.detail
     assert 'next writable' not in check.detail
+
+
+@pytest.mark.parametrize('always_race', [False, True])
+def test_inspection_retries_changed_source_instead_of_reporting_corruption(
+        tmp_path, monkeypatch, always_race):
+    import skodun.store as mod
+    db = tmp_path / 'healthy.db'
+    _write_review(db, 'retained')
+    real_snapshot = mod._snapshot_database
+    copies = []
+    def snapshot(path):
+        result = real_snapshot(path)
+        temporary, image, error = result
+        copies.append(image)
+        if error is None and (always_race or len(copies) == 1):
+            # A mixed raw snapshot can be malformed although the live writer
+            # committed a healthy image after the copy started.
+            with closing(sqlite3.connect(db)) as writer:
+                writer.execute('UPDATE reviews SET summary=? WHERE id=?',
+                               (f'writer-{len(copies)}', 'retained'))
+                writer.commit()
+            raw = bytearray(image.read_bytes())
+            raw[4096:8192] = b'\xff' * 4096
+            image.write_bytes(raw)
+        return result
+    monkeypatch.setattr(mod, '_snapshot_database', snapshot)
+    info = inspect_schema(db)
+    if always_race:
+        assert len(copies) == 3
+        assert info.reason_code == 'busy'
+        assert info.detail == 'source_changed'
+        assert info.integrity_check is None
+    else:
+        assert len(copies) == 2
+        assert info.state == 'current'
+        assert info.integrity_check == 'ok'
+    with closing(sqlite3.connect(db)) as original:
+        assert original.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+    assert not _quarantines(db)
