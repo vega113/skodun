@@ -788,3 +788,60 @@ def test_recovery_schema_comparison_preserves_constraint_literal_case(tmp_path, 
         raw.commit()
     _stream_source_dump(monkeypatch, source)
     assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('damage', ['malformed', 'not_object', 'id', 'axis', 'trust', 'index', 'duplicate', 'nan'])
+def test_recovery_rejects_invalid_or_inconsistent_review_artifacts(tmp_path, monkeypatch, damage):
+    import json
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with closing(sqlite3.connect(source)) as raw:
+        text = raw.execute('SELECT artifact_json FROM reviews').fetchone()[0]
+        artifact = json.loads(text)
+        if damage == 'malformed':
+            text = '{'
+        elif damage == 'not_object':
+            text = '[]'
+        elif damage == 'duplicate':
+            text = text[:-1] + ', "id":"kept"}'
+        elif damage == 'nan':
+            text = text[:-1] + ', "extra":NaN}'
+        elif damage == 'index':
+            raw.execute("UPDATE reviews SET head='different-indexed-head'")
+        else:
+            if damage == 'id':
+                artifact['id'] = 'different-id'
+            elif damage == 'axis':
+                artifact['parse_ok'] = 'false'
+            else:
+                artifact['trustworthy'] = not artifact['trustworthy']
+            text = json.dumps(artifact)
+        raw.execute('UPDATE reviews SET artifact_json=?', (text,))
+        raw.commit()
+    before = source.read_bytes()
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert not mod._recover_sqlite_image(source, dest)
+    assert not dest.exists()
+    assert source.read_bytes() == before
+
+
+def test_recovery_preserves_valid_legacy_nullable_projections(tmp_path, monkeypatch):
+    import json
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with closing(sqlite3.connect(source)) as raw:
+        artifact = json.loads(raw.execute('SELECT artifact_json FROM reviews').fetchone()[0])
+        for name in ('review_started_at', 'review_completed_at', 'repo_id', 'terminal_reason', 'outcome'):
+            artifact.pop(name, None)
+            raw.execute(f'UPDATE reviews SET {name}=NULL')
+        artifact.pop('context_hash', None)
+        raw.execute('UPDATE reviews SET context_hash=NULL, artifact_json=?', (json.dumps(artifact),))
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest)
+    with Store.open(dest) as restored:
+        assert restored.get_review('kept') == artifact

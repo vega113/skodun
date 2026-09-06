@@ -170,3 +170,7 @@ authority even when SQLite physical integrity reports ok.
 Recovered schema objects must match the declared object set exactly. Comparison
 ignores SQL layout and keyword case while preserving quoted values, so extra
 triggers/tables or altered constraint literals cannot become authoritative.
+
+Each recovered review must have a valid object artifact, unambiguous JSON,
+valid store trust fields, and indexed values matching the writer projection.
+Legacy absent/null additive metadata remains valid without rewriting history.

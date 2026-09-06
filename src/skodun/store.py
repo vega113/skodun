@@ -1593,6 +1593,60 @@ def _recovered_schema_valid(conn: sqlite3.Connection) -> bool:
         return actual == schema(expected)
 
 
+def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
+    """Check artifacts and their indexed projections without rewriting history."""
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate artifact key")
+            value[key] = item
+        return value
+
+    def reject_constant(value):
+        raise ValueError("non-JSON numeric constant")
+
+    missing = object()
+    names = ("id", *_REVIEW_COLUMNS)
+    count = 0
+    try:
+        rows = conn.execute("SELECT " + ",".join(names) + " FROM reviews")
+        for values in rows:
+            if time.monotonic() >= deadline:
+                return False
+            row = dict(zip(names, values))
+            if not isinstance(row["artifact_json"], str):
+                return False
+            artifact = json.loads(row["artifact_json"], object_pairs_hook=unique_object,
+                                  parse_constant=reject_constant)
+            if (not isinstance(artifact, dict) or not isinstance(artifact.get("id"), str)
+                    or not artifact["id"].strip() or artifact["id"] != row["id"]):
+                return False
+            normalized = _normalize_record(artifact, label="recovery")
+            if normalized["trustworthy"] != bool(row["trustworthy"]):
+                return False
+            if "trustworthy" in artifact and (
+                    type(artifact["trustworthy"]) is not bool
+                    or artifact["trustworthy"] != normalized["trustworthy"]):
+                return False
+            projected = dict(zip(_REVIEW_COLUMNS, _review_values(artifact)))
+            for name, expected in projected.items():
+                if name == "artifact_json" or row[name] == expected:
+                    continue
+                source_key = {"sev_high": "high", "sev_medium": "medium", "sev_low": "low"}.get(name)
+                source = ((artifact.get("severity") or {}).get(source_key, missing)
+                          if source_key else artifact.get(name, missing))
+                # Additive migrations leave absent historical values NULL.
+                # Validate raw projections, not normalization's new timestamps.
+                if row[name] is None and source is missing and expected in (None, 0, ""):
+                    continue
+                return False
+            count += 1
+    except (ValueError, TypeError, AttributeError, OverflowError, RecursionError):
+        return False
+    return count > 0 and time.monotonic() < deadline
+
+
 _RECOVERY_STATEMENT_LIMIT = 16 * 1024 * 1024
 
 
@@ -1650,7 +1704,7 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
                 valid = (check is not None and check[0] == "ok"
                          and _recovered_schema_valid(conn)
                          and conn.execute("PRAGMA foreign_key_check").fetchone() is None
-                         and conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] > 0)
+                         and _recovered_reviews_valid(conn, deadline))
                 return valid
             except (sqlite3.DatabaseError, OSError, ValueError):
                 return False
