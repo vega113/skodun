@@ -105,8 +105,8 @@ with schema migration, and rechecked under the lifecycle lock. Private regular
 file quarantine preserves original bytes. Replacement requires the complete
 current declared schema and at least one review; older, partial, or failed
 recoveries remain quarantined for manual restoration. Every observed failed
-integrity check is invalid. Normal inspection for opens omits the full scan
-unless the torn-WAL signature is present; doctor requests a full check.
+integrity check is invalid. Routine opens use a bounded table probe instead of a full scan, including
+cleanly closed WAL stores; doctor requests a full integrity check.
 
 The v21 migration adds nullable `owner_start` to admission rows. New machine
 tickets record process birth identity; a live PID with a different observed
@@ -128,3 +128,7 @@ quarantine path.
 The inner `review_fg` limit follows the same host-first, repository-minimum
 precedence. Repository values cannot raise a host file/default foreground
 ceiling, and a host environment override cannot erase repository tightening.
+
+Foreground holders also retain their declared inner limits across worktrees.
+Legacy dual-hold admissions remain single-slot and respect store-only holders.
+Foreground holder age starts at admission, keeping queue time out of its TTL.

@@ -795,7 +795,7 @@ def _acquire_repo_fg(
 
             attempted = True
             active = store.capacity_active_views(RESOURCE_REVIEW_FG, scope)
-            if decide_admit(ticket.id, active, cap):
+            if decide_admit(ticket.id, active, min(cap, 1)):
                 slice_sec = max(min(float(poll_sec), max(remaining, 0.0)), 0.0)
                 got = try_lock(slice_sec)
                 if got:

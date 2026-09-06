@@ -193,13 +193,13 @@ def run_doctor(
         elif info.state == "invalid":
             repair = ""
             if info.reason_code == "torn_wal":
-                repair = (" repairable: do not replace with an empty store; "
-                          "quarantine is *.malformed-<utc> on the next writable "
-                          "open")
+                repair = (" do not replace with an empty store; a writable open "
+                          "may attempt quarantined recovery; restore from a "
+                          "verified backup if recovery is unavailable")
             elif info.reason_code == "invalid_sqlite":
                 repair = " preserve the original; restore manually from a verified backup"
             elif info.reason_code == "busy":
-                repair = " writers hold the file; retry, this is not malformed"
+                repair = " store is busy or changed during inspection; retry"
             report.add("store", False,
                        f"schema state=invalid path={store_path} "
                        f"reason_code={info.reason_code or 'invalid_schema'}; "

@@ -370,9 +370,14 @@ def _inspect_schema_once(path: Path, *, full_integrity: bool) -> SchemaInfo:
                 row = conn.execute("PRAGMA journal_mode").fetchone()
                 journal_mode = (row[0] if row else None) or _journal_mode_from_header(path)
                 integrity = None
-                if full_integrity or _torn_wal_signature(path):
+                if full_integrity:
                     integrity_row = conn.execute("PRAGMA integrity_check").fetchone()
                     integrity = str(integrity_row[0]) if integrity_row else "unknown"
+                elif version == SCHEMA_VERSION:
+                    # Touch one table row, not every page/index. This catches
+                    # an unreadable incident image without scanning a healthy
+                    # checkpointed WAL store on each routine open.
+                    conn.execute("SELECT status FROM reviews NOT INDEXED LIMIT 1").fetchone()
                 extra = _durability_fields(
                     path, journal_mode=str(journal_mode).lower(),
                     integrity=integrity)
@@ -4231,9 +4236,13 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                             continue  # Same owner or insufficient evidence: retain.
                         reason = REASON_STALE_PID  # Proven PID reuse, never signal it.
                 if reason is None:
+                    age_from = row["queued_at"]
+                    if resource_class == "review-fg" and row["status"] in ("admitted", "running"):
+                        # Holder TTL starts at admission; queueing has its own budget.
+                        age_from = row["started_at"] or row["admitted_at"] or age_from
                     reason = should_reclaim_admission(
                         status=row["status"], pid=row["pid"],
-                        queued_at=row["queued_at"], stale_sec=stale_sec,
+                        queued_at=age_from, stale_sec=stale_sec,
                         now_epoch=now_epoch, pid_alive_fn=pid_alive_fn)
                 if reason is None:
                     continue
@@ -4283,7 +4292,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                  *self._CAPACITY_ACTIVE)).fetchall()
             views = [WaiterView(id=p["id"], status=p["status"],
                                 queued_at=p["queued_at"], enqueue_order=p["enqueue_order"]) for p in peers]
-            if row["resource_class"] == "review-machine":
+            if row["resource_class"] in ("review-machine", "review-fg"):
                 holder_limits = [p["capacity_limit"] or 1 for p in peers
                                  if p["status"] in ("admitted", "running")]
                 capacity = min([capacity, *holder_limits])
@@ -4295,7 +4304,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                 """UPDATE capacity_admissions
                    SET status='admitted', admitted_at=?, capacity_limit=?
                    WHERE id=? AND status='queued'""",
-                (admitted_at, declared_capacity if row["resource_class"] == "review-machine"
+                (admitted_at, declared_capacity if row["resource_class"] in ("review-machine", "review-fg")
                  else None, admission_id))
             self._c.execute("COMMIT")
         except BaseException:
@@ -4328,10 +4337,15 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
             if row["status"] != "queued":
                 self._c.execute("COMMIT")
                 return None
+            if (row["resource_class"] == "review-fg"
+                    and self.capacity_holder_count("review-fg", row["scope"]) > 0):
+                self._c.execute("COMMIT")
+                return None
             admitted_at = _iso_now()
             self._c.execute(
                 """UPDATE capacity_admissions
-                   SET status='admitted', admitted_at=?
+                   SET status='admitted', admitted_at=?,
+                       capacity_limit=CASE WHEN resource_class='review-fg' THEN 1 ELSE capacity_limit END
                    WHERE id=? AND status='queued'""",
                 (admitted_at, admission_id))
             self._c.execute("COMMIT")

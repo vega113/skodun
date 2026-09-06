@@ -358,12 +358,16 @@ def test_delete_store_failed_integrity_is_invalid(tmp_path):
 
 
 @pytest.mark.parametrize("readonly", [False, True])
-def test_ordinary_delete_open_skips_full_integrity_scan(tmp_path, monkeypatch, readonly):
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_ordinary_open_skips_full_integrity_scan(tmp_path, monkeypatch, readonly, journal_mode):
     import skodun.store as mod
     db = tmp_path / "s.db"
     _write_review(db, "retained")
     with closing(sqlite3.connect(db, isolation_level=None)) as conn:
-        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute(f"PRAGMA journal_mode={journal_mode}")
+    if journal_mode == "WAL":
+        assert _header_write_version(db) == 2
+        assert not Path(str(db) + "-wal").exists()
     statements = []
     real = mod.sqlite3.connect
     def connect(*a, **k):
@@ -424,7 +428,7 @@ def test_inspection_retries_changed_source_instead_of_reporting_corruption(
     copies = []
     def snapshot(path):
         result = real_snapshot(path)
-        temporary, image, error = result
+        _temporary, image, error = result
         copies.append(image)
         if error is None and (always_race or len(copies) == 1):
             # A mixed raw snapshot can be malformed although the live writer
@@ -451,3 +455,15 @@ def test_inspection_retries_changed_source_instead_of_reporting_corruption(
     with closing(sqlite3.connect(db)) as original:
         assert original.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
     assert not _quarantines(db)
+
+
+def test_doctor_torn_wal_guidance_does_not_promise_every_open_will_recover(tmp_path, monkeypatch):
+    db = tmp_path / 'torn.db'
+    original = _make_torn_wal(db)
+    monkeypatch.setenv('SKODUN_CONFIG', str(tmp_path / 'absent.toml'))
+    report = run_doctor(repo=tmp_path, store_path=db)
+    check = next(c for c in report.checks if c.name == 'store')
+    assert not check.ok
+    assert 'may attempt quarantined recovery' in check.detail
+    assert 'next writable' not in check.detail
+    assert db.read_bytes() == original

@@ -992,3 +992,55 @@ def test_machine_limit_of_two_cannot_be_raised_by_later_wide_waiters(store):
     assert store.capacity_get(second.parent.id)['capacity_limit'] == 4
     finish(store, second)
     finish(store, third)
+
+
+def test_foreground_holder_limit_binds_other_worktrees_but_not_other_repos(store):
+    first = acquire_for_fg(store, scope='/repo', capacity=1, machine_capacity=8,
+                           wait_sec=.1, poll_sec=.01)
+    assert store.capacity_get(first.id)['capacity_limit'] == 1
+    other = acquire_for_fg(store, scope='/other-repo', capacity=4, machine_capacity=8,
+                           wait_sec=.1, poll_sec=.01)
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                       wait_sec=.03, poll_sec=.01)
+    finish(store, first)
+    second = acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                            wait_sec=.1, poll_sec=.01)
+    third = acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                           wait_sec=.1, poll_sec=.01)
+    assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_FG, '/repo') == 2
+    for ticket in (other, second, third):
+        finish(store, ticket)
+
+
+def test_foreground_holder_age_starts_at_admission_after_a_long_wait(store):
+    from datetime import datetime, timezone
+    first = acquire_for_fg(store, scope='/repo', capacity=1, machine_capacity=4,
+                           wait_sec=.1, poll_sec=.01)
+    store._c.execute("UPDATE capacity_admissions SET queued_at='2000-01-01T00:00:00Z' WHERE id=?",
+                     (first.id,))
+    started = datetime.strptime(first.started_at, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).timestamp()
+    assert capacity.reclaim_stale(store, scope='/repo', stale_sec=30,
+                                  now_epoch=started + 1, pid_alive_fn=lambda pid: True) == []
+    finish(store, first)
+
+
+def test_legacy_single_slot_and_store_only_holders_respect_each_other(store):
+    first = acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                           wait_sec=.1, poll_sec=.01)
+    attempts = []
+    def legacy_lock(seconds):
+        attempts.append(seconds)
+        return True
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                       wait_sec=.03, poll_sec=.01, try_lock=legacy_lock)
+    assert attempts == []
+    finish(store, first)
+    legacy = acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                            wait_sec=.1, poll_sec=.01, try_lock=legacy_lock)
+    assert store.capacity_get(legacy.id)['capacity_limit'] == 1
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                       wait_sec=.03, poll_sec=.01)
+    finish(store, legacy)

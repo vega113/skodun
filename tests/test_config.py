@@ -1718,7 +1718,7 @@ def test_repo_machine_ceiling_survives_host_environment_override(
 @pytest.mark.parametrize("key", ["_repo_machine", "_repo_review_fg"])
 def test_internal_repo_capacity_metadata_is_not_a_config_key(tmp_path, key):
     global_path = _write(tmp_path / 'global.toml', f'[capacity]\n{key} = 8\n')
-    with pytest.raises(ValueError, match='unknown.*capacity'):
+    with pytest.raises(ValueError, match=r'unknown.*capacity'):
         load_config(None, global_path=global_path)
 
 
