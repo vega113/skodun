@@ -1695,9 +1695,10 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                     if request_store._identity_json(row["scope"], decoded["identity_json"]) != row["identity_json"]:
                         return False
                     execution = conn.execute(
-                        "SELECT request_id,pid,source,status FROM request_executions WHERE owner_token=?",
-                        (row["owner_token"],)).fetchone()
-                    if (execution is None or execution["request_id"] != row["id"]
+                        "SELECT request_id,owner_token,pid,source,status FROM request_executions "
+                        "WHERE request_id=? ORDER BY seq DESC LIMIT 1",
+                        (row["id"],)).fetchone()
+                    if (execution is None or execution["owner_token"] != row["owner_token"]
                             or execution["pid"] != row["pid"] or execution["source"] != row["source"]):
                         return False
                     result = decoded.get("result_json")

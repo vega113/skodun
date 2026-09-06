@@ -931,3 +931,19 @@ def test_recovery_rejects_invalid_request_and_checkpoint_invariants(tmp_path, mo
         raw.commit()
     _stream_source_dump(monkeypatch, source)
     assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+def test_recovery_refuses_request_owner_that_matches_only_an_older_execution(tmp_path, monkeypatch):
+    import skodun.store as mod
+    from tests.test_budget_store import begin, resume
+    source = tmp_path / 'source.db'
+    with Store.open(source) as store:
+        store.save_review({**REC, 'id': 'kept'})
+        rid, seq = begin(store)
+        resume(store, rid, seq)
+    _stream_source_dump(monkeypatch, source)
+    assert mod._recover_sqlite_image(source, tmp_path / 'valid.db')
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute("UPDATE review_requests SET owner_token='private-owner',pid=123,source='cli' WHERE id=?", (rid,))
+        raw.commit()
+    assert not mod._recover_sqlite_image(source, tmp_path / 'invalid.db')
