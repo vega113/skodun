@@ -2,6 +2,10 @@
 # Operator-owned CLI/MCP entry point. Never source project-local configuration.
 set -eu
 profile="${SKODUN_HOST_PROFILE:-${XDG_CONFIG_HOME:-${HOME:?HOME is required}/.config}/skodun/host-profile.sh}"
+case "$profile" in
+    /*) ;;
+    *) echo 'skodun-host: host profile path must be absolute' >&2; exit 2 ;;
+esac
 if [ ! -f "$profile" ]; then
     echo "skodun-host: missing host profile: $profile" >&2
     exit 2

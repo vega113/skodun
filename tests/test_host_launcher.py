@@ -1,4 +1,9 @@
-"""Exercise the optional host launcher as a real subprocess, without providers."""
+"""Drive examples/bin/skodun-host through its real subprocess entry point.
+
+Profiles and executable stand-ins belong to each test's temporary directory.
+The launcher must validate the selected paths, propagate arguments/environment
+and preserve exit status; these tests never launch a review provider.
+"""
 import json
 import os
 from pathlib import Path
@@ -65,4 +70,15 @@ def test_launcher_requires_executable_in_profile(tmp_path, monkeypatch):
     result = invoke(tmp_path, '# Missing executable configuration.\n')
     assert result.returncode == 2
     assert 'set SKODUN_REAL_BIN' in result.stderr
+    assert result.stdout == ''
+
+
+@pytest.mark.parametrize('profile', ['host-profile.sh', './host-profile.sh'])
+def test_launcher_rejects_relative_profile_before_sourcing(tmp_path, profile):
+    (tmp_path / 'host-profile.sh').write_text('echo must-not-run\n')
+    result = subprocess.run([str(LAUNCHER)], cwd=tmp_path,
+                            env={**os.environ, 'SKODUN_HOST_PROFILE': profile},
+                            text=True, capture_output=True, timeout=5)
+    assert result.returncode == 2
+    assert 'host profile path must be absolute' in result.stderr
     assert result.stdout == ''

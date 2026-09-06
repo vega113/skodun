@@ -32,8 +32,8 @@ select providers. Use it for both CLI and MCP startup.
    SKODUN_REAL_BIN="$HOME/.local/pipx/venvs/skodun/bin/skodun"
    export SKODUN_REVIEW_FG_CAPACITY=2
    export SKODUN_LEGACY_FG_LOCK=0
-   # Use the existing, explicitly approved host provider limit:
-   export SKODUN_PROVIDER_MAX_IN_FLIGHT=1
+   # This example assumes an existing, explicitly approved provider limit of 2:
+   export SKODUN_PROVIDER_MAX_IN_FLIGHT=2
    ```
 
    This is an explicit host-wide opt-in affecting every repository reached
@@ -78,5 +78,5 @@ upgrade: a package manager can replace a managed symlink. Verify the immutable
 build and MCP handshakes again; this launcher does not auto-update loaded code.
 
 The profile is trusted executable shell configuration, like a shell rc file.
-Never point `SKODUN_HOST_PROFILE` at an untrusted repository file. Do not store
+The profile path must be absolute. Never point `SKODUN_HOST_PROFILE` at an untrusted repository file. Do not store
 secrets in it or print a process's full environment during an audit.
