@@ -11,8 +11,9 @@ if [ ! -f "$profile" ]; then
     exit 2
 fi
 # Trusted shell configuration, like a shell rc file; never store credentials here.
-# The selected executable must come from this profile, not an inherited alias.
-unset SKODUN_REAL_BIN
+# Executable and capacity come from this profile, not stale client settings.
+unset SKODUN_REAL_BIN SKODUN_REVIEW_FG_CAPACITY SKODUN_LEGACY_FG_LOCK \
+    SKODUN_PROVIDER_MAX_IN_FLIGHT
 . "$profile"
 if [ -z "${SKODUN_REAL_BIN:-}" ] || [ ! -x "$SKODUN_REAL_BIN" ]; then
     echo 'skodun-host: set SKODUN_REAL_BIN to the absolute installed executable' >&2

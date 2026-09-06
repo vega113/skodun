@@ -82,3 +82,18 @@ def test_launcher_rejects_relative_profile_before_sourcing(tmp_path, profile):
     assert result.returncode == 2
     assert 'host profile path must be absolute' in result.stderr
     assert result.stdout == ''
+
+
+def test_launcher_clears_inherited_capacity_when_profile_omits_it(tmp_path, monkeypatch):
+    names = ('SKODUN_REVIEW_FG_CAPACITY', 'SKODUN_LEGACY_FG_LOCK',
+             'SKODUN_PROVIDER_MAX_IN_FLIGHT')
+    for name in names:
+        monkeypatch.setenv(name, '9')
+    target = tmp_path / 'inspect-capacity'
+    target.write_text(f'#!{sys.executable}\nimport json, os\n'
+                      f'print(json.dumps([os.environ.get(n) for n in {names!r}]))\n')
+    target.chmod(0o700)
+    result = invoke(tmp_path, f"SKODUN_REAL_BIN='{target}'\n"
+                    'export SKODUN_REVIEW_FG_CAPACITY=2\n')
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == ['2', None, None]

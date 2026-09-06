@@ -8,7 +8,9 @@ already running MCP process or a GUI client that did not inherit that shell.
 The optional [host launcher](../examples/bin/skodun-host) reads one trusted,
 operator-owned shell file before starting the installed executable. It does not
 install Skodun, restart clients, change product defaults, load credentials, or
-select providers. Use it for both CLI and MCP startup.
+select providers. It clears inherited executable and foreground/legacy/provider
+capacity settings before sourcing the profile, so omitted capacity settings use
+product defaults. Use it for both CLI and MCP startup.
 
 ## Prepare and activate
 
