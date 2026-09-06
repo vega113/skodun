@@ -33,7 +33,7 @@ _LIMITS = ('max_queue_seconds', 'max_review_seconds', 'max_provider_wait_seconds
 _DEADLINES = ('queue', 'review', 'total', 'provider_wait')
 _TIMING = ('queue_wait_ms', 'provider_wait_ms', 'review_wall_ms', 'review_active_ms', 'total_ms')
 _FIELDS = frozenset(('scope', 'request_id', 'execution_seq', 'phase', 'limits',
-                    'deadlines', 'timing', 'review_paused_for_queue', 'reason_code', 'updated_at'))
+                    'deadlines', 'timing', 'provider_waits', 'review_paused_for_queue', 'reason_code', 'updated_at'))
 
 
 class BudgetDataError(ValueError):
@@ -106,6 +106,13 @@ def _snapshot(request_id, execution_seq, value):
         'timing': {key: _number(key, timing.get(key)) for key in _TIMING},
         'review_paused_for_queue': paused, 'reason_code': reason,
         'updated_at': _timestamp('updated_at', value.get('updated_at'))}
+    if 'provider_waits' in value:
+        waits = _object('provider_waits', value['provider_waits'], ('active_count', 'deadlines'))
+        count, items = waits.get('active_count'), waits.get('deadlines')
+        if type(count) is not int or not 0 <= count <= 2 or not isinstance(items, list) or len(items) != count:
+            raise ValueError('provider_waits must contain at most two active deadlines')
+        normalized['provider_waits'] = {'active_count': count,
+            'deadlines': [_timestamp('provider wait deadline', item) for item in items]}
     encoded = json.dumps(normalized, sort_keys=True, separators=(',', ':'), allow_nan=False)
     if len(encoded.encode('utf-8')) > MAX_SNAPSHOT_BYTES:
         raise ValueError('snapshot exceeds 65536 bytes')
@@ -214,7 +221,7 @@ class BudgetStoreMixin:
             if not isinstance(encoded, str) or len(encoded.encode('utf-8')) > MAX_SNAPSHOT_BYTES:
                 raise ValueError('snapshot size')
             decoded = json.loads(encoded, object_pairs_hook=_unique_json_pairs)
-            if not isinstance(decoded, dict) or set(decoded) != _FIELDS:
+            if not isinstance(decoded, dict) or set(decoded) not in (_FIELDS, _FIELDS - {'provider_waits'}):
                 raise ValueError('incomplete snapshot fields')
             for name, keys in (('limits', _LIMITS), ('deadlines', _DEADLINES), ('timing', _TIMING)):
                 if not isinstance(decoded.get(name), dict) or set(decoded[name]) != set(keys):

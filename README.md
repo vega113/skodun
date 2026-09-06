@@ -5,6 +5,8 @@ subscribed to, instead of an API key.**
 
 Foreground calls now carry [durable request identity](docs/review-requests.md),
 including before admission, with explicit idempotency keys for caller retries.
+Opt-in [independent batch execution](docs/parallel-batches.md) keeps the default
+sequential and accepts a per-request limit of at most two foreground workers.
 
 Reviewers are declared in a TOML config (provider, model, effort, role, and an
 optional quota-fallback chain), and the pipeline is built around fail-closed trust

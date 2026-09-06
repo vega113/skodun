@@ -3425,6 +3425,10 @@ def test_current_detached_worker_cancels_cooperatively_without_pid_signal(tmp_pa
     assert response['owner_reachability'] == 'unverified'
     terminal=_await(db,rid,timeout=15)
     assert terminal['status'] == 'failed' and terminal['trustworthy'] is False
+    # Terminal coverage is written before run_worker's final audit settlement.
+    # Wait for the captured owned process, not merely the earlier record state.
+    assert len(spawned) == 1
+    assert spawned[0].wait(timeout=15) == 0
     with Store.open(db) as store:
         assert store.get_review('unrelated-live') == unrelated
         event=store.cancellation_events(rid)[0]
