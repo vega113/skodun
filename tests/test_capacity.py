@@ -863,7 +863,7 @@ from skodun.capacity import acquire_for_fg, finish, AdmissionTimeout
 with Store.open(Path(sys.argv[1])) as store:
     try:
         ticket = acquire_for_fg(store, scope=sys.argv[2], capacity=8,
-            machine_capacity=1, wait_sec=.1, poll_sec=.01)
+            machine_capacity=1 if sys.argv[2] == "repo-a" else 4, wait_sec=.1, poll_sec=.01)
     except AdmissionTimeout:
         print('blocked', flush=True)
     else:
@@ -959,3 +959,36 @@ def test_linux_unreadable_birth_token_is_unknown_without_wall_clock_fallback(mon
     monkeypatch.setattr(capacity.subprocess, 'run', lambda *a, **k:
                         pytest.fail('do not substitute a wall-clock identity'))
     assert capacity.process_birth_token(123) is None
+
+
+def test_tighter_machine_holder_limit_binds_other_repositories_until_release(store):
+    tight = acquire_for_fg(store, scope='/tight-repo', capacity=4, machine_capacity=1,
+                           wait_sec=.1, poll_sec=.01)
+    assert store.capacity_get(tight.parent.id)['capacity_limit'] == 1
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope='/wide-repo', capacity=4, machine_capacity=4,
+                       wait_sec=.03, poll_sec=.01)
+    finish(store, tight)
+    first = acquire_for_fg(store, scope='/wide-repo', capacity=4, machine_capacity=4,
+                           wait_sec=.1, poll_sec=.01)
+    second = acquire_for_fg(store, scope='/another-repo', capacity=4, machine_capacity=4,
+                            wait_sec=.1, poll_sec=.01)
+    assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, capacity.MACHINE_SCOPE) == 2
+    finish(store, first)
+    finish(store, second)
+
+
+def test_machine_limit_of_two_cannot_be_raised_by_later_wide_waiters(store):
+    first = acquire_for_fg(store, scope='/one', capacity=2, machine_capacity=2,
+                           wait_sec=.1, poll_sec=.01)
+    second = acquire_for_fg(store, scope='/two', capacity=4, machine_capacity=4,
+                            wait_sec=.1, poll_sec=.01)
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope='/three', capacity=4, machine_capacity=4,
+                       wait_sec=.03, poll_sec=.01)
+    finish(store, first)
+    third = acquire_for_fg(store, scope='/three', capacity=4, machine_capacity=4,
+                           wait_sec=.1, poll_sec=.01)
+    assert store.capacity_get(second.parent.id)['capacity_limit'] == 4
+    finish(store, second)
+    finish(store, third)

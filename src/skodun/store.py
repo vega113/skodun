@@ -1151,7 +1151,11 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (18, _MIGRATION_V18),
     (19, _MIGRATION_V19),
     (20, MIGRATION_V20),
-    (21, ("ALTER TABLE capacity_admissions ADD COLUMN owner_start TEXT",)),
+    (21, (
+        "ALTER TABLE capacity_admissions ADD COLUMN owner_start TEXT",
+        "ALTER TABLE capacity_admissions ADD COLUMN capacity_limit INTEGER "
+        "CHECK(capacity_limit IS NULL OR (typeof(capacity_limit)='integer' AND capacity_limit>=1))",
+    )),
 )
 
 
@@ -4216,6 +4220,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
         from .capacity import WaiterView, decide_admit
 
         admission_id = _require_text("admission_id", admission_id)
+        declared_capacity = capacity
         if capacity < 1:
             return None
         self._c.execute("BEGIN IMMEDIATE")
@@ -4227,21 +4232,26 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                 self._c.execute("COMMIT")
                 return None if row is None else dict(row)
             peers = self._c.execute(
-                """SELECT rowid AS enqueue_order, id, status, queued_at FROM capacity_admissions
+                """SELECT rowid AS enqueue_order, id, status, queued_at, capacity_limit FROM capacity_admissions
                    WHERE resource_class=? AND scope=? AND status IN (?,?,?)""",
                 (row["resource_class"], row["scope"],
                  *self._CAPACITY_ACTIVE)).fetchall()
             views = [WaiterView(id=p["id"], status=p["status"],
                                 queued_at=p["queued_at"], enqueue_order=p["enqueue_order"]) for p in peers]
+            if row["resource_class"] == "review-machine":
+                holder_limits = [p["capacity_limit"] or 1 for p in peers
+                                 if p["status"] in ("admitted", "running")]
+                capacity = min([capacity, *holder_limits])
             if not decide_admit(admission_id, views, capacity):
                 self._c.execute("COMMIT")
                 return None
             admitted_at = _iso_now()
             self._c.execute(
                 """UPDATE capacity_admissions
-                   SET status='admitted', admitted_at=?
+                   SET status='admitted', admitted_at=?, capacity_limit=?
                    WHERE id=? AND status='queued'""",
-                (admitted_at, admission_id))
+                (admitted_at, declared_capacity if row["resource_class"] == "review-machine"
+                 else None, admission_id))
             self._c.execute("COMMIT")
         except BaseException:
             try:

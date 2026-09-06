@@ -29,7 +29,7 @@ that shares the default store, while today’s per-repo `review-fg` stays an
 | Config | Env + optional `[capacity]` in `~/.config/skodun/config.toml`; repo `.skodun.toml` may only **tighten** | Global / env set the machine ceiling |
 | Surfaces | CLI `review`, pre-push `dispatch`, every `skodun mcp` via `run_review` → `acquire_for_fg` | One admit path |
 | Diagnostics | `skodun stats` and `skodun doctor` show machine cap, holders by repo, holders by provider | Operator-visible |
-| Schema | Additive v21 owner_start column | Detect recycled machine-owner PIDs |
+| Schema | Additive v21 ownership and holder-limit columns | Detect recycled PIDs and retain tighter active caps |
 
 ## Knobs
 
@@ -111,3 +111,8 @@ tickets record process birth identity; a live PID with a different observed
 identity is reclaimable without signalling that process. Missing identity
 evidence retains the ticket conservatively. Terminal cleanup retries transient
 SQLite operational failures three times with bounded backoff.
+
+Each admitted machine ticket persists its requested capacity limit. Admission
+uses the minimum of the incoming limit and every active machine holder limit
+inside the same write transaction. A repo's tighter limit remains binding until
+its ticket is released; later clients cannot raise it while that holder runs.

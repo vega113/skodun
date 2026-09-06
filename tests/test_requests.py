@@ -247,6 +247,7 @@ def test_request_schema_upgrade_is_explicit_and_preserves_reviews(tmp_path):
         c.execute('DROP TABLE request_links')
         c.execute('DROP TABLE review_requests')
         c.execute('ALTER TABLE capacity_admissions DROP COLUMN owner_start')
+        c.execute('ALTER TABLE capacity_admissions DROP COLUMN capacity_limit')
         c.execute('PRAGMA user_version=16')
         c.commit()
     before = db.read_bytes()

@@ -329,6 +329,7 @@ def test_v19_inspection_does_not_migrate_and_explicit_upgrade_is_additive(tmp_pa
     with closing(sqlite3.connect(db)) as connection:
         connection.execute('DROP TABLE review_followup_checkpoints')
         connection.execute('ALTER TABLE capacity_admissions DROP COLUMN owner_start')
+        connection.execute('ALTER TABLE capacity_admissions DROP COLUMN capacity_limit')
         connection.execute('PRAGMA user_version=19')
         connection.commit()
         old_objects = set(connection.execute("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))

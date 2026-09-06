@@ -28,6 +28,7 @@ def _downgrade(path, version=12):
     with closing(sqlite3.connect(path)) as conn:
         if version < 21:
             conn.execute("ALTER TABLE capacity_admissions DROP COLUMN owner_start")
+            conn.execute("ALTER TABLE capacity_admissions DROP COLUMN capacity_limit")
         if version < 20:
             conn.execute("DROP TABLE IF EXISTS review_followup_checkpoints")
         if version < 18:
@@ -467,6 +468,7 @@ def test_v20_upgrade_adds_nullable_machine_owner_without_rewriting_admissions(tm
         store.capacity_finish('historical', status='released')
         before = store.capacity_get('historical')
         before.pop('owner_start')
+        before.pop('capacity_limit')
     _downgrade(db, version=20)
     image = db.read_bytes()
     with pytest.raises(SchemaLifecycleError, match='migration'):
@@ -477,4 +479,5 @@ def test_v20_upgrade_adds_nullable_machine_owner_without_rewriting_admissions(tm
     with Store.open(db) as store:
         after = store.capacity_get('historical')
         assert after.pop('owner_start') is None
+        assert after.pop('capacity_limit') is None
         assert after == before
