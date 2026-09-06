@@ -1106,6 +1106,20 @@ def test_recovery_rejects_unauditable_triage_decisions(tmp_path, monkeypatch, da
 
 
 @pytest.mark.parametrize('event', ['dismiss', 'defer'])
+def test_recovery_rejects_triage_without_its_audit_review(tmp_path, monkeypatch, event):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_triage_fixture(source, event)
+    with Store.open(source) as store:
+        store.save_review({**store.get_review('kept'), 'id': 'surviving'})
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute("DELETE FROM reviews WHERE id='kept'")
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('event', ['dismiss', 'defer'])
 def test_recovery_preserves_valid_triage_and_its_audit_history(tmp_path, monkeypatch, event):
     import skodun.store as mod
     source = tmp_path / 'source.db'

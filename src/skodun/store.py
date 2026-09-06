@@ -1840,7 +1840,7 @@ def _recovered_triage_valid(conn: sqlite3.Connection, deadline: float) -> bool:
                                  (expected, row["recovery_rowid"]))
                 review = conn.execute("SELECT branch,base_sha FROM reviews WHERE id=?",
                                       (row["review_id"],)).fetchone()
-                if review is not None and (review[0], review[1]) != (row["branch"], row["base_sha"]):
+                if review is None or (review[0], review[1]) != (row["branch"], row["base_sha"]):
                     return False
         valid = True
         return True
