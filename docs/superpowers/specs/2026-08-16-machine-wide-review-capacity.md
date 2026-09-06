@@ -27,7 +27,7 @@ that shares the default store, while today’s per-repo `review-fg` stays an
 | Same-server MCP | Keep refuse-if-busy | Tree-moved hazard from S3 |
 | Provider caps | Unchanged, already machine-wide **on the shared store** | `SKODUN_DB=/tmp/other.db` opts out of provider and review caps |
 | Config | Env + optional `[capacity]` in `~/.config/skodun/config.toml`; repo `.skodun.toml` may only **tighten** | Global / env set the machine ceiling |
-| Surfaces | CLI `review`, pre-push `dispatch`, every `skodun mcp` via `run_review` → `acquire_for_fg` | One admit path |
+| Surfaces | CLI/MCP foreground via `acquire_for_fg`; dispatched workers acquire the same outer resource through finalization | Shared store authority |
 | Diagnostics | `skodun stats` and `skodun doctor` show machine cap, holders by repo, holders by provider | Operator-visible |
 | Schema | Additive v21 ownership and holder-limit columns | Detect recycled PIDs and retain tighter active caps |
 
@@ -132,3 +132,9 @@ ceiling, and a host environment override cannot erase repository tightening.
 Foreground holders also retain their declared inner limits across worktrees.
 Legacy dual-hold admissions remain single-slot and respect store-only holders.
 Foreground holder age starts at admission, keeping queue time out of its TTL.
+
+Detached pre-push workers acquire the same machine resource after validating
+the reserved identity, and recheck ownership/status after waiting. They retain
+the ticket through conditional finalization and cancellation audit. Their
+reservation budget includes the bounded machine wait. Background branch leases
+remain their inner coordination mechanism; they do not acquire foreground locks.

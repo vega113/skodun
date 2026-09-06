@@ -2336,6 +2336,7 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                        *, cancel: "threading.Event | None" = None) -> dict:
     """Review a PUSHED ref for an already-reserved record. Persists NOTHING.
 
+    The worker owns machine admission through finalization around this call.
     The background half of `run_review`, and the list of what it does NOT do is
     the interface: no foreground lock (the reservation lease already serialised
     this branch, and a detached worker must not block on a human's review), no
