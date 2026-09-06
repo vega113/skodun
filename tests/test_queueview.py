@@ -522,3 +522,62 @@ def test_bounded_queue_inspection_uses_the_same_front_as_admission(tmp_path, mon
         row = queueview._admission(store, first, '2026-09-05T00:00:01Z', [], {})
         assert row['position'] == store.capacity_position('z-first') == 1
         assert row['holders_truncated'] is True
+
+
+@pytest.mark.parametrize("failed_followup", [False, True])
+@pytest.mark.parametrize("surface", ["cli", "mcp"])
+def test_unbatched_followup_costs_retain_real_attempts(tmp_path, monkeypatch, capsys, failed_followup, surface):
+    from tests.test_requests import _ready_repo
+    from tests.test_pipeline import _fake_grok, _emit, CLEAN
+    repo = _ready_repo(tmp_path, monkeypatch)
+    config = repo / '.skodun.toml'
+    config.write_text(config.read_text() + '\n[defaults]\ntimeout_retries=0\ndegraded_retries=0\n')
+    body = ('if [ "$CALL" = "2" ]; then exit 7; fi\n' if failed_followup else '') + _emit(CLEAN)
+    monkeypatch.setenv('SKODUN_GROK_BIN', str(_fake_grok(tmp_path, body)))
+    monkeypatch.setenv('SKODUN_SKEPTIC_PASS', '1')
+    db = tmp_path / 'costs.db'
+    monkeypatch.setenv('SKODUN_DB', str(db))
+    if surface == 'cli':
+        code = cli.main(['review', '--repo', str(repo), '--fresh', '--json'])
+        result = json.loads(capsys.readouterr().out)
+    else:
+        spec = next(item for item in mcpserver.default_registry() if item.name == 'review')
+        response = spec.handler(mcpserver.HandlerCall(params={'repo': str(repo), 'fresh': True},
+            store_factory=lambda: Store.open(db), cancel=threading.Event()))
+        code, result = response.status, response.metadata['result']
+    assert code == (4 if failed_followup else 0)
+    assert (tmp_path / 'bin/calls.log').read_text().splitlines() == ['invoked', 'invoked']
+    assert result['counts']['complete'] is True
+    assert result['counts']['provider_launches'] == 2
+    assert len({row['attempt_id'] for row in result['attempts']}) == 2
+    with Store.open(db) as store:
+        record = store.get_review(result['ids']['review_id'])
+        assert record['trustworthy'] is (not failed_followup)
+        extra = record['extra_passes']['skeptic']['attempts']
+        assert len(extra) == 1 and extra[0]['input_bytes'] > 0
+        code, text = services.svc_queue(store, request_id=result['ids']['request_id'], output='json')
+        assert code == 0
+        costs = json.loads(text)['requests'][0]['costs']
+        assert costs['counts_complete'] is True and costs['launched_calls'] == 2
+        assert costs['aggregate_launched_prompt_bytes'] == sum(a['input_bytes'] for a in record['attempts'] + extra)
+        assert services.svc_gate(store, repo)[0] == (2 if failed_followup else 0)
+
+
+def test_unbatched_chain_exception_keeps_attempt_count_unknown(tmp_path, monkeypatch, capsys):
+    from tests.test_requests import _ready_repo
+    from skodun import pipeline
+    repo = _ready_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv('SKODUN_SKEPTIC_PASS', '1')
+    monkeypatch.setenv('SKODUN_DB', str(tmp_path / 'costs.db'))
+    real = pipeline._run_chain
+    def fail_extra(*args, **kwargs):
+        if (args[7] if len(args) > 7 else kwargs.get('tag')) == 'skeptic':
+            raise RuntimeError('chain failed without a returned observation')
+        return real(*args, **kwargs)
+    monkeypatch.setattr(pipeline, '_run_chain', fail_extra)
+    assert cli.main(['review', '--repo', str(repo), '--fresh', '--json']) == 4
+    result = json.loads(capsys.readouterr().out)
+    assert result['counts']['complete'] is False
+    assert result['counts']['provider_launches'] is None
+    assert result['counts']['known_provider_launches'] == 1
+    assert result['missing_attempt_scopes'][0]['id'] == 'skeptic'

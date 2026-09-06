@@ -492,7 +492,7 @@ def test_final_recovery_persistence_failure_is_not_success(tmp_path, monkeypatch
 
 
 
-def test_unrecorded_security_attempts_make_counts_incomplete(tmp_path, monkeypatch):
+def test_security_attempts_are_complete_and_legacy_omission_is_unknown(tmp_path, monkeypatch):
     from tests.test_pipeline import _calls
     repo = _ready_repo(tmp_path, monkeypatch)
     monkeypatch.setenv('SKODUN_SECURITY_PASS', '1')
@@ -500,12 +500,20 @@ def test_unrecorded_security_attempts_make_counts_incomplete(tmp_path, monkeypat
     (repo / 'auth' / 'session.py').write_text('def authenticate(): return True\n')
     with Store.open(tmp_path / 'db') as store:
         code, _, meta = services.svc_review_detailed(store, repo)
+        legacy = store.get_review(meta['result']['ids']['review_id'])
     result = meta['result']
     assert code == 0 and _calls(tmp_path) == 2
-    assert result['counts']['provider_launches'] is None
-    assert result['counts']['known_provider_launches'] == 1
-    assert result['counts']['complete'] is False
-    assert result['missing_attempt_scopes'] == [{'kind': 'extra_pass', 'id': 'security'}]
+    assert result['counts']['provider_launches'] == 2
+    assert result['counts']['complete'] is True
+    assert result['missing_attempt_scopes'] == []
+    # A historical record has the same outcome but lacks this observation.
+    # Preserve the reader's unknown projection; never backfill invented calls.
+    legacy['extra_passes']['security'].pop('attempts')
+    from skodun.review_results import observation
+    old = observation(legacy)
+    assert old['launched_count'] is None and old['known_launched_count'] == 1
+    assert old['counts_complete'] is False
+    assert old['missing_attempt_scopes'] == [{'kind': 'extra_pass', 'id': 'security'}]
 
 
 

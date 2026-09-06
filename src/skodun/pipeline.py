@@ -4386,7 +4386,7 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
             reason = f"extra pass {name}: {reason}"
         return _with_provenance(
             passes.merge_failed_extra_pass(rec, name, reason),
-            name, _provenance(outcome))
+            name, {**_provenance(outcome), "attempts": list(outcome.attempts)})
     p = outcome.parsed
     extra = {
         "id": f"{rec['id']}.{name}",
@@ -4402,20 +4402,14 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
         "findings": list(p.findings),
         "findings_total": len(p.findings),
         "failure_reason": ("" if p.parse_ok else passes.failed_pass_reason(name)),
-        # NO `attempts` key: `passes._merge` builds the `extra_passes[<name>]`
-        # meta dict from a fixed set of keys and never copies one, so an
-        # `attempts` list here was built, handed over, and dropped on the floor.
-        # A field that looks like telemetry and records nothing is worse than an
-        # absent one — it invites a reader to trust a number that is not there.
-        # Carrying it through means widening the meta schema `passes` owns; if
-        # that is ever wanted, add it there and populate it from
-        # `outcome.attempts` here.
+        # Runtime attempts are attached below through _with_provenance;
+        # the pure passes._merge metadata schema and trust semantics stay intact.
     }
     # WHICH provider answered this pass is not in the meta schema `passes`
     # owns, and it cannot be inferred from the reviewer that was asked: a pass
     # with its own fallback chain may have been answered by any entry in it.
     return _with_provenance(passes.merge_extra_pass(rec, extra, name), name,
-                            _provenance(outcome))
+                            {**_provenance(outcome), "attempts": list(outcome.attempts)})
 
 
 def _refuter_failed(rec: dict, finder_findings_total: int, note: str,
