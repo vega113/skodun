@@ -177,3 +177,17 @@ def test_cli_stats_uses_repository_capacity_from_nested_directory(tmp_path, monk
     monkeypatch.chdir(nested)
     assert main(['stats', '--json']) == 0
     assert json.loads(capsys.readouterr().out)['live_capacity']['machine_cap'] == 1
+
+
+def test_cli_stats_outside_git_uses_global_capacity(tmp_path, monkeypatch, capsys):
+    from skodun.cli import main
+    cfg = tmp_path / 'global.toml'
+    cfg.write_text('[capacity]\nmachine = 3\n')
+    db = tmp_path / 'db'
+    with Store.open(db):
+        pass
+    monkeypatch.setenv('SKODUN_CONFIG', str(cfg))
+    monkeypatch.setenv('SKODUN_DB', str(db))
+    monkeypatch.chdir(tmp_path)
+    assert main(['stats', '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['live_capacity']['machine_cap'] == 3

@@ -969,6 +969,7 @@ def _cmd_queue(args) -> int:
 
 def _cmd_stats(args) -> int:
     """Read operational telemetry; this command never mutates gate/trust."""
+    from . import gitio
     from .services import svc_stats
     from .store import Store
 
