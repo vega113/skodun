@@ -138,3 +138,7 @@ the reserved identity, and recheck ownership/status after waiting. They retain
 the ticket through conditional finalization and cancellation audit. Their
 reservation budget includes the bounded machine wait. Background branch leases
 remain their inner coordination mechanism; they do not acquire foreground locks.
+
+Process observations include zombie state. A proven exited owner is reclaimable
+even while its PID and birth token remain visible; missing observation evidence
+remains conservative. Identity and state are read together.

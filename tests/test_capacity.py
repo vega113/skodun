@@ -916,15 +916,15 @@ def test_finish_keeps_machine_parent_retryable_on_store_failure(store, monkeypat
 
 
 def test_machine_holder_reclaims_proven_recycled_pid_but_retains_unknown(store, monkeypatch):
-    monkeypatch.setattr(capacity, 'process_birth_token', lambda pid: 'original-start')
+    monkeypatch.setattr(capacity, 'process_observation', lambda pid: capacity.ProcessObservation('original-start'))
     ticket = acquire_for_fg(store, scope='/repo', capacity=1, machine_capacity=1,
                             wait_sec=.1, poll_sec=.01)
     assert store.capacity_get(ticket.parent.id)['owner_start'] == 'original-start'
-    monkeypatch.setattr(capacity, 'process_birth_token', lambda pid: None)
+    monkeypatch.setattr(capacity, 'process_observation', lambda pid: capacity.ProcessObservation())
     assert capacity.reclaim_stale(store, scope=capacity.MACHINE_SCOPE,
         resource_class=capacity.RESOURCE_REVIEW_MACHINE, stale_sec=0,
         pid_alive_fn=lambda pid: True) == []
-    monkeypatch.setattr(capacity, 'process_birth_token', lambda pid: 'different-start')
+    monkeypatch.setattr(capacity, 'process_observation', lambda pid: capacity.ProcessObservation('different-start'))
     assert capacity.reclaim_stale(store, scope=capacity.MACHINE_SCOPE,
         resource_class=capacity.RESOURCE_REVIEW_MACHINE, stale_sec=0,
         pid_alive_fn=lambda pid: True) == [ticket.parent.id]
@@ -1044,3 +1044,55 @@ def test_legacy_single_slot_and_store_only_holders_respect_each_other(store):
         acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
                        wait_sec=.03, poll_sec=.01)
     finish(store, legacy)
+
+
+@pytest.mark.parametrize('resource', ['review-machine', 'review-fg', 'provider:xai'])
+def test_zombie_owner_is_reclaimed_even_when_pid_exists_and_token_matches(store, monkeypatch, resource):
+    monkeypatch.setattr(capacity, 'pid_alive', lambda pid: True)
+    monkeypatch.setattr(capacity, 'process_observation', lambda pid: capacity.ProcessObservation('same-start'))
+    ticket = enqueue(store, scope='scope', resource_class=resource)
+    try_admit(store, ticket, capacity=1)
+    capacity.mark_started(store, ticket)
+    monkeypatch.setattr(capacity, 'process_observation', lambda pid: capacity.ProcessObservation('same-start', True))
+    assert capacity.reclaim_stale(store, scope='scope', resource_class=resource,
+                                  stale_sec=10**9) == [ticket.id]
+
+
+def test_ps_observation_reports_zombie_without_changing_birth_identity(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(capacity.sys, 'platform', 'darwin')
+    def ps(argv, **kwargs):
+        assert 'stat=' in argv and 'lstart=' in argv
+        return subprocess.CompletedProcess(argv, 0, stdout='Z+ Sun Sep  6 12:00:00 2026\n')
+    monkeypatch.setattr(capacity.subprocess, 'run', ps)
+    assert capacity.process_observation(123) == capacity.ProcessObservation('Sun Sep 6 12:00:00 2026', True)
+
+
+def test_real_unreaped_linux_child_cannot_keep_machine_capacity(store):
+    import os
+    import sys
+    if not sys.platform.startswith('linux') or not hasattr(os, 'WNOWAIT'):
+        pytest.skip('Linux waitid WNOWAIT is needed to retain a real zombie')
+    reader, writer = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(writer)
+        os.read(reader, 1)
+        os._exit(0)
+    os.close(reader)
+    try:
+        ticket = enqueue(store, scope='*', resource_class='review-machine', pid=pid)
+        try_admit(store, ticket, capacity=1)
+        capacity.mark_started(store, ticket)
+        os.write(writer, b'x')
+        os.close(writer)
+        writer = -1
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        os.kill(pid, 0)  # PID still exists: only process-state evidence proves exit.
+        assert capacity.process_observation(pid).exited is True
+        assert capacity.reclaim_stale(store, scope='*', resource_class='review-machine',
+                                      stale_sec=10**9) == [ticket.id]
+    finally:
+        if writer >= 0:
+            os.close(writer)
+        os.waitpid(pid, 0)

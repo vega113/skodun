@@ -4227,14 +4227,18 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
             ended_at = _iso_now()
             for row in rows:
                 reason = None
-                if resource_class == "review-machine" and row["pid"]:
-                    from .capacity import pid_alive, process_birth_token, REASON_STALE_PID
+                if row["pid"] and (resource_class == "review-machine" or pid_alive_fn is None):
+                    from .capacity import pid_alive, process_observation, REASON_STALE_PID
                     alive = pid_alive if pid_alive_fn is None else pid_alive_fn
                     if alive(int(row["pid"])):
-                        observed = process_birth_token(int(row["pid"]))
-                        if not row["owner_start"] or not observed or observed == row["owner_start"]:
-                            continue  # Same owner or insufficient evidence: retain.
-                        reason = REASON_STALE_PID  # Proven PID reuse, never signal it.
+                        observed = process_observation(int(row["pid"]))
+                        if observed.exited:
+                            reason = REASON_STALE_PID
+                        elif resource_class == "review-machine":
+                            if (not row["owner_start"] or not observed.token
+                                    or observed.token == row["owner_start"]):
+                                continue  # Same owner or insufficient evidence: retain.
+                            reason = REASON_STALE_PID  # Proven PID reuse, never signal it.
                 if reason is None:
                     age_from = row["queued_at"]
                     if resource_class == "review-fg" and row["status"] in ("admitted", "running"):

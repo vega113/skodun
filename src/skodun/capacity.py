@@ -511,36 +511,49 @@ def finish(store: "Store", ticket: Ticket, *, status: str = STATUS_RELEASED,
     raise AssertionError("unreachable")
 
 
-def process_birth_token(pid: int) -> str | None:
-    """Observe process creation identity; missing evidence never proves reuse."""
+@dataclass(frozen=True)
+class ProcessObservation:
+    """A birth identity and positive exit evidence; missing data proves neither."""
+    token: str | None = None
+    exited: bool = False
+
+
+def process_observation(pid: int) -> ProcessObservation:
+    """Observe identity and zombie state together without signalling a process."""
     if pid <= 0:
-        return None
+        return ProcessObservation()
+    exited = False
     if sys.platform.startswith("linux"):
         try:
-            # Field 22 is boot-relative, unlike ps's wall-clock rendering.
-            # Pair it with boot_id so a reboot cannot alias an old owner.
             raw = Path(f"/proc/{pid}/stat").read_text()
             fields = raw.rsplit(")", 1)[1].split()
+            exited = fields[0] == "Z"
             ticks = fields[19]
             if not ticks.isascii() or not ticks.isdigit():
-                return None
+                return ProcessObservation(exited=exited)
             boot = UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip())
-            return f"linux:{boot}:{ticks}"
+            return ProcessObservation(f"linux:{boot}:{ticks}", exited)
         except (OSError, ValueError, IndexError):
-            return None
+            return ProcessObservation(exited=exited)
     try:
         proc = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True,
-            text=True, timeout=1, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
-        token = " ".join(proc.stdout.split())
-        if proc.returncode or not token:
-            return None
-        # Reject diagnostics or malformed output rather than treating them as
-        # a new process incarnation. ps supplies stable wall-clock start time.
+            ["ps", "-p", str(pid), "-o", "stat=", "-o", "lstart="],
+            capture_output=True, text=True, timeout=1,
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+        parts = proc.stdout.split()
+        if proc.returncode or not parts:
+            return ProcessObservation()
+        exited = parts[0].startswith("Z")
+        token = " ".join(parts[1:])
         time.strptime(token, "%a %b %d %H:%M:%S %Y")
-        return token
+        return ProcessObservation(token, exited)
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None
+        return ProcessObservation(exited=exited)
+
+
+def process_birth_token(pid: int) -> str | None:
+    """Observe process creation identity; missing evidence never proves reuse."""
+    return process_observation(pid).token
 
 
 def _cancelled(cancel: "threading.Event | None") -> bool:
