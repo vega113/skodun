@@ -1,0 +1,2406 @@
+{
+  "schema_version": "foreground-pilot-evidence/v1",
+  "workload": "four frozen small Python diffs; repeated fresh reviews",
+  "unique_diff_count": 4,
+  "request_count": 16,
+  "trials": [
+    {
+      "series": "initial",
+      "build": "7f97e84b54a39fdcc4666a6d57fb10468e51cbd8",
+      "foreground_capacity": 1,
+      "provider_capacity_per_scope": 1,
+      "elapsed_seconds": 193.3928925410146,
+      "elapsed_sample_count": 1,
+      "request_count": 4,
+      "trustworthy_completed": 4,
+      "window": {
+        "started_at": "2026-09-06T03:54:38Z",
+        "ended_at": "2026-09-06T03:57:52Z"
+      },
+      "sampling_errors": 0,
+      "sampled_peaks": [
+        {
+          "resource_class": "review-fg",
+          "peak": 1
+        },
+        {
+          "resource_class": "provider:openai",
+          "peak": 1
+        },
+        {
+          "resource_class": "provider:xai",
+          "peak": 1
+        }
+      ],
+      "requests": [
+        {
+          "lane": 1,
+          "request_id": "sk_req_20260906T035438Z_64235_1c41bf28",
+          "review_id": "sk_20260906T035439Z_64235_5ae491d9",
+          "diff_hash": "c35d8c7712d7db62b3c6a74faeda7937eaf79ec9",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": null,
+            "complete": false,
+            "known_candidates": 1,
+            "known_provider_launches": 1,
+            "provider_launches": null,
+            "review_id": "sk_20260906T035439Z_64235_5ae491d9",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 3,
+            "queue_wait_ms": 2,
+            "review_active_ms": 18334,
+            "review_wall_ms": 18334,
+            "scope": "request_execution",
+            "total_ms": 18645
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T035439Z_64235_5ae491d9",
+                "kind": "review"
+              },
+              "attempt_id": "6a9de54ebbe1417197c23810f9a3c4b5",
+              "provider": "openai",
+              "model": "gpt-5.6-luna",
+              "effort": "high",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 10.568,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [
+            {
+              "id": "skeptic",
+              "kind": "extra_pass"
+            }
+          ],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T035439Z_64235_2c3c5d5b",
+              "configured_capacity": 1,
+              "effective_capacity": 1,
+              "execution_seq": 2,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T035439Z_64235_7328e1f7",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 2,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            },
+            {
+              "admission_id": "ca_20260906T035449Z_64235_7daf9b3d",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 2,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": false,
+            "launched_calls": null,
+            "reported_launched_calls": 1,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": null,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 1,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        },
+        {
+          "lane": 2,
+          "request_id": "sk_req_20260906T035438Z_64234_06096eb5",
+          "review_id": "sk_20260906T035519Z_64234_f5f85814",
+          "diff_hash": "da800ba1763c8e6589d2acf3853c697bc7b2587e",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": null,
+            "complete": false,
+            "known_candidates": 1,
+            "known_provider_launches": 1,
+            "provider_launches": null,
+            "review_id": "sk_20260906T035519Z_64234_f5f85814",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 2,
+            "queue_wait_ms": 40044,
+            "review_active_ms": 64044,
+            "review_wall_ms": 64044,
+            "scope": "request_execution",
+            "total_ms": 104399
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T035519Z_64234_f5f85814",
+                "kind": "review"
+              },
+              "attempt_id": "0f1385714ffb4c6d87903eac5aa7a90c",
+              "provider": "xai",
+              "model": "grok-4.6",
+              "effort": "medium",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 30.037,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [
+            {
+              "id": "skeptic",
+              "kind": "extra_pass"
+            }
+          ],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T035439Z_64234_515112a0",
+              "configured_capacity": 1,
+              "effective_capacity": 1,
+              "execution_seq": 1,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T035519Z_64234_8a193084",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 1,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            },
+            {
+              "admission_id": "ca_20260906T035549Z_64234_6d60fab9",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 1,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": false,
+            "launched_calls": null,
+            "reported_launched_calls": 1,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": null,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 1,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        },
+        {
+          "lane": 3,
+          "request_id": "sk_req_20260906T035438Z_64233_d29aea5a",
+          "review_id": "sk_20260906T035459Z_64233_4374d5f6",
+          "diff_hash": "83906d0138a8dd913b3d29ed73b93c13110ffa45",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": null,
+            "complete": false,
+            "known_candidates": 1,
+            "known_provider_launches": 1,
+            "provider_launches": null,
+            "review_id": "sk_20260906T035459Z_64233_4374d5f6",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 3,
+            "queue_wait_ms": 20024,
+            "review_active_ms": 16432,
+            "review_wall_ms": 16432,
+            "scope": "request_execution",
+            "total_ms": 36773
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T035459Z_64233_4374d5f6",
+                "kind": "review"
+              },
+              "attempt_id": "b90a1fb273284582ad42510a57436ee4",
+              "provider": "openai",
+              "model": "gpt-5.6-luna",
+              "effort": "high",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 7.946,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [
+            {
+              "id": "skeptic",
+              "kind": "extra_pass"
+            }
+          ],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T035439Z_64233_d46cfa65",
+              "configured_capacity": 1,
+              "effective_capacity": 1,
+              "execution_seq": 3,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T035459Z_64233_c5c719ff",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 3,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            },
+            {
+              "admission_id": "ca_20260906T035507Z_64233_739e2eec",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 3,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": false,
+            "launched_calls": null,
+            "reported_launched_calls": 1,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": null,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 1,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        },
+        {
+          "lane": 4,
+          "request_id": "sk_req_20260906T035438Z_64236_27e15d2b",
+          "review_id": "sk_20260906T035629Z_64236_a15cb0a1",
+          "diff_hash": "46db9507c8f1ef41ec4291f922027f83e3127080",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": null,
+            "complete": false,
+            "known_candidates": 1,
+            "known_provider_launches": 1,
+            "provider_launches": null,
+            "review_id": "sk_20260906T035629Z_64236_a15cb0a1",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 2,
+            "queue_wait_ms": 110091,
+            "review_active_ms": 82239,
+            "review_wall_ms": 82239,
+            "scope": "request_execution",
+            "total_ms": 192634
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T035629Z_64236_a15cb0a1",
+                "kind": "review"
+              },
+              "attempt_id": "1d04c3c7d45842528b74ce2b0862e65c",
+              "provider": "xai",
+              "model": "grok-4.6",
+              "effort": "medium",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 28.297,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [
+            {
+              "id": "skeptic",
+              "kind": "extra_pass"
+            }
+          ],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T035439Z_64236_ca39933e",
+              "configured_capacity": 1,
+              "effective_capacity": 1,
+              "execution_seq": 4,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T035629Z_64236_62420c38",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 4,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            },
+            {
+              "admission_id": "ca_20260906T035657Z_64236_95026d0b",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 4,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": false,
+            "launched_calls": null,
+            "reported_launched_calls": 1,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": null,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 1,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        }
+      ],
+      "admission_terminal_counts": {
+        "released": 12
+      },
+      "active_admissions_after": 0,
+      "no_fifo_timestamp_inversion": true
+    },
+    {
+      "series": "initial",
+      "build": "7f97e84b54a39fdcc4666a6d57fb10468e51cbd8",
+      "foreground_capacity": 2,
+      "provider_capacity_per_scope": 1,
+      "elapsed_seconds": 216.58470187499188,
+      "elapsed_sample_count": 1,
+      "request_count": 4,
+      "trustworthy_completed": 4,
+      "window": {
+        "started_at": "2026-09-06T03:57:53Z",
+        "ended_at": "2026-09-06T04:01:30Z"
+      },
+      "sampling_errors": 0,
+      "sampled_peaks": [
+        {
+          "resource_class": "provider:xai",
+          "peak": 1
+        },
+        {
+          "resource_class": "review-fg",
+          "peak": 2
+        },
+        {
+          "resource_class": "provider:openai",
+          "peak": 1
+        },
+        {
+          "resource_class": "provider:google:gemini",
+          "peak": 1
+        }
+      ],
+      "requests": [
+        {
+          "lane": 1,
+          "request_id": "sk_req_20260906T035753Z_71235_0b874443",
+          "review_id": "sk_20260906T035814Z_71235_bf843923",
+          "diff_hash": "c35d8c7712d7db62b3c6a74faeda7937eaf79ec9",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": null,
+            "complete": false,
+            "known_candidates": 1,
+            "known_provider_launches": 1,
+            "provider_launches": null,
+            "review_id": "sk_20260906T035814Z_71235_bf843923",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 3,
+            "queue_wait_ms": 20024,
+            "review_active_ms": 16190,
+            "review_wall_ms": 16190,
+            "scope": "request_execution",
+            "total_ms": 36522
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T035814Z_71235_bf843923",
+                "kind": "review"
+              },
+              "attempt_id": "9e0c53fa25e8481fb91d72a4ed2396ca",
+              "provider": "openai",
+              "model": "gpt-5.6-luna",
+              "effort": "high",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 7.7,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [
+            {
+              "id": "skeptic",
+              "kind": "extra_pass"
+            }
+          ],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T035754Z_71235_598a1814",
+              "configured_capacity": 2,
+              "effective_capacity": 2,
+              "execution_seq": 7,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T035814Z_71235_d7f902c4",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 7,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            },
+            {
+              "admission_id": "ca_20260906T035821Z_71235_2ae9a496",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 7,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": false,
+            "launched_calls": null,
+            "reported_launched_calls": 1,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": null,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 1,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        },
+        {
+          "lane": 2,
+          "request_id": "sk_req_20260906T035753Z_71236_2532a42d",
+          "review_id": "sk_20260906T035754Z_71236_a72adc32",
+          "diff_hash": "da800ba1763c8e6589d2acf3853c697bc7b2587e",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": null,
+            "complete": false,
+            "known_candidates": 1,
+            "known_provider_launches": 1,
+            "provider_launches": null,
+            "review_id": "sk_20260906T035754Z_71236_a72adc32",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 4,
+            "queue_wait_ms": 2,
+            "review_active_ms": 109162,
+            "review_wall_ms": 109162,
+            "scope": "request_execution",
+            "total_ms": 109484
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T035754Z_71236_a72adc32",
+                "kind": "review"
+              },
+              "attempt_id": "eb716a76a0ae40eb9225a33aab87146b",
+              "provider": "xai",
+              "model": "grok-4.6",
+              "effort": "medium",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 34.162,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [
+            {
+              "id": "skeptic",
+              "kind": "extra_pass"
+            }
+          ],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T035754Z_71236_1aa245b2",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 5,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            },
+            {
+              "admission_id": "ca_20260906T035754Z_71236_b25d3347",
+              "configured_capacity": 2,
+              "effective_capacity": 2,
+              "execution_seq": 5,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T035828Z_71236_e54ceec2",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 5,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": false,
+            "launched_calls": null,
+            "reported_launched_calls": 1,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": null,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 1,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        },
+        {
+          "lane": 3,
+          "request_id": "sk_req_20260906T035753Z_71237_cb8c268e",
+          "review_id": "sk_20260906T035754Z_71237_79838c51",
+          "diff_hash": "83906d0138a8dd913b3d29ed73b93c13110ffa45",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": null,
+            "complete": false,
+            "known_candidates": 1,
+            "known_provider_launches": 1,
+            "provider_launches": null,
+            "review_id": "sk_20260906T035754Z_71237_79838c51",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 4,
+            "queue_wait_ms": 2,
+            "review_active_ms": 15920,
+            "review_wall_ms": 15920,
+            "scope": "request_execution",
+            "total_ms": 16235
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T035754Z_71237_79838c51",
+                "kind": "review"
+              },
+              "attempt_id": "01d7c9500c6d46ffa53c2e7466e97c7c",
+              "provider": "openai",
+              "model": "gpt-5.6-luna",
+              "effort": "high",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 8.222,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [
+            {
+              "id": "skeptic",
+              "kind": "extra_pass"
+            }
+          ],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T035754Z_71237_b3befb2b",
+              "configured_capacity": 2,
+              "effective_capacity": 2,
+              "execution_seq": 6,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T035754Z_71237_faf147d7",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 6,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            },
+            {
+              "admission_id": "ca_20260906T035802Z_71237_fd869dae",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 6,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": false,
+            "launched_calls": null,
+            "reported_launched_calls": 1,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": null,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 1,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        },
+        {
+          "lane": 4,
+          "request_id": "sk_req_20260906T035753Z_71238_d257ea07",
+          "review_id": "sk_20260906T035834Z_71238_1fa12bf7",
+          "diff_hash": "46db9507c8f1ef41ec4291f922027f83e3127080",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": null,
+            "complete": false,
+            "known_candidates": 2,
+            "known_provider_launches": 1,
+            "provider_launches": null,
+            "review_id": "sk_20260906T035834Z_71238_1fa12bf7",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 60013,
+            "queue_wait_ms": 40037,
+            "review_active_ms": 115836,
+            "review_wall_ms": 115836,
+            "scope": "request_execution",
+            "total_ms": 216190
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T035834Z_71238_1fa12bf7",
+                "kind": "review"
+              },
+              "attempt_id": "8e4749324a47419182f0f4a87c743002",
+              "provider": "xai",
+              "model": "grok-4.6",
+              "effort": "medium",
+              "launched": false,
+              "input_bytes": 2304,
+              "duration_sec": null,
+              "reason_code": "provider_wait_exhausted"
+            },
+            {
+              "scope": {
+                "id": "sk_20260906T035834Z_71238_1fa12bf7",
+                "kind": "review"
+              },
+              "attempt_id": "3b964a6971824a8ebc88ba8f12776059",
+              "provider": "google",
+              "model": "gemini-3.7-flash-high",
+              "effort": null,
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 53.696,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [
+            {
+              "id": "skeptic",
+              "kind": "extra_pass"
+            }
+          ],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T035754Z_71238_f55950ba",
+              "configured_capacity": 2,
+              "effective_capacity": 2,
+              "execution_seq": 8,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T035834Z_71238_e1a584a3",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 8,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            },
+            {
+              "admission_id": "ca_20260906T035934Z_71238_ed33ba85",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 8,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:google:gemini",
+              "scope": "google:gemini"
+            },
+            {
+              "admission_id": "ca_20260906T040027Z_71238_690bbd03",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 8,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": false,
+            "launched_calls": null,
+            "reported_launched_calls": 1,
+            "candidate_skips": 1,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": null,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 1,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        }
+      ],
+      "admission_terminal_counts": {
+        "released": 12,
+        "expired": 1
+      },
+      "active_admissions_after": 0,
+      "no_fifo_timestamp_inversion": true
+    },
+    {
+      "series": "attributed",
+      "build": "cc631b87db668771c3a6a29dbaf0c83b5dc9a4a4",
+      "foreground_capacity": 1,
+      "provider_capacity_per_scope": 1,
+      "elapsed_seconds": 256.1609583339887,
+      "elapsed_sample_count": 1,
+      "request_count": 4,
+      "trustworthy_completed": 4,
+      "window": {
+        "started_at": "2026-09-06T04:38:34Z",
+        "ended_at": "2026-09-06T04:42:51Z"
+      },
+      "sampling_errors": 0,
+      "sampled_peaks": [
+        {
+          "resource_class": "review-fg",
+          "peak": 1
+        },
+        {
+          "resource_class": "provider:openai",
+          "peak": 1
+        },
+        {
+          "resource_class": "provider:xai",
+          "peak": 1
+        }
+      ],
+      "requests": [
+        {
+          "lane": 1,
+          "request_id": "sk_req_20260906T043834Z_22515_a3aef2e5",
+          "review_id": "sk_20260906T043835Z_22515_2deda9b8",
+          "diff_hash": "c35d8c7712d7db62b3c6a74faeda7937eaf79ec9",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": 2,
+            "complete": true,
+            "known_candidates": 2,
+            "known_provider_launches": 2,
+            "provider_launches": 2,
+            "review_id": "sk_20260906T043835Z_22515_2deda9b8",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 3,
+            "queue_wait_ms": 2,
+            "review_active_ms": 17030,
+            "review_wall_ms": 17030,
+            "scope": "request_execution",
+            "total_ms": 17334
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T043835Z_22515_2deda9b8",
+                "kind": "review"
+              },
+              "attempt_id": "f5d9657713a14c9680182a4a48e5cdf1",
+              "provider": "openai",
+              "model": "gpt-5.6-luna",
+              "effort": "high",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 9.023,
+              "reason_code": "provider_completed"
+            },
+            {
+              "scope": {
+                "id": "skeptic",
+                "kind": "extra_pass"
+              },
+              "attempt_id": "9cde3de73f0349aea80a6c42db1bad9b",
+              "provider": "openai",
+              "model": "gpt-5.6-luna",
+              "effort": "high",
+              "launched": true,
+              "input_bytes": 1899,
+              "duration_sec": 7.993,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T043835Z_22515_62903471",
+              "configured_capacity": 1,
+              "effective_capacity": 1,
+              "execution_seq": 9,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T043835Z_22515_959ee354",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 9,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            },
+            {
+              "admission_id": "ca_20260906T043844Z_22515_33acc93a",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 9,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": true,
+            "launched_calls": 2,
+            "reported_launched_calls": 2,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": 4203,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 2,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        },
+        {
+          "lane": 2,
+          "request_id": "sk_req_20260906T043834Z_22517_33447754",
+          "review_id": "sk_20260906T043855Z_22517_1856f7ce",
+          "diff_hash": "da800ba1763c8e6589d2acf3853c697bc7b2587e",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": 2,
+            "complete": true,
+            "known_candidates": 2,
+            "known_provider_launches": 2,
+            "provider_launches": 2,
+            "review_id": "sk_20260906T043855Z_22517_1856f7ce",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 4,
+            "queue_wait_ms": 20018,
+            "review_active_ms": 90579,
+            "review_wall_ms": 90579,
+            "scope": "request_execution",
+            "total_ms": 110935
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T043855Z_22517_1856f7ce",
+                "kind": "review"
+              },
+              "attempt_id": "265ec42bc3204eca9dcd9f13c0d8261a",
+              "provider": "xai",
+              "model": "grok-4.6",
+              "effort": "medium",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 23.702,
+              "reason_code": "provider_completed"
+            },
+            {
+              "scope": {
+                "id": "skeptic",
+                "kind": "extra_pass"
+              },
+              "attempt_id": "2d42ac58bc724761bd3d1a4901f31eb7",
+              "provider": "xai",
+              "model": "grok-4.6",
+              "effort": "medium",
+              "launched": true,
+              "input_bytes": 1899,
+              "duration_sec": 66.864,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T043835Z_22517_884ba9f6",
+              "configured_capacity": 1,
+              "effective_capacity": 1,
+              "execution_seq": 10,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T043855Z_22517_de2e132e",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 10,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            },
+            {
+              "admission_id": "ca_20260906T043919Z_22517_52613665",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 10,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": true,
+            "launched_calls": 2,
+            "reported_launched_calls": 2,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": 4203,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 2,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        },
+        {
+          "lane": 3,
+          "request_id": "sk_req_20260906T043834Z_22516_449ae3ca",
+          "review_id": "sk_20260906T044035Z_22516_4de952bd",
+          "diff_hash": "83906d0138a8dd913b3d29ed73b93c13110ffa45",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": 2,
+            "complete": true,
+            "known_candidates": 2,
+            "known_provider_launches": 2,
+            "provider_launches": 2,
+            "review_id": "sk_20260906T044035Z_22516_4de952bd",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 3,
+            "queue_wait_ms": 120101,
+            "review_active_ms": 18559,
+            "review_wall_ms": 18559,
+            "scope": "request_execution",
+            "total_ms": 139003
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T044035Z_22516_4de952bd",
+                "kind": "review"
+              },
+              "attempt_id": "f31b5088ce5f4ffba6c9fd769ee2440b",
+              "provider": "openai",
+              "model": "gpt-5.6-luna",
+              "effort": "high",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 8.253,
+              "reason_code": "provider_completed"
+            },
+            {
+              "scope": {
+                "id": "skeptic",
+                "kind": "extra_pass"
+              },
+              "attempt_id": "efa38e67d6ad4c28999c063477b76e0a",
+              "provider": "openai",
+              "model": "gpt-5.6-luna",
+              "effort": "high",
+              "launched": true,
+              "input_bytes": 1899,
+              "duration_sec": 10.292,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T043835Z_22516_b1fee674",
+              "configured_capacity": 1,
+              "effective_capacity": 1,
+              "execution_seq": 11,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T044035Z_22516_457b7032",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 11,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            },
+            {
+              "admission_id": "ca_20260906T044043Z_22516_7c01c961",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 11,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": true,
+            "launched_calls": 2,
+            "reported_launched_calls": 2,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": 4203,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 2,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        },
+        {
+          "lane": 4,
+          "request_id": "sk_req_20260906T043834Z_22518_6f74ccd4",
+          "review_id": "sk_20260906T044055Z_22518_7e2f688f",
+          "diff_hash": "46db9507c8f1ef41ec4291f922027f83e3127080",
+          "execution": {
+            "continuable": null,
+            "exit_code": 1,
+            "reason_code": "review_findings",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": 2,
+            "complete": true,
+            "known_candidates": 2,
+            "known_provider_launches": 2,
+            "provider_launches": 2,
+            "review_id": "sk_20260906T044055Z_22518_7e2f688f",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 4,
+            "queue_wait_ms": 140126,
+            "review_active_ms": 114783,
+            "review_wall_ms": 114783,
+            "scope": "request_execution",
+            "total_ms": 255213
+          },
+          "gate_exit": 1,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T044055Z_22518_7e2f688f",
+                "kind": "review"
+              },
+              "attempt_id": "9dae4cfc9be84fdfbda33f9211d7c6ac",
+              "provider": "xai",
+              "model": "grok-4.6",
+              "effort": "medium",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 31.21,
+              "reason_code": "provider_completed"
+            },
+            {
+              "scope": {
+                "id": "skeptic",
+                "kind": "extra_pass"
+              },
+              "attempt_id": "5bcc22bf0d464ddf88bb089ff56174ea",
+              "provider": "xai",
+              "model": "grok-4.6",
+              "effort": "medium",
+              "launched": true,
+              "input_bytes": 1899,
+              "duration_sec": 83.557,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T043835Z_22518_7e44b692",
+              "configured_capacity": 1,
+              "effective_capacity": 1,
+              "execution_seq": 12,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T044055Z_22518_11a595ea",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 12,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            },
+            {
+              "admission_id": "ca_20260906T044126Z_22518_d21e103e",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 12,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": true,
+            "launched_calls": 2,
+            "reported_launched_calls": 2,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": 4203,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 2,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        }
+      ],
+      "admission_terminal_counts": {
+        "released": 12
+      },
+      "active_admissions_after": 0,
+      "no_fifo_timestamp_inversion": true
+    },
+    {
+      "series": "attributed",
+      "build": "cc631b87db668771c3a6a29dbaf0c83b5dc9a4a4",
+      "foreground_capacity": 2,
+      "provider_capacity_per_scope": 1,
+      "elapsed_seconds": 178.5170003339881,
+      "elapsed_sample_count": 1,
+      "request_count": 4,
+      "trustworthy_completed": 4,
+      "window": {
+        "started_at": "2026-09-06T04:42:52Z",
+        "ended_at": "2026-09-06T04:45:51Z"
+      },
+      "sampling_errors": 0,
+      "sampled_peaks": [
+        {
+          "resource_class": "review-fg",
+          "peak": 2
+        },
+        {
+          "resource_class": "provider:openai",
+          "peak": 1
+        },
+        {
+          "resource_class": "provider:xai",
+          "peak": 1
+        }
+      ],
+      "requests": [
+        {
+          "lane": 1,
+          "request_id": "sk_req_20260906T044252Z_28868_a2388968",
+          "review_id": "sk_20260906T044252Z_28868_407e9c79",
+          "diff_hash": "c35d8c7712d7db62b3c6a74faeda7937eaf79ec9",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": 2,
+            "complete": true,
+            "known_candidates": 2,
+            "known_provider_launches": 2,
+            "provider_launches": 2,
+            "review_id": "sk_20260906T044252Z_28868_407e9c79",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 4,
+            "queue_wait_ms": 2,
+            "review_active_ms": 19558,
+            "review_wall_ms": 19558,
+            "scope": "request_execution",
+            "total_ms": 19870
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T044252Z_28868_407e9c79",
+                "kind": "review"
+              },
+              "attempt_id": "e24419eab6db4d3aa2f84d27187faa43",
+              "provider": "openai",
+              "model": "gpt-5.6-luna",
+              "effort": "high",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 8.23,
+              "reason_code": "provider_completed"
+            },
+            {
+              "scope": {
+                "id": "skeptic",
+                "kind": "extra_pass"
+              },
+              "attempt_id": "2b4ffc8c8a604517be395f0d9ba814ea",
+              "provider": "openai",
+              "model": "gpt-5.6-luna",
+              "effort": "high",
+              "launched": true,
+              "input_bytes": 1899,
+              "duration_sec": 11.309,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T044252Z_28868_e30a37db",
+              "configured_capacity": 2,
+              "effective_capacity": 2,
+              "execution_seq": 14,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T044253Z_28868_1c794b7c",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 14,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            },
+            {
+              "admission_id": "ca_20260906T044301Z_28868_4d00f6f4",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 14,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": true,
+            "launched_calls": 2,
+            "reported_launched_calls": 2,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": 4203,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 2,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        },
+        {
+          "lane": 2,
+          "request_id": "sk_req_20260906T044252Z_28869_cf97484c",
+          "review_id": "sk_20260906T044252Z_28869_06520270",
+          "diff_hash": "da800ba1763c8e6589d2acf3853c697bc7b2587e",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": 2,
+            "complete": true,
+            "known_candidates": 2,
+            "known_provider_launches": 2,
+            "provider_launches": 2,
+            "review_id": "sk_20260906T044252Z_28869_06520270",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 34067,
+            "queue_wait_ms": 3,
+            "review_active_ms": 121410,
+            "review_wall_ms": 121410,
+            "scope": "request_execution",
+            "total_ms": 121719
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T044252Z_28869_06520270",
+                "kind": "review"
+              },
+              "attempt_id": "717b433597094cb59e14712fd922e956",
+              "provider": "xai",
+              "model": "grok-4.6",
+              "effort": "medium",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 40.177,
+              "reason_code": "provider_completed"
+            },
+            {
+              "scope": {
+                "id": "skeptic",
+                "kind": "extra_pass"
+              },
+              "attempt_id": "5301d349012e45c9a9bf313046609eed",
+              "provider": "xai",
+              "model": "grok-4.6",
+              "effort": "medium",
+              "launched": true,
+              "input_bytes": 1899,
+              "duration_sec": 47.155,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T044252Z_28869_56b0ea5a",
+              "configured_capacity": 2,
+              "effective_capacity": 2,
+              "execution_seq": 13,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T044253Z_28869_acf62c8c",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 13,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            },
+            {
+              "admission_id": "ca_20260906T044333Z_28869_39a8ccdd",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 13,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": true,
+            "launched_calls": 2,
+            "reported_launched_calls": 2,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": 4203,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 2,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        },
+        {
+          "lane": 3,
+          "request_id": "sk_req_20260906T044252Z_28871_29844cca",
+          "review_id": "sk_20260906T044312Z_28871_9257687a",
+          "diff_hash": "83906d0138a8dd913b3d29ed73b93c13110ffa45",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": 2,
+            "complete": true,
+            "known_candidates": 2,
+            "known_provider_launches": 2,
+            "provider_launches": 2,
+            "review_id": "sk_20260906T044312Z_28871_9257687a",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 3,
+            "queue_wait_ms": 20025,
+            "review_active_ms": 17819,
+            "review_wall_ms": 17819,
+            "scope": "request_execution",
+            "total_ms": 38177
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T044312Z_28871_9257687a",
+                "kind": "review"
+              },
+              "attempt_id": "935bff5226f04c7199740af8783093bf",
+              "provider": "openai",
+              "model": "gpt-5.6-luna",
+              "effort": "high",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 7.235,
+              "reason_code": "provider_completed"
+            },
+            {
+              "scope": {
+                "id": "skeptic",
+                "kind": "extra_pass"
+              },
+              "attempt_id": "21ac1883030e4246ab8b6574b8dad4dc",
+              "provider": "openai",
+              "model": "gpt-5.6-luna",
+              "effort": "high",
+              "launched": true,
+              "input_bytes": 1899,
+              "duration_sec": 10.569,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T044252Z_28871_635d213a",
+              "configured_capacity": 2,
+              "effective_capacity": 2,
+              "execution_seq": 15,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T044313Z_28871_b1312947",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 15,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            },
+            {
+              "admission_id": "ca_20260906T044320Z_28871_cb52bad4",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 15,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:openai",
+              "scope": "openai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": true,
+            "launched_calls": 2,
+            "reported_launched_calls": 2,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": 4203,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 2,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        },
+        {
+          "lane": 4,
+          "request_id": "sk_req_20260906T044252Z_28870_d2955623",
+          "review_id": "sk_20260906T044332Z_28870_7a7ce26b",
+          "diff_hash": "46db9507c8f1ef41ec4291f922027f83e3127080",
+          "execution": {
+            "continuable": null,
+            "exit_code": 0,
+            "reason_code": "review_clean",
+            "replayed": false,
+            "request_persisted": true,
+            "retryable": null,
+            "reused": false,
+            "state": "completed"
+          },
+          "coverage": {
+            "current_identity_match": null,
+            "parse_ok": true,
+            "partial": false,
+            "trustworthy": true
+          },
+          "counts": {
+            "candidates": 2,
+            "complete": true,
+            "known_candidates": 2,
+            "known_provider_launches": 2,
+            "provider_launches": 2,
+            "review_id": "sk_20260906T044332Z_28870_7a7ce26b",
+            "scope": "observed_review"
+          },
+          "timing": {
+            "provider_wait_ms": 47323,
+            "queue_wait_ms": 40040,
+            "review_active_ms": 137184,
+            "review_wall_ms": 137184,
+            "scope": "request_execution",
+            "total_ms": 177664
+          },
+          "gate_exit": 0,
+          "lineage_context_bytes": 0,
+          "attempts": [
+            {
+              "scope": {
+                "id": "sk_20260906T044332Z_28870_7a7ce26b",
+                "kind": "review"
+              },
+              "attempt_id": "869b446ef2be464a8f6a5fb2bb457130",
+              "provider": "xai",
+              "model": "grok-4.6",
+              "effort": "medium",
+              "launched": true,
+              "input_bytes": 2304,
+              "duration_sec": 34.041,
+              "reason_code": "provider_completed"
+            },
+            {
+              "scope": {
+                "id": "skeptic",
+                "kind": "extra_pass"
+              },
+              "attempt_id": "e241d34892b4458ab277c0035d71440e",
+              "provider": "xai",
+              "model": "grok-4.6",
+              "effort": "medium",
+              "launched": true,
+              "input_bytes": 1899,
+              "duration_sec": 55.926,
+              "reason_code": "provider_completed"
+            }
+          ],
+          "missing_attempt_scopes": [],
+          "capacity_layers": [
+            {
+              "admission_id": "ca_20260906T044252Z_28870_ba44b8ab",
+              "configured_capacity": 2,
+              "effective_capacity": 2,
+              "execution_seq": 16,
+              "legacy_dual_hold": false,
+              "resource_class": "review-fg",
+              "scope": "<fixture>/source/.git"
+            },
+            {
+              "admission_id": "ca_20260906T044333Z_28870_78bf8966",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 16,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            },
+            {
+              "admission_id": "ca_20260906T044407Z_28870_0668a6b1",
+              "configured_capacity": null,
+              "effective_capacity": 1,
+              "execution_seq": 16,
+              "legacy_dual_hold": null,
+              "resource_class": "provider:xai",
+              "scope": "xai"
+            }
+          ],
+          "cost_summary": {
+            "counts_complete": true,
+            "launched_calls": 2,
+            "reported_launched_calls": 2,
+            "candidate_skips": 0,
+            "eligibility_skips": 0,
+            "retry_calls": 0,
+            "aggregate_launched_prompt_bytes": 4203,
+            "token_usage": {
+              "cache": null,
+              "cache_reported_calls": 0,
+              "complete": false,
+              "input": null,
+              "input_reported_calls": 0,
+              "launched_calls": 2,
+              "output": null,
+              "output_reported_calls": 0,
+              "reasoning": null,
+              "reasoning_reported_calls": 0,
+              "reported_cache": null,
+              "reported_calls": 0,
+              "reported_input": null,
+              "reported_output": null,
+              "reported_reasoning": null,
+              "reported_total": null,
+              "total": null
+            },
+            "metered_spend": {
+              "attributable_events": 0,
+              "reported_usd": null,
+              "scan_truncated": false,
+              "scope": "owned linked review metered API events only",
+              "subscription_cost_usd": null,
+              "usd": null
+            }
+          }
+        }
+      ],
+      "admission_terminal_counts": {
+        "released": 12
+      },
+      "active_admissions_after": 0,
+      "no_fifo_timestamp_inversion": true
+    }
+  ],
+  "limitations": [
+    "Two single-trial profile comparisons; small sample and unisolated provider/network/host variation.",
+    "Initial-series follow-up attempts were unrecorded; totals remain unknown. The attributed series follows #216.",
+    "Normal advisory lineage context may evolve between fresh reviews; per-record context bytes are included.",
+    "One-second admission samples provide observed lower-bound peaks, not a continuous process census.",
+    "Initial CLI prompt bytes are not billed tokens. Missing token/dollar observations remain unknown."
+  ],
+  "one_execution_and_final_record_per_request": true,
+  "frozen_inputs": [
+    {
+      "lane": "<fixture>/lane-1",
+      "reviewer": "finder-codex",
+      "identity": {
+        "worktree_root": "<fixture>/lane-1",
+        "repo_id": "<fixture>/source/.git",
+        "canonical_repository": null,
+        "branch": "codex/pilot-1",
+        "head": "ece11d1c1bcec092c477005cd67c5f9317ff3b6c",
+        "base_ref": "main",
+        "base_sha": "ece11d1c1bcec092c477005cd67c5f9317ff3b6c",
+        "diff_hash": "c35d8c7712d7db62b3c6a74faeda7937eaf79ec9",
+        "tree_fingerprint": "a3a4d6fca2e8763fb19f43e57dbe8c0831ef26359db4c298edb83f528a7521d3",
+        "config_hash": "77a30e2cc6406a123a483c52c0844b54134143c5c90d037cfec9144fc6c94ea2",
+        "capture_error": null,
+        "policy_hash": "4f350d3effab3e4d750c4c918b0f77d087df252f915930683e144218330bfa77"
+      },
+      "reachable_subscription_reviewers": [
+        "finder",
+        "finder-codex",
+        "finder-gemini",
+        "refuter"
+      ]
+    },
+    {
+      "lane": "<fixture>/lane-2",
+      "reviewer": "finder",
+      "identity": {
+        "worktree_root": "<fixture>/lane-2",
+        "repo_id": "<fixture>/source/.git",
+        "canonical_repository": null,
+        "branch": "codex/pilot-2",
+        "head": "ece11d1c1bcec092c477005cd67c5f9317ff3b6c",
+        "base_ref": "main",
+        "base_sha": "ece11d1c1bcec092c477005cd67c5f9317ff3b6c",
+        "diff_hash": "da800ba1763c8e6589d2acf3853c697bc7b2587e",
+        "tree_fingerprint": "b9bd4daf3d86f29c99fce21c17f2831114ada998277bd867ad22cfb09d3448f2",
+        "config_hash": "77a30e2cc6406a123a483c52c0844b54134143c5c90d037cfec9144fc6c94ea2",
+        "capture_error": null,
+        "policy_hash": "4f350d3effab3e4d750c4c918b0f77d087df252f915930683e144218330bfa77"
+      },
+      "reachable_subscription_reviewers": [
+        "finder",
+        "finder-codex",
+        "finder-gemini",
+        "refuter"
+      ]
+    },
+    {
+      "lane": "<fixture>/lane-3",
+      "reviewer": "finder-codex",
+      "identity": {
+        "worktree_root": "<fixture>/lane-3",
+        "repo_id": "<fixture>/source/.git",
+        "canonical_repository": null,
+        "branch": "codex/pilot-3",
+        "head": "ece11d1c1bcec092c477005cd67c5f9317ff3b6c",
+        "base_ref": "main",
+        "base_sha": "ece11d1c1bcec092c477005cd67c5f9317ff3b6c",
+        "diff_hash": "83906d0138a8dd913b3d29ed73b93c13110ffa45",
+        "tree_fingerprint": "3014568b9702e1c56dc144e3d228e27a41c7799dd5ef5af486959ed7d46a6821",
+        "config_hash": "77a30e2cc6406a123a483c52c0844b54134143c5c90d037cfec9144fc6c94ea2",
+        "capture_error": null,
+        "policy_hash": "4f350d3effab3e4d750c4c918b0f77d087df252f915930683e144218330bfa77"
+      },
+      "reachable_subscription_reviewers": [
+        "finder",
+        "finder-codex",
+        "finder-gemini",
+        "refuter"
+      ]
+    },
+    {
+      "lane": "<fixture>/lane-4",
+      "reviewer": "finder",
+      "identity": {
+        "worktree_root": "<fixture>/lane-4",
+        "repo_id": "<fixture>/source/.git",
+        "canonical_repository": null,
+        "branch": "codex/pilot-4",
+        "head": "ece11d1c1bcec092c477005cd67c5f9317ff3b6c",
+        "base_ref": "main",
+        "base_sha": "ece11d1c1bcec092c477005cd67c5f9317ff3b6c",
+        "diff_hash": "46db9507c8f1ef41ec4291f922027f83e3127080",
+        "tree_fingerprint": "f783563bde0e15213b15c6ff50cb63416817514c4699abbf82fe2332902a811a",
+        "config_hash": "77a30e2cc6406a123a483c52c0844b54134143c5c90d037cfec9144fc6c94ea2",
+        "capture_error": null,
+        "policy_hash": "4f350d3effab3e4d750c4c918b0f77d087df252f915930683e144218330bfa77"
+      },
+      "reachable_subscription_reviewers": [
+        "finder",
+        "finder-codex",
+        "finder-gemini",
+        "refuter"
+      ]
+    }
+  ]
+}
