@@ -1,0 +1,99 @@
+"""Drive examples/bin/skodun-host through its real subprocess entry point.
+
+Profiles and executable stand-ins belong to each test's temporary directory.
+The launcher must validate the selected paths, propagate arguments/environment
+and preserve exit status; these tests never launch a review provider.
+"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+LAUNCHER = Path(__file__).resolve().parents[1] / 'examples/bin/skodun-host'
+
+
+def invoke(tmp_path, body=None, args=()):
+    profile = tmp_path / 'host-profile.sh'
+    if body is not None:
+        profile.write_text(body)
+    env = {**os.environ, 'SKODUN_HOST_PROFILE': str(profile)}
+    return subprocess.run([str(LAUNCHER), *args], env=env,
+                          text=True, capture_output=True, timeout=5)
+
+
+def test_launcher_forwards_profile_arguments_and_exit(tmp_path):
+    target = tmp_path / 'installed skodun'
+    target.write_text(f'#!{sys.executable}\n' + '''import json, os, sys
+print(json.dumps([sys.argv[1:], os.environ['SKODUN_REVIEW_FG_CAPACITY'],
+                  os.environ['SKODUN_LEGACY_FG_LOCK']]))
+sys.exit(3)
+''')
+    target.chmod(0o700)
+    result = invoke(tmp_path, f"SKODUN_REAL_BIN='{target}'\n"
+                    'export SKODUN_REVIEW_FG_CAPACITY=2\n'
+                    'export SKODUN_LEGACY_FG_LOCK=0\n',
+                    ('review', '--repo', '/a path/with spaces', '$(literal)'))
+    assert result.returncode == 3
+    assert json.loads(result.stdout) == [
+        ['review', '--repo', '/a path/with spaces', '$(literal)'], '2', '0']
+    assert result.stderr == ''
+
+
+@pytest.mark.parametrize('body, message', [
+    (None, 'missing host profile'),
+    ('', 'set SKODUN_REAL_BIN'),
+    ('SKODUN_REAL_BIN=missing\n', 'set SKODUN_REAL_BIN'),
+    (f"SKODUN_REAL_BIN='{LAUNCHER}'\n", 'points back'),
+    ('exit 7\n', None),
+])
+def test_launcher_refuses_invalid_setup(tmp_path, body, message):
+    result = invoke(tmp_path, body)
+    assert result.returncode == (7 if message is None else 2)
+    assert result.stdout == ''
+    if message:
+        assert message in result.stderr
+
+
+def test_launcher_refuses_symlink_recursion(tmp_path):
+    alias = tmp_path / 'skodun'
+    alias.symlink_to(LAUNCHER)
+    result = invoke(tmp_path, f"SKODUN_REAL_BIN='{alias}'\n")
+    assert result.returncode == 2
+    assert 'points back' in result.stderr
+
+
+def test_launcher_requires_executable_in_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv('SKODUN_REAL_BIN', '/bin/echo')
+    result = invoke(tmp_path, '# Missing executable configuration.\n')
+    assert result.returncode == 2
+    assert 'set SKODUN_REAL_BIN' in result.stderr
+    assert result.stdout == ''
+
+
+@pytest.mark.parametrize('profile', ['host-profile.sh', './host-profile.sh'])
+def test_launcher_rejects_relative_profile_before_sourcing(tmp_path, profile):
+    (tmp_path / 'host-profile.sh').write_text('echo must-not-run\n')
+    result = subprocess.run([str(LAUNCHER)], cwd=tmp_path,
+                            env={**os.environ, 'SKODUN_HOST_PROFILE': profile},
+                            text=True, capture_output=True, timeout=5)
+    assert result.returncode == 2
+    assert 'host profile path must be absolute' in result.stderr
+    assert result.stdout == ''
+
+
+def test_launcher_clears_inherited_capacity_when_profile_omits_it(tmp_path, monkeypatch):
+    names = ('SKODUN_REVIEW_FG_CAPACITY', 'SKODUN_LEGACY_FG_LOCK',
+             'SKODUN_PROVIDER_MAX_IN_FLIGHT')
+    for name in names:
+        monkeypatch.setenv(name, '9')
+    target = tmp_path / 'inspect-capacity'
+    target.write_text(f'#!{sys.executable}\nimport json, os\n'
+                      f'print(json.dumps([os.environ.get(n) for n in {names!r}]))\n')
+    target.chmod(0o700)
+    result = invoke(tmp_path, f"SKODUN_REAL_BIN='{target}'\n"
+                    'export SKODUN_REVIEW_FG_CAPACITY=2\n')
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == ['2', None, None]
