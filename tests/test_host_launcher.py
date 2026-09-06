@@ -58,3 +58,11 @@ def test_launcher_refuses_symlink_recursion(tmp_path):
     result = invoke(tmp_path, f"SKODUN_REAL_BIN='{alias}'\n")
     assert result.returncode == 2
     assert 'points back' in result.stderr
+
+
+def test_launcher_requires_executable_in_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv('SKODUN_REAL_BIN', '/bin/echo')
+    result = invoke(tmp_path, '# Missing executable configuration.\n')
+    assert result.returncode == 2
+    assert 'set SKODUN_REAL_BIN' in result.stderr
+    assert result.stdout == ''
