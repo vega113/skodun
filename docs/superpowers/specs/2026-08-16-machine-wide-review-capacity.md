@@ -179,3 +179,8 @@ Recovery checks every declared JSON-bearing payload column. Request identity
 uses the same canonical scope/size validation as request creation; owner and
 execution projections and replayable results must agree. Existing checkpoint,
 follow-up, budget, and evidence validators guard their recovered payloads.
+
+Recovered receipt decisions must agree with their payloads and indexed identity:
+accepted receipts require the embedded identity, reason ok, and successful
+producer facts. Rejection and nonce-conflict projections retain their existing
+invariants without inventing unavailable historical policy proof.

@@ -947,3 +947,74 @@ def test_recovery_refuses_request_owner_that_matches_only_an_older_execution(tmp
         raw.execute("UPDATE review_requests SET owner_token='private-owner',pid=123,source='cli' WHERE id=?", (rid,))
         raw.commit()
     assert not mod._recover_sqlite_image(source, tmp_path / 'invalid.db')
+
+
+@pytest.mark.parametrize('damage', ['accepted_reason', 'accepted_identity', 'rejected_ok', 'rejected_unknown'])
+def test_recovery_rejects_inconsistent_receipt_decisions(tmp_path, monkeypatch, damage):
+    import json
+    from dataclasses import replace
+    import skodun.store as mod
+    from skodun.evidence import parse_receipt
+    from tests.test_evidence import identity, policy, receipt_mapping
+    source = tmp_path / 'source.db'
+    with Store.open(source) as store:
+        store.save_review({**REC, 'id':'kept'})
+        receipt = parse_receipt(json.dumps(receipt_mapping()))
+        store.save_evidence_receipt(identity(), policy(), receipt.canonical_json, '2026-08-13T16:00:03Z')
+    with closing(sqlite3.connect(source)) as raw:
+        if damage == 'accepted_reason':
+            raw.execute("UPDATE evidence_receipts SET reason_code='policy_mismatch'")
+        elif damage == 'accepted_identity':
+            raw.execute('UPDATE evidence_receipts SET identity_digest=?',
+                        (replace(identity(), worktree_root='/another').digest,))
+        elif damage == 'rejected_ok':
+            raw.execute("UPDATE evidence_receipts SET status='rejected',reason_code='ok'")
+        else:
+            raw.execute("UPDATE evidence_receipts SET status='rejected',reason_code='invented'")
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+def test_recovery_preserves_a_valid_identity_mismatch_rejection(tmp_path, monkeypatch):
+    import json
+    from dataclasses import replace
+    import skodun.store as mod
+    from skodun.evidence import parse_receipt
+    from tests.test_evidence import identity, policy, receipt_mapping
+    source = tmp_path / 'source.db'
+    with Store.open(source) as store:
+        store.save_review({**REC, 'id':'kept'})
+        receipt = parse_receipt(json.dumps(receipt_mapping()))
+        result = store.save_evidence_receipt(replace(identity(), worktree_root='/another'),
+            policy(), receipt.canonical_json, '2026-08-13T16:00:03Z')
+        assert result['status'] == 'rejected' and result['reason_code'] == 'worktree_mismatch'
+    _stream_source_dump(monkeypatch, source)
+    assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+def test_recovery_rejects_a_failed_producer_relabelled_accepted(tmp_path, monkeypatch):
+    import json
+    import skodun.store as mod
+    from skodun.evidence import parse_receipt
+    from tests.test_evidence import identity, policy, receipt_mapping
+    source = tmp_path / 'source.db'
+    with Store.open(source) as store:
+        store.save_review({**REC, 'id':'kept'})
+        receipt = parse_receipt(json.dumps(receipt_mapping(exit_code=1, terminal_state='failed')))
+        result = store.save_evidence_receipt(identity(), policy(), receipt.canonical_json, '2026-08-13T16:00:03Z')
+        assert result['reason_code'] == 'producer_failed'
+        store._c.execute("UPDATE evidence_receipts SET status='accepted',reason_code='ok'")
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+def test_recovery_rejects_an_invalid_conflict_projection(tmp_path, monkeypatch):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_control_fixture(source)
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute("UPDATE evidence_receipt_conflicts SET reason_code='ok'")
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')

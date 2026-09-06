@@ -1655,6 +1655,43 @@ def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
     return count > 0 and time.monotonic() < deadline
 
 
+def _recovered_receipt_projection_valid(conn, table, row, receipt) -> bool:
+    """Check the stored decision's observable invariants without inventing policy proof."""
+    from .evidence import EvidenceIdentity
+    embedded = EvidenceIdentity(receipt.repository_id, receipt.worktree_root,
+        receipt.certification_base, receipt.current_head, receipt.diff_hash,
+        receipt.stack_slice_id).digest
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", row["identity_digest"]) is None:
+        return False
+    _require_ts("ingested_at", row["ingested_at"])
+    if table == "evidence_receipt_conflicts":
+        existing = conn.execute(
+            "SELECT nonce FROM evidence_receipts WHERE identity_digest=? AND receipt_digest=?",
+            (row["identity_digest"], row["existing_receipt_digest"])).fetchone()
+        return (row["reason_code"] == "nonce_conflict" and existing is not None
+                and existing[0] == row["nonce"]
+                and row["receipt_digest"] != row["existing_receipt_digest"])
+    if row["status"] == "accepted":
+        return (row["reason_code"] == "ok" and row["identity_digest"] == embedded
+                and receipt.diagnostic_category == "ok" and receipt.terminal_state == "passed"
+                and receipt.exit_code == 0)
+    identity_failures = {"repository_mismatch", "worktree_mismatch", "base_mismatch",
+                         "head_mismatch", "diff_mismatch", "stack_slice_mismatch"}
+    other_failures = {"policy_mismatch", "command_mismatch", "evidence_kind_mismatch",
+                      "provenance_mismatch", "diagnostic_mismatch", "producer_failed"}
+    reason = row["reason_code"]
+    if row["status"] != "rejected" or reason not in identity_failures | other_failures:
+        return False
+    if (reason in identity_failures) != (row["identity_digest"] != embedded):
+        return False
+    if reason == "diagnostic_mismatch" and receipt.diagnostic_category == "ok":
+        return False
+    if reason == "producer_failed":
+        return (receipt.diagnostic_category == "ok"
+                and (receipt.terminal_state != "passed" or receipt.exit_code != 0))
+    return True
+
+
 def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool:
     """Validate JSON-bearing control/checkpoint tables using their existing doors."""
     from dataclasses import asdict
@@ -1733,7 +1770,8 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                     receipt = parse_receipt(row["receipt_json"])
                     if (receipt.canonical_json != row["receipt_json"]
                             or any(getattr(receipt, field) != row[field]
-                                   for field in ("receipt_digest", "nonce", "evidence_kind", "terminal_state"))):
+                                   for field in ("receipt_digest", "nonce", "evidence_kind", "terminal_state"))
+                            or not _recovered_receipt_projection_valid(conn, table, row, receipt)):
                         return False
         return time.monotonic() < deadline
     except (ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
