@@ -1955,7 +1955,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
     @classmethod
     def open_readonly(cls, path: Path) -> "Store":
         """Open an existing current store with SQLite's `mode=ro` policy."""
-        info = inspect_schema(path)
+        info = inspect_schema(path, full_integrity=False)
         if info.state == "missing":
             raise SchemaLifecycleError(
                 "missing", f"store does not exist: {path}", version=None)

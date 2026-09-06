@@ -436,7 +436,7 @@ def test_unreadable_blocker_snapshot_refuses_migration(tmp_path, monkeypatch):
     _downgrade(db)
     info = inspect_schema(db)
     import skodun.store as store_mod
-    monkeypatch.setattr(store_mod, "inspect_schema", lambda path: info)
+    monkeypatch.setattr(store_mod, "inspect_schema", lambda path, **kwargs: info)
     monkeypatch.setattr(
         store_mod, "_snapshot_database",
         lambda path: (None, None, SchemaInfo(

@@ -936,3 +936,26 @@ def test_process_birth_token_is_stable_for_this_process():
     first = capacity.process_birth_token(os.getpid())
     assert first is not None
     assert capacity.process_birth_token(os.getpid()) == first
+
+
+def test_linux_birth_token_uses_boot_identity_and_ticks_not_wall_clock(monkeypatch):
+    monkeypatch.setattr(capacity.sys, 'platform', 'linux')
+    boot = '12345678-1234-1234-1234-123456789abc'
+    stat = '123 (command with ) spaces) ' + ' '.join(['S'] + ['0'] * 18 + ['987654'])
+    contents = {'/proc/123/stat': stat, '/proc/sys/kernel/random/boot_id': boot}
+    monkeypatch.setattr(capacity.Path, 'read_text', lambda path: contents[str(path)])
+    monkeypatch.setattr(capacity.subprocess, 'run', lambda *a, **k:
+                        pytest.fail('Linux identity must not depend on ps wall time'))
+    assert capacity.process_birth_token(123) == f'linux:{boot}:987654'
+    contents['/proc/123/stat'] = stat.replace('987654', '987655')
+    assert capacity.process_birth_token(123) == f'linux:{boot}:987655'
+
+
+def test_linux_unreadable_birth_token_is_unknown_without_wall_clock_fallback(monkeypatch):
+    monkeypatch.setattr(capacity.sys, 'platform', 'linux')
+    def unreadable(path):
+        raise OSError('proc unavailable')
+    monkeypatch.setattr(capacity.Path, 'read_text', unreadable)
+    monkeypatch.setattr(capacity.subprocess, 'run', lambda *a, **k:
+                        pytest.fail('do not substitute a wall-clock identity'))
+    assert capacity.process_birth_token(123) is None

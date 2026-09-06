@@ -31,6 +31,9 @@ import time
 import math
 import sqlite3
 import subprocess
+import sys
+from pathlib import Path
+from uuid import UUID
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -504,6 +507,19 @@ def process_birth_token(pid: int) -> str | None:
     """Observe process creation identity; missing evidence never proves reuse."""
     if pid <= 0:
         return None
+    if sys.platform.startswith("linux"):
+        try:
+            # Field 22 is boot-relative, unlike ps's wall-clock rendering.
+            # Pair it with boot_id so a reboot cannot alias an old owner.
+            raw = Path(f"/proc/{pid}/stat").read_text()
+            fields = raw.rsplit(")", 1)[1].split()
+            ticks = fields[19]
+            if not ticks.isascii() or not ticks.isdigit():
+                return None
+            boot = UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+            return f"linux:{boot}:{ticks}"
+        except (OSError, ValueError, IndexError):
+            return None
     try:
         proc = subprocess.run(
             ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True,

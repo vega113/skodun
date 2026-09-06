@@ -357,7 +357,8 @@ def test_delete_store_failed_integrity_is_invalid(tmp_path):
     assert info.reason_code == "invalid_sqlite"
 
 
-def test_ordinary_delete_open_skips_full_integrity_scan(tmp_path, monkeypatch):
+@pytest.mark.parametrize("readonly", [False, True])
+def test_ordinary_delete_open_skips_full_integrity_scan(tmp_path, monkeypatch, readonly):
     import skodun.store as mod
     db = tmp_path / "s.db"
     _write_review(db, "retained")
@@ -370,7 +371,8 @@ def test_ordinary_delete_open_skips_full_integrity_scan(tmp_path, monkeypatch):
         conn.set_trace_callback(statements.append)
         return conn
     monkeypatch.setattr(mod.sqlite3, "connect", connect)
-    with Store.open(db):
+    opener = Store.open_readonly if readonly else Store.open
+    with opener(db):
         pass
     assert not any('integrity_check' in sql for sql in statements)
     assert inspect_schema(db).integrity_check == "ok"
