@@ -1699,3 +1699,23 @@ def test_global_fg_capacity_is_clipped_after_machine_env_resolution(tmp_path):
     cfg = load_config(None, global_path=global_path)
     assert resolved_fg_capacity(cfg, env={'SKODUN_REVIEW_MACHINE_CAPACITY': '4'}) == 4
     assert resolved_fg_capacity(cfg, env={}) == 1
+
+
+@pytest.mark.parametrize('global_machine', [None, 2, 8])
+@pytest.mark.parametrize('repo_machine, expected', [(1, 1), (3, 3), (8, 4)])
+def test_repo_machine_ceiling_survives_host_environment_override(
+        tmp_path, global_machine, repo_machine, expected):
+    from skodun.capacity import resolved_machine_capacity
+    text = '' if global_machine is None else f'[capacity]\nmachine = {global_machine}\n'
+    global_path = _write(tmp_path / 'global.toml', text)
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _write(repo / '.skodun.toml', f'[capacity]\nmachine = {repo_machine}\n')
+    cfg = load_config(repo, global_path=global_path)
+    assert resolved_machine_capacity(cfg, env={'SKODUN_REVIEW_MACHINE_CAPACITY': '4'}) == expected
+
+
+def test_internal_repo_capacity_metadata_is_not_a_config_key(tmp_path):
+    global_path = _write(tmp_path / 'global.toml', '[capacity]\n_repo_machine = 8\n')
+    with pytest.raises(ValueError, match='unknown.*capacity'):
+        load_config(None, global_path=global_path)

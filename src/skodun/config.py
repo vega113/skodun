@@ -444,11 +444,13 @@ class CapacitySettings:
     """Optional `[capacity]` table: machine outer cap and inner review-fg.
 
     ``None`` means "no file opinion" so env / capacity.py defaults apply.
-    A repo layer may only lower ``machine`` relative to the global file.
+    A repo layer may only lower ``machine`` relative to the host ceiling.
     """
 
     machine: int | None = None
     review_fg: int | None = None
+    # Preserve the repo ceiling so a host environment override cannot raise it.
+    _repo_machine: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1023,7 +1025,7 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
                 if not isinstance(raw_r, dict):
                     raise ValueError("[capacity] must be a table")
                 cap_repo = dict(raw_r)
-    known_cap = {f.name for f in fields(CapacitySettings)}
+    known_cap = {f.name for f in fields(CapacitySettings) if not f.name.startswith("_")}
     bad = (set(cap_global) | set(cap_repo)) - known_cap
     if bad:
         raise ValueError(f"unknown [capacity] keys: {sorted(bad)}")
@@ -1061,7 +1063,8 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
                   retention=Retention(**retvals),
                   routing=routing,
                   schedule_jobs=schedule_cfg.jobs,
-                  capacity=CapacitySettings(machine=machine, review_fg=review_fg))
+                  capacity=CapacitySettings(machine=machine, review_fg=review_fg,
+                                            _repo_machine=r_machine))
 
 
 def _bounded_retention_int(key: str, value: object, minimum: int) -> int:

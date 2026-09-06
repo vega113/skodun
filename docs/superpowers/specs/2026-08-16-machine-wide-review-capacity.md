@@ -56,8 +56,10 @@ review_fg = 1
 ```
 
 A repo value **above** the machine cap is clipped. A repo cannot raise the
-machine cap — including when the global file has no `[capacity] machine`
-key: the ceiling is then the shipped default of 1, not the repo's number.
+host machine cap. When neither the environment nor the global file sets that
+cap, the ceiling is the shipped default of 1, not the repo's number. Repository
+tightening is applied after host environment resolution, so an environment
+override cannot erase an explicit repository ceiling.
 `skodun doctor` / `skodun stats` print `resolved_machine_capacity` (env,
 then file, then default), the same value `run_review` uses.
 

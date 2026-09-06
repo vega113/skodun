@@ -169,14 +169,19 @@ def machine_capacity_from_env(env: Mapping[str, str] | None = None) -> int:
 
 def resolved_machine_capacity(cfg: object | None = None,
                               env: Mapping[str, str] | None = None) -> int:
-    """Env wins when set; otherwise optional ``cfg.capacity.machine``; else 1."""
+    """Resolve the host ceiling, then apply any explicit repository tightening."""
     env = os.environ if env is None else env
+    settings = getattr(cfg, "capacity", None)
     if str(env.get(MACHINE_CAPACITY_ENV) or "").strip():
-        return machine_capacity_from_env(env)
-    machine = getattr(getattr(cfg, "capacity", None), "machine", None)
-    if isinstance(machine, int) and not isinstance(machine, bool) and machine >= 1:
-        return machine
-    return machine_capacity_from_env(env)
+        machine = machine_capacity_from_env(env)
+    else:
+        machine = getattr(settings, "machine", None)
+        if not isinstance(machine, int) or isinstance(machine, bool) or machine < 1:
+            machine = machine_capacity_from_env(env)
+    repo = getattr(settings, "_repo_machine", None)
+    if isinstance(repo, int) and not isinstance(repo, bool) and repo >= 1:
+        machine = min(machine, repo)
+    return machine
 
 
 def resolved_fg_capacity(cfg: object | None = None,
