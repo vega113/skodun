@@ -186,7 +186,7 @@ def resolved_machine_capacity(cfg: object | None = None,
 
 def resolved_fg_capacity(cfg: object | None = None,
                          env: Mapping[str, str] | None = None) -> int:
-    """Inner FG cap: env if set, else file, then clipped by the machine cap."""
+    """Resolve host FG capacity, apply repo tightening, then the machine ceiling."""
     env = os.environ if env is None else env
     if str(env.get(CAPACITY_ENV) or "").strip():
         repo = capacity_from_env(env)
@@ -197,6 +197,9 @@ def resolved_fg_capacity(cfg: object | None = None,
             repo = review_fg
         else:
             repo = capacity_from_env(env)
+    repo_limit = getattr(getattr(cfg, "capacity", None), "_repo_review_fg", None)
+    if isinstance(repo_limit, int) and not isinstance(repo_limit, bool) and repo_limit >= 1:
+        repo = min(repo, repo_limit)
     return effective_fg_capacity(repo, resolved_machine_capacity(cfg, env))
 
 

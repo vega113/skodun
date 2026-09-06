@@ -238,19 +238,23 @@ def test_real_owned_children_cancel_and_workers_close_before_return(tmp_path, mo
     assert not any(t.name.startswith('skodun-batch') for t in threading.enumerate())
 
 
-@pytest.mark.parametrize('fg_capacity', [1, 2])
-def test_simultaneous_requests_respect_repo_cap_and_provider_fifo(tmp_path, monkeypatch, fg_capacity):
+@pytest.mark.parametrize('fg_capacity, repo_tighten', [(1, False), (2, False), (1, True)])
+def test_simultaneous_requests_respect_repo_cap_and_provider_fifo(
+        tmp_path, monkeypatch, fg_capacity, repo_tighten):
     from concurrent.futures import ThreadPoolExecutor
     import time
     from tests.test_gitio import _git
     repo = _lane(tmp_path, monkeypatch)
+    if repo_tighten:
+        with (repo / '.skodun.toml').open('a') as config:
+            config.write('\n[capacity]\nreview_fg=1\n')
     peer = tmp_path / 'peer'
     _git(repo, 'worktree', 'add', '-b', 'peer', str(peer))
     for path in [repo / '.skodun.toml', repo / 'a.txt', *repo.glob('f*.txt')]:
         (peer / path.name).write_bytes(path.read_bytes())
     monkeypatch.setenv('SKODUN_LEGACY_FG_LOCK', '0')
-    monkeypatch.setenv('SKODUN_REVIEW_FG_CAPACITY', str(fg_capacity))
-    monkeypatch.setenv('SKODUN_REVIEW_MACHINE_CAPACITY', '2')
+    monkeypatch.setenv('SKODUN_REVIEW_FG_CAPACITY', str(4 if repo_tighten else fg_capacity))
+    monkeypatch.setenv('SKODUN_REVIEW_MACHINE_CAPACITY', '4' if repo_tighten else '2')
     monkeypatch.setenv('SKODUN_LOCK_WAIT_SECONDS', '20')
     monkeypatch.setenv('SKODUN_LOCK_POLL_SECONDS', '0.05')
     release, both_a = threading.Event(), threading.Event()

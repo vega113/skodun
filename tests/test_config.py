@@ -1715,7 +1715,24 @@ def test_repo_machine_ceiling_survives_host_environment_override(
     assert resolved_machine_capacity(cfg, env={'SKODUN_REVIEW_MACHINE_CAPACITY': '4'}) == expected
 
 
-def test_internal_repo_capacity_metadata_is_not_a_config_key(tmp_path):
-    global_path = _write(tmp_path / 'global.toml', '[capacity]\n_repo_machine = 8\n')
+@pytest.mark.parametrize("key", ["_repo_machine", "_repo_review_fg"])
+def test_internal_repo_capacity_metadata_is_not_a_config_key(tmp_path, key):
+    global_path = _write(tmp_path / 'global.toml', f'[capacity]\n{key} = 8\n')
     with pytest.raises(ValueError, match='unknown.*capacity'):
         load_config(None, global_path=global_path)
+
+
+@pytest.mark.parametrize('global_fg', [None, 2, 8])
+@pytest.mark.parametrize('repo_fg', [1, 3, 8])
+def test_repo_fg_only_tightens_host_file_default_and_environment(tmp_path, global_fg, repo_fg):
+    from skodun.capacity import resolved_fg_capacity
+    text = '[capacity]\nmachine=8\n'
+    if global_fg is not None:
+        text += f'review_fg={global_fg}\n'
+    global_path = _write(tmp_path / 'global.toml', text)
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _write(repo / '.skodun.toml', f'[capacity]\nreview_fg={repo_fg}\n')
+    cfg = load_config(repo, global_path=global_path)
+    assert resolved_fg_capacity(cfg, env={}) == min(global_fg or 1, repo_fg)
+    assert resolved_fg_capacity(cfg, env={'SKODUN_REVIEW_FG_CAPACITY': '4'}) == min(4, repo_fg)

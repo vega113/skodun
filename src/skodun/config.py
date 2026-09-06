@@ -444,13 +444,14 @@ class CapacitySettings:
     """Optional `[capacity]` table: machine outer cap and inner review-fg.
 
     ``None`` means "no file opinion" so env / capacity.py defaults apply.
-    A repo layer may only lower ``machine`` relative to the host ceiling.
+    Repository values may only lower their corresponding host ceilings.
     """
 
     machine: int | None = None
     review_fg: int | None = None
     # Preserve the repo ceiling so a host environment override cannot raise it.
     _repo_machine: int | None = None
+    _repo_review_fg: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1056,7 +1057,9 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
             if "review_fg" in cap_global else None)
     r_fg = (_cap_int("[capacity]", "review_fg", cap_repo["review_fg"])
             if "review_fg" in cap_repo else None)
-    review_fg = r_fg if r_fg is not None else g_fg
+    from .capacity import DEFAULT_CAPACITY
+    review_fg = (min(r_fg, g_fg if g_fg is not None else DEFAULT_CAPACITY)
+                 if r_fg is not None else g_fg)
 
     return Config(defaults=Defaults(**dvals), reviewers=reviewers,
                   dispatch=Dispatch(**pvals),
@@ -1064,7 +1067,7 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
                   routing=routing,
                   schedule_jobs=schedule_cfg.jobs,
                   capacity=CapacitySettings(machine=machine, review_fg=review_fg,
-                                            _repo_machine=r_machine))
+                                            _repo_machine=r_machine, _repo_review_fg=r_fg))
 
 
 def _bounded_retention_int(key: str, value: object, minimum: int) -> int:

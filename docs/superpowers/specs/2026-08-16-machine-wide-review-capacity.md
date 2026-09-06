@@ -124,3 +124,7 @@ file identity or write metadata changed during inspection. Inspection retries
 with fresh snapshots up to three times, then reports busy if the source keeps
 moving. Genuine unchanged corruption still follows the existing refusal or
 quarantine path.
+
+The inner `review_fg` limit follows the same host-first, repository-minimum
+precedence. Repository values cannot raise a host file/default foreground
+ceiling, and a host environment override cannot erase repository tightening.
