@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import errno
 import hashlib
+import io
 import os
 import re
 import shutil
@@ -1580,54 +1581,70 @@ def _recovered_schema_valid(conn: sqlite3.Connection) -> bool:
         return all(actual.get(key) == sql for key, sql in schema(expected).items())
 
 
+_RECOVERY_STATEMENT_LIMIT = 16 * 1024 * 1024
+
+
+def _replay_recovery_dump(conn: sqlite3.Connection, dump, deadline: float) -> bool:
+    """Replay native .recover statements with bounded memory and execution time."""
+    statement = ""
+    executed = 0
+    dump.seek(0)
+    # Preserve literal CR/LF and leading-dot lines inside quoted SQL values.
+    with io.TextIOWrapper(dump, encoding="utf-8", newline="") as reader:
+        for chunk in iter(lambda: reader.readline(64 * 1024), ""):
+            if time.monotonic() >= deadline:
+                return False
+            if not statement.strip() and (
+                    not chunk.strip() or chunk.startswith(".") or chunk.lstrip().startswith("--")):
+                continue
+            if len(statement) + len(chunk) > _RECOVERY_STATEMENT_LIMIT:
+                return False
+            statement += chunk
+            if chunk.rstrip().endswith(";") and sqlite3.complete_statement(statement):
+                conn.execute(statement)
+                executed += 1
+                statement = ""
+    return executed > 0 and not statement.strip() and not conn.in_transaction
+
+
 def _recover_sqlite_image(src: Path, dest: Path) -> bool:
-    """Replay ``sqlite3 .recover`` into ``dest``. False if unusable."""
+    """Recover through private temporary streams, never buffering the full dump."""
     try:
-        proc = subprocess.run(
-            ["sqlite3", "-readonly",
-             f"file:{quote(str(src.absolute()))}?mode=ro&immutable=1", ".recover"],
-            capture_output=True, text=True, timeout=300,
-        )
+        with tempfile.TemporaryFile(dir=dest.parent) as dump, tempfile.TemporaryFile(dir=dest.parent) as errors:
+            proc = subprocess.run(
+                ["sqlite3", "-readonly",
+                 f"file:{quote(str(src.absolute()))}?mode=ro&immutable=1", ".recover"],
+                stdout=dump, stderr=errors, timeout=300,
+            )
+            dump.flush()
+            if proc.returncode != 0 or os.fstat(dump.fileno()).st_size == 0:
+                return False
+            fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+            conn = None
+            valid = False
+            try:
+                conn = sqlite3.connect(dest, isolation_level=None)
+                conn.set_authorizer(lambda action, *_:
+                    sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_ATTACH else sqlite3.SQLITE_OK)
+                deadline = time.monotonic() + 300
+                conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
+                if not _replay_recovery_dump(conn, dump, deadline):
+                    return False
+                check = conn.execute("PRAGMA integrity_check").fetchone()
+                valid = (check is not None and check[0] == "ok"
+                         and _recovered_schema_valid(conn)
+                         and conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] > 0)
+                return valid
+            except (sqlite3.DatabaseError, OSError, ValueError):
+                return False
+            finally:
+                if conn is not None:
+                    conn.close()
+                if not valid:
+                    dest.unlink(missing_ok=True)
     except (OSError, subprocess.TimeoutExpired):
         return False
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return False
-    # ``.recover`` prefixes CLI-only dot commands (``.dbconfig``). Those are
-    # not SQL and would abort ``executescript`` before any INSERT landed.
-    sql = "\n".join(
-        line for line in proc.stdout.splitlines()
-        if line and not line.startswith(".")
-    )
-    if not sql.strip():
-        return False
-    fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    os.close(fd)
-    conn = sqlite3.connect(dest)
-    try:
-        # Recovery SQL may define the new image, never attach another authority.
-        conn.set_authorizer(lambda action, *_:
-            sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_ATTACH else sqlite3.SQLITE_OK)
-        conn.executescript(sql)
-        check = conn.execute("PRAGMA integrity_check").fetchone()
-        integrity = str(check[0]) if check else "unknown"
-        tables = {
-            str(r[0]) for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")
-        }
-        schema_valid = _recovered_schema_valid(conn)
-        n_reviews = 0
-        if "reviews" in tables:
-            n_reviews = int(conn.execute(
-                "SELECT COUNT(*) FROM reviews").fetchone()[0])
-    except sqlite3.DatabaseError:
-        conn.close()
-        dest.unlink(missing_ok=True)
-        return False
-    conn.close()
-    if integrity != "ok" or not schema_valid or n_reviews < 1:
-        dest.unlink(missing_ok=True)
-        return False
-    return True
 
 
 def _live_image_is_corrupt(path: Path) -> bool:

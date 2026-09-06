@@ -157,3 +157,8 @@ Copy failures clean up only files created by that attempt, verified through
 retained file descriptors. Pre-existing or replaced paths are preserved. If
 the authoritative source changed or disappeared, copied evidence is retained
 instead of being deleted.
+
+Recovery output is written to private temporary files and replayed one native
+SQL statement at a time. Replay limits statements to 16 Mi characters and has
+a 300-second execution budget. Oversized statements, unfinished transactions,
+and failed validation refuse replacement while preserving original evidence.

@@ -20,6 +20,15 @@ from skodun.store import SCHEMA_VERSION, SchemaLifecycleError, Store, inspect_sc
 from tests.test_store import REC
 
 
+def _mock_recovery_output(monkeypatch, sql):
+    import skodun.store as mod
+    def produce(argv, **kwargs):
+        assert 'capture_output' not in kwargs
+        kwargs['stdout'].write(sql.encode('utf-8'))
+        return subprocess.CompletedProcess(argv, 0)
+    monkeypatch.setattr(mod.subprocess, 'run', produce)
+
+
 def _write_review(db: Path, review_id: str) -> None:
     rec = {**REC, "id": review_id}
     with Store.open(db) as st:
@@ -263,8 +272,7 @@ def test_recovery_rejects_incomplete_current_schema(tmp_path, monkeypatch, damag
         else:
             conn.execute("ALTER TABLE reviews ADD COLUMN surprise TEXT")
         sql = '\n'.join(conn.iterdump()) + f'\nPRAGMA user_version={SCHEMA_VERSION};'
-    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k:
-                        subprocess.CompletedProcess(a, 0, stdout=sql))
+    _mock_recovery_output(monkeypatch, sql)
     assert not mod._recover_sqlite_image(good, tmp_path / "recovered.db")
 
 
@@ -277,8 +285,7 @@ def test_verified_recovery_preserves_review_and_private_permissions(tmp_path, mo
     db = tmp_path / "broken.db"
     original = _make_torn_wal(db)
     db.chmod(0o600)
-    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k:
-                        subprocess.CompletedProcess(a, 0, stdout=sql))
+    _mock_recovery_output(monkeypatch, sql)
     with Store.open(db) as store:
         assert store._c.execute("SELECT id FROM reviews").fetchall()[0][0] == "retained"
     assert db.stat().st_mode & 0o777 == 0o600
@@ -538,8 +545,7 @@ def test_recovery_sql_cannot_attach_another_database(tmp_path, monkeypatch):
     outside = tmp_path / 'outside.db'
     literal = str(outside).replace("'", "''")
     sql = f"ATTACH DATABASE '{literal}' AS escaped; CREATE TABLE escaped.wrong(x);"
-    monkeypatch.setattr(mod.subprocess, 'run', lambda *a, **k:
-                        subprocess.CompletedProcess(a, 0, stdout=sql))
+    _mock_recovery_output(monkeypatch, sql)
     assert not mod._recover_sqlite_image(tmp_path / 'source', tmp_path / 'dest')
     assert not outside.exists()
 
@@ -627,3 +633,65 @@ def test_failed_copy_keeps_evidence_if_the_source_changed(tmp_path, monkeypatch,
     with pytest.raises(OSError):
         mod._copy_store_image(src, dest)
     assert dest.read_bytes() == b'original evidence'
+
+
+def _stream_source_dump(monkeypatch, source, *, truncate=False):
+    import skodun.store as mod
+    sizes = []
+    def produce(argv, **kwargs):
+        assert 'capture_output' not in kwargs
+        assert os.fstat(kwargs['stdout'].fileno()).st_mode & 0o077 == 0
+        assert os.fstat(kwargs['stderr'].fileno()).st_mode & 0o077 == 0
+        count = kwargs['stdout'].write(b'.dbconfig defensive off\n')
+        with closing(sqlite3.connect(source)) as conn:
+            for line in conn.iterdump():
+                if truncate and line == 'COMMIT;':
+                    break
+                count += kwargs['stdout'].write((line + '\n').encode())
+        count += kwargs['stdout'].write(f'PRAGMA user_version={SCHEMA_VERSION};\n'.encode())
+        sizes.append(count)
+        return subprocess.CompletedProcess(argv, 0)
+    monkeypatch.setattr(mod.subprocess, 'run', produce)
+    return sizes
+
+
+def test_recovery_streams_many_statements_and_preserves_multiline_values(tmp_path, monkeypatch):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    summary = 'first\n.keep this line\nlast\r\nend'
+    with Store.open(source) as store:
+        for i in range(100):
+            store.save_review({**REC, 'id': f'row-{i}', 'summary': summary})
+    sizes = _stream_source_dump(monkeypatch, source)
+    monkeypatch.setattr(mod, '_RECOVERY_STATEMENT_LIMIT', 32 * 1024)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest)
+    assert sizes[0] > mod._RECOVERY_STATEMENT_LIMIT
+    with closing(sqlite3.connect(dest)) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM reviews').fetchone()[0] == 100
+        assert conn.execute('SELECT summary FROM reviews LIMIT 1').fetchone()[0] == summary
+
+
+def test_recovery_refuses_an_oversized_statement_without_replacing_source(tmp_path, monkeypatch):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    with Store.open(source) as store:
+        store.save_review({**REC, 'id': 'large-row', 'summary': 'x' * 65536})
+    _stream_source_dump(monkeypatch, source)
+    assert mod._recover_sqlite_image(source, tmp_path / 'normal.db')
+    before = source.read_bytes()
+    monkeypatch.setattr(mod, '_RECOVERY_STATEMENT_LIMIT', 32 * 1024)
+    dest = tmp_path / 'refused.db'
+    assert not mod._recover_sqlite_image(source, dest)
+    assert not dest.exists()
+    assert source.read_bytes() == before
+
+
+def test_recovery_refuses_a_dump_with_an_unfinished_transaction(tmp_path, monkeypatch):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'retained')
+    _stream_source_dump(monkeypatch, source, truncate=True)
+    dest = tmp_path / 'refused.db'
+    assert not mod._recover_sqlite_image(source, dest)
+    assert not dest.exists()
