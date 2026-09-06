@@ -1018,3 +1018,53 @@ def test_recovery_rejects_an_invalid_conflict_projection(tmp_path, monkeypatch):
         raw.commit()
     _stream_source_dump(monkeypatch, source)
     assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('damage', ['missing_one', 'missing_all', 'extra', 'diff', 'boundary', 'prompt'])
+def test_recovery_requires_complete_checkpoint_plan_projection(tmp_path, monkeypatch, damage):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_control_fixture(source)
+    with closing(sqlite3.connect(source)) as raw:
+        if damage == 'missing_one':
+            raw.execute("DELETE FROM review_checkpoints WHERE pass_kind='batch'")
+        elif damage == 'missing_all':
+            raw.execute('DELETE FROM review_checkpoints')
+        elif damage == 'extra':
+            raw.execute("INSERT INTO review_checkpoints "
+                        "(orchestration_id,pass_kind,pass_index,state,diff_hash,boundary_hash) "
+                        "VALUES ('orch-1','batch',99,'pending','d','b')")
+        else:
+            column = {'diff':'diff_hash', 'boundary':'boundary_hash', 'prompt':'prompt_hash'}[damage]
+            raw.execute(f"UPDATE review_checkpoints SET {column}='changed' WHERE pass_kind='batch'")
+        raw.commit()
+        assert raw.execute('PRAGMA foreign_key_check').fetchone() is None
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+def test_recovery_preserves_expired_checkpoint_envelopes(tmp_path, monkeypatch):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_control_fixture(source)
+    with Store.open(source) as store:
+        assert store.expire_orchestrations(now='2026-09-06T00:00:00Z') == 1
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest)
+    with Store.open(dest) as store:
+        assert store.get_orchestration('orch-1')['state'] == 'expired'
+        assert all(row['payload_json'] is None for row in store.list_checkpoints('orch-1'))
+
+
+def test_recovery_accepts_runtime_bound_integration_prompt(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from tests.test_checkpoints import _identity, NOW, LATER
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_control_fixture(source)
+    with Store.open(source) as store:
+        store.claim_checkpoint('orch-1', replace(_identity().pass_identities[1], prompt_hash='z'*64),
+                               owner='integrator', now=NOW, lease_expires_at=LATER)
+    _stream_source_dump(monkeypatch, source)
+    assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db')

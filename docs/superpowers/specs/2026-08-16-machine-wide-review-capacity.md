@@ -184,3 +184,7 @@ Recovered receipt decisions must agree with their payloads and indexed identity:
 accepted receipts require the embedded identity, reason ok, and successful
 producer facts. Rejection and nonce-conflict projections retain their existing
 invariants without inventing unavailable historical policy proof.
+
+Recovered orchestration checkpoint keys and fixed identities must match the
+declared pass plan. Runtime-bound integration prompts remain supported, and
+expired checkpoint envelopes may retain their intentionally cleared payloads.

@@ -1749,9 +1749,31 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                         return False
                     if any(row[key] != value for key, value in asdict(identity).items() if key in row.keys()):
                         return False
+                    planned = {(item.kind, item.index): item for item in identity.pass_identities}
+                    if len(planned) != len(identity.pass_identities):
+                        return False
+                    seen = set()
+                    children = conn.execute(
+                        "SELECT pass_kind,pass_index,diff_hash,boundary_hash,prompt_hash "
+                        "FROM review_checkpoints WHERE orchestration_id=? UNION ALL "
+                        "SELECT pass_kind,pass_index,diff_hash,boundary_hash,prompt_hash "
+                        "FROM review_followup_checkpoints WHERE orchestration_id=?", (row["id"], row["id"]))
+                    for child in children:
+                        key = (child["pass_kind"], child["pass_index"])
+                        expected = planned.get(key)
+                        if (expected is None or key in seen or child["diff_hash"] != expected.diff_hash
+                                or child["boundary_hash"] != expected.boundary_hash
+                                or expected.prompt_hash is not None and child["prompt_hash"] != expected.prompt_hash):
+                            return False
+                        seen.add(key)
+                    if seen != set(planned):
+                        return False
                 elif table in ("review_checkpoints", "review_followup_checkpoints"):
                     if row["state"] == "complete" and row["payload_json"] is None:
-                        return False
+                        parent = conn.execute("SELECT state FROM review_orchestrations WHERE id=?",
+                                              (row["orchestration_id"],)).fetchone()
+                        if parent is None or parent[0] != "expired":
+                            return False
                     if "payload_json" in decoded:
                         checkpoints.CheckpointPayload.from_mapping(decoded["payload_json"])
                     if table == "review_followup_checkpoints":
