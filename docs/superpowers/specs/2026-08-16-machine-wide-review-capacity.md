@@ -90,3 +90,18 @@ via the store (same bounded `SKODUN_ADMISSION_WAIT_SECONDS` as today).
   the machine cap.
 - Existing same-scope S3/S4 FIFO tests keep passing (inner rule unchanged).
 - `SKODUN_DB` pointing at a second file is a separate admission universe.
+
+## Delivery safety refinements
+
+Machine admission retains a slot while its owner PID is live. Queue age and
+execution age alone cannot prove that a cross-repo holder has stopped; dead
+owners remain reclaimable. Machine and repo tickets both link to the durable
+request and use the same foreground queue deadline.
+
+Malformed recovery is restricted to the torn-WAL incident shape, serialized
+with schema migration, and rechecked under the lifecycle lock. Private regular
+file quarantine preserves original bytes. Replacement requires the complete
+current declared schema and at least one review; older, partial, or failed
+recoveries remain quarantined for manual restoration. Every observed failed
+integrity check is invalid. Normal inspection for opens omits the full scan
+unless the torn-WAL signature is present; doctor requests a full check.

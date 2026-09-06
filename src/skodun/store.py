@@ -311,7 +311,7 @@ def _durability_fields(path: Path, *, journal_mode: str | None = None,
     }
 
 
-def inspect_schema(path: Path) -> SchemaInfo:
+def inspect_schema(path: Path, *, full_integrity: bool = True) -> SchemaInfo:
     """Inspect a database without creating or mutating filesystem state."""
     path = Path(path)
     snapshot, db_path, error = _snapshot_database(path)
@@ -333,18 +333,21 @@ def inspect_schema(path: Path) -> SchemaInfo:
                 version = int(conn.execute("PRAGMA user_version").fetchone()[0])
                 row = conn.execute("PRAGMA journal_mode").fetchone()
                 journal_mode = (row[0] if row else None) or _journal_mode_from_header(path)
-                integrity_row = conn.execute("PRAGMA integrity_check").fetchone()
-                integrity = str(integrity_row[0]) if integrity_row else "unknown"
+                integrity = None
+                if full_integrity or _torn_wal_signature(path):
+                    integrity_row = conn.execute("PRAGMA integrity_check").fetchone()
+                    integrity = str(integrity_row[0]) if integrity_row else "unknown"
                 extra = _durability_fields(
                     path, journal_mode=str(journal_mode).lower(),
                     integrity=integrity)
                 # A file-copy snapshot of a live non-empty WAL can look
                 # torn. Only an empty/missing -wal plus a bad check is the
                 # incident shape; that is safe to fail closed on.
-                if integrity != "ok" and _torn_wal_signature(path):
+                if integrity is not None and integrity != "ok":
                     return SchemaInfo(
                         "invalid", str(path), None, SCHEMA_VERSION,
-                        reason_code="torn_wal",
+                        reason_code=("torn_wal" if _torn_wal_signature(path)
+                                     else "invalid_sqlite"),
                         detail=f"integrity_check={integrity}; repairable "
                                f"(do not replace with an empty store)",
                         **extra)
@@ -1430,21 +1433,56 @@ def _quarantine_path(path: Path) -> Path:
     return dest
 
 
-def _copy_store_image(src: Path, dest: Path) -> None:
-    shutil.copy2(src, dest)
-    for suffix in ("-wal", "-shm"):
-        side = Path(str(src) + suffix)
-        size = _sidecar_size(side)
-        if size is None:
-            continue
-        shutil.copy2(side, Path(str(dest) + suffix))
+def _copy_store_image(src: Path, dest: Path, *, expected: os.stat_result | None = None) -> None:
+    """Copy only regular files to exclusive, private quarantine destinations."""
+    for suffix in ("", "-wal", "-shm"):
+        source = Path(str(src) + suffix)
+        fd, error = _open_regular_file(source)
+        if error is not None:
+            if suffix and error.state == "missing":
+                continue
+            raise SchemaLifecycleError(error.reason_code or "missing",
+                                       f"unsafe quarantine source: {source}", version=None)
+        with os.fdopen(fd, "rb") as stream:
+            observed = os.fstat(stream.fileno())
+            if not suffix and expected is not None and (
+                    observed.st_dev, observed.st_ino, observed.st_mtime_ns, observed.st_size) != (
+                    expected.st_dev, expected.st_ino, expected.st_mtime_ns, expected.st_size):
+                raise SchemaLifecycleError("store_changed", "store changed before quarantine",
+                                           version=None)
+            out = os.open(Path(str(dest) + suffix),
+                          os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(out, "wb") as target:
+                shutil.copyfileobj(stream, target, length=1024 * 1024)
+                target.flush()
+                os.fsync(target.fileno())
+
+
+def _recovered_schema_valid(conn: sqlite3.Connection) -> bool:
+    """Require the complete declared schema, including columns and indexes."""
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version != SCHEMA_VERSION:
+        return False
+    with closing(sqlite3.connect(":memory:", isolation_level=None)) as expected:
+        expected.executescript(_SCHEMA)
+        for target, delta in _MIGRATIONS:
+            if isinstance(delta, str):
+                expected.executescript(delta)
+            else:
+                _apply_atomic(expected, target, delta)
+        def schema(db):
+            return {(kind, name): " ".join(sql.split()).lower()
+                    for kind, name, sql in db.execute(
+                        "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL")}
+        actual = schema(conn)
+        return all(actual.get(key) == sql for key, sql in schema(expected).items())
 
 
 def _recover_sqlite_image(src: Path, dest: Path) -> bool:
     """Replay ``sqlite3 .recover`` into ``dest``. False if unusable."""
     try:
         proc = subprocess.run(
-            ["sqlite3", str(src), ".recover"],
+            ["sqlite3", str(src.absolute()), ".recover"],
             capture_output=True, text=True, timeout=300,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1459,8 +1497,8 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
     )
     if not sql.strip():
         return False
-    if dest.exists():
-        dest.unlink()
+    fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(fd)
     conn = sqlite3.connect(dest)
     try:
         conn.executescript(sql)
@@ -1470,6 +1508,7 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
             str(r[0]) for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")
         }
+        schema_valid = _recovered_schema_valid(conn)
         n_reviews = 0
         if "reviews" in tables:
             n_reviews = int(conn.execute(
@@ -1479,7 +1518,7 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
         dest.unlink(missing_ok=True)
         return False
     conn.close()
-    if integrity != "ok" or "reviews" not in tables or n_reviews < 1:
+    if integrity != "ok" or not schema_valid or n_reviews < 1:
         dest.unlink(missing_ok=True)
         return False
     return True
@@ -1503,34 +1542,51 @@ def _live_image_is_corrupt(path: Path) -> bool:
 
 
 def _repair_malformed_store(path: Path, info: SchemaInfo) -> None:
-    """Copy the torn image aside and replace it only with a verified recover.
-
-    Never deletes the broken bytes. Never creates a silent empty store: if
-    ``.recover`` cannot produce a reviews-bearing, integrity-ok image, the
-    original path is left untouched and the opener fails closed.
-    """
-    quarantine = _quarantine_path(path)
-    _copy_store_image(path, quarantine)
-    recovered = Path(str(path) + f".recovered-{quarantine.name.rsplit('malformed-', 1)[-1]}")
+    """Serialize recovery with migration and recheck before replacing authority."""
+    lock = Path(str(path) + ".migration.lock")
     try:
-        if _recover_sqlite_image(quarantine, recovered):
-            os.replace(recovered, path)
-            for suffix in ("-wal", "-shm"):
-                leftover = Path(str(path) + suffix)
-                if leftover.exists() and leftover.is_file():
-                    leftover.unlink()
-            return
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise SchemaLifecycleError("migration_busy", f"lifecycle lock is held: {lock}",
+                                   version=None) from exc
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
     finally:
-        recovered.unlink(missing_ok=True)
-        for suffix in ("-wal", "-shm"):
-            Path(str(recovered) + suffix).unlink(missing_ok=True)
-    raise SchemaLifecycleError(
-        info.reason_code or "torn_wal",
-        f"store cannot be opened: {path}; quarantined copy at {quarantine}; "
-        "not replaced with an empty store — restore from backup or inspect "
-        "the quarantine",
-        version=None,
-    )
+        os.close(fd)
+    try:
+        current = inspect_schema(path)
+        if current.state == "current":
+            return  # A preceding repair already installed the authority.
+        if (current.reason_code != "torn_wal" or not _live_image_is_corrupt(path)):
+            raise SchemaLifecycleError(current.reason_code or "invalid_schema",
+                                       f"store recovery refused: {path}", version=None)
+        original = path.lstat()
+        quarantine = _quarantine_path(path)
+        _copy_store_image(path, quarantine, expected=original)
+        # Recovery scratch files stay in a private directory on the same device.
+        with tempfile.TemporaryDirectory(prefix=".skodun-recover-", dir=path.parent) as tmp:
+            recovered = Path(tmp) / "recovered.db"
+            if _recover_sqlite_image(quarantine, recovered):
+                observed = path.lstat()
+                if (observed.st_dev, observed.st_ino, observed.st_mtime_ns, observed.st_size) != (
+                        original.st_dev, original.st_ino, original.st_mtime_ns, original.st_size):
+                    raise SchemaLifecycleError("store_changed", "store changed during recovery",
+                                               version=None)
+                if not _torn_wal_signature(path):
+                    raise SchemaLifecycleError("store_changed", "WAL changed during recovery",
+                                               version=None)
+                os.chmod(recovered, stat.S_IMODE(original.st_mode) & 0o600)
+                os.replace(recovered, path)
+                for suffix in ("-wal", "-shm"):
+                    Path(str(path) + suffix).unlink(missing_ok=True)
+                return
+        raise SchemaLifecycleError(
+            info.reason_code or "torn_wal",
+            f"store cannot be opened: {path}; quarantined copy at {quarantine}; "
+            "not replaced with an empty or incomplete store; restore from backup",
+            version=None)
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -1840,9 +1896,9 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                 "migration_busy", f"migration lock is held: {migration_lock}",
                 version=None)
         if existed:
-            info = inspect_schema(path)
+            info = inspect_schema(path, full_integrity=False)
             if (info.state == "invalid"
-                    and info.reason_code in {"torn_wal", "invalid_sqlite"}
+                    and info.reason_code == "torn_wal"
                     and _live_image_is_corrupt(path)):
                 _repair_malformed_store(path, info)
                 info = inspect_schema(path)
@@ -4108,6 +4164,14 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                 (resource_class, scope, *self._CAPACITY_ACTIVE)).fetchall()
             ended_at = _iso_now()
             for row in rows:
+                # Machine holders have no cross-repo legacy lock as a backstop.
+                # A live owner retains its slot until release; age is not proof
+                # that its bounded runner and descendants have finished.
+                if resource_class == "review-machine" and row["pid"]:
+                    from .capacity import pid_alive
+                    alive = pid_alive if pid_alive_fn is None else pid_alive_fn
+                    if alive(int(row["pid"])):
+                        continue
                 reason = should_reclaim_admission(
                     status=row["status"],
                     pid=row["pid"],

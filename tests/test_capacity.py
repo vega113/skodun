@@ -822,3 +822,29 @@ def test_enqueue_order_survives_new_process_and_terminal_rows(tmp_path, monkeypa
         assert store.capacity_position('z-first') is None
         assert store.capacity_position('a-second') == 1
         assert store.capacity_try_admit('0-third', capacity=1) is None
+
+
+def test_machine_holder_is_not_reclaimed_after_long_queue_or_execution(store):
+    first = acquire_for_fg(store, scope="/repo-a", capacity=1, wait_sec=0.1,
+                           poll_sec=0.01, machine_capacity=1)
+    store._c.execute("UPDATE capacity_admissions SET queued_at='2000-01-01T00:00:00Z', "
+                     "admitted_at='2000-01-02T00:00:00Z' WHERE id=?", (first.parent.id,))
+    assert capacity.reclaim_stale(store, scope=capacity.MACHINE_SCOPE,
+        resource_class=capacity.RESOURCE_REVIEW_MACHINE, stale_sec=0,
+        pid_alive_fn=lambda pid: True) == []
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope="/repo-b", capacity=1, wait_sec=0.02,
+                       poll_sec=0.01, machine_capacity=1, stale_sec=0,
+                       pid_alive_fn=lambda pid: True)
+    assert capacity.reclaim_stale(store, scope=capacity.MACHINE_SCOPE,
+        resource_class=capacity.RESOURCE_REVIEW_MACHINE, stale_sec=0,
+        pid_alive_fn=lambda pid: False) == [first.parent.id]
+    finish(store, first)
+
+
+def test_machine_ticket_released_when_inner_lock_fails(store):
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope="/repo-a", capacity=1, wait_sec=0.02,
+                       poll_sec=0.01, machine_capacity=1, try_lock=lambda _: False)
+    assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE,
+                                        capacity.MACHINE_SCOPE) == 0

@@ -105,7 +105,7 @@ def link_capacity(store, admission_id, resource_class):
     ctx = current()
     if ctx is not None and ctx.store is store:
         store.link_request(ctx.id, 'capacity', admission_id)
-        if resource_class == 'review-fg':
+        if resource_class in {'review-machine', 'review-fg'}:
             if not store.advance_request(ctx.id, owner_token=ctx.owner_token,
                                          state='queued', now=now()):
                 raise RuntimeError('request ownership lost before queue admission')

@@ -1013,13 +1013,13 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     cap_repo: dict = {}
     if layers:
         raw_g = layers[0].get("capacity", {})
-        if raw_g:
+        if "capacity" in layers[0]:
             if not isinstance(raw_g, dict):
                 raise ValueError("[capacity] must be a table")
             cap_global = dict(raw_g)
         if len(layers) > 1:
             raw_r = layers[1].get("capacity", {})
-            if raw_r:
+            if "capacity" in layers[1]:
                 if not isinstance(raw_r, dict):
                     raise ValueError("[capacity] must be a table")
                 cap_repo = dict(raw_r)

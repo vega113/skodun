@@ -1679,3 +1679,15 @@ def test_dogfood_pin_and_fallback_graph_are_unchanged(tmp_path):
     assert openai.provider == "openai"
     assert openai.model == "gpt-5.6-luna"
     assert openai.effort == "high"
+
+
+@pytest.mark.parametrize("value", ["false", "0", '""', "[]"])
+@pytest.mark.parametrize("layer", ["global", "repo"])
+def test_falsey_capacity_non_tables_are_rejected(tmp_path, value, layer):
+    global_path = _write(tmp_path / "global.toml", "")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = global_path if layer == "global" else repo / ".skodun.toml"
+    _write(target, f"capacity = {value}\n")
+    with pytest.raises(ValueError, match="capacity.*must be a table"):
+        load_config(repo, global_path=global_path)

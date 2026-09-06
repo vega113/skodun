@@ -245,3 +245,144 @@ def test_doctor_machine_cap_follows_toml_when_env_is_unset(tmp_path, monkeypatch
     assert cap_check.ok
     assert f"machine_cap={expected}" in cap_check.detail
     assert expected == 2
+
+
+@pytest.mark.parametrize("damage", ["table", "index", "column"])
+def test_recovery_rejects_incomplete_current_schema(tmp_path, monkeypatch, damage):
+    import skodun.store as mod
+    good = tmp_path / "good.db"
+    _write_review(good, "retained")
+    with sqlite3.connect(good) as conn:
+        if damage == "table":
+            conn.execute("DROP TABLE capacity_admissions")
+        elif damage == "index":
+            index = conn.execute("SELECT name FROM sqlite_master WHERE type='index' "
+                                 "AND sql IS NOT NULL LIMIT 1").fetchone()[0]
+            conn.execute(f'DROP INDEX "{index}"')
+        else:
+            conn.execute("ALTER TABLE reviews ADD COLUMN surprise TEXT")
+        sql = '\n'.join(conn.iterdump()) + f'\nPRAGMA user_version={SCHEMA_VERSION};'
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k:
+                        subprocess.CompletedProcess(a, 0, stdout=sql))
+    assert not mod._recover_sqlite_image(good, tmp_path / "recovered.db")
+
+
+def test_verified_recovery_preserves_review_and_private_permissions(tmp_path, monkeypatch):
+    import skodun.store as mod
+    good = tmp_path / "good.db"
+    _write_review(good, "retained")
+    with sqlite3.connect(good) as conn:
+        sql = '\n'.join(conn.iterdump()) + f'\nPRAGMA user_version={SCHEMA_VERSION};'
+    db = tmp_path / "broken.db"
+    original = _make_torn_wal(db)
+    db.chmod(0o600)
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k:
+                        subprocess.CompletedProcess(a, 0, stdout=sql))
+    with Store.open(db) as store:
+        assert store._c.execute("SELECT id FROM reviews").fetchall()[0][0] == "retained"
+    assert db.stat().st_mode & 0o777 == 0o600
+    quarantine = _quarantines(db)[0]
+    assert quarantine.read_bytes() == original
+    assert quarantine.stat().st_mode & 0o777 == 0o600
+
+
+def test_recovery_uses_absolute_path_for_leading_dash(tmp_path, monkeypatch):
+    import skodun.store as mod
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 1, stdout="")
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    assert not mod._recover_sqlite_image(Path("-unsafe.db"), tmp_path / "out")
+    assert calls[0][1] == str(tmp_path / "-unsafe.db")
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_quarantine_refuses_unsafe_source(tmp_path, kind):
+    import skodun.store as mod
+    src = tmp_path / "source"
+    if kind == "symlink":
+        target = tmp_path / "secret"
+        target.write_text("must not be copied")
+        src.symlink_to(target)
+    else:
+        os.mkfifo(src)
+    with pytest.raises(SchemaLifecycleError):
+        mod._copy_store_image(src, tmp_path / "quarantine")
+    assert not (tmp_path / "quarantine").exists()
+
+
+def test_recovery_rechecks_under_lifecycle_lock(tmp_path, monkeypatch):
+    import skodun.store as mod
+    db = tmp_path / "s.db"
+    _make_torn_wal(db)
+    stale = inspect_schema(db)
+    # Simulate another opener completing recovery before this caller takes lock.
+    db.unlink()
+    Path(str(db) + "-wal").unlink(missing_ok=True)
+    _write_review(db, "peer-recovered")
+    monkeypatch.setattr(mod, "_recover_sqlite_image", lambda *a:
+                        pytest.fail("must not replace the peer's recovered store"))
+    mod._repair_malformed_store(db, stale)
+    with Store.open(db) as store:
+        assert store._c.execute("SELECT id FROM reviews").fetchone()[0] == "peer-recovered"
+    assert not Path(str(db) + ".migration.lock").exists()
+
+
+def test_repair_refuses_when_lifecycle_lock_is_held(tmp_path):
+    import skodun.store as mod
+    db = tmp_path / "s.db"
+    original = _make_torn_wal(db)
+    lock = Path(str(db) + ".migration.lock")
+    lock.write_text(str(os.getpid()))
+    with pytest.raises(SchemaLifecycleError, match="lifecycle lock"):
+        mod._repair_malformed_store(db, inspect_schema(db))
+    assert db.read_bytes() == original
+    assert lock.exists()
+
+
+def test_delete_store_failed_integrity_is_invalid(tmp_path):
+    db = tmp_path / "s.db"
+    _write_review(db, "retained")
+    with sqlite3.connect(db) as conn:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        index = conn.execute("SELECT name FROM sqlite_master WHERE type='index' "
+                             "AND tbl_name='reviews' AND sql IS NOT NULL LIMIT 1").fetchone()[0]
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute("UPDATE sqlite_master SET rootpage=999999 WHERE name=?", (index,))
+    info = inspect_schema(db)
+    assert info.state == "invalid"
+    assert info.reason_code == "invalid_sqlite"
+
+
+def test_ordinary_delete_open_skips_full_integrity_scan(tmp_path, monkeypatch):
+    import skodun.store as mod
+    db = tmp_path / "s.db"
+    _write_review(db, "retained")
+    with sqlite3.connect(db) as conn:
+        conn.execute("PRAGMA journal_mode=DELETE")
+    statements = []
+    real = mod.sqlite3.connect
+    def connect(*a, **k):
+        conn = real(*a, **k)
+        conn.set_trace_callback(statements.append)
+        return conn
+    monkeypatch.setattr(mod.sqlite3, "connect", connect)
+    with Store.open(db):
+        pass
+    assert not any('integrity_check' in sql for sql in statements)
+    assert inspect_schema(db).integrity_check == "ok"
+
+
+def test_quarantine_rejects_replaced_regular_inode(tmp_path):
+    import skodun.store as mod
+    source = tmp_path / "source"
+    source.write_bytes(b"original")
+    original = source.stat()
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"different")
+    os.replace(replacement, source)
+    with pytest.raises(SchemaLifecycleError, match="changed before quarantine"):
+        mod._copy_store_image(source, tmp_path / "quarantine", expected=original)
+    assert not (tmp_path / "quarantine").exists()
