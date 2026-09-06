@@ -154,7 +154,9 @@ def test_real_review_links_provider_capacity_and_final_artifact(tmp_path, monkey
         assert status == 0
         request = store.get_request(meta['request']['id'])
         links = request['links']
-        assert len([l for l in links if l['kind'] == 'capacity']) == 2
+        assert {store.capacity_get(l['target_id'])['resource_class']
+                for l in links if l['kind'] == 'capacity'} == {
+                    'review-machine', 'review-fg', 'provider:xai'}
         review_id = next(l['target_id'] for l in links if l['kind'] == 'review')
         rec = store.get_review(review_id)
         assert rec['request_id'] == request['id']

@@ -250,6 +250,7 @@ def test_simultaneous_requests_respect_repo_cap_and_provider_fifo(tmp_path, monk
         (peer / path.name).write_bytes(path.read_bytes())
     monkeypatch.setenv('SKODUN_LEGACY_FG_LOCK', '0')
     monkeypatch.setenv('SKODUN_REVIEW_FG_CAPACITY', str(fg_capacity))
+    monkeypatch.setenv('SKODUN_REVIEW_MACHINE_CAPACITY', '2')
     monkeypatch.setenv('SKODUN_LOCK_WAIT_SECONDS', '20')
     monkeypatch.setenv('SKODUN_LOCK_POLL_SECONDS', '0.05')
     release, both_a = threading.Event(), threading.Event()

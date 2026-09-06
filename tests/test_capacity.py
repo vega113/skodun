@@ -848,3 +848,46 @@ def test_machine_ticket_released_when_inner_lock_fails(store):
                        poll_sec=0.01, machine_capacity=1, try_lock=lambda _: False)
     assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE,
                                         capacity.MACHINE_SCOPE) == 0
+
+
+def test_machine_cap_is_shared_by_independent_processes(tmp_path):
+    import os
+    import subprocess
+    import sys
+    db = tmp_path / 'shared.db'
+    script = '''
+import sys
+from pathlib import Path
+from skodun.store import Store
+from skodun.capacity import acquire_for_fg, finish, AdmissionTimeout
+with Store.open(Path(sys.argv[1])) as store:
+    try:
+        ticket = acquire_for_fg(store, scope=sys.argv[2], capacity=8,
+            machine_capacity=1, wait_sec=.1, poll_sec=.01)
+    except AdmissionTimeout:
+        print('blocked', flush=True)
+    else:
+        print('held', flush=True)
+        if sys.argv[2] == 'repo-a':
+            sys.stdin.readline()
+        finish(store, ticket)
+'''
+    env = {**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')}
+    with Store.open(db):
+        pass
+    with subprocess.Popen([sys.executable, '-c', script, str(db), 'repo-a'],
+                          env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as holder:
+        try:
+            assert holder.stdout.readline().strip() == 'held'
+            blocked = subprocess.run([sys.executable, '-c', script, str(db), 'repo-b'],
+                                     env=env, capture_output=True, text=True, timeout=10)
+            assert blocked.returncode == 0, blocked.stderr
+            assert blocked.stdout.strip() == 'blocked'
+        finally:
+            stdout, stderr = holder.communicate('\n', timeout=10)
+        assert holder.returncode == 0, stderr
+    admitted = subprocess.run([sys.executable, '-c', script, str(db), 'repo-b'],
+                             env=env, capture_output=True, text=True, timeout=10)
+    assert admitted.returncode == 0, admitted.stderr
+    assert admitted.stdout.strip() == 'held'
