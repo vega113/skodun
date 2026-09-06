@@ -132,8 +132,10 @@ def test_svc_review_status_by_id_and_current_for_repo(tmp_path):
         assert "model=m1" in text
 
         code, text = services.svc_review_status(st, repo=repo)
-        assert code == 0
-        assert "id=sk_run" in text and "state=running" in text
+        assert code == 2  # No resolvable caller worktree; never select by shared repo.
+        assert "reason_code=scope_unavailable" in text
+        code, text = services.svc_review_status(st, scope="host")
+        assert code == 0 and "sk_run" in text and "sk_done" in text
 
         code, text = services.svc_review_status(st, review_id="sk_done")
         assert code == 0
@@ -271,8 +273,8 @@ def test_cancel_dead_running_row_demotes_durably(tmp_path):
 # stale FG sweep via status path (aligned with recover_stale)
 # ==========================================================================
 
-def test_status_sweeps_aged_fg_running_row(tmp_path, monkeypatch):
-    """An ancient FG running row is recovered on status, same as prepush."""
+def test_status_never_sweeps_aged_fg_running_row(tmp_path, monkeypatch):
+    """Observation must not recover or mutate an unfinished legacy record."""
     # reviewed_at far in the past; worst_runtime_sec tiny → over ceiling
     rec = _artifact([], id="sk_stale", status="running", mode="now",
                     pid=None, findings_total=0, repo="/repos/stale",
@@ -280,13 +282,14 @@ def test_status_sweeps_aged_fg_running_row(tmp_path, monkeypatch):
                     worst_runtime_sec=1)
     db = _db_with(tmp_path, rec)
     with Store.open(db) as st:
+        before = st.get_review("sk_stale")
         code, text = services.svc_review_status(st, review_id="sk_stale")
         assert code == 0
-        assert "state=running" not in text
+        assert "state=running" in text
         stored = st.get_review("sk_stale")
-        assert stored["status"] == "failed"
-        assert stored["trustworthy"] is False
-        assert "stale" in (stored.get("failure_reason") or "").lower()
+        assert stored["status"] == "running"
+        assert stored == before
+        assert not stored.get("failure_reason")
 
 
 # ==========================================================================

@@ -174,6 +174,7 @@ class DedupEvidence:
     enabled: bool
     valid: bool = False
     candidate_context_hash: str | None = None
+    planning_policy: dict | None = None
 
 
 def _classify(artifact: object) -> tuple[str, str | None]:
@@ -256,6 +257,12 @@ def evidence_permits_suppression(artifact: object,
         return False
     if evidence.enabled is not True or evidence.valid is not True:
         return False
+    if evidence.planning_policy is not None:
+        from .planning_policy import mismatch
+        if not isinstance(artifact, dict) or not isinstance(evidence.planning_policy, dict):
+            return False
+        if mismatch(artifact.get('planning_policy'), evidence.planning_policy) is not None:
+            return False
     return context_permits_suppression(artifact, evidence.candidate_context_hash)
 
 
@@ -317,9 +324,11 @@ def build_dedup_evidence(store: "Store", repo: Path, diff: "Diff", oid: str,
         # a non-bool that happens to be truthy must not turn dedup on.
         return DedupEvidence(enabled=False)
     try:
+        from .planning_policy import describe
+        policy = describe(d, finder)
         if not d.context_pack:
             return DedupEvidence(enabled=True, valid=True,
-                                 candidate_context_hash=None)
+                                 candidate_context_hash=None, planning_policy=policy)
         headroom = promptbuild.context_headroom(
             budget.prompt_budget(d, finder), len(diff.data), packing=True)
         pack = contextpack.pack(Path(repo), list(diff.files), dict(diff.statuses),
@@ -333,7 +342,7 @@ def build_dedup_evidence(store: "Store", repo: Path, diff: "Diff", oid: str,
         _note(f"dedup evidence unavailable for {oid or '<no oid>'} "
               f"({type(exc).__name__}: {exc}); this push will be reviewed")
         return DedupEvidence(enabled=True, valid=False)
-    return DedupEvidence(enabled=True, valid=True, candidate_context_hash=candidate)
+    return DedupEvidence(enabled=True, valid=True, candidate_context_hash=candidate, planning_policy=policy)
 
 
 # ===========================================================================
@@ -1037,7 +1046,8 @@ def _dispatch_ref(store: "Store", store_path: Path, repo: Path, cfg,
     reservation = store.reserve_prepush(
         ref.branch, ref.local_oid, base.ref, base.sha, diff_hash,
         reserved_budget(cfg, diff.data), evidence,
-        repo=str(gitio.git_common_dir(repo)))
+        repo=str(gitio.git_common_dir(repo)),
+        worktree_root=str(gitio._worktree_root(repo).resolve()))
     if reservation.record_id is None:
         _note(f"{ref.branch}: diff {diff_hash} is already covered by review "
               f"{reservation.suppressed_by}; skipping")
@@ -1156,34 +1166,83 @@ def run_worker(record_id: str, repo: Path, branch: str, local_oid: str,
             return WorkerOutcome(2, _banner_failure(
                 f"the review worker could not open its store: {e!r}"))
         with store:
+            owner_context = {}
             try:
-                return _work(store, cancel, record_id, repo, branch, local_oid,
-                             base_sha, base_ref)
+                result = _work(store, cancel, record_id, repo, branch, local_oid,
+                               base_sha, base_ref, owner_context=owner_context)
             except pipeline.ReviewCancelled as exc:
-                # A SIGTERM landing after the last watchdog tick and outside
-                # every checkpoint. Converted here into the SAME orderly
-                # conditional failed finalize, so it can never surface as a
-                # traceback out of a detached process nor leave the reservation
-                # `running` for a stale sweep to find a whole budget later.
-                return _record_cancellation(store, record_id, exc)
-            except BaseException as e:
-                # The review did not complete, so it certifies nothing -- and the
-                # reservation must not be left `running`. Conditional: a
-                # superseded record stays superseded.
-                reason = f"the background review failed: {e!r}"
+                result = _record_cancellation(store, record_id, exc)
+            except BaseException as exc:
+                reason = f"the background review failed: {exc!r}"
                 _note(reason)
                 try:
                     store.fail_if_running(record_id, reason)
-                except BaseException:       # pragma: no cover - defensive
+                except BaseException:
                     pass
-                return WorkerOutcome(0, _banner_failure(reason))
+                result = WorkerOutcome(0, _banner_failure(reason))
+            return _complete_worker_control(store, record_id, owner_context, result)
     finally:
         _restore_sigterm(previous)
 
 
+def _demote_owned_cancellation(store, record_id, owner, reason='cancelled: worker observed cancellation'):
+    """Try existing demotion doors only while the captured owner still matches."""
+    had_error = False
+    for method in ('mark_cancelled','mark_failed'):
+        try:
+            current = store.get_review(record_id) or {}
+            if not owner.matches(current):
+                return False, True
+            if current.get('status') != 'running' and current.get('trustworthy') is False:
+                return True, had_error
+            getattr(store, method)(record_id, reason)
+            current = store.get_review(record_id) or {}
+            if owner.matches(current) and current.get('status') != 'running' and current.get('trustworthy') is False:
+                return True, had_error
+            had_error = True
+        except BaseException:
+            had_error = True
+    return False, True
+
+
+def _complete_worker_control(store, record_id, context, result):
+    """Settle only safe terminal outcomes; an effective audit is never erased early."""
+    token = context.get('cancel')
+    if token is None:
+        return result
+    try:
+        current = store.get_review(record_id) or {}
+        if not token.owner.matches(current):
+            return WorkerOutcome(2, _banner_failure('worker cancellation ownership changed'))
+        if token.cancel_latched or token.finalization_error:
+            demoted, error = _demote_owned_cancellation(store, record_id, token.owner)
+            token.finalization_error = token.finalization_error or error
+            if not demoted:
+                # In particular, do not relabel an observed signal as a race
+                # lost to completion while its trusted artifact still stands.
+                return WorkerOutcome(2, _banner_failure('worker cancellation demotion failed; cancellation remains unresolved'))
+        if not token.flush_audit():
+            return WorkerOutcome(2, _banner_failure('worker cancellation audit could not be persisted'))
+        current = store.get_review(record_id) or {}
+        if current.get('status') != 'running':
+            from .control import cancellation_completion
+            from .requests import now
+            store.finish_cancellations(target_id=record_id,
+                outcome=cancellation_completion(current), now=now())
+        if token.finalization_error:
+            return WorkerOutcome(2, _banner_failure('worker cancellation finalization encountered a persistence error'))
+        if token.cancel_latched:
+            from .trust import banner
+            return WorkerOutcome(result.code, banner(current))
+        return result
+    except BaseException as exc:
+        _note(f'worker cancellation audit completion pending: {type(exc).__name__}')
+        return WorkerOutcome(2, _banner_failure('worker cancellation audit completion failed'))
+
+
 def _work(store: "Store", cancel: threading.Event, record_id: str, repo: Path,
           branch: str, local_oid: str, base_sha: str,
-          base_ref: str) -> WorkerOutcome:
+          base_ref: str, *, owner_context=None) -> WorkerOutcome:
     """Steps 2-8 of `run_worker`. Raises; the caller owns every failure shape."""
     from . import gitio, pipeline
     from .trust import banner
@@ -1221,6 +1280,14 @@ def _work(store: "Store", cancel: threading.Event, record_id: str, repo: Path,
         store.fail_if_running(record_id, reason)
         return WorkerOutcome(0, _banner_failure(reason))
 
+    from .request_cancel import RecordCancel
+    if not store.publish_record_cancellation(record_id, os.getpid()):
+        return WorkerOutcome(0, _banner_failure('worker no longer owns its reservation'))
+    cancel = RecordCancel(store, record_id, cancel, str(gitio._worktree_root(repo).resolve()))
+    if owner_context is not None:
+        owner_context['owner'] = cancel.owner
+        owner_context['cancel'] = cancel
+
     cfg = _load_config(repo)
     d = effective_defaults(cfg.defaults, cfg.dispatch)
     rec = pipeline.run_prepush_review(store, repo, record_id, branch, local_oid,
@@ -1255,10 +1322,20 @@ def _work(store: "Store", cancel: threading.Event, record_id: str, repo: Path,
     # BEFORE the store call and therefore cannot see a signal that arrives while
     # SQLite holds the write lock -- and such a signal would otherwise leave a
     # trustworthy record for a review that was killed.
-    if pipeline.runner._cancelled(cancel):
-        if store.mark_cancelled(record_id, "cancelled during finalization"):
-            _note("cancelled during finalization; the committed record was "
-                  "demoted")
+    try:
+        cancelled = cancel.is_set()
+    except BaseException:
+        cancel.finalization_error = True
+        _demote_owned_cancellation(store, record_id, cancel.owner)
+        raise
+    if cancelled:
+        demoted, error = _demote_owned_cancellation(store, record_id, cancel.owner,
+            'cancelled during finalization; cancellation audit failed' if cancel.audit_error else
+            'cancelled during finalization')
+        cancel.finalization_error = error or not demoted
+        if not demoted:
+            return WorkerOutcome(2, _banner_failure('worker cancellation demotion failed; cancellation remains unresolved'))
+        _note('cancelled during finalization; the committed record was demoted')
     current = store.get_review(record_id) or rec
     return WorkerOutcome(0, banner(current))
 
@@ -1360,8 +1437,10 @@ def _install_sigterm(cancel: threading.Event):
     cancelled still terminates on its own watchdog budget, so this is degraded
     rather than fatal.
     """
+    from .request_cancel import mark_event
+
     def handler(signum, frame):        # pragma: no cover - driven by a signal
-        cancel.set()
+        mark_event(cancel, 'signal')
     try:
         # `signal.signal` returns the PREVIOUS handler, which is what
         # `_restore_sigterm` puts back. It can legitimately be `SIG_DFL`, whose

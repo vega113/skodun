@@ -30,6 +30,7 @@ import shutil
 import threading
 import time
 import contextvars
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -49,6 +50,7 @@ _DEFAULT_PROVIDER_WAIT_SEC = 30.0
 _SPAWN_UNAVAILABLE_ERRNOS = frozenset({
     errno.ENOENT, errno.EACCES, errno.EPERM, errno.ENOEXEC,
 })
+_CURRENT_INPUT_BYTES = contextvars.ContextVar("skodun_input_bytes", default=None)
 _CURRENT_EXECUTION = contextvars.ContextVar(
     "skodun_attempt_execution", default=None)
 
@@ -110,7 +112,8 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
              classification: dict | None = None,
              skipped: str | None = None,
              usage: dict | None = None,
-             capacity_timing: dict | None = None) -> dict:
+             capacity_timing: dict | None = None,
+             reason_code: str | None = None) -> dict:
     """One `attempts[]` row, in the ONE shape the artifact schema defines.
 
     Every row carries the identity of the entry it belongs to (`provider`,
@@ -132,6 +135,8 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
     """
     row: dict = {
         "n": n,
+        "attempt_id": uuid.uuid4().hex,
+        "input_bytes": _CURRENT_INPUT_BYTES.get(),
         "provider": r.provider,
         "model": r.model,
         "effort": r.effort,
@@ -141,6 +146,8 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
         "first_output_sec": first_output_sec,
         "classification": classification,
     }
+    if reason_code is not None:
+        row["reason_code"] = reason_code
     if skipped is not None:
         row["skipped"] = skipped
     if usage is not None:
@@ -152,6 +159,31 @@ def _attempt(n: int, r: Reviewer, *, rc: int | None = None,
     # be misleading even if the adapter was resolved before the skip.
     if execution is not None and skipped is None:
         row["execution_provenance"] = dict(execution)
+    return row
+
+
+def _prompt_size_skip(n: int, entry: Reviewer, adapter, error: PromptTooLarge,
+                      *, next_entry: bool,
+                      capacity_timing: dict | None = None) -> dict:
+    """One prompt-local refusal, never provider-wide quota unavailability."""
+    from .pipeline import _note
+
+    next_step = "trying the next entry" if next_entry else "no entries remain"
+    _note(f"{entry.name} ({entry.provider}) cannot take this prompt "
+          f"({error.size} bytes > {error.limit}); {next_step}")
+    verdict = ClassifyResult("unavailable", PROMPT_TOO_LARGE_CATEGORY, str(error))
+    row = _attempt(n, entry,
+                   skipped=f"prompt too large for this provider: {error}",
+                   classification=_classification(verdict),
+                   capacity_timing=capacity_timing)
+    row["input_eligibility"] = {
+        "adapter_name": adapter.name,
+        "transport": getattr(adapter, "prompt_transport", None),
+        "capability_version": getattr(adapter, "prompt_capability_version", None),
+        "reason": "prompt_too_large",
+        "input_bytes": error.size,
+        "limit_bytes": error.limit,
+    }
     return row
 
 
@@ -489,14 +521,14 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
     design: it is a `BaseException` precisely so the `except Exception` guards
     between here and the worker cannot turn a killed run into a degraded review.
 
-    ``admission_deadline`` is a ``time.monotonic()`` absolute end for the
-    shared admit+bind budget (review-fg wait already spent by the pipeline
-    before this call, plus every provider wait/hop here). When omitted, a
-    fresh budget is started for this chain so standalone callers and tests
-    still get one wall-clock bound that is **not** reset per hop.
+    ``admission_deadline`` remains a compatibility input: its initial
+    remainder supplies this pass's cumulative provider admission allowance.
+    Foreground callers use the request policy. Only actual admission waits
+    spend the allowance; model runtime is excluded and fallbacks share it.
     """
     from .pipeline import _chain_for, _note
     _CURRENT_EXECUTION.set(None)
+    _CURRENT_INPUT_BYTES.set(len(prompt))
     chain = _chain_for(cfg, head)
     attempts: list[dict] = []
     exhausted: list[str] = []
@@ -504,11 +536,16 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
     # `attempts[]` list has a unique ordinal; the per-entry count below is what
     # the retry budgets and the timeout message talk about.
     n = 0
-    # One wall-clock deadline for all provider waits/hops in this chain.
-    if admission_deadline is None:
-        admission_deadline = (
-            time.monotonic()
-            + capacity.admission_wait_from_env(_DEFAULT_PROVIDER_WAIT_SEC))
+    # One cumulative admission allowance per pass. Model runtime and the
+    # foreground queue never spend this allowance; fallback waits share it.
+    from . import budgets
+    controller = budgets.current(store)
+    wait_limit = (_remaining_admission_sec(admission_deadline)
+                  if admission_deadline is not None else
+                  controller.limits.provider_wait if controller is not None else
+                  capacity.admission_wait_from_env(_DEFAULT_PROVIDER_WAIT_SEC))
+    allowance = (controller.provider_allowance(wait_limit) if controller is not None
+                 else budgets.ProviderAllowance(wait_limit))
 
     for i, entry in enumerate(chain):
         # Do not let a skipped fallback inherit the prior entry's executable
@@ -566,16 +603,41 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
             exhausted.append(f"{entry.name}/{entry.provider}: {detail}")
             continue
 
+        # Deterministic transport eligibility is prompt-local and runs before
+        # slot admission or scratch-file staging. The bounded adapter shares
+        # this guard with build_cmd, including fatal validation precedence;
+        # do not substitute a raw len(prompt) comparison that hides config or
+        # decoding errors. Unknown-limit adapters need no size preflight.
+        validate_prompt = getattr(adapter, "validate_prompt", None)
+        if validate_prompt is not None:
+            try:
+                validate_prompt(prompt, entry)
+            except PromptTooLarge as e:
+                n += 1
+                attempts.append(_prompt_size_skip(
+                    n, entry, adapter, e, next_entry=i + 1 < len(chain)))
+                exhausted.append(f"{entry.name}/{entry.provider}: {e}")
+                continue
+            except Exception as e:
+                n += 1
+                attempts.append(_attempt(
+                    n, entry, skipped=f"could not build the invocation: {e!r}",
+                    reason_code="invocation_invalid"))
+                return _Outcome(None, attempts,
+                                f"reviewer {entry.name!r} could not be "
+                                f"invoked: {e!r}")
+
         # Remaining shared admit+bind budget — not a fresh full wait per hop.
-        wait_sec = _remaining_admission_sec(admission_deadline)
+        wait_sec = allowance.remaining()
         provider_ticket: capacity.Ticket | None = None
         capacity_timing: dict | None = None
         try:
             try:
-                provider_ticket = _acquire_provider_slot(
-                    store, entry.provider, quota_pool=quota_pool,
-                    wait_sec=wait_sec,
-                    cancel=cancel, on_progress=_note)
+                with allowance.waiting():
+                    provider_ticket = _acquire_provider_slot(
+                        store, entry.provider, quota_pool=quota_pool,
+                        wait_sec=wait_sec,
+                        cancel=cancel, on_progress=_note)
             except capacity.AdmissionCancelled as e:
                 raise runner.ReviewCancelled(str(e)) from e
             except capacity.AdmissionTimeout as e:
@@ -596,6 +658,7 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                 _note(f"{entry.name} ({entry.provider}): {detail}")
                 attempts.append(_attempt(
                     n, entry, skipped=f"provider capacity: {detail}",
+                    reason_code="provider_wait_exhausted",
                     capacity_timing=capacity_timing))
                 exhausted.append(
                     f"{entry.name}/{entry.provider}: provider capacity wait")
@@ -621,33 +684,10 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                     prompt_file.write_bytes(prompt)
                     cmd = adapter.build_cmd(prompt_file, entry, d, cwd, contract)
                 except PromptTooLarge as e:
-                    # THIS PROVIDER cannot carry THIS PROMPT — which is what
-                    # `unavailable` means, and what a fallback chain is for. So it
-                    # takes the `unavailable` path below rather than the fatal one:
-                    # an `agy`-headed chain with a `codex` fallback reviews a large
-                    # change instead of dying on it.
-                    #
-                    # Fail-closed is untouched. Nothing becomes trustworthy that
-                    # was not reviewed: this appends an attempt and BREAKS to the
-                    # next entry, and a chain that runs out still returns
-                    # `parsed=None` with a reason that names the size and the
-                    # ceiling (both are in `e`'s message, and on `e.size`/`e.limit`
-                    # for a caller that would rather not read prose).
-                    #
-                    # NOT cached against the provider: `_remember_unavailable` is
-                    # not called, and the category is deliberately not `quota` —
-                    # the only provider-wide-cacheable one. The next, smaller
-                    # prompt will be accepted by the very same CLI.
-                    verdict = ClassifyResult(
-                        "unavailable", PROMPT_TOO_LARGE_CATEGORY, str(e))
-                    next_step = ("trying the next entry" if i + 1 < len(chain)
-                                 else "no entries remain")
-                    _note(f"{entry.name} ({entry.provider}) cannot take this "
-                          f"prompt ({e.size} bytes > {e.limit}); {next_step}")
-                    attempts.append(_attempt(
-                        n, entry,
-                        skipped=f"prompt too large for this provider: {e}",
-                        classification=_classification(verdict),
+                    # Defensive build-time guard uses the same refusal shape.
+                    # Never remember a prompt-size refusal as provider quota.
+                    attempts.append(_prompt_size_skip(
+                        n, entry, adapter, e, next_entry=i + 1 < len(chain),
                         capacity_timing=capacity_timing))
                     exhausted.append(f"{entry.name}/{entry.provider}: {e}")
                     break
@@ -662,6 +702,7 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                     attempts.append(_attempt(
                         n, entry,
                         skipped=f"could not build the invocation: {e!r}",
+                        reason_code="invocation_invalid",
                         capacity_timing=capacity_timing))
                     return _Outcome(None, attempts,
                                     f"reviewer {entry.name!r} could not be "
@@ -674,6 +715,10 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                               if getattr(adapter, "stdin_from_prompt_file", False)
                               else None)
                 try:
+                    if runner._cancelled(cancel):
+                        raise runner.ReviewCancelled("review cancelled before provider launch")
+                    if controller is not None:
+                        controller.provider_started()
                     result = runner.run_with_watchdog(
                         cmd, d.timeout_sec, cwd, out_path, err_path,
                         stdin_path=stdin_path, cancel=cancel)

@@ -59,7 +59,7 @@ _SRC = str(Path(skodun.__file__).resolve().parents[1])
 EXPECTED_TOOLS = ["gate", "review_readiness", "review", "log", "surface", "triage_list",
                   "triage_dismiss", "adopt_refuter", "triage_reopen",
                   "triage_defer", "review_status", "review_cancel",
-                  "feedback_add", "feedback_list", "evidence"]
+                  "feedback_add", "feedback_list", "evidence", "queue", "review_plan"]
 
 TRACKING_REF = "GH-412"
 DEFER_REASON = "in-bounds for this surface; the hot path is the batcher upstream"
@@ -701,9 +701,9 @@ def test_the_review_tool_takes_a_reviewer_by_name_in_its_schema():
     spec = _specs()["review"]
     props = spec.input_schema["properties"]
     assert set(props) == {"repo", "reviewer", "client_family", "recover",
-                          "max_attempts", "max_wall_seconds",
-                          "reuse_trusted", "fresh", "batch_target_bytes",
-                          "stack_manifest"}
+                          "max_attempts", "max_wall_seconds", "max_queue_seconds",
+                          "max_review_seconds", "max_provider_wait_seconds", "reuse_trusted", "fresh", "batch_target_bytes", "batch_concurrency",
+                          "stack_manifest", "request_key", "continue_compatible"}
     assert props["reviewer"]["type"] == "string"
     assert props["reviewer"]["description"]
     assert spec.input_schema["required"] == []
@@ -840,9 +840,9 @@ def _review_family(monkeypatch, db, *, client_name=None, **params):
 
     def fake(store, repo, **kw):
         seen.update(kw)
-        return 0, "SKODUN VERDICT: trustworthy=true findings=0"
+        return 0, "SKODUN VERDICT: trustworthy=true findings=0", {}
 
-    monkeypatch.setattr(services, "svc_review", fake)
+    monkeypatch.setattr(services, "svc_review_detailed", fake)
     spec = _specs()["review"]
     spec.handler(HandlerCall(params=params,
                              store_factory=lambda: Store.open(db),
@@ -1809,3 +1809,24 @@ def test_a_malformed_repo_is_refused_rather_than_defaulted_to_the_cwd(
     absent = _tool("gate", db)
     assert absent.status == 2, absent
     assert "repo must be a path" not in absent.text
+
+
+@pytest.mark.parametrize("contributors", [None, [], ["openai"], ["xai", "openai"], ["openai-api"]])
+def test_independence_refusal_has_cli_mcp_parity_and_no_triage_write(tmp_path, monkeypatch, capsys, contributors):
+    from tests.test_cli import RAN
+    from skodun.gate import open_findings
+
+    meta = dict(RAN, contributing_providers=contributors)
+    if contributors is None:
+        meta.pop("contributing_providers")  # A legacy artifact.
+    db = _seeded(tmp_path, _finding(0, _annotation()), extra_passes={"refuter": meta})
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    cli, tool = _both(db, ["triage", "--adopt-refuter", "rev1", "0"],
+                      "adopt_refuter", capsys, review_id="rev1", index=0)
+    assert cli == tool
+    assert cli[0] == 1
+    assert "independent" in cli[1]
+    with Store.open(db) as store:
+        ledger = store.triage_for("feat", "s" * 40)
+        assert ledger == {}
+        assert len(open_findings(store.get_review("rev1"), ledger)) == 1

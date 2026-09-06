@@ -1,0 +1,502 @@
+"""Explicit continuation reuses only exact usable batch evidence.
+
+Shipped services, pipeline, store claims and finalization run against temporary
+repos/stores. Providers are fake runners; consumed source evidence never mutates.
+"""
+
+import threading
+from pathlib import Path
+
+import pytest
+
+from skodun import runner, services
+from skodun.store import Store
+from tests.test_batched_review import _body
+from tests.test_requests import _ready_repo
+
+CLEAN = b'{"structuredOutput":{"summary":"ok","findings":[]},"stopReason":"EndTurn"}'
+
+
+@pytest.fixture
+def lane(tmp_path, monkeypatch):
+    repo = _ready_repo(tmp_path, monkeypatch)
+    config = repo / '.skodun.toml'
+    config.write_text(config.read_text() + '\n[defaults]\nmax_diff_bytes=4000\ndegraded_retries=0\ntimeout_retries=0\n')
+    for i in range(4):
+        (repo / f'f{i}.txt').write_text(_body(f'f{i}'))
+    calls = []
+    failures = set()
+    def provider(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        name = Path(cmd[cmd.index('--prompt-file') + 1]).name
+        label = 'integration' if name.startswith('integration.') else name.split('.')[1]
+        calls.append(label)
+        out.write_bytes(b'not a review' if label in failures else CLEAN)
+        return runner.RunResult(rc=0, timed_out=False, duration_sec=.1, first_output_sec=.05)
+    monkeypatch.setattr(runner, 'run_with_watchdog', provider)
+    with Store.open(tmp_path / 'db') as store:
+        yield repo, store, calls, failures
+
+
+@pytest.mark.parametrize('failed', ['b2', 'integration'])
+def test_consumed_untrustworthy_continuation_retries_failed_and_dependent_work(lane, failed):
+    repo, store, calls, failures = lane
+    failures.add(failed)
+    status, _, original = services.svc_review_detailed(store, repo)
+    assert status == 4
+    source_id = original['result']['ids']['batch_orchestration_id']
+    source = store.get_orchestration(source_id)
+    checkpoints = store.list_checkpoints(source_id)
+    assert source['state'] == 'consumed'
+    calls.clear()
+    failures.clear()
+    status, _, continued = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert status == 0
+    assert calls == (['b2', 'integration'] if failed == 'b2' else ['integration'])
+    assert continued['request']['id'] == original['request']['id']
+    child_id = continued['result']['ids']['batch_orchestration_id']
+    assert child_id != source_id
+    assert store.get_orchestration(source_id) == source
+    assert store.list_checkpoints(source_id) == checkpoints
+    assert continued['continuation']['source_orchestration_id'] == source_id
+    assert store.get_orchestration(child_id)['state'] == 'consumed'
+
+
+def test_interrupted_after_three_usable_batches_runs_only_missing_and_integration(lane, monkeypatch):
+    from skodun.request_cancel import mark_event
+    repo, store, calls, _failures = lane
+    cancel = threading.Event()
+    complete = store.complete_checkpoint
+    def stop_after_three(orchestration_id, kind, index, **kwargs):
+        applied = complete(orchestration_id, kind, index, **kwargs)
+        if kind == 'batch' and index == 3:
+            mark_event(cancel, 'requested_cancel')
+        return applied
+    monkeypatch.setattr(store, 'complete_checkpoint', stop_after_three)
+    status, _, original = services.svc_review_detailed(store, repo, cancel=cancel)
+    assert status == 4 and calls == ['b1', 'b2', 'b3']
+    monkeypatch.setattr(store, 'complete_checkpoint', complete)
+    calls.clear()
+    status, _, continued = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert status == 0 and calls == ['b4', 'integration']
+    assert continued['request']['id'] == original['request']['id']
+    identity = continued['request']['identity']
+    assert store.find_resume_candidate(identity['repo_id'], identity['worktree_root'], identity['branch']) is None
+    calls.clear()
+    assert services.svc_review_detailed(store, repo)[0] == 0
+    assert calls == ['b1', 'b2', 'b3', 'b4', 'integration']
+
+
+def test_continue_rejects_fresh_intent_without_execution(lane):
+    repo, store, calls, _failures = lane
+    status, _, metadata = services.svc_review_detailed(store, repo, continue_compatible=True, fresh=True)
+    assert status == 2 and not calls
+    assert metadata['result']['execution']['reason_code'] == 'invalid_input'
+
+
+@pytest.mark.parametrize('change', ['diff', 'boundary', 'reviewer'])
+def test_changed_identity_refuses_reuse_with_stable_mismatch(lane, change):
+    repo, store, calls, failures = lane
+    failures.add('b2')
+    status, _, original = services.svc_review_detailed(store, repo)
+    assert status == 4
+    calls.clear()
+    kwargs = {}
+    if change == 'diff':
+        (repo / 'f1.txt').write_text(_body('different'))
+    elif change == 'boundary':
+        kwargs['batch_target_bytes'] = 1500
+    else:
+        kwargs['reviewer'] = 'finder'
+    status, _, metadata = services.svc_review_detailed(store, repo, continue_compatible=True, **kwargs)
+    assert status == 2 and calls == []
+    assert metadata['continuation']['status'] == 'refused'
+    assert metadata['continuation']['first_mismatch']
+    assert metadata['result']['coverage']['trustworthy'] is None
+
+
+def test_fresh_second_opinion_reruns_all_batches(lane):
+    repo, store, calls, failures = lane
+    failures.add('b2')
+    _, _, original = services.svc_review_detailed(store, repo)
+    calls.clear()
+    failures.clear()
+    status, _, fresh = services.svc_review_detailed(store, repo, fresh=True)
+    assert status == 0 and calls == ['b1', 'b2', 'b3', 'b4', 'integration']
+    assert fresh['request']['id'] != original['request']['id']
+    assert fresh['result']['continuation'] is None
+
+
+def test_two_racing_continuers_launch_no_duplicate(lane, monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    repo, store, calls, failures = lane
+    failures.add('b2')
+    _, _, original = services.svc_review_detailed(store, repo)
+    failures.clear()
+    calls.clear()
+    started, release = threading.Event(), threading.Event()
+    provider = runner.run_with_watchdog
+    def hold_failed_pass(cmd, *args, **kwargs):
+        if '.b2.' in Path(cmd[cmd.index('--prompt-file') + 1]).name:
+            started.set()
+            assert release.wait(10)
+        return provider(cmd, *args, **kwargs)
+    monkeypatch.setattr(runner, 'run_with_watchdog', hold_failed_pass)
+    def first():
+        with Store.open(tmp_path / 'db') as peer:
+            return services.svc_review_detailed(peer, repo, continue_compatible=True)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        active = pool.submit(first)
+        try:
+            assert started.wait(10)
+            status, _, duplicate = services.svc_review_detailed(store, repo, continue_compatible=True)
+            assert status == 3
+            assert duplicate['request']['id'] == original['request']['id']
+        finally:
+            release.set()
+        assert active.result()[0] == 0
+    assert calls == ['b2', 'integration']
+
+
+@pytest.mark.parametrize('surface', ['cli', 'mcp'])
+def test_explicit_continuation_on_both_shipped_surfaces(lane, tmp_path, monkeypatch, capsys, surface):
+    import json
+    from skodun.cli import main
+    from skodun.mcpserver import HandlerCall
+    from tests.test_mcptools import _specs
+    repo, _store, calls, failures = lane
+    monkeypatch.setenv('SKODUN_DB', str(tmp_path / 'db'))
+    failures.add('integration')
+    if surface == 'cli':
+        assert main(['review', '--repo', str(repo), '--json']) == 4
+        first = json.loads(capsys.readouterr().out)
+    else:
+        response = _specs()['review'].handler(HandlerCall(params={'repo': str(repo)},
+            store_factory=lambda: Store.open(tmp_path / 'db'), cancel=threading.Event()))
+        assert response.status == 4
+        first = response.metadata['result']
+    calls.clear()
+    failures.clear()
+    if surface == 'cli':
+        assert main(['review', '--repo', str(repo), '--json', '--continue']) == 0
+        result = json.loads(capsys.readouterr().out)
+    else:
+        response = _specs()['review'].handler(HandlerCall(params={'repo': str(repo), 'continue_compatible': True},
+            store_factory=lambda: Store.open(tmp_path / 'db'), cancel=threading.Event()))
+        assert response.status == 0
+        result = response.metadata['result']
+    assert calls == ['integration']
+    assert result['ids']['request_id'] == first['ids']['request_id']
+    assert result['continuation']['counts'] == {'reused': 4, 'executed': 1, 'failed': 0}
+
+
+def test_changed_capability_reconsiders_transport_without_provider_poisoning(lane, monkeypatch):
+    from skodun import chain
+    from skodun.adapters.agy import AgyAdapter
+    repo, store, _calls, _failures = lane
+    cfg = repo / '.skodun.toml'
+    cfg.write_text(cfg.read_text().replace('role = "finder"', 'role = "finder"\nfallbacks = ["small"]') +
+                   '\n[[reviewers]]\nname="small"\nprovider="google"\nmodel="small-model"\nrole="finder"\n')
+    monkeypatch.setenv('SKODUN_AGY_BIN', '/bin/sh')
+    limit = [1]
+    monkeypatch.setattr(AgyAdapter, 'prompt_limit', lambda self: limit[0])
+    admitted = []
+    acquire = chain._acquire_provider_slot
+    def admission(store, provider, **kwargs):
+        admitted.append(provider)
+        return acquire(store, provider, **kwargs)
+    monkeypatch.setattr(chain, '_acquire_provider_slot', admission)
+    launched = []
+    def timeout_then_fallback(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        google = '--print' in cmd
+        label = 'google' if google else Path(cmd[cmd.index('--prompt-file') + 1]).name
+        launched.append(label)
+        if not google and '.b2.' in label:
+            return runner.RunResult(rc=124, timed_out=True, duration_sec=10, first_output_sec=None)
+        out.write_bytes(CLEAN)
+        return runner.RunResult(rc=0, timed_out=False, duration_sec=.1, first_output_sec=.05)
+    monkeypatch.setattr(runner, 'run_with_watchdog', timeout_then_fallback)
+    assert services.svc_review_detailed(store, repo)[0] == 4
+    assert services.svc_review_detailed(store, repo, continue_compatible=True)[0] == 4
+    assert 'google' not in admitted and 'google' not in launched
+    limit[0] = 100_000
+    status, _, result = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert status == 0
+    assert admitted.count('google') == 1 and launched.count('google') == 1
+    assert result['continuation']['counts']['reused'] == 3
+
+
+def test_child_identity_is_distinct_while_source_canonical_identity_stays_stable(lane):
+    import json
+    from skodun.checkpoints import OrchestrationIdentity, first_mismatch
+    repo, store, _calls, failures = lane
+    failures.add('integration')
+    _, _, initial = services.svc_review_detailed(store, repo)
+    source = store.get_orchestration(initial['result']['ids']['batch_orchestration_id'])
+    parsed = OrchestrationIdentity.from_json(source['identity_json'])
+    assert 'continuation_source' not in json.loads(parsed.canonical_json())
+    assert parsed.digest() == source['identity_digest']
+    failures.clear()
+    _, _, result = services.svc_review_detailed(store, repo, continue_compatible=True)
+    child = store.get_orchestration(result['result']['ids']['batch_orchestration_id'])
+    continued = OrchestrationIdentity.from_json(child['identity_json'])
+    assert continued.continuation_source == source['id']
+    assert first_mismatch(parsed, continued) is None
+    assert parsed.digest() != continued.digest()
+
+
+def test_corrupted_source_pass_cannot_seed_new_evidence(lane):
+    repo, store, calls, failures = lane
+    failures.add('b2')
+    _, _, initial = services.svc_review_detailed(store, repo)
+    source_id = initial['result']['ids']['batch_orchestration_id']
+    store._c.execute("UPDATE review_checkpoints SET diff_hash='wrong' WHERE orchestration_id=? AND pass_index=1", (source_id,))
+    calls.clear()
+    status, _, metadata = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert status == 2 and not calls
+    assert metadata['result']['execution']['reason_code'] == 'continuation_source_pass_mismatch'
+
+
+def test_usable_findings_do_not_change_the_continued_prompt_context(lane, monkeypatch):
+    from skodun import pipeline
+    from tests.test_gitio import _git
+    import json
+    repo, store, calls, failures = lane
+    _git(repo, 'remote', 'add', 'origin', 'https://github.com/acme/continuation-test.git')
+    clock = ['2026-09-05T00:00:00Z']
+    monkeypatch.setattr(pipeline, '_iso_now', lambda: clock[0])
+    provider = runner.run_with_watchdog
+    def finding_in_first_batch(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        result = provider(cmd, timeout_sec, cwd, out, err, stdin_path=stdin_path, cancel=cancel)
+        name = Path(cmd[cmd.index('--prompt-file') + 1]).name
+        if '.b1.' in name:
+            out.write_text(json.dumps({'structuredOutput': {'summary': 'one finding', 'findings': [
+                {'file': 'f0.txt', 'line': 1, 'severity': 'medium', 'title': 'Missing guard', 'detail': 'Verify input before applying it'}]},
+                'stopReason': 'EndTurn'}))
+        return result
+    monkeypatch.setattr(runner, 'run_with_watchdog', finding_in_first_batch)
+    failures.add('b2')
+    code, _, first = services.svc_review_detailed(store, repo)
+    assert code == 4 and first['result']['findings']['total'] == 1
+    clock[0] = '2026-09-05T00:01:00Z'
+    failures.clear()
+    calls.clear()
+    code, _, continued = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert code == 1
+    assert calls == ['b2', 'integration']
+    assert continued['request']['id'] == first['request']['id']
+    assert continued['result']['findings']['total'] == 1
+    calls.clear()
+    fresh_code, _, fresh = services.svc_review_detailed(store, repo, fresh=True)
+    assert fresh_code == code == 1
+    assert fresh['result']['coverage']['trustworthy'] is True
+    assert calls == ['b1', 'b2', 'b3', 'b4', 'integration']
+
+
+def test_explicit_compatible_recovery_keeps_successful_batches_across_attempts(lane, monkeypatch):
+    repo, store, calls, failures = lane
+    failures.add('b2')
+    _, _, first = services.svc_review_detailed(store, repo)
+    calls.clear()
+    provider = runner.run_with_watchdog
+    attempts = []
+    def succeeds_on_second_retry(cmd, *args, **kwargs):
+        if '.b2.' in Path(cmd[cmd.index('--prompt-file') + 1]).name:
+            attempts.append(1)
+            if len(attempts) == 2:
+                failures.clear()
+        return provider(cmd, *args, **kwargs)
+    monkeypatch.setattr(runner, 'run_with_watchdog', succeeds_on_second_retry)
+    status, _, result = services.svc_review_detailed(
+        store, repo, continue_compatible=True, recover=True, max_attempts=2)
+    assert status == 0 and calls == ['b2', 'integration', 'b2', 'integration']
+    assert result['request']['id'] == first['request']['id']
+    assert result['recovery']['attempts'] == 2
+    assert result['continuation']['counts'] == {'reused': 3, 'executed': 2, 'failed': 0}
+
+
+def test_expired_execution_continues_with_a_new_budget_and_only_missing_work(lane, monkeypatch):
+    from tests.test_budget_execution import controlled_clock
+    repo, store, calls, _failures = lane
+    clock = controlled_clock(monkeypatch)
+    provider = runner.run_with_watchdog
+    def measured(cmd, *args, **kwargs):
+        result = provider(cmd, *args, **kwargs)
+        clock.value += .1
+        return result
+    monkeypatch.setattr(runner, 'run_with_watchdog', measured)
+    complete = store.complete_checkpoint
+    def expire_after_three(orchestration_id, kind, index, **kwargs):
+        result = complete(orchestration_id, kind, index, **kwargs)
+        if kind == 'batch' and index == 3:
+            clock.value += 1.1
+        return result
+    monkeypatch.setattr(store, 'complete_checkpoint', expire_after_three)
+    code, _, first = services.svc_review_detailed(store, repo, max_review_seconds=1, max_wall_seconds=2)
+    assert code == 4 and calls == ['b1', 'b2', 'b3']
+    assert first['result']['execution']['reason_code'] == 'review_budget_exhausted'
+    assert store.get_request(first['request']['id'])['state'] == 'expired'
+    monkeypatch.setattr(store, 'complete_checkpoint', complete)
+    calls.clear()
+    code, _, continued = services.svc_review_detailed(
+        store, repo, continue_compatible=True, max_review_seconds=10, max_wall_seconds=20)
+    assert code == 0 and calls == ['b4', 'integration']
+    assert continued['request']['id'] == first['request']['id']
+    assert continued['request']['execution_seq'] != first['request']['execution_seq']
+    assert continued['timing']['review_wall_ms'] == pytest.approx(200)
+    assert continued['continuation']['counts'] == {'reused': 3, 'executed': 2, 'failed': 0}
+
+
+@pytest.mark.parametrize('mutation', ['integration_index', 'extra_key', 'wrong_count', 'fake_truncation'])
+def test_continuation_receipt_rejects_inconsistent_pass_telemetry(mutation):
+    from skodun.continuation import valid_receipt
+    value = {'policy': 'compatible', 'status': 'continued', 'source_orchestration_id': 'source',
+             'orchestration_id': 'child', 'first_mismatch': None,
+             'passes': [{'kind': 'integration', 'index': 0, 'action': 'reused'}],
+             'counts': {'reused': 1, 'executed': 0, 'failed': 0}, 'passes_truncated': False}
+    if mutation == 'integration_index':
+        value['passes'][0]['index'] = 9
+    elif mutation == 'extra_key':
+        value['passes'][0]['unexpected'] = 'field'
+    elif mutation == 'wrong_count':
+        value['counts']['reused'] = 0
+    else:
+        value['passes_truncated'] = True
+    assert not valid_receipt(value)
+
+
+@pytest.mark.parametrize('malformation', ['missing_field', 'unexpected_field'])
+def test_malformed_pass_identity_is_a_stable_continuation_refusal(lane, malformation):
+    import json
+    repo, store, calls, failures = lane
+    failures.add('integration')
+    _, _, first = services.svc_review_detailed(store, repo)
+    source_id = first['result']['ids']['batch_orchestration_id']
+    identity = json.loads(store.get_orchestration(source_id)['identity_json'])
+    if malformation == 'missing_field':
+        identity['pass_identities'][0].pop('diff_hash')
+    else:
+        identity['pass_identities'][0]['unexpected'] = 'field'
+    store._c.execute('UPDATE review_orchestrations SET identity_json=? WHERE id=?',
+                     (json.dumps(identity), source_id))
+    calls.clear()
+    code, _, metadata = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert code == 2 and calls == []
+    assert metadata['result']['execution']['reason_code'] == 'continuation_identity_mismatch'
+    assert metadata['continuation']['first_mismatch'] == 'identity_json'
+    assert metadata['result']['ids']['review_id'] is None
+
+
+def test_local_integration_build_failure_is_in_the_failed_pass_receipt(lane, monkeypatch):
+    from skodun import passes, pipeline
+    from skodun.review_results import observation
+    repo, store, calls, failures = lane
+    failures.add('integration')
+    assert services.svc_review_detailed(store, repo)[0] == 4
+    calls.clear()
+    failures.clear()
+    captured = []
+    orchestrate = pipeline._orchestrate
+    def observe_orchestration(*args, **kwargs):
+        rec = orchestrate(*args, **kwargs)
+        captured.append(rec)
+        return rec
+    def cannot_prepare(*args, **kwargs):
+        raise ValueError('local integration preparation failed')
+    monkeypatch.setattr(pipeline, '_orchestrate', observe_orchestration)
+    monkeypatch.setattr(passes, 'integration_prompt', cannot_prepare)
+    assert services.svc_review_detailed(store, repo, continue_compatible=True)[0] == 4
+    assert calls == []
+    rec, = captured
+    assert rec['integration']['ran'] is False
+    assert rec['integration']['attempts'] == []
+    assert rec['integration']['telemetry']['attempts'] == []
+    receipt = observation(rec)['continuation']
+    assert receipt['counts'] == {'reused': 4, 'executed': 0, 'failed': 1}
+    assert {'kind': 'integration', 'index': 0, 'action': 'failed'} in receipt['passes']
+    # This remains a local failed pass, not a made-up completed checkpoint or
+    # provider call; the existing atomic publication guard still refuses it.
+    child = store.get_orchestration(rec['batch_orchestration_id'])
+    assert child['state'] != 'consumed'
+    assert any(row['pass_kind'] == 'integration' and row['state'] == 'pending'
+               for row in store.list_checkpoints(child['id']))
+
+
+def test_known_source_request_mismatch_is_refused_before_a_new_request(lane, monkeypatch):
+    repo, store, calls, failures = lane
+    failures.add('integration')
+    assert services.svc_review_detailed(store, repo)[0] == 4
+    before = store.list_requests(worktree_root=str(repo.resolve()))
+    calls.clear()
+    monkeypatch.setenv('SKODUN_GROK_BIN', '/bin/sh')
+    code, _, metadata = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert code == 2 and calls == []
+    assert metadata['result']['execution']['reason_code'] == 'continuation_identity_mismatch'
+    assert metadata['continuation']['first_mismatch'] == 'policy_hash'
+    assert metadata['request']['persisted'] is False
+    assert store.list_requests(worktree_root=str(repo.resolve())) == before
+
+
+@pytest.mark.parametrize('mutation', ['missing', 'different_receipts', 'different_generation'])
+def test_explicit_continuation_replay_requires_one_matching_receipt(lane, mutation):
+    import copy
+    from skodun.review_results import valid_replay
+    repo, store, _calls, failures = lane
+    failures.add('integration')
+    services.svc_review_detailed(store, repo)
+    failures.clear()
+    code, _, metadata = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert code == 0
+    saved = copy.deepcopy(store.get_request(metadata['request']['id'])['result'])
+    assert saved['metadata']['request']['continuation_policy'] == 'compatible'
+    assert valid_replay(saved)
+    if mutation == 'missing':
+        saved['metadata'].pop('continuation')
+        saved['metadata']['observation']['continuation'] = None
+    elif mutation == 'different_receipts':
+        saved['metadata']['continuation']['source_orchestration_id'] = 'different-source'
+    else:
+        saved['metadata']['continuation']['orchestration_id'] = 'different-child'
+        saved['metadata']['observation']['continuation']['orchestration_id'] = 'different-child'
+    assert not valid_replay(saved)
+
+
+def test_ordinary_same_request_resume_does_not_require_explicit_receipt(lane, monkeypatch):
+    from skodun.request_cancel import mark_event
+    from skodun.review_results import valid_replay
+    repo, store, _calls, _failures = lane
+    cancel = threading.Event()
+    complete = store.complete_checkpoint
+    def stop_after_three(orchestration_id, kind, index, **kwargs):
+        applied = complete(orchestration_id, kind, index, **kwargs)
+        if kind == 'batch' and index == 3:
+            mark_event(cancel, 'requested_cancel')
+        return applied
+    monkeypatch.setattr(store, 'complete_checkpoint', stop_after_three)
+    assert services.svc_review_detailed(store, repo, cancel=cancel)[0] == 4
+    monkeypatch.setattr(store, 'complete_checkpoint', complete)
+    code, _, metadata = services.svc_review_detailed(store, repo)
+    assert code == 0 and metadata['request']['continued'] is True
+    assert metadata.get('continuation') is None
+    assert valid_replay(store.get_request(metadata['request']['id'])['result'])
+
+
+@pytest.mark.parametrize('status', [2, 4])
+def test_explicit_policy_failure_before_a_generation_needs_no_receipt(status):
+    from skodun.review_results import valid_replay
+    value = {'status': status, 'text': 'refused before generation', 'metadata': {
+        'request': {'continued': True, 'continuation_policy': 'compatible'},
+        'termination': {'reason_code': 'preflight_refused' if status == 2 else 'persistence_failed'}}}
+    assert valid_replay(value)
+
+
+def test_missing_source_ownership_does_not_invent_an_identity_mismatch(lane):
+    repo, store, calls, failures = lane
+    failures.add('integration')
+    _, _, first = services.svc_review_detailed(store, repo)
+    source_id = first['result']['ids']['batch_orchestration_id']
+    store._c.execute("DELETE FROM request_links WHERE kind='batch_orchestration' AND target_id=?", (source_id,))
+    calls.clear()
+    code, _, metadata = services.svc_review_detailed(store, repo, continue_compatible=True)
+    assert code == 2 and calls == []
+    assert metadata['result']['execution']['reason_code'] == 'continuation_request_ownership'
+    assert metadata['continuation']['first_mismatch'] is None

@@ -3,6 +3,11 @@
 **A local code-review pipeline that runs through an AI coding CLI you are already
 subscribed to, instead of an API key.**
 
+Foreground calls now carry [durable request identity](docs/review-requests.md),
+including before admission, with explicit idempotency keys for caller retries.
+Opt-in [independent batch execution](docs/parallel-batches.md) keeps the default
+sequential and accepts a per-request limit of at most two foreground workers.
+
 Reviewers are declared in a TOML config (provider, model, effort, role, and an
 optional quota-fallback chain), and the pipeline is built around fail-closed trust
 semantics:
@@ -65,6 +70,7 @@ Background:
 | Command | What it does | Exit codes |
 | --- | --- | --- |
 | `skodun review [--repo DIR] [--reviewer NAME] [--client-family FAMILY] [--recover] [--max-attempts N] [--max-wall-seconds S] [--reuse-trusted] [--fresh] [--stack-manifest PATH]` | Run a foreground review and record it. `--reviewer` heads this run's chain with a named `[[reviewers]]` entry; opt-in `--recover` makes bounded fresh attempts after an untrustworthy result, while opt-in `--reuse-trusted` reuses only an exact trustworthy foreground artifact. `--fresh` bypasses reuse for a deliberate second opinion. `--stack-manifest` adds validated attribution to the same full certification diff and also bypasses older reuse; invalid metadata is reported and ignored. | `0` trustworthy and clean · `1` trustworthy, findings open · `2` preflight refusal (nothing ran) · `3` gave up waiting for the lock · `4` no trustworthy review was recorded · `130` interrupted with Ctrl-C (stdout is left empty on purpose — an operator's own interruption, not a refusal). |
+| `skodun review-plan [--repo DIR] [--reviewer NAME] [--batch-target-bytes N] [--target-source measured --target-latency-seconds S] [--json]` | [Preview full review scope and exact known call sizes](docs/review-plan.md), fallback transport eligibility and conditional passes without provider calls or writes. Measured targets are fixed application suggestions; missing timing remains unknown. | `0` plan produced · `2` invalid, stale or known-unreviewable inputs. |
 | `skodun review-readiness [--repo DIR] [--reviewer NAME] [--client-family FAMILY] [--json]` | Read-only, pre-capacity diagnosis of the configured trustworthy review topology: known-impossible paths report a stable reason code; unknown live provider health remains eligible. It never probes a model, changes gate/trust, or certifies a push. | `0` potentially available · `2` known-impossible, config, repository, or store-read failure. |
 | `skodun gate [--repo DIR]` | Fail closed unless a trustworthy review already covers this exact diff; every decision is written to the audit log. Wire it into pre-push or CI. | `0` clean or every finding triaged · `1` findings open · `2` no trustworthy review covers this diff. Every unexpected exception maps to `2`, never `1`. |
 | `skodun providers [--repo DIR]` | List every registered provider adapter, whether its CLI binary is resolvable and executable right now, and its cached availability state. Read-only; never gates anything. | `0` always, even with missing binaries — that is exactly what this command exists to report · `1` a reviewer in the loaded config (enabled or not) names a `provider` with no registered adapter · `2` `--repo`/config/store could not be read at all. |
@@ -148,6 +154,30 @@ review; it cannot make a review more or less trustworthy. Direct-parent advisory
 execution is reserved but not exposed by this release, so every runnable
 stack-aware artifact remains `coverage_scope=certification_full` and
 `gate_eligible=true`.
+
+
+Foreground review budgets are independent. `--max-queue-seconds` limits cumulative
+foreground admission waiting. `--max-review-seconds` starts at the first provider
+launch, includes later provider waits, and pauses during foreground re-admission.
+`--max-provider-wait-seconds` sets each pass's cumulative provider admission
+allowance, shared across fallback candidates; model runtime does not spend it.
+Its default is `SKODUN_ADMISSION_WAIT_SECONDS` when set, otherwise 30 seconds;
+zero still permits an immediate free-slot attempt. Batches, integration, and
+follow-up passes use the same policy. Transport-ineligible candidates spend none
+of this allowance. A free capable fallback may still run when provider waiting
+is exhausted, provided the review and total budgets remain available.
+
+`--max-wall-seconds` is a total execution ceiling including every queue, also
+without `--recover`; recovery keeps its 900-second default. Queue and review
+limits are optional. All explicit limits are bounded to one day. The versioned
+`review --json` / MCP result distinguishes `queue_budget_exhausted`,
+`provider_wait_exhausted`, `review_budget_exhausted`, and `total_budget_exhausted`.
+Timing reports `queue_wait_ms`, `provider_wait_ms`, literal `review_wall_ms`,
+charged `review_active_ms`, and `total_ms`; these overlap and must not be summed.
+Budget and effective-capacity observations belong to an exact request execution
+and admission ticket. Old records have unknown limits. Observing or replaying a
+request key never buys another queue position or restarts an expired request;
+changing limits requires a new key or an explicitly supported new execution.
 
 ## Configuration
 
@@ -536,6 +566,24 @@ positive" is refused exactly like a human typing the same words, and a verdict
 other than `refuted` (`confirmed`, `uncertain`) or reasoning the pass already
 flagged as too thin is refused before anything is written.
 
+Adoption now requires recorded independent provider provenance before any triage
+write. The pipeline compares the refuter against every actual finder contributor:
+the accepted provider after fallback, or all accepted batch and integration
+providers (including clean contributors). It filters the entire configured refuter
+chain, including fallbacks. If none remains, or contributor provenance is unknown,
+it records why the refuter was skipped and leaves the findings unrefuted without
+changing review trust. No provider outside that explicit chain is introduced.
+
+The comparison uses provider families: `openai` and `openai-api` are one family;
+`xai`, `google`, and `junie` each retain their adapter provider ID. This is only a
+proxy for independence, not proof of independent models or reasoning (an adapter
+may offer models from multiple vendors). Routing's cross-model preference is not
+used as evidence. Legacy annotations lacking the complete contributor set, or
+annotations whose provider/model differs from the recorded pass, cannot be
+adopted. This intentionally replaces the old same-provider warning after adoption.
+There is no compatibility override: re-review with an independent provider, or
+explicitly dismiss the individual finding with your own valid audited reason.
+
 The refuter pass, like the security and skeptic passes, has an env kill switch:
 `SKODUN_SECURITY_PASS=0`, `SKODUN_SKEPTIC_PASS=0`, `SKODUN_REFUTER_PASS=0`
 disable the respective pass (any other value, or leaving the variable unset,
@@ -565,10 +613,24 @@ build and batch plan is sized with it. Two consequences worth knowing:
 
 A prompt that still exceeds an adapter's ceiling — a chain can span providers,
 and one sized for a file-fed head may reach an argv-bound fallback — is
-classified `unavailable` for that entry and **the chain advances** to the next
-one, exactly as a quota outage would. This is still fail-closed: an exhausted
-chain is a `failed`, untrustworthy record naming the prompt size and the
-ceiling, and nothing becomes trustworthy that was not reviewed.
+checked against the actual complete UTF-8 bytes **before provider capacity
+admission, invocation staging, or process launch**. An incompatible candidate
+is skipped with `classification.category=prompt_size`, and the chain advances
+to the next configured entry. The skip's `input_eligibility` records the adapter,
+transport, adapter capability version, exact input bytes, limit, and stable
+`prompt_too_large` reason. It has no execution duration or capacity wait; an
+upstream provider that already ran retains its own attempt and timeout details.
+Capability versions identify the adapter guard, not a newly probed CLI build.
+
+This check runs for each batch and integration prompt as well. It preserves
+strict UTF-8, embedded-NUL, and effort validation; those fatal errors still stop
+the chain. Size refusals never enter provider-wide quota caching: repeated
+unchanged inputs skip admission again, and a smaller prompt remains eligible.
+Unknown transport limits do not imply a model context capacity or an input
+failure. No extra provider is enabled and no evidence is truncated to force a
+fit. If the configured chain is exhausted, the record remains failed and
+untrustworthy, with per-entry reasons and the numeric ceiling. Replan with a
+smaller complete envelope or configure a capable permitted provider.
 
 ### `max_cost_usd`
 
@@ -1101,3 +1163,70 @@ directory layout is baked into the tests.
 ## License
 
 [Apache-2.0](LICENSE)
+
+### Observe and control one worktree's requests
+
+`skodun review-status` now defaults to the normalized current worktree.
+`--repo PATH` identifies a worktree, including a subdirectory or symlink to it;
+it no longer selects another worktree sharing that repository. Queued requests
+are visible before a review exists. Multiple active local requests produce an
+`ambiguous_worktree_activity` refusal with their IDs. An empty local lane
+returns `no_worktree_activity`; status never recovers or repairs old records.
+
+Use `review-status --scope repository --repo PATH --json` or
+`review-status --scope host --json` for explicit lists. List entries identify
+the request/review and worktree. An explicit ID intentionally permits inspecting
+or cancelling another worktree; actor labels are audit claims, not authentication.
+
+Capture the `SKODUN REQUEST` ID emitted when review starts, then control that ID:
+
+```sh
+skodun review-status "$REQUEST_ID" --json
+skodun review-cancel "$REQUEST_ID" --expected-request-id "$REQUEST_ID" \
+  --expected-worktree "$WORKTREE" --expected-head "$HEAD_SHA" \
+  --expected-diff-hash "$DIFF_HASH" --reason "Stopping this superseded review request" --json
+skodun triage "$REVIEW_ID" 0 "The existing input guard covers this reported case" \
+  --expected-request-id "$REQUEST_ID" --expected-worktree "$WORKTREE" \
+  --expected-head "$HEAD_SHA" --expected-diff-hash "$DIFF_HASH"
+```
+
+Values above come from the captured status identity, not from a host-wide
+"latest" lookup. Missing target identity and stale guards refuse before control.
+Cancellation and every triage mutation still require explicit IDs; there is no
+bare cancel or bulk triage. CLI guards have equivalent snake_case MCP parameters.
+MCP `review_cancel` records the initiating client name when supplied, or an
+explicit bounded `actor` claim. Never supply credentials as an actor or reason.
+
+Cancellation is persisted before request control. Queued/running request owners
+observe an event for their exact execution; cancelling a queued request cannot
+signal a different active review. Status includes its actor/source, caller
+PID/worktree, reason, cause, timestamp, and eventual outcome. If completion wins
+the race, the audit says `completed_before_cancel` and preserves that result.
+External signal/disconnect causes are observations, with unknown actor; a set
+cancellation token alone does not identify an operator. Process loss is reported
+as a read-only observation, never implicit cleanup or permission to retry.
+
+The sanitized historical attribution limits are recorded in
+[the unfinished-outcome sample](docs/reports/2026-09-05-unfinished-attribution.md).
+
+Current prepush workers publish `record_audit_v1` after validating their
+reservation and observe cancellation for that exact record ID, without PID
+signals. An exact in-process review token also remains usable. Truly legacy
+workers have no immutable process-instance witness: an argv/review-ID match or
+live foreground/MCP PID alone is refused with `legacy_owner_unproven`, without
+signalling or demoting the row.
+Cancel through the original owning client's control instead. This prevents an
+old review ID from cancelling a different request on the same MCP process.
+
+If a durable request owner is absent, cancellation reports
+`request_owner_unreachable` and audits that outcome without generic recovery.
+The request/coverage rows remain available for a separate, evidence-based
+lifecycle investigation.
+
+A successful cancellation submission acknowledges durable intent only.
+`delivery_state=pending_owner_acknowledgement` and
+`owner_reachability=unverified` remain explicit until the owning execution
+records its outcome; numeric PID existence is not proof of delivery.
+Structured automation output: see [versioned review results](docs/review-results.md) for `review --json`, MCP parity, reason codes, and scoped counts.
+
+Explicit [compatible batch continuation](docs/compatible-continuation.md) retries failed batches, integration, and required foreground security/skeptic passes while preserving usable exact checkpoints (`review --continue`, MCP `continue_compatible`). Optional refuter annotation retains its existing policy.

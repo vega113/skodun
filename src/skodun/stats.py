@@ -65,4 +65,8 @@ def render(data: Mapping, *, fmt: str = "text") -> str:
             f"machine_cap={live.get('machine_cap')} "
             f"machine_holders={live.get('machine_holders')} "
             f"by_repo={repo_bit} by_provider={prov_bit}")
+    if 'audit_denominators' in data:
+        lines.append('audit_denominators=' + json.dumps(data['audit_denominators'], sort_keys=True))
+        lines.append('call_observations=' + json.dumps(data['call_observations'], sort_keys=True))
+        lines.append('timing_observations=' + json.dumps(timing, sort_keys=True))
     return "\n".join(lines)

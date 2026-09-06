@@ -234,6 +234,12 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
     # so a failure to import it is the one import failure no banner can report.
     from .trust import banner, banner_failure
 
+    def failure(code):
+        if result_metadata is not None:
+            result_metadata.clear()
+            result_metadata['termination'] = {'reason_code': code}
+
+
     try:
         # Inside the guard: an import error here — a partial install, a syntax
         # error introduced in `pipeline.py`, a missing stdlib module in a
@@ -247,6 +253,7 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
     except KeyboardInterrupt:
         raise
     except BaseException as e:
+        failure("pipeline_unavailable")
         return 2, banner_failure(
             f"could not load the review pipeline: {e!r}; no review ran")
 
@@ -262,16 +269,23 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
     except KeyboardInterrupt:
         raise
     except BaseException as e:
+        failure("repository_invalid")
         return 2, banner_failure(f"{e}; no review ran")
     try:
-        cfg = load_config(root)
+        from .requests import current
+        ctx = current()
+        cfg = (ctx.config if ctx is not None and ctx.store is store and ctx.config is not None
+               else load_config(root))
     except KeyboardInterrupt:
         raise
     except BaseException as e:
         # A config that will not load is a refusal before anything ran, not a
         # review that came back badly: 2, the preflight code.
+        failure("configuration_invalid")
         return 2, banner_failure(f"could not load the config: {e!r}")
 
+    from .review_results import linked_reviews, cancelled_observation
+    prior_reviews = linked_reviews(store)
     try:
         if batch_target_bytes is not None:
             from dataclasses import replace
@@ -284,18 +298,31 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
                          resume_checkpoints=resume_checkpoints,
                          stack_request=stack_request)
     except PreflightRefused as e:
+        failure(getattr(e, "reason_code", "preflight_refused"))
+        if result_metadata is not None and hasattr(e, "continuation"):
+            result_metadata["continuation"] = e.continuation
         return 2, banner_failure(str(e))
     except LockTimeout as e:
+        failure("admission_expired")
         return 3, banner_failure(str(e))
     except PersistenceFailed:
+        failure("persistence_failed")
         return 4, banner_failure("no review was recorded")
     except GitError as e:
+        failure("repository_invalid")
         # A directory that is not a git checkout at all, a git that will not run,
         # a repo with no HEAD: every git call the pipeline makes happens before
         # the reviewer is launched, so this is a preflight failure — nothing ran
         # — and preflight refusals are 2, not "the review failed".
         return 2, banner_failure(f"{e}; no review ran")
     except ReviewCancelled:
+        failure(getattr(cancel, "reason_code", None) or "requested_cancel")
+        if result_metadata is not None:
+            facts = cancelled_observation(store, prior_reviews)
+            if facts is not None:
+                result_metadata['observation'] = facts
+                if facts.get('continuation') is not None:
+                    result_metadata['continuation'] = facts['continuation']
         # BEFORE the general `BaseException` below, and it has to be: a
         # cancellation is not "the review failed" with a stack trace worth
         # quoting, and `run_review`'s own `finally` has already downgraded
@@ -311,6 +338,7 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
         raise
     except BaseException as e:
         # Anything else: the review did not complete, so it certifies nothing.
+        failure("execution_failed")
         return 4, banner_failure(f"the review failed: {e!r}")
 
     # The verdict and optional stack projection are derived from the PERSISTED
@@ -318,6 +346,11 @@ def _svc_review_once(store, repo, *, progress_sink=None, cancel=None,
     # line on both CLI and MCP surfaces.
     if result_metadata is not None and isinstance(rec.get("stack"), dict):
         result_metadata["stack"] = dict(rec["stack"])
+    if result_metadata is not None:
+        from .review_results import observation
+        result_metadata["observation"] = observation(rec)
+        if result_metadata["observation"].get("continuation") is not None:
+            result_metadata["continuation"] = result_metadata["observation"]["continuation"]
     text = banner(rec)
     if rec.get("trustworthy") is not True:
         return 4, text
@@ -439,27 +472,35 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
         from .trust import banner_failure
         reason = REVIEW_CANCELLED_REASON
         return (4, banner_failure(reason)), None, {
+                "termination": {"reason_code": getattr(cancel, "reason_code", None) or "requested_cancel"},
             "reuse": {"hit": False, "reason": reason}}
     result = None
+    from .review_results import observation
+
     try:
         from .cli import _repo_root
         from .config import load_config
 
         root = _repo_root(Path(repo))
-        cfg = load_config(root)
+        from .requests import current
+        ctx = current()
+        cfg = (ctx.config if ctx is not None and ctx.store is store and ctx.config is not None
+               else load_config(root))
         if batch_target_bytes is not None:
             from dataclasses import replace
             cfg = replace(cfg, defaults=replace(
                 cfg.defaults, batch_target_bytes=batch_target_bytes))
         result = reuse.probe(
             store, root, cfg=cfg, client_family=client_family,
-            intent_client_family=intent_client_family)
+            intent_client_family=intent_client_family,
+            batch_concurrency=ctx.batch_concurrency if ctx is not None and ctx.store is store else 1)
         if (result.candidate is not None and cancel is not None
                 and cancel.is_set()):
             reason = REVIEW_CANCELLED_REASON
             _reuse_audit(store, result, outcome="bypass", reason=reason)
             from .trust import banner_failure
             return (4, banner_failure(reason)), None, {
+                "termination": {"reason_code": getattr(cancel, "reason_code", None) or "requested_cancel"},
                 "reuse": {"hit": False, "reason": reason}}
         if result.candidate is None:
             _reuse_audit(store, result, outcome="miss", reason=result.reason)
@@ -472,12 +513,14 @@ def _try_reuse(store, repo, *, reuse_trusted: bool, fresh: bool,
             reason = REVIEW_CANCELLED_REASON
             from .trust import banner_failure
             return (4, banner_failure(reason)), None, {
+                "termination": {"reason_code": getattr(cancel, "reason_code", None) or "requested_cancel"},
                 "reuse": {"hit": False, "reason": reason}}
         _reuse_audit(store, result, outcome="hit", reason=result.reason)
         text = (f"SKODUN REUSE: review_id={result.candidate['id']} "
                 f"reason={result.reason}\n{verdict}")
         return (status, text), None, {
-            "reuse": {"hit": True, "review_id": result.candidate["id"]}}
+            "reuse": {"hit": True, "review_id": result.candidate["id"]},
+            "observation": observation(result.candidate)}
     except KeyboardInterrupt:
         raise
     except BaseException as exc:
@@ -512,9 +555,9 @@ def _recovery_review_id(text: str) -> str | None:
 
 
 def _annotate_recovery_attempt(store, text: str, orchestration_id: str,
-                               ordinal: int) -> tuple[dict | None, str | None]:
+                               ordinal: int, *, review_id=None) -> tuple[dict | None, str | None]:
     """Persist v9 orchestration metadata without changing trust axes."""
-    review_id = _recovery_review_id(text)
+    review_id = review_id or _recovery_review_id(text)
     if review_id is None:
         return None, None
     rec = store.get_review(review_id)
@@ -555,9 +598,59 @@ def _recovery_attempt_provider(rec: dict) -> str | None:
 def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         reviewer=None, client_family=None, recover=False,
                         max_attempts=None, max_wall_seconds=None,
+                        max_queue_seconds=None, max_review_seconds=None,
+                        max_provider_wait_seconds=None,
                         reuse_trusted=False, fresh=False,
                         reuse_client_family=_REUSE_INTENT_UNSET,
-                        batch_target_bytes=None, stack_manifest=None
+                        batch_target_bytes=None, stack_manifest=None, batch_concurrency=1,
+                        request_key=None, request_source="service", request_actor=None, continue_compatible=False
+                        ) -> tuple[int, str, dict]:
+    """Durably identify an accepted request before readiness or admission."""
+    from .review_results import attach
+    from .budgets import Limits
+    try:
+        from .planning_policy import validate_concurrency
+        validate_concurrency(batch_concurrency)
+        if batch_concurrency == 2 and (getattr(store, "_path", None) is None or not store._path.is_file()):
+            raise ValueError("parallel batches require the current file-backed request Store")
+        limits = Limits.from_args(recover=recover, max_wall_seconds=max_wall_seconds,
+            max_queue_seconds=max_queue_seconds, max_review_seconds=max_review_seconds,
+            max_provider_wait_seconds=max_provider_wait_seconds)
+    except (ValueError, TypeError, OverflowError) as exc:
+        from .trust import banner_failure
+        return attach(2, banner_failure(str(exc)), {
+            "termination": {"reason_code": "invalid_input"}})
+    from .continuation import validation_error
+    error = validation_error(continue_compatible, fresh=fresh,
+                             reuse_trusted=reuse_trusted, request_key=request_key)
+    if error:
+        from .trust import banner_failure
+        return attach(2, banner_failure(error), {'termination': {'reason_code': 'invalid_input'}})
+
+    kwargs = dict(progress_sink=progress_sink, cancel=cancel, reviewer=reviewer,
+                  client_family=client_family, recover=recover,
+                  max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
+                  reuse_trusted=reuse_trusted, fresh=fresh,
+                  reuse_client_family=reuse_client_family,
+                  batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest,
+                  continue_compatible=continue_compatible, batch_concurrency=batch_concurrency)
+    # Syntactically invalid options are not accepted execution requests. Keep
+    # their no-store validation contract, including overflow/bool refusals.
+    if (_validate_batch_target(batch_target_bytes)[1]
+            or (recover and _validate_recovery_limits(max_attempts, max_wall_seconds)[2])):
+        return attach(*_svc_review_detailed_impl(store, repo, **kwargs))
+    from .requests import tracked_review
+    return attach(*tracked_review(_svc_review_detailed_impl)(
+        store, repo, request_key=request_key, request_source=request_source,
+        request_actor=request_actor, budget_limits=limits, **kwargs))
+
+
+def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
+                        reviewer=None, client_family=None, recover=False,
+                        max_attempts=None, max_wall_seconds=None,
+                        reuse_trusted=False, fresh=False,
+                        reuse_client_family=_REUSE_INTENT_UNSET,
+                        batch_target_bytes=None, stack_manifest=None, continue_compatible=False, batch_concurrency=1
                         ) -> tuple[int, str, dict]:
     """Shared review surface plus recovery metadata for MCP structured output."""
     import threading
@@ -568,6 +661,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
     if target_reason:
         from .trust import banner_failure
         return 2, banner_failure(target_reason), {
+            "termination": {"reason_code": "invalid_input"},
             "telemetry": {"batch_target_bytes": batch_target_bytes,
                            "validation_error": target_reason}}
 
@@ -577,12 +671,16 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         if reason:
             from .trust import banner_failure
             return 2, banner_failure(reason), {
+                "termination": {"reason_code": "invalid_input"},
                 "recovery": {"terminal_reason": reason}}
 
     stack_request = None
     if stack_manifest is not None:
         from . import stack
-        stack_request = stack.load_request(stack_manifest)
+        from .requests import current
+        ctx = current()
+        stack_request = (ctx.stack_request if ctx is not None and ctx.store is store
+                         else stack.load_request(stack_manifest))
 
     reuse_result, reuse_note, reuse_metadata = _try_reuse(
         store, repo, reuse_trusted=reuse_trusted, fresh=fresh,
@@ -608,8 +706,8 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         status, text = _svc_review_once(
             store, repo, progress_sink=progress_sink, cancel=cancel,
             reviewer=reviewer, client_family=client_family,
-            resume_checkpoints=(not fresh and reviewer is None
-                                and intent_family is None),
+            resume_checkpoints=(continue_compatible or (not fresh and reviewer is None
+                                and intent_family is None)),
             batch_target_bytes=batch_target_bytes,
             stack_request=stack_request, result_metadata=result_metadata)
         if "stack" in result_metadata:
@@ -633,6 +731,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         def __init__(self):
             self._event = threading.Event()
             self.deadline_expired = False
+            self._cause = None
 
         def _refresh(self):
             if cancel is not None and cancel.is_set():
@@ -641,11 +740,30 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                 self.deadline_expired = True
                 self._event.set()
 
+        @property
+        def reason_code(self):
+            self._refresh()
+            if self.deadline_expired:
+                return 'budget_expired'
+            if self._event.is_set():
+                return getattr(cancel, 'reason_code', None) or self._cause or 'unknown_cancel_token'
+            return None
+
+        @reason_code.setter
+        def reason_code(self, cause):
+            self._cause = cause
+
         def is_set(self):
             self._refresh()
             return self._event.is_set()
 
         def set(self):
+            if cancel is not None:
+                if self._cause is not None:
+                    from .request_cancel import mark_event
+                    mark_event(cancel, self._cause)
+                else:
+                    cancel.set()
             self._event.set()
 
         def wait(self, seconds):
@@ -661,8 +779,11 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
     request_cancel = _RecoveryCancel()
 
     def cancellation_reason():
-        if request_cancel.deadline_expired:
+        cause = getattr(cancel, 'reason_code', None)
+        if request_cancel.deadline_expired or cause == 'total_budget_exhausted':
             return "recovery wall budget exhausted"
+        if cause in ('queue_budget_exhausted', 'review_budget_exhausted'):
+            return cause.replace('_', ' ')
         if cancel is not None and cancel.is_set():
             return REVIEW_CANCELLED_REASON
         return None
@@ -683,6 +804,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
     last_status, last_text = 4, banner_failure("no review was recorded")
     last_rec: dict | None = None
     terminal_reason = ""
+    terminal_code = None
     result_metadata = {}
     for ordinal in range(max_attempts):
         reason = cancellation_reason()
@@ -691,19 +813,23 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             if reason == "recovery wall budget exhausted":
                 last_text = banner_failure(reason)
             terminal_reason = reason
+            terminal_code = request_cancel.reason_code
             break
         if ordinal and initial_identity is not None:
             try:
                 if _recovery_identity(repo) != initial_identity:
                     terminal_reason = "repository identity or diff moved between recovery attempts"
+                    terminal_code = "identity_changed"
                     break
             except KeyboardInterrupt:
                 raise
             except BaseException as e:
                 terminal_reason = f"could not recheck identity before recovery: {e!r}"
+                terminal_code = "identity_unavailable"
                 break
         if time.monotonic() >= deadline:
             terminal_reason = "recovery wall budget exhausted"
+            terminal_code = "budget_expired"
             break
 
         attempt_count += 1
@@ -712,31 +838,44 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             store, repo, progress_sink=progress_sink, cancel=request_cancel,
             reviewer=reviewer, client_family=client_family,
             avoid_providers=(set(terminal_providers)
-                             if reviewer is None else set()),
+                             if reviewer is None and not continue_compatible else set()),
             # Recovery attempts are deliberately independent second looks.
             # The caller may opt into checkpoint resume for an ordinary review,
             # but the bounded recovery contract has always promised fresh
             # records and provider diversity; reusing a partial batch here
             # would silently turn a retry into the same interrupted run.
-            resume_checkpoints=False, batch_target_bytes=batch_target_bytes,
+            resume_checkpoints=continue_compatible, batch_target_bytes=batch_target_bytes,
             stack_request=stack_request,
             result_metadata=attempt_metadata)
+        result_metadata = attempt_metadata
         try:
-            last_rec, review_id = _annotate_recovery_attempt(
-                store, last_text, orchestration_id, ordinal)
+            observed_id = (attempt_metadata.get('observation') or {}).get('review_id')
+            if observed_id:
+                last_rec, review_id = _annotate_recovery_attempt(
+                    store, last_text, orchestration_id, ordinal, review_id=observed_id)
+            elif 'termination' in attempt_metadata:
+                # Typed no-record failures cannot borrow an ID from prose.
+                last_rec, review_id = None, None
+            else:
+                last_rec, review_id = _annotate_recovery_attempt(
+                    store, last_text, orchestration_id, ordinal)
         except KeyboardInterrupt:
             raise
         except BaseException as e:
             terminal_reason = f"could not persist recovery metadata: {e!r}"
+            terminal_code = "persistence_failed"
+            result_metadata = {}
+            last_status = 4
             break
         # Keep only metadata belonging to the persisted terminal attempt. A
         # preflight refusal or lock timeout may leave no record at all; in that
         # case a prior attempt's stack projection must not be rendered beside
         # the later failure banner.
-        result_metadata = attempt_metadata if last_rec is not None else {}
         if review_id is not None:
             review_ids.append(review_id)
         if last_rec is None:
+            terminal_code = (request_cancel.reason_code or
+                             (attempt_metadata.get("termination") or {}).get("reason_code"))
             terminal_reason = (
                 cancellation_reason() or
                 (REVIEW_CANCELLED_REASON if "cancel" in last_text.lower()
@@ -747,28 +886,33 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
             break
         if last_rec.get("status") == RUNNING:
             terminal_reason = "review remained running; recovery stopped"
+            terminal_code = "review_incomplete"
             break
         reason = cancellation_reason()
         if reason is not None:
             last_status = 4
             terminal_reason = reason
+            terminal_code = request_cancel.reason_code
             break
         if initial_identity is None:
             last_status = 4
             terminal_reason = ("could not establish recovery identity; "
                                "recovery stopped")
+            terminal_code = "identity_unavailable"
             break
         try:
             if (_recovery_record_identity(last_rec) != initial_identity
                     or _recovery_identity(repo) != initial_identity):
                 last_status = 4
                 terminal_reason = "repository identity or diff moved after recovery attempt"
+                terminal_code = "identity_changed"
                 break
         except KeyboardInterrupt:
             raise
         except BaseException as e:
             last_status = 4
             terminal_reason = f"could not recheck identity after recovery: {e!r}"
+            terminal_code = "identity_unavailable"
             break
         if last_rec.get("trustworthy") is True:
             terminal_reason = "trustworthy review reached"
@@ -789,6 +933,7 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
 
     if not terminal_reason:
         terminal_reason = "recovery attempt budget exhausted"
+        terminal_code = "recovery_attempts_exhausted"
     if last_rec is not None:
         try:
             last_rec["terminal_reason"] = terminal_reason
@@ -800,7 +945,19 @@ def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
         except KeyboardInterrupt:
             raise
         except BaseException:
-            pass
+            terminal_code = "persistence_failed"
+            last_status = 4
+            last_text = banner_failure("could not persist recovery result")
+            result_metadata = {}
+    if terminal_code is not None:
+        result_metadata['termination'] = {'reason_code': terminal_code}
+        if terminal_code == 'persistence_failed':
+            result_metadata.pop('observation', None)
+        elif terminal_code in ('identity_changed', 'identity_unavailable'):
+            observed = result_metadata.get('observation')
+            if observed is not None:
+                result_metadata['observation'] = {
+                    **observed, 'current_identity_match': False if terminal_code == 'identity_changed' else None}
     prefix = (f"SKODUN RECOVERY: orchestration_id={orchestration_id} "
               f"attempts={attempt_count} "
               f"review_ids={','.join(review_ids) or '-'} "
@@ -831,16 +988,23 @@ def _render_review_banner(rec: dict) -> str:
 def svc_review(store, repo, *, progress_sink=None, cancel=None,
                reviewer=None, client_family=None, recover=False,
                max_attempts=None, max_wall_seconds=None,
+               max_queue_seconds=None, max_review_seconds=None,
+               max_provider_wait_seconds=None,
                reuse_trusted=False, fresh=False,
                reuse_client_family=_REUSE_INTENT_UNSET,
-               batch_target_bytes=None, stack_manifest=None) -> tuple[int, str]:
+               batch_target_bytes=None, batch_concurrency=1, stack_manifest=None,
+               request_key=None, request_source="service", continue_compatible=False) -> tuple[int, str]:
     status, text, _ = svc_review_detailed(
         store, repo, progress_sink=progress_sink, cancel=cancel,
         reviewer=reviewer, client_family=client_family, recover=recover,
         max_attempts=max_attempts, max_wall_seconds=max_wall_seconds,
+        max_queue_seconds=max_queue_seconds, max_review_seconds=max_review_seconds,
+        max_provider_wait_seconds=max_provider_wait_seconds,
         reuse_trusted=reuse_trusted, fresh=fresh,
         reuse_client_family=reuse_client_family,
-        batch_target_bytes=batch_target_bytes, stack_manifest=stack_manifest)
+        batch_target_bytes=batch_target_bytes, batch_concurrency=batch_concurrency, stack_manifest=stack_manifest,
+        request_key=request_key, request_source=request_source,
+        continue_compatible=continue_compatible)
     return status, text
 
 
@@ -929,6 +1093,8 @@ def svc_stats(store, since_days=7, fmt="text") -> tuple[int, str]:
         }
         data = dict(data)
         data["live_capacity"] = live
+        from .queueview import augment_stats
+        data = augment_stats(store, data)
         return 0, stats.render(data, fmt=fmt)
     except KeyboardInterrupt:
         raise
@@ -1138,7 +1304,7 @@ def svc_triage_list(store, review_id) -> tuple[int, str]:
     return 0, "\n".join(lines)
 
 
-def svc_triage_dismiss(store, review_id, index, reason) -> tuple[int, str]:
+def svc_triage_dismiss(store, review_id, index, reason, **expected) -> tuple[int, str]:
     """Dismiss one finding with an audited reason. `(0, text)` or `(2, why-not)`.
 
     The PLAIN dismissal path keeps its shipped exit contract, in which a rejected
@@ -1152,6 +1318,14 @@ def svc_triage_dismiss(store, review_id, index, reason) -> tuple[int, str]:
     `(status, text)` contract the CLI and the MCP transport are both built on.
     Its two siblings already had the guard; this is the same one.
     """
+    from .control import guard_review
+    try:
+        refusal = guard_review(store, review_id, expected)
+    except Exception:
+        refusal = 'target_identity_unavailable'
+    if refusal:
+        return 2, f"skodun triage: refused reason_code={refusal}"
+
     import time
 
     from .store import _TS_FORMAT
@@ -1178,7 +1352,7 @@ def svc_triage_dismiss(store, review_id, index, reason) -> tuple[int, str]:
                f"{review_id}")
 
 
-def svc_adopt_refuter(store, review_id, index) -> tuple[int, str]:
+def svc_adopt_refuter(store, review_id, index, **expected) -> tuple[int, str]:
     """Dismiss one finding by adopting its refuter annotation. Exit contract:
 
       0  the decision was recorded
@@ -1192,11 +1366,19 @@ def svc_adopt_refuter(store, review_id, index) -> tuple[int, str]:
     never got as far as having an opinion. Collapsing them would make "your
     refuter said `confirmed`" indistinguishable from "you typed the wrong id".
     """
+    from .control import guard_review
+    try:
+        refusal = guard_review(store, review_id, expected)
+    except Exception:
+        refusal = 'target_identity_unavailable'
+    if refusal:
+        return 2, f"skodun triage: refused reason_code={refusal}"
+
     import time
 
     from .store import _TS_FORMAT
     from .triage import (ArtifactError, FindingNotFound, TriageError,
-                         adopt_refuter, refuter_same_provider_as_finder)
+                         adopt_refuter)
 
     if index is None:
         # Before the load, matching the CLI's own order: a call with no finding
@@ -1222,24 +1404,12 @@ def svc_adopt_refuter(store, review_id, index) -> tuple[int, str]:
         return 2, f"skodun triage: could not record the dismissal: {e!r}"
 
     lines = []
-    # The refuter exists so that a DIFFERENT provider examines the findings; a
-    # model asked to check its own work is agreeable about it. A config may still
-    # put the refuter on the finder's provider — the operator's call, and better
-    # than no re-examination — and the pass records that it happened. This is the
-    # one moment where that fact has consequences, so it is said out loud here
-    # rather than left in the artifact for nobody to read. A WARNING and not a
-    # refusal: adoption is an explicit human act, and the human is the authority
-    # this path exists to consult.
-    if refuter_same_provider_as_finder(review):
-        lines.append("skodun triage: WARNING the refuter answered from the same "
-                     "provider as the finder, so this verdict is a model "
-                     "re-examining its own work")
     lines.append(f"skodun triage: adopted the refuter's dismissal of finding "
                  f"{index} on review {review_id}")
     return 0, "\n".join(lines)
 
 
-def svc_triage_reopen(store, review_id, index, reason) -> tuple[int, str]:
+def svc_triage_reopen(store, review_id, index, reason, **expected) -> tuple[int, str]:
     """Reopen ONE previously dismissed finding, with an audited reason.
 
     `--adopt-refuter`'s exit contract (see `svc_adopt_refuter`): 0 recorded, 1
@@ -1250,6 +1420,14 @@ def svc_triage_reopen(store, review_id, index, reason) -> tuple[int, str]:
     because it moves the gate from 0 back to 1, and nothing may do that silently.
     Append-only: the dismissal it overturns stays in the ledger with its reason.
     """
+    from .control import guard_review
+    try:
+        refusal = guard_review(store, review_id, expected)
+    except Exception:
+        refusal = 'target_identity_unavailable'
+    if refusal:
+        return 2, f"skodun triage: refused reason_code={refusal}"
+
     import time
 
     from .store import _TS_FORMAT
@@ -1285,7 +1463,7 @@ def svc_triage_reopen(store, review_id, index, reason) -> tuple[int, str]:
 
 
 def svc_triage_defer(store, review_id, index, tracking_ref,
-                     reason) -> tuple[int, str]:
+                     reason, **expected) -> tuple[int, str]:
     """Defer ONE finding to a FILED tracking reference, with an audited reason.
 
     `svc_triage_reopen`'s exit contract, exactly (0 recorded, 1 refused, 2 not
@@ -1304,6 +1482,14 @@ def svc_triage_defer(store, review_id, index, tracking_ref,
     declined decision -- and it is the refusal both surfaces have to share, so
     it comes from `TRIAGE_DEFER_USAGE` and neither of them owns the words.
     """
+    from .control import guard_review
+    try:
+        refusal = guard_review(store, review_id, expected)
+    except Exception:
+        refusal = 'target_identity_unavailable'
+    if refusal:
+        return 2, f"skodun triage: refused reason_code={refusal}"
+
     import time
 
     from .store import _TS_FORMAT
@@ -1461,6 +1647,7 @@ def _review_annotation_suffix(rec: dict) -> str:
                 tokens.append(_status_field(f"stack_{key}", value))
     for key in ("stack_context_bytes", "stack_context_truncated",
                 "lineage_context_bytes", "lineage_context_truncated",
+                "lineage_context_diagnostics", "fingerprint_diagnostics",
                 "fingerprint_status", "fingerprint_candidate_count",
                 "fingerprint_candidate_limit", "fingerprint_candidates_truncated"):
         value = rec.get(key)
@@ -1553,6 +1740,7 @@ def format_status_line(rec: dict, *, now: float | None = None,
     parts.extend(_status_field(key, rec.get(key)) for key in (
         "stack_context_bytes", "stack_context_truncated",
         "lineage_context_bytes", "lineage_context_truncated",
+        "lineage_context_diagnostics", "fingerprint_diagnostics",
         "fingerprint_status", "fingerprint_candidate_count",
         "fingerprint_candidate_limit", "fingerprint_candidates_truncated")
                  if rec.get(key) not in (None, ""))
@@ -1584,38 +1772,49 @@ def _maybe_recover_stale(store) -> None:
         pass
 
 
-def svc_review_status(store, review_id=None, repo=None, *, output="text") -> tuple[int, str]:
-    """Observe one review. `(0, line)` or `(2, why-not)`.
+def svc_review_status(store, review_id=None, repo=None, *, output="text",
+                      scope="worktree", limit=50) -> tuple[int, str]:
+    """Read explicit identity, or unambiguous caller-worktree activity only.
 
-    `review_id` wins when both are given. Without an id, `repo` selects the
-    current review for that repository (newest `running`, else newest terminal);
-    without either, the host-wide current review. Not a gate: never computes
-    trust over the worktree.
-
-    Runs `recover_stale` first so an aged FG `running` row is reported as the
-    terminal state the sweep produces rather than as forever-running.
+    Broader scopes always list entries. Observation never recovers stale rows.
     """
-    _maybe_recover_stale(store)
+    import json
+    from . import control, requests
+
     try:
-        if review_id is not None and str(review_id).strip() != "":
-            rid = str(review_id).strip()
-            rec = store.get_review(rid)
-            if rec is None:
-                return 2, f"skodun review-status: no such review: {rid}"
-        else:
-            scope = None
-            if repo is not None and str(repo).strip() != "":
-                scope = str(repo).strip()
-            rec = store.current_review(scope)
-            if rec is None:
-                if scope is not None:
-                    return 2, (f"skodun review-status: no review for repo "
-                               f"{scope}")
-                return 2, "skodun review-status: no reviews in the store"
+        if review_id is None or review_id == "":
+            if type(limit) is not int or not 1 <= limit <= 100:
+                raise ValueError('invalid status limit')
+            rows, identity = control.status_candidates(store, repo, scope,
+                100 if scope == 'worktree' else limit)
+            if scope != 'worktree':
+                payload = {'scope': scope, 'entries': rows, 'limit': limit}
+                return 0, json.dumps(payload, sort_keys=True)
+            active = [r for r in rows if r['state'] in ('accepted','queued','running')]
+            if len(active) > 1:
+                return 2, json.dumps({'reason_code':'ambiguous_worktree_activity',
+                    'scope':identity, 'entries':active}, sort_keys=True)
+            if not rows:
+                return 2, json.dumps({'reason_code':'no_worktree_activity',
+                    'scope':identity, 'entries':[]}, sort_keys=True)
+            review_id = (active or rows)[0]['id']
+        rid = str(review_id).strip()
+        row = store.get_request(rid)
+        if row is not None:
+            request = requests.projection(row)
+            if output == 'json':
+                return 0, json.dumps({'request':request, 'reason_code':row.get('reason_code')}, sort_keys=True)
+            return 0, ('SKODUN REQUEST: ' + json.dumps(request, sort_keys=True))
+        rec = store.get_review(rid)
+        if rec is None:
+            return 2, f"skodun review-status: no such review or request: {rid}"
+        lifecycle = control.lifecycle(rec, store.cancellation_events(
+            rec.get('request_id') or rec['id']))
     except KeyboardInterrupt:
         raise
-    except BaseException as e:
-        return 2, f"skodun review-status: could not read the store: {e!r}"
+    except BaseException as exc:
+        return 2, (f"skodun review-status: scope/read refusal: {type(exc).__name__} "
+                   "reason_code=scope_unavailable")
     from .readmodel import project_review
     orchestration = None
     checkpoints = ()
@@ -1632,16 +1831,20 @@ def svc_review_status(store, review_id=None, repo=None, *, output="text") -> tup
     if output == "json":
         import json
         payload = {"id": rec.get("id"), "state": report_state(rec),
-                   "coverage": projection.to_dict()}
+                   "coverage": projection.to_dict(), "identity": control.review_identity(rec),
+                   "lifecycle": lifecycle}
         for key in ("stack_context_bytes", "stack_context_truncated",
                     "lineage_context_bytes", "lineage_context_truncated",
+                    "lineage_context_diagnostics", "fingerprint_diagnostics",
                     "fingerprint_status", "fingerprint_candidate_count",
                     "fingerprint_candidate_limit",
                     "fingerprint_candidates_truncated"):
             if rec.get(key) not in (None, ""):
                 payload[key] = rec[key]
         return 0, json.dumps(payload, sort_keys=True)
-    return 0, format_status_line(rec, projection=projection)
+    return 0, (format_status_line(rec, projection=projection) + " identity=" +
+               json.dumps(control.review_identity(rec), sort_keys=True) + " lifecycle=" +
+               json.dumps(lifecycle, sort_keys=True))
 
 
 def svc_evidence_summary(store, identity_digest: str, *, output="text") -> tuple[int, str]:
@@ -1674,7 +1877,80 @@ def svc_evidence_summary(store, identity_digest: str, *, output="text") -> tuple
         for row in rows)
 
 
-def svc_review_cancel(store, review_id) -> tuple[int, str]:
+def svc_review_cancel(store, review_id, *, expected_request_id=None,
+                      expected_worktree=None, expected_head=None, expected_diff_hash=None,
+                      actor="operator", source="service", caller_worktree=None,
+                      reason="Explicit cancellation requested", output="text") -> tuple[int, str]:
+    """Audit an explicitly guarded target before any cancellation side effect."""
+    import json
+    import os
+    from . import control, requests
+
+    if not isinstance(review_id, str) or not review_id.strip():
+        return 2, "skodun review-cancel: review_id is required"
+    rid = review_id.strip()
+    try:
+        request = store.get_request(rid)
+        rec = None if request else store.get_review(rid)
+        if request is None and rec is None:
+            return 2, f"skodun review-cancel: no such review: {rid}"
+        if request is None and rec.get('request_id'):
+            request = store.get_request(rec['request_id'])
+        identity = ({**request['identity'], 'request_id':request['id']} if request
+                    else control.review_identity(rec))
+        refusal = control.guard(identity, expected_request_id=expected_request_id,
+            expected_worktree=expected_worktree, expected_head=expected_head,
+            expected_diff_hash=expected_diff_hash)
+        if refusal:
+            return 2, f"skodun review-cancel: refused reason_code={refusal}"
+        if (request and request['state'] not in ('accepted','queued','running')
+                or rec is not None and rec.get('status') != 'running'):
+            return 2, f"skodun review-cancel: target {rid} is already terminal ({request['state'] if request else report_state(rec)})"
+        try:
+            caller_scope = control.scope_identity(caller_worktree or '.')['worktree_root']
+        except Exception:
+            caller_scope = None
+        audit_id = store.record_cancellation(target_id=rid, request=request,
+            identity=identity, actor=actor, source=source, caller_pid=os.getpid(),
+            caller_worktree=caller_scope,
+            reason=reason, cause='requested_cancel', now=requests.now())
+        if request is not None:
+            # The execution-fenced owner observes this durable event before its
+            # next queue/provider checkpoint. No signal can hit another request.
+            if _pid_alive(request['pid']):
+                code, text = 0, (f"skodun review-cancel: cancel requested for {rid}; "
+                                 "pending owner acknowledgement; reachability unverified")
+            else:
+                store.finish_cancellations(request_id=request['id'],
+                    owner_token=request['owner_token'], outcome='owner_unreachable', now=requests.now())
+                code, text = 2, (f"skodun review-cancel: request owner is absent for {rid}; "
+                                 "reason_code=request_owner_unreachable; no recovery performed")
+        else:
+            code, text = _cancel_legacy_review(store, rid)
+            current = store.get_review(rid)
+            if code != 0:
+                store.finish_cancellations(target_id=rid, outcome='refused_unproven_owner', now=requests.now())
+            elif current and current.get('status') != 'running':
+                store.finish_cancellations(target_id=rid,
+                    outcome=control.cancellation_completion(current),
+                    now=requests.now())
+        payload = {'target_id':rid, 'request_id':request['id'] if request else None,
+                   'reason_code':('requested_cancel' if code == 0 else
+                                  'request_owner_unreachable' if request else 'legacy_owner_unproven'),
+                   'audit_id':audit_id,
+                   'identity':identity, 'cancellation':store.cancellation_events(rid),
+                   'delivery_state':'pending_owner_acknowledgement' if code == 0 and (request or (rec or {}).get('cancellation_protocol')) else 'not_pending',
+                   'owner_reachability':'unverified' if code == 0 and (request or (rec or {}).get('cancellation_protocol')) else 'not_asserted'}
+        return code, json.dumps(payload, sort_keys=True) if output == 'json' else (
+            text + ' audit_id=' + str(audit_id))
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        return 2, ('skodun review-cancel: refused before control completion '
+                   f'reason_code=cancel_refused error={type(exc).__name__}')
+
+
+def _cancel_legacy_review(store, review_id) -> tuple[int, str]:
     """Request cancellation of one in-flight review. `(0, text)` or `(2, why)`.
 
     Order of operations (each step is best-effort; together they cover FG, MCP
@@ -1684,8 +1960,8 @@ def svc_review_cancel(store, review_id) -> tuple[int, str]:
        surfaces).
     2. Set the in-process cancel token when this process holds it (MCP /
        same-process FG).
-    3. SIGTERM a confirmed background worker, or a live FG pid that still owns
-       the row (handler sets the token).
+    3. Current prepush workers observe record-specific durable audit intent.
+       Legacy argv/PID matches alone are never enough to authorize signals.
     4. If nothing is alive to finish the demotion, `fail_if_running` with a
        cancel reason so the row is not forever-`running` and the next FG wait
        is not blocked by a ghost.
@@ -1694,16 +1970,12 @@ def svc_review_cancel(store, review_id) -> tuple[int, str]:
     still owns cleanup when the process is reachable; this function does not
     re-implement that stack.
     """
-    import os
-    import signal
-
-    from . import dispatch, pipeline
+    from . import pipeline
     from .store import RUNNING
 
     if review_id is None or str(review_id).strip() == "":
         return 2, "skodun review-cancel: review_id is required"
     rid = str(review_id).strip()
-    _maybe_recover_stale(store)
     try:
         rec = store.get_review(rid)
     except KeyboardInterrupt:
@@ -1717,66 +1989,30 @@ def svc_review_cancel(store, review_id) -> tuple[int, str]:
         return 2, (f"skodun review-cancel: review {rid} is already terminal "
                    f"({state})")
 
+    from .request_cancel import RECORD_CANCEL_PROTOCOL
+    if rec.get('cancellation_protocol') == RECORD_CANCEL_PROTOCOL:
+        return 0, (f"skodun review-cancel: cancel requested for {rid}; "
+                   "pending worker acknowledgement; reachability unverified")
+
     token_set = pipeline.request_cancel(rid)
-    signalled = False
     pid = rec.get("pid")
-    # When the token is in THIS process, setting it is enough: SIGTERM would
-    # hit our own process (tests, MCP server) and is unnecessary. Cross-process
-    # cancel is the only case that needs a signal.
-    if not token_set:
-        if dispatch.pid_is_skodun_worker(pid, rid):
-            try:
-                os.kill(int(pid), signal.SIGTERM)
-                signalled = True
-            except (OSError, ProcessLookupError, ValueError, TypeError):
-                pass
-        elif _pid_is_live_skodun_fg(pid) and int(pid) != os.getpid():
-            # Foreground CLI or MCP server in another process. MCP installs its
-            # SIGTERM forwarder on the MAIN thread (reviews run on a worker
-            # thread where signal handlers cannot be installed); that forwarder
-            # sets the cancel token so the review's finally demotes cleanly.
-            # Never signal ourselves.
-            try:
-                os.kill(int(pid), signal.SIGTERM)
-                signalled = True
-            except (OSError, ProcessLookupError, ValueError, TypeError):
-                pass
-
-    demoted = False
-    if not token_set and not signalled:
-        # Dead or unconfirmable holder: durable terminal now, same fail-closed
-        # posture as recover_stale, with a cancel reason so report_state maps
-        # to `cancelled` rather than a generic failed sweep.
-        try:
-            demoted = bool(store.fail_if_running(rid, REVIEW_CANCEL_DURABLE_REASON))
-        except KeyboardInterrupt:
-            raise
-        except BaseException as e:
-            return 2, (f"skodun review-cancel: could not demote review {rid}: "
-                       f"{e!r}")
-    elif signalled:
-        # Wait briefly for the holder to demote via its cancel path. If the
-        # process died without demoting (no SIGTERM handler — the MCP bug this
-        # poll closes), finish the row here so it is not forever-running.
-        outcome = _await_cancel_or_demote(store, rid, pid)
-        if outcome == "done":
-            return 0, f"skodun review-cancel: cancel completed for {rid}"
-        if outcome == "demoted":
-            return 0, (f"skodun review-cancel: cancelled {rid} "
-                       f"(durable terminal; holder exited without demoting)")
-        # Still running: cancel was requested; the holder is finishing.
-        return 0, f"skodun review-cancel: cancel requested for {rid}"
-
-    if demoted:
-        return 0, (f"skodun review-cancel: cancelled {rid} "
-                   f"(durable terminal; holder was not reachable)")
+    # Legacy artifacts have no immutable process-instance witness. Even argv
+    # naming this review can belong to a reused PID or another invocation.
     if token_set:
         return 0, f"skodun review-cancel: cancel requested for {rid}"
-    # Live but unconfirmable pid: do not SIGTERM a stranger. Operator can
-    # re-run after the process dies, or recover_stale will sweep by age.
-    return 0, (f"skodun review-cancel: cancel noted for {rid}; "
-               f"holder pid {pid!r} could not be confirmed — "
-               f"re-check with review-status")
+    if _pid_alive(pid):
+        return 2, (f"skodun review-cancel: refused {rid}; "
+                   "reason_code=legacy_owner_unproven; use the original caller's cancellation control")
+    try:
+        demoted = store.fail_if_running(rid, REVIEW_CANCEL_DURABLE_REASON)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        return 2, f"skodun review-cancel: could not demote review {rid}: {type(exc).__name__}"
+    if demoted:
+        return 0, (f"skodun review-cancel: cancelled {rid} "
+                   "(durable terminal; holder was not reachable)")
+    return 2, f"skodun review-cancel: target {rid} became terminal"
 
 
 #: How long cross-process cancel waits for the holder to demote before either
@@ -1954,3 +2190,38 @@ def svc_feedback_list(
         return 0, "skodun feedback: (none)"
     lines = [feedback_mod.format_row(r) for r in rows]
     return 0, "\n".join(lines)
+
+
+def svc_queue(store, repo=None, *, request_id=None, scope='worktree', limit=50,
+              output='text', now=None) -> tuple[int, str]:
+    """Shared read-only request ownership/cost inspection for CLI and MCP."""
+    from . import control, queueview
+    try:
+        if scope not in ('worktree', 'repository', 'host'):
+            raise ValueError('scope must be worktree, repository or host')
+        worktree, repository = None, None
+        if request_id is None and scope != 'host':
+            identity = control.scope_identity(repo or '.')
+            if scope == 'worktree':
+                worktree = identity['worktree_root']
+            else:
+                repository = identity['repo_id']
+        data = queueview.inspect(store, request_id=request_id, worktree_root=worktree,
+            repository_id=repository, scope=scope, limit=limit, now=now)
+        return 0, queueview.render(data, output)
+    except (ValueError, TypeError) as exc:
+        return 2, f'skodun queue: refused: {exc}'
+    except Exception as exc:
+        return 2, f'skodun queue: inspection unavailable: {type(exc).__name__}'
+
+
+def svc_review_plan(store, repo, *, output='text', history_unavailable_reason=None, **options) -> tuple[int, str]:
+    """Preview the shared planner without requests, capacity or provider calls."""
+    from . import plan_preview
+    try:
+        data = plan_preview.preview(store, Path(repo), **options)
+        if history_unavailable_reason is not None:
+            data['measurements']['unavailable_reason'] = history_unavailable_reason
+        return (2 if data['status'] in ('stale', 'unreviewable') else 0), plan_preview.render(data, output)
+    except Exception as exc:
+        return 2, f'skodun review-plan: refused: {exc}'

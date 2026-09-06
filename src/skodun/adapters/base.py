@@ -91,7 +91,10 @@ PROMPT_TOO_LARGE_CATEGORY = "prompt_size"
 
 
 class PromptTooLarge(ValueError):
-    """`build_cmd`'s refusal of a prompt this CLI cannot physically carry.
+    """Refusal of a prompt this CLI cannot physically carry.
+
+    Raised by deterministic pre-admission validation and the same defensive
+    guard in `build_cmd`.
 
     A DISTINCT type because `chain.run_chain` has to tell it apart from every
     other `build_cmd` failure, and the two get opposite treatment:
@@ -427,6 +430,14 @@ class Adapter(Protocol):
     `name` is the adapter (`"grok"`, `"codex"`); `provider` is the registry key
     it is reachable under (`"xai"`, `"openai"`). They differ because one
     provider may ship more than one CLI.
+
+    A bounded transport additionally offers `validate_prompt(prompt: bytes,
+    r: Reviewer) -> None`, a side-effect-free hook called before provider
+    admission. It MUST reuse its build_cmd guard and preserve fatal config /
+    encoding validation ahead of PromptTooLarge. Optional `prompt_transport`
+    and `prompt_capability_version` identify that guard in refusal metadata;
+    a capability version is not a probed provider CLI version. Unknown-limit
+    adapters need no hook; None is no adapter ceiling, not model context size.
     """
 
     name: str

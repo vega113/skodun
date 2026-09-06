@@ -29,6 +29,7 @@ def _record(identity: reuse.ReuseIdentity, **changes):
         checklist_hash=identity.checklist_hash,
         tree_fingerprint=identity.tree_fingerprint,
         security_policy_hash=identity.security_policy_hash,
+        planning_policy=identity.planning_policy,
         repo_id=identity.repo_id, worktree_root=identity.worktree_root,
         mode="now", source="skodun", status="clean", parse_ok=True,
         degraded=False, diff_truncated=False, findings=[], findings_total=0,

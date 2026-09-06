@@ -40,12 +40,15 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import closing
 from urllib.parse import quote
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import ids
+from .followups import table_for
+from .followup_store import FollowupStoreMixin, MIGRATION_V20
 from .trust import is_trustworthy
 
 _TRUST_AXES = ("parse_ok", "degraded", "diff_truncated")
@@ -62,7 +65,11 @@ _REUSE_OUTCOMES = frozenset(("hit", "miss", "bypass", "error"))
 
 #: The schema this build of skodun writes and understands. A store stamped
 #: higher was written by a newer skodun and is refused, untouched.
-SCHEMA_VERSION = 16
+from .request_store import RequestStoreMixin, MIGRATION as _MIGRATION_V17
+from .control_store import ControlStoreMixin, MIGRATION as _MIGRATION_V18
+from .budget_store import BudgetStoreMixin, MIGRATION as _MIGRATION_V19
+
+SCHEMA_VERSION = 20
 
 
 class SchemaLifecycleError(ValueError):
@@ -599,19 +606,22 @@ def migration_blockers(path: Path) -> tuple[str, ...]:
                         break
             if live_review:
                 blockers.append("active_review")
-        if "review_checkpoints" in tables:
-            columns = _table_columns(conn, "review_checkpoints")
+        for checkpoint_table in ('review_checkpoints', 'review_followup_checkpoints'):
+            if checkpoint_table not in tables:
+                continue
+            columns = _table_columns(conn, checkpoint_table)
             if "lease_expires_at" in columns:
                 live = conn.execute(
-                    "SELECT 1 FROM review_checkpoints WHERE state='running' "
+                    f"SELECT 1 FROM {checkpoint_table} WHERE state='running' "
                     "AND lease_expires_at IS NOT NULL AND lease_expires_at > ? "
                     "LIMIT 1", (now,)).fetchone()
             else:
                 live = conn.execute(
-                    "SELECT 1 FROM review_checkpoints WHERE state='running' "
+                    f"SELECT 1 FROM {checkpoint_table} WHERE state='running' "
                     "LIMIT 1").fetchone()
             if live:
                 blockers.append("active_checkpoint_claim")
+                break
         if "capacity_admissions" in tables:
             from .capacity import DEFAULT_STALE_SEC, should_reclaim_admission
             rows = conn.execute(
@@ -1134,6 +1144,10 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (14, _MIGRATION_V14),
     (15, _MIGRATION_V15),
     (16, _MIGRATION_V16),
+    (17, _MIGRATION_V17),
+    (18, _MIGRATION_V18),
+    (19, _MIGRATION_V19),
+    (20, MIGRATION_V20),
 )
 
 
@@ -1774,7 +1788,7 @@ class Reservation:
     superseded: tuple[dict, ...] = field(default_factory=tuple)
 
 
-class Store:
+class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStoreMixin):
     def __init__(self, conn: sqlite3.Connection, path: Path | None = None,
                  *, _snapshot: tempfile.TemporaryDirectory | None = None):
         self._c = conn
@@ -2008,18 +2022,14 @@ class Store:
         original_version = int(info.version)
         migrated = False
         try:
-            source = sqlite3.connect(path, isolation_level=None)
             target_uri = (f"file:{quote(str(backup.resolve()))}?mode=rw")
-            target = sqlite3.connect(target_uri, uri=True, isolation_level=None)
-            try:
+            with closing(sqlite3.connect(path, isolation_level=None)) as source, closing(
+                    sqlite3.connect(target_uri, uri=True, isolation_level=None)) as target:
                 source.backup(target)
                 if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise ValueError("backup integrity check failed")
-            finally:
-                target.close()
-                source.close()
             backup.chmod(0o600)
-            with sqlite3.connect(path, isolation_level=None) as conn:
+            with closing(sqlite3.connect(path, isolation_level=None)) as conn, conn:
                 _migrate(conn)
                 version = int(conn.execute("PRAGMA user_version").fetchone()[0])
                 if version != SCHEMA_VERSION:
@@ -2149,6 +2159,7 @@ class Store:
                 lineage_annotator(self, normalized)
                 normalized = _normalize_record(
                     normalized, label="save_checkpointed_review")
+            self._require_followup_publication(orchestration_id, rec=normalized)
             self._write_review(normalized)
             persisted = self.get_review(normalized["id"])
             if persisted is None:
@@ -2206,7 +2217,14 @@ class Store:
         is factored out is that the reservation runs it INSIDE its own
         transaction while `save_review` runs it in autocommit.
         """
+        from .requests import bind_review
+        rec = dict(rec)
+        bind_review(self, rec)
         self._c.execute(_INSERT_REVIEW, (rec["id"],) + _review_values(rec))
+        if rec.get("status") != RUNNING:
+            from .control import cancellation_completion
+            self.finish_cancellations(target_id=rec["id"], now=_iso_now(),
+                outcome=cancellation_completion(rec))
         self._write_lineage(rec)
 
     def _write_lineage(self, rec: Mapping) -> None:
@@ -2316,84 +2334,142 @@ class Store:
     def lineage_finding_candidates_with_meta(
             self, repository_id: str, *, before_reviewed_at: str | None = None,
             limit: int = 200) -> tuple[list[dict], bool]:
-        """Return bounded prior findings for one repository, newest first.
+        """Compatibility wrapper for bounded, validated recent findings."""
+        rows, meta = self.lineage_candidates_with_diagnostics(
+            repository_id, before_reviewed_at=before_reviewed_at, limit=limit)
+        return rows, meta["truncated"]
 
-        The limit is a flattened finding count, not a predecessor review count.
-        Pages of `limit + 1` raw rows skip unreadable or invalid indexes so a
-        ghost row cannot starve older valid predecessors. A raw-scan cap keeps
-        the terminal writer transaction bounded.
+    def lineage_candidates_with_diagnostics(
+            self, repository_id: str, *, before_reviewed_at: str | None = None,
+            limit: int = 200, fingerprint: str | None = None,
+            scan_limit: int = 1024) -> tuple[list[dict], dict]:
+        """Read bounded candidates using the existing exact or recency index.
+
+        Raw scans include invalid rows. Artifact provenance and digest must
+        agree with the projection; legacy/corrupt rows cannot forge matches.
+        Rowid breaks timestamp ties in index order, avoiding a temporary sort
+        of an arbitrarily large review. No schema change or inspection write.
         """
+        from .fingerprint import VERSION, finding_fingerprint
+
         repository_id = _require_text("repository_id", repository_id)
-        if type(limit) is not int or limit <= 0:
-            raise ValueError("lineage candidate limit must be a positive int")
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("lineage candidate limit must be an int in 1..200")
+        if type(scan_limit) is not int or not 1 <= scan_limit <= 1024:
+            raise ValueError("lineage scan limit must be an int in 1..1024")
         if before_reviewed_at is not None:
-            before_reviewed_at = _require_ts(
-                "before_reviewed_at", before_reviewed_at)
+            before_reviewed_at = _require_ts("before_reviewed_at", before_reviewed_at)
+        if fingerprint is not None and (
+                not isinstance(fingerprint, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint) is None):
+            raise ValueError("invalid lineage fingerprint")
         want = limit + 1
-        scan_cap = min(want * 4, 1024)
+        scan_cap = min(want * 4, scan_limit)
         findings: list[dict] = []
         cache: dict[str, dict | None] = {}
         examined = 0
-        cursor: tuple[str, str, int] | None = None
+        cursor = None
         exhausted = False
         while len(findings) < want and examined < scan_cap:
             where = "repository_id=?"
             params: list[object] = [repository_id]
+            if fingerprint is not None:
+                where += " AND fingerprint_version=? AND fingerprint=?"
+                params.extend([VERSION, fingerprint])
+                order = "created_at DESC, rowid DESC"
+                columns = "(created_at, rowid)"
+            else:
+                order = "created_at DESC, review_id DESC, rowid DESC"
+                columns = "(created_at, review_id, rowid)"
             if before_reviewed_at is not None:
                 where += " AND created_at < ?"
                 params.append(before_reviewed_at)
             if cursor is not None:
-                created_at, review_id, finding_index = cursor
-                where += (
-                    " AND (created_at < ? OR (created_at = ? AND review_id < ?)"
-                    " OR (created_at = ? AND review_id = ? AND finding_index < ?))"
-                )
-                params.extend([created_at, created_at, review_id,
-                               created_at, review_id, finding_index])
+                where += f" AND {columns} < ({','.join('?' for _ in cursor)})"
+                params.extend(cursor)
             batch = min(want, scan_cap - examined)
             rows = self._c.execute(
-                f"""SELECT review_id, finding_index, created_at
-                      FROM finding_lineage WHERE {where}
-                     ORDER BY created_at DESC, review_id DESC, finding_index DESC
-                     LIMIT ?""",
-                tuple(params) + (batch,)).fetchall()
+                f"SELECT rowid AS serial, * FROM finding_lineage WHERE {where} "
+                f"ORDER BY {order} LIMIT ?", tuple(params) + (batch,)).fetchall()
             examined += len(rows)
-            if len(rows) < batch:
-                exhausted = True
+            exhausted = len(rows) < batch
             if not rows:
                 break
-            cursor = (rows[-1]["created_at"], rows[-1]["review_id"],
-                      rows[-1]["finding_index"])
+            last = rows[-1]
+            cursor = ((last["created_at"], last["serial"]) if fingerprint is not None
+                      else (last["created_at"], last["review_id"], last["serial"]))
             for row in rows:
                 review_id = row["review_id"]
                 if review_id not in cache:
-                    artifact = self.get_review(review_id)
+                    try:
+                        artifact = self.get_review(review_id)
+                    except (ValueError, TypeError):
+                        artifact = None
                     if (not isinstance(artifact, dict)
-                            or artifact.get("status") == RUNNING):
-                        cache[review_id] = None
-                    else:
-                        cache[review_id] = artifact
+                            or artifact.get("id") != review_id
+                            or artifact.get("status") == RUNNING
+                            or (artifact.get("lineage_repository_id") or "unknown") != repository_id):
+                        artifact = None
+                    cache[review_id] = artifact
                 artifact = cache[review_id]
-                if artifact is None:
+                if artifact is None or artifact.get("reviewed_at") != row["created_at"]:
                     continue
                 index = row["finding_index"]
-                stored = artifact.get("findings") or ()
-                if not isinstance(index, int) or index < 0 or index >= len(stored):
+                stored = artifact.get("findings")
+                if (not isinstance(stored, list) or type(index) is not int
+                        or not 0 <= index < len(stored) or not isinstance(stored[index], dict)
+                        or row["fingerprint_version"] != VERSION):
                     continue
-                previous_finding = stored[index]
-                if not isinstance(previous_finding, dict):
+                previous = stored[index]
+                try:
+                    digest = finding_fingerprint(previous)
+                except (ValueError, TypeError, UnicodeError):
                     continue
-                enriched = dict(previous_finding)
-                enriched["_lineage_review_id"] = review_id
-                enriched["_lineage_finding_index"] = index
-                enriched["_lineage_reviewed_at"] = artifact.get("reviewed_at")
+                if digest != row["fingerprint"] or previous.get("finding_fingerprint_v2") != digest:
+                    continue
+                enriched = dict(previous)
+                enriched.update(_lineage_review_id=review_id,
+                                _lineage_finding_index=index,
+                                _lineage_reviewed_at=artifact.get("reviewed_at"))
                 findings.append(enriched)
                 if len(findings) >= want:
                     break
             if exhausted:
                 break
         truncated = len(findings) > limit or not exhausted
-        return findings[:limit], truncated
+        return findings[:limit], {
+            "scanned_count": examined, "matched_count": len(findings[:limit]),
+            "truncated": truncated, "scan_limit": scan_cap,
+            "scan_truncated": not exhausted and examined >= scan_cap,
+            "candidate_truncated": len(findings) > limit,
+        }
+
+    def lineage_prompt_candidates(
+            self, repository_id: str, *, before_reviewed_at: str | None = None,
+            limit: int = 200) -> tuple[list[dict], dict]:
+        """Attach bounded prior dispositions, never reasons or triage actions.
+
+        The event stream's primary key bounds this optional read to 1025 rows.
+        Match the original review plus finding identity to preserve repository
+        provenance. Missing history after the scan cap is explicitly unknown.
+        """
+        from .textnorm import finding_key
+
+        rows, meta = self.lineage_candidates_with_diagnostics(
+            repository_id, before_reviewed_at=before_reviewed_at, limit=limit)
+        events = self._c.execute(
+            "SELECT review_id, finding_key, event FROM triage_events "
+            "ORDER BY seq DESC LIMIT 1025").fetchall() if rows else []
+        dispositions = {}
+        for event in events[:1024]:
+            dispositions.setdefault((event["review_id"], event["finding_key"]), event["event"])
+        for row in rows:
+            key = (row["_lineage_review_id"], finding_key(row.get("file", ""), row.get("title", "")))
+            row["_lineage_disposition"] = dispositions.get(
+                key, "unknown" if len(events) > 1024 else "open")
+        meta["disposition_scanned_count"] = min(len(events), 1024)
+        meta["disposition_truncated"] = len(events) > 1024
+        return rows, meta
 
     def lineage_review_candidates(self, repository_id: str) -> list[dict]:
         """Compatibility wrapper for the bounded lineage candidate read."""
@@ -2613,41 +2689,16 @@ class Store:
                     """SELECT * FROM review_orchestrations
                         WHERE identity_digest=?
                           AND state IN ('active','cancelled','failed','complete')
+                          AND id NOT IN (SELECT json_extract(identity_json,'$.continuation_source')
+                            FROM review_orchestrations WHERE state<>'expired'
+                              AND json_extract(identity_json,'$.continuation_source') IS NOT NULL)
                         ORDER BY created_at DESC, id DESC LIMIT 1""",
                     (identity.digest(),)).fetchone()
             if existing is not None:
                 self._c.execute("COMMIT")
                 return dict(existing)
-            self._c.execute(
-                """INSERT INTO review_orchestrations (
-                     id, state, requested_mode, created_at, updated_at,
-                     expires_at, repo_id, worktree_root, branch, head,
-                     base_ref, base_sha, diff_hash, tree_fingerprint,
-                     context_hash, checklist_hash, reviewer_hash, config_hash,
-                     policy_hash, planner_version, batch_budget, batch_count,
-                     boundary_digest, integration_plan_digest,
-                     identity_digest, identity_json)
-                   VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (orchestration_id, requested_mode, created_at, created_at,
-                 expires_at, identity.repo_id, identity.worktree_root,
-                 identity.branch, identity.head, identity.base_ref,
-                 identity.base_sha, identity.diff_hash,
-                 identity.tree_fingerprint, identity.context_hash,
-                 identity.checklist_hash, identity.reviewer_hash,
-                 identity.config_hash, identity.policy_hash,
-                 identity.planner_version, identity.batch_budget,
-                 identity.batch_count, identity.boundary_digest,
-                 identity.integration_plan_digest, identity.digest(),
-                 identity.canonical_json()))
-            self._c.executemany(
-                """INSERT INTO review_checkpoints (
-                     orchestration_id, pass_kind, pass_index, state,
-                     prompt_hash, diff_hash, boundary_hash)
-                   VALUES (?, ?, ?, 'pending', ?, ?, ?)""",
-                [(orchestration_id, item.kind, item.index, item.prompt_hash,
-                  item.diff_hash, item.boundary_hash)
-                 for item in identity.pass_identities])
+            self._insert_orchestration(orchestration_id, identity, requested_mode,
+                                       created_at, expires_at)
             self._c.execute("COMMIT")
         except BaseException:
             try:
@@ -2659,6 +2710,40 @@ class Store:
         assert row is not None
         return row
 
+    def _insert_orchestration(self, orchestration_id, identity, requested_mode,
+                              created_at, expires_at):
+        """Insert already-validated plan rows inside the caller's transaction."""
+        self._c.execute(
+            """INSERT INTO review_orchestrations (
+                 id, state, requested_mode, created_at, updated_at,
+                 expires_at, repo_id, worktree_root, branch, head,
+                 base_ref, base_sha, diff_hash, tree_fingerprint,
+                 context_hash, checklist_hash, reviewer_hash, config_hash,
+                 policy_hash, planner_version, batch_budget, batch_count,
+                 boundary_digest, integration_plan_digest,
+                 identity_digest, identity_json)
+               VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (orchestration_id, requested_mode, created_at, created_at,
+             expires_at, identity.repo_id, identity.worktree_root,
+             identity.branch, identity.head, identity.base_ref,
+             identity.base_sha, identity.diff_hash,
+             identity.tree_fingerprint, identity.context_hash,
+             identity.checklist_hash, identity.reviewer_hash,
+             identity.config_hash, identity.policy_hash,
+             identity.planner_version, identity.batch_budget,
+             identity.batch_count, identity.boundary_digest,
+             identity.integration_plan_digest, identity.digest(),
+             identity.canonical_json()))
+        for item in identity.pass_identities:
+            self._c.execute(
+                f"""INSERT INTO {table_for(item.kind)} (
+                     orchestration_id, pass_kind, pass_index, state,
+                     prompt_hash, diff_hash, boundary_hash)
+                   VALUES (?, ?, ?, 'pending', ?, ?, ?)""",
+                (orchestration_id, item.kind, item.index, item.prompt_hash,
+                 item.diff_hash, item.boundary_hash))
+
     def get_orchestration(self, orchestration_id: str) -> dict | None:
         orchestration_id = _require_text("orchestration_id", orchestration_id)
         row = self._c.execute(
@@ -2667,19 +2752,138 @@ class Store:
         return dict(row) if row is not None else None
 
     def find_resume_candidate(self, repo_id: str, worktree_root: str,
-                              branch: str) -> dict | None:
-        """Newest incomplete candidate in one exact repository/worktree lane."""
-        values = (
-            _require_text("repo_id", repo_id),
-            _require_text("worktree_root", worktree_root),
-            _require_text("branch", branch),
-        )
-        row = self._c.execute(
-            """SELECT * FROM review_orchestrations
-                WHERE repo_id=? AND worktree_root=? AND branch=?
-                  AND state IN ('active','cancelled','failed','complete')
-                ORDER BY created_at DESC, id DESC LIMIT 1""", values).fetchone()
+                              branch: str, *, include_consumed=False) -> dict | None:
+        """Newest candidate; explicit continuation may select failed consumed work."""
+        values = tuple(_require_text(name, value) for name, value in (
+            ('repo_id', repo_id), ('worktree_root', worktree_root), ('branch', branch)))
+        if type(include_consumed) is not bool:
+            raise ValueError('include_consumed must be bool')
+        if include_consumed:
+            row = self._c.execute(
+                """SELECT o.* FROM review_orchestrations o
+                   LEFT JOIN reviews r ON r.id=o.final_review_id
+                   WHERE o.repo_id=? AND o.worktree_root=? AND o.branch=?
+                     AND (o.state IN ('active','cancelled','failed','complete')
+                          OR (o.state='consumed' AND r.trustworthy=0 AND r.status<>'running'))
+                     AND o.id NOT IN (SELECT json_extract(identity_json,'$.continuation_source')
+                       FROM review_orchestrations WHERE state<>'expired'
+                         AND json_extract(identity_json,'$.continuation_source') IS NOT NULL)
+                   ORDER BY o.created_at DESC,o.id DESC LIMIT 1""", values).fetchone()
+        else:
+            row = self._c.execute(
+                """SELECT * FROM review_orchestrations
+                    WHERE repo_id=? AND worktree_root=? AND branch=?
+                      AND state IN ('active','cancelled','failed','complete')
+                      AND id NOT IN (SELECT json_extract(identity_json,'$.continuation_source')
+                        FROM review_orchestrations WHERE state<>'expired'
+                          AND json_extract(identity_json,'$.continuation_source') IS NOT NULL)
+                    ORDER BY created_at DESC,id DESC LIMIT 1""", values).fetchone()
         return dict(row) if row is not None else None
+
+    def continuation_lineage_cutoff(self, request_id, source_id):
+        """Rebuild the source's advisory context without feeding it its own output."""
+        request_id = _require_text('request_id', request_id)
+        source_id = _require_text('source_id', source_id)
+        row = self._c.execute(
+            """SELECT r.artifact_json FROM request_links l JOIN reviews r ON r.id=l.target_id
+               WHERE l.request_id=? AND l.kind='review'
+                 AND json_extract(r.artifact_json,'$.batch_orchestration_id')=?
+               ORDER BY r.reviewed_at,r.id LIMIT 1""", (request_id, source_id)).fetchone()
+        if row is None:
+            return None
+        rec = json.loads(row['artifact_json'])
+        cutoff = rec.get('lineage_context_cutoff') or rec.get('review_started_at') or rec.get('reviewed_at')
+        return _require_ts('lineage_context_cutoff', cutoff)
+
+    def fork_continuation(self, source_id, identity, *, request_id, owner_token,
+                          created_at, expires_at):
+        """Atomically seed one owned generation; never rearm consumed source rows."""
+        from dataclasses import replace
+        from .continuation import ContinuationRefused
+        from .checkpoints import OrchestrationIdentity, CheckpointPayload, first_mismatch, usable_payload
+        source_id = _require_text('source_id', source_id)
+        request_id = _require_text('request_id', request_id)
+        owner_token = _require_text('owner_token', owner_token)
+        created_at = _require_ts('created_at', created_at)
+        expires_at = _require_ts('expires_at', expires_at)
+        if expires_at <= created_at or not isinstance(identity, OrchestrationIdentity):
+            raise ValueError('invalid continuation identity or expiry')
+        child_identity = replace(identity, continuation_source=source_id)
+        self._c.execute('BEGIN IMMEDIATE')
+        try:
+            request = self._c.execute(
+                "SELECT state,owner_token FROM review_requests WHERE id=?", (request_id,)).fetchone()
+            linked = self._c.execute(
+                "SELECT 1 FROM request_links WHERE request_id=? AND kind='batch_orchestration' AND target_id=?",
+                (request_id, source_id)).fetchone()
+            if (request is None or request['owner_token'] != owner_token or
+                    request['state'] not in ('accepted','queued','running') or linked is None):
+                raise ContinuationRefused('continuation_request_ownership')
+            source = self.get_orchestration(source_id)
+            if source is None or source['expires_at'] <= created_at:
+                raise ContinuationRefused('continuation_source_expired')
+            source_identity = OrchestrationIdentity.from_json(source['identity_json'])
+            if source_identity.digest() != source['identity_digest']:
+                raise ContinuationRefused('continuation_source_corrupt')
+            if first_mismatch(source_identity, identity):
+                raise ContinuationRefused('continuation_identity_mismatch')
+            if source['state'] == 'consumed':
+                review = self._c.execute('SELECT trustworthy,status FROM reviews WHERE id=?',
+                                         (source['final_review_id'],)).fetchone()
+                if review is None or review['trustworthy'] != 0 or review['status'] == RUNNING:
+                    raise ContinuationRefused('continuation_source_trustworthy')
+            elif source['state'] not in ('active','cancelled','failed','complete'):
+                raise ContinuationRefused('continuation_source_unavailable')
+            rows = self.list_checkpoints(source_id)
+            planned = {(item.kind, item.index): item for item in identity.pass_identities}
+            if {(row['pass_kind'], row['pass_index']) for row in rows} != set(planned):
+                raise ContinuationRefused('continuation_source_plan_mismatch')
+            for row in rows:
+                expected = planned[(row['pass_kind'], row['pass_index'])]
+                if (row['diff_hash'] != expected.diff_hash or row['boundary_hash'] != expected.boundary_hash
+                        or (expected.prompt_hash is not None and row['prompt_hash'] != expected.prompt_hash)):
+                    raise ContinuationRefused('continuation_source_pass_mismatch')
+            if any(row['state'] == 'running' and (not _is_canonical_ts(row['lease_expires_at'])
+                   or row['lease_expires_at'] > created_at) for row in rows):
+                raise ContinuationRefused('continuation_source_in_flight')
+            existing = self._c.execute(
+                "SELECT * FROM review_orchestrations WHERE identity_digest=? AND state<>'expired' ORDER BY created_at DESC,id DESC LIMIT 1",
+                (child_identity.digest(),)).fetchone()
+            if existing is not None:
+                self._c.execute('COMMIT')
+                return dict(existing)
+            child_id = ids.new_review_id('sk_batch_')
+            self._insert_orchestration(child_id, child_identity, source['requested_mode'], created_at, expires_at)
+            usable = []
+            for row in rows:
+                if row['state'] == 'complete' and row['payload_json'] is not None:
+                    payload = CheckpointPayload(row['payload_json'])
+                    if usable_payload(payload):
+                        usable.append((row, payload))
+            batches_complete = sum(row['pass_kind'] == 'batch' for row, _ in usable) == identity.batch_count
+            for row, payload in usable:
+                if row['pass_kind'] in ('security', 'skeptic'):
+                    continue
+                if row['pass_kind'] == 'integration' and not batches_complete:
+                    continue
+                value = payload.as_dict()
+                value['provenance'] = {**value['provenance'], 'continuation_source': source_id,
+                                       'continuation_action': 'reused'}
+                payload = CheckpointPayload.from_mapping(value)
+                self._c.execute(
+                    """UPDATE review_checkpoints SET state='complete',payload_json=?,completed_at=?,prompt_hash=?
+                       WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",
+                    (payload.json_text,row['completed_at'],row['prompt_hash'],child_id,row['pass_kind'],row['pass_index']))
+            self._seed_followup_candidates(source_id, child_id, rows)
+            self.link_request(request_id, 'batch_orchestration', child_id)
+            self._c.execute('COMMIT')
+            return self.get_orchestration(child_id)
+        except BaseException:
+            try:
+                self._c.execute('ROLLBACK')
+            except BaseException:
+                pass
+            raise
 
     def record_orchestration_mismatch(self, orchestration_id: str,
                                       field_name: str, *, at: str) -> bool:
@@ -2700,10 +2904,15 @@ class Store:
                 WHERE orchestration_id=?
                 ORDER BY CASE pass_kind WHEN 'batch' THEN 0 ELSE 1 END,
                          pass_index""", (orchestration_id,)).fetchall()
-        return [dict(row) for row in rows]
+        result = [dict(row) for row in rows]
+        extras = self._c.execute(
+            "SELECT * FROM review_followup_checkpoints WHERE orchestration_id=? ORDER BY pass_kind",
+            (orchestration_id,)).fetchall()
+        return result + [dict(row) for row in extras]
 
     def claim_checkpoint(self, orchestration_id: str, pass_identity, *,
-                         owner: str, now: str, lease_expires_at: str) -> dict:
+                         owner: str, now: str, lease_expires_at: str,
+                         binding_hash: str | None = None) -> dict:
         """Claim a missing pass, reuse a complete one, or observe live work.
 
         The returned `claim_token` plus monotonic `fence` is the completion
@@ -2734,7 +2943,7 @@ class Store:
                     f"orchestration {orchestration_id!r} is "
                     f"{orchestration['state']!r}, not resumable")
             row = self._c.execute(
-                """SELECT * FROM review_checkpoints
+                f"""SELECT * FROM {table_for(pass_identity.kind)}
                     WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",
                 (orchestration_id, pass_identity.kind,
                  pass_identity.index)).fetchone()
@@ -2744,12 +2953,14 @@ class Store:
                 raise ValueError("checkpoint diff_hash does not match the plan")
             if row["boundary_hash"] != pass_identity.boundary_hash:
                 raise ValueError("checkpoint boundary_hash does not match the plan")
+            if pass_identity.kind in ("security", "skeptic"):
+                self._require_followup_claim_binding(orchestration_id, row, binding_hash)
             stored_prompt = row["prompt_hash"]
             if stored_prompt is None:
-                if pass_identity.kind != "integration":
+                if pass_identity.kind not in ("integration", "security", "skeptic"):
                     raise ValueError("checkpoint prompt_hash is missing")
                 self._c.execute(
-                    """UPDATE review_checkpoints SET prompt_hash=?
+                    f"""UPDATE {table_for(pass_identity.kind)} SET prompt_hash=?
                         WHERE orchestration_id=? AND pass_kind=? AND pass_index=?
                           AND prompt_hash IS NULL""",
                     (pass_identity.prompt_hash, orchestration_id,
@@ -2772,7 +2983,7 @@ class Store:
             token = ids.new_review_id("sk_claim_")
             fence = int(row["fence"] or 0) + 1
             self._c.execute(
-                """UPDATE review_checkpoints
+                f"""UPDATE {table_for(pass_identity.kind)}
                       SET state='running', claim_token=?, fence=?, claim_owner=?,
                           claimed_at=?, lease_expires_at=?, failure_reason=NULL
                     WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",
@@ -2786,7 +2997,7 @@ class Store:
                     WHERE id=?""",
                 (now, lease_expires_at, lease_expires_at, orchestration_id))
             claimed = self._c.execute(
-                """SELECT * FROM review_checkpoints
+                f"""SELECT * FROM {table_for(pass_identity.kind)}
                     WHERE orchestration_id=? AND pass_kind=? AND pass_index=?""",
                 (orchestration_id, pass_identity.kind,
                  pass_identity.index)).fetchone()
@@ -2804,7 +3015,7 @@ class Store:
     def complete_checkpoint(
             self, orchestration_id: str, pass_kind: str, pass_index: int, *,
             owner: str, claim_token: str, fence: int, payload,
-            completed_at: str) -> bool:
+            completed_at: str, binding_hash: str | None = None) -> bool:
         """Conditionally complete the caller's exact fenced claim."""
         from .checkpoints import CheckpointPayload
 
@@ -2822,8 +3033,14 @@ class Store:
         payload = CheckpointPayload.from_mapping(payload.as_dict())
         self._c.execute("BEGIN IMMEDIATE")
         try:
+            if pass_kind in ('security', 'skeptic'):
+                row = self._c.execute('SELECT * FROM review_followup_checkpoints WHERE orchestration_id=? AND pass_kind=?',
+                                      (orchestration_id, pass_kind)).fetchone()
+                if row is None:
+                    raise ValueError('follow-up checkpoint missing')
+                self._require_followup_claim_binding(orchestration_id, row, binding_hash)
             cur = self._c.execute(
-                """UPDATE review_checkpoints
+                f"""UPDATE {table_for(pass_kind)}
                       SET state='complete', payload_json=?, completed_at=?,
                           claim_token=NULL, claim_owner=NULL, claimed_at=NULL,
                           lease_expires_at=NULL, failure_reason=NULL
@@ -2861,7 +3078,7 @@ class Store:
         self._c.execute("BEGIN IMMEDIATE")
         try:
             cur = self._c.execute(
-                """UPDATE review_checkpoints
+                f"""UPDATE {table_for(pass_kind)}
                       SET state='pending', claim_token=NULL, claim_owner=NULL,
                           claimed_at=NULL, lease_expires_at=NULL, failure_reason=?
                     WHERE orchestration_id=? AND pass_kind=? AND pass_index=?
@@ -2906,6 +3123,10 @@ class Store:
                         SELECT id FROM review_orchestrations
                          WHERE state='expired' AND expires_at <= ?)""",
                 (now,))
+            self._c.execute(
+                """UPDATE review_followup_checkpoints SET payload_json=NULL,candidate_json=NULL
+                   WHERE orchestration_id IN (SELECT id FROM review_orchestrations
+                     WHERE state='expired' AND expires_at <= ?)""", (now,))
             self._c.execute("COMMIT")
             return cur.rowcount
         except BaseException:
@@ -3067,36 +3288,43 @@ class Store:
         """
         self._c.execute("BEGIN IMMEDIATE")
         try:
-            cur = self._c.execute(
-                """UPDATE reviews SET status='failed', degraded=1, trustworthy=0,
-                     artifact_json=json_set(artifact_json,
-                       '$.status', 'failed',
-                       '$.degraded', json('true'),
-                       '$.degraded_reason', ?,
-                       '$.failure_reason', ?,
-                       '$.trustworthy', json('false'))
-                   WHERE id=? AND trustworthy=1""",
-                (reason, reason, review_id))
-            if cur.rowcount == 1:
-                row = self._c.execute(
-                    "SELECT json_extract(artifact_json, '$.batch_orchestration_id') AS oid "
-                    "FROM reviews WHERE id=?", (review_id,)).fetchone()
-                if row is not None and row["oid"]:
-                    self._c.execute(
-                        """UPDATE review_orchestrations
-                              SET state='failed', final_review_id=NULL,
-                                  updated_at=?, terminal_reason=?
-                            WHERE id=? AND state='consumed'
-                              AND final_review_id=?""",
-                        (_iso_now(), reason, row["oid"], review_id))
+            applied = self._mark_cancelled_in_transaction(review_id, reason)
             self._c.execute("COMMIT")
-            return cur.rowcount == 1
+            return applied
         except BaseException:
             try:
                 self._c.execute("ROLLBACK")
             except BaseException:
                 pass
             raise
+
+    def _mark_cancelled_in_transaction(self, review_id: str, reason: str) -> bool:
+        """Existing cancellation update, shared with atomic owner observation."""
+        if not self._c.in_transaction:
+            raise RuntimeError('cancellation demotion requires a transaction')
+        cur = self._c.execute(
+            """UPDATE reviews SET status='failed', degraded=1, trustworthy=0,
+                 artifact_json=json_set(artifact_json,
+                   '$.status', 'failed',
+                   '$.degraded', json('true'),
+                   '$.degraded_reason', ?,
+                   '$.failure_reason', ?,
+                   '$.trustworthy', json('false'))
+               WHERE id=? AND trustworthy=1""",
+            (reason, reason, review_id))
+        if cur.rowcount == 1:
+            row = self._c.execute(
+                "SELECT json_extract(artifact_json, '$.batch_orchestration_id') AS oid "
+                "FROM reviews WHERE id=?", (review_id,)).fetchone()
+            if row is not None and row["oid"]:
+                self._c.execute(
+                    """UPDATE review_orchestrations
+                          SET state='failed', final_review_id=NULL,
+                              updated_at=?, terminal_reason=?
+                        WHERE id=? AND state='consumed'
+                          AND final_review_id=?""",
+                    (_iso_now(), reason, row["oid"], review_id))
+        return cur.rowcount == 1
 
     def fail_if_running(self, review_id: str, reason: str) -> bool:
         """`mark_failed`, but only while the record is still `running`.
@@ -3121,7 +3349,7 @@ class Store:
     def reserve_prepush(self, branch: str, head: str, base_ref: str,
                         base_sha: str, diff_hash: str, worst_runtime_sec: int,
                         evidence, *, repo: str, now: str | None = None,
-                        id_prefix: str = "sk_") -> Reservation:
+                        id_prefix: str = "sk_", worktree_root: str | None = None) -> Reservation:
         """Decide dedup, retire the branch's older runs, and reserve one record.
 
         ONE `BEGIN IMMEDIATE` transaction, and everything below is inside it
@@ -3201,6 +3429,7 @@ class Store:
                 findings=[], findings_total=0, summary="", failure_reason=None,
                 usable_output=False, worst_runtime_sec=worst_runtime_sec,
                 pid=None, superseded_by=None, repo=repo,
+                **({"worktree_root":worktree_root} if worktree_root is not None else {}),
             ), label="reserve_prepush"))
             self._c.execute("COMMIT")
             return Reservation(record_id=record_id, superseded=retired)
@@ -3402,6 +3631,9 @@ class Store:
                 self._consume_orchestration_in_transaction(
                     batch_orchestration_id, record_id, _iso_now())
             if applied:
+                from .control import cancellation_completion
+                self.finish_cancellations(target_id=record_id, now=_iso_now(),
+                    outcome=cancellation_completion(merged))
                 self._write_lineage(merged)
             self._c.execute("COMMIT")
             return applied
@@ -3772,12 +4004,12 @@ class Store:
         resource_class = _require_text("resource_class", resource_class)
         scope = _require_text("scope", scope)
         rows = self._c.execute(
-            """SELECT id, status, queued_at FROM capacity_admissions
+            """SELECT rowid AS enqueue_order, id, status, queued_at FROM capacity_admissions
                WHERE resource_class=? AND scope=? AND status IN (?,?,?)
-               ORDER BY queued_at, id""",
+               ORDER BY queued_at, rowid""",
             (resource_class, scope, *self._CAPACITY_ACTIVE)).fetchall()
         return [WaiterView(id=r["id"], status=r["status"],
-                           queued_at=r["queued_at"]) for r in rows]
+                           queued_at=r["queued_at"], enqueue_order=r["enqueue_order"]) for r in rows]
 
     def capacity_position(self, admission_id: str) -> int | None:
         """1-based FIFO position among active peers, or None if terminal/missing."""
@@ -3791,24 +4023,31 @@ class Store:
 
     def capacity_terminal_wait_ms(self, resource_class: str, scope: str,
                                   *, limit: int = 20) -> list[int]:
-        """Recent terminal ``wait_ms`` values (newest first), for ETA p50."""
+        """Recent observed queue waits, excluding admitted provider run time.
+
+        The old wait_ms column is total admission lifetime, not queue wait.
+        Expired/rejected never-admitted rows end their wait at ended_at.
+        """
         resource_class = _require_text("resource_class", resource_class)
         scope = _require_text("scope", scope)
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        if type(limit) is not int or not 1 <= limit <= 200:
             limit = 20
         rows = self._c.execute(
-            """SELECT wait_ms FROM capacity_admissions
-               WHERE resource_class=? AND scope=?
-                 AND status IN ('released','expired','rejected')
-                 AND wait_ms IS NOT NULL
-               ORDER BY ended_at DESC, id DESC LIMIT ?""",
+            """SELECT queue_wait_ms,queued_at,admitted_at,started_at,ended_at,status
+                 FROM capacity_admissions WHERE resource_class=? AND scope=?
+                  AND status IN ('released','expired','rejected')
+                ORDER BY ended_at DESC,id DESC LIMIT ?""",
             (resource_class, scope, limit)).fetchall()
-        out: list[int] = []
-        for r in rows:
-            try:
-                out.append(int(r["wait_ms"]))
-            except (TypeError, ValueError):
-                continue
+        out = []
+        for row in rows:
+            value = row['queue_wait_ms']
+            if type(value) is not int or value < 0:
+                end = row['admitted_at']
+                if end is None and row['started_at'] is None and row['status'] in ('expired', 'rejected'):
+                    end = row['ended_at']
+                value = _duration_ms(row['queued_at'], end)
+            if type(value) is int and value >= 0:
+                out.append(value)
         return out
 
     def capacity_holder_count(self, resource_class: str, scope: str) -> int:
@@ -3865,7 +4104,7 @@ class Store:
             rows = self._c.execute(
                 """SELECT * FROM capacity_admissions
                    WHERE resource_class=? AND scope=? AND status IN (?,?,?)
-                   ORDER BY queued_at, id""",
+                   ORDER BY queued_at, rowid""",
                 (resource_class, scope, *self._CAPACITY_ACTIVE)).fetchall()
             ended_at = _iso_now()
             for row in rows:
@@ -3918,12 +4157,12 @@ class Store:
                 self._c.execute("COMMIT")
                 return None if row is None else dict(row)
             peers = self._c.execute(
-                """SELECT id, status, queued_at FROM capacity_admissions
+                """SELECT rowid AS enqueue_order, id, status, queued_at FROM capacity_admissions
                    WHERE resource_class=? AND scope=? AND status IN (?,?,?)""",
                 (row["resource_class"], row["scope"],
                  *self._CAPACITY_ACTIVE)).fetchall()
             views = [WaiterView(id=p["id"], status=p["status"],
-                                queued_at=p["queued_at"]) for p in peers]
+                                queued_at=p["queued_at"], enqueue_order=p["enqueue_order"]) for p in peers]
             if not decide_admit(admission_id, views, capacity):
                 self._c.execute("COMMIT")
                 return None

@@ -139,3 +139,13 @@ def test_shared_surface_validation_rejects_bool_negative_and_unbounded_targets()
     assert _validate_batch_target(True)[1]
     assert _validate_batch_target(-1)[1]
     assert _validate_batch_target(10_000_001)[1]
+
+
+def test_attempt_telemetry_retains_call_identity_input_size_and_skip_without_prompt():
+    row = attempt_telemetry({'attempt_id': 'call-1', 'n': 2, 'skipped': 'prompt_too_large',
+        'rc': None, 'timed_out': None, 'input_bytes': 690000, 'prompt': 'never persist'}, timeout_sec=5)
+    assert row['attempt_id'] == 'call-1'
+    assert row['input_bytes'] == 690000
+    assert row['input_scope'] == 'provider_input'
+    assert row['launched'] is False
+    assert 'prompt' not in row

@@ -114,6 +114,12 @@ def build_parser() -> argparse.ArgumentParser:
         "review", help="review the outgoing change now, in the foreground")
     review.add_argument("--repo", type=Path, default=Path("."),
                         help="repository to review (default: the current directory)")
+    review.add_argument("--json", action="store_true",
+                        help="emit one versioned structured review result")
+    review.add_argument("--continue", dest="continue_compatible", action="store_true",
+                        help="continue usable exact batch checkpoints, retrying failed work")
+    review.add_argument("--request-key", default=None,
+                        help="idempotency key for this exact worktree request")
     # THE NAME of a `[[reviewers]]` entry, never a provider id: two enabled
     # entries may share a provider, and picking one of them by a rule nobody
     # asked about would also pick its model, its effort, its own prompt budget
@@ -149,7 +155,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="recovery attempt limit, including the first attempt (default: 3)")
     review.add_argument(
         "--max-wall-seconds", type=float, default=None, dest="max_wall_seconds",
-        help="recovery wall-clock budget (default: 900 seconds)")
+        help="total execution budget, including queues (recovery default: 900 seconds)")
+    review.add_argument("--max-queue-seconds", type=float, default=None,
+                        help="cumulative foreground admission budget")
+    review.add_argument("--max-review-seconds", type=float, default=None,
+                        help="budget after first provider launch; pauses during foreground requeue")
+    review.add_argument("--max-provider-wait-seconds", type=float, default=None,
+                        help="provider admission allowance per pass, shared across fallbacks")
     review.add_argument(
         "--reuse-trusted", action="store_true", dest="reuse_trusted",
         help="reuse an exact trustworthy foreground review when available")
@@ -157,6 +169,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--fresh", action="store_true", dest="fresh",
         help="run wholly fresh, bypassing trusted reuse and incomplete batch "
              "checkpoints")
+    review.add_argument("--batch-concurrency", type=int, choices=(1, 2), default=1,
+                        help="opt-in foreground batch workers; default sequential")
     review.add_argument(
         "--batch-target-bytes", type=int, default=None,
         dest="batch_target_bytes",
@@ -191,21 +205,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", dest="json_output",
         help="render the same statistics as machine-readable JSON")
 
+    plan = sub.add_parser("review-plan", help="preview full-scope review inputs without provider calls")
+    plan.add_argument("--repo", type=Path, default=Path("."))
+    plan.add_argument("--mode", choices=("now", "prepush"), default=None)
+    plan.add_argument("--reviewer", default=None)
+    plan.add_argument("--client-family", default=None)
+    plan.add_argument("--batch-concurrency", type=int, choices=(1, 2), default=1)
+    plan.add_argument("--batch-target-bytes", type=int, default=None)
+    plan.add_argument("--target-source", choices=("configured", "measured"), default="configured")
+    plan.add_argument("--target-latency-seconds", type=float, default=None)
+    plan.add_argument("--stack-manifest", type=Path, default=None)
+    for name in ("local-ref", "local-oid", "remote-ref", "remote-oid", "review-id"):
+        plan.add_argument("--" + name, default=None)
+    plan.add_argument("--json", action="store_true", dest="json_output")
+
+    queue = sub.add_parser("queue", help="inspect request owners, capacity and observed costs")
+    queue.add_argument("request_id", nargs="?", default=None)
+    queue.add_argument("--repo", type=Path, default=Path("."))
+    queue.add_argument("--scope", choices=("worktree", "repository", "host"), default="worktree")
+    queue.add_argument("--limit", type=int, default=50)
+    queue.add_argument("--json", action="store_true", dest="json_output")
+
     # Epic S1: observe / cancel without a second gate. Hyphenated CLI names
     # match install-hooks / import-legacy; MCP tools use underscores like the
     # rest of the tool surface (review_status, review_cancel).
-    rstatus = sub.add_parser(
-        "review-status",
-        help="show status of a review by id, or the current one for --repo")
-    rstatus.add_argument(
-        "review_id", nargs="?", default=None, metavar="REVIEW-ID",
-        help="review id to inspect (default: current for --repo, or host-wide)")
-    rstatus.add_argument(
-        "--repo", type=Path, default=None,
-        help="when no id is given, report the current review for this "
-             "repository (default: host-wide current)")
-    rstatus.add_argument("--json", action="store_true", dest="json_output",
-                         help="render coverage and pass state as JSON")
+    rstatus = sub.add_parser("review-status", help="observe local worktree activity or an explicit ID")
+    rstatus.add_argument("review_id", nargs="?", default=None, metavar="REVIEW-OR-REQUEST-ID")
+    rstatus.add_argument("--repo", type=Path, default=Path("."), help="caller worktree (default .)")
+    rstatus.add_argument("--scope", choices=("worktree","repository","host"), default="worktree",
+                         help="broader scopes list identifiable entries")
+    rstatus.add_argument("--limit", type=int, default=50)
+    rstatus.add_argument("--json", action="store_true", dest="json_output")
 
     evidence = sub.add_parser(
         "evidence", help="show bounded advisory evidence receipts")
@@ -464,6 +494,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="repository whose config is loaded (default: .)")
     retain.add_argument("--dry-run", action="store_true",
                         help="report what would be deleted without deleting")
+    retain.add_argument("--request-results-days", type=int, default=None,
+                        help="expire terminal request result payloads older than N days; "
+                             "keep request keys, links, and review artifacts")
     doctor = sub.add_parser(
         "doctor",
         help="diagnose install, store, adapters, and MCP readiness (read-only)")
@@ -492,6 +525,14 @@ def build_parser() -> argparse.ArgumentParser:
     tri.add_argument("--adopt-refuter", action="store_true", dest="adopt_refuter",
                      help="dismiss ONE finding by adopting its refuter "
                           "annotation as the audited reason")
+    from .control import GUARDS
+    for parser in (tri, rcancel):
+        for name in GUARDS:
+            parser.add_argument("--" + name.replace("_", "-"), default=None,
+                                help="refuse if the explicit target identity differs")
+    rcancel.add_argument("--actor", default="operator", help="audited claim, not authentication")
+    rcancel.add_argument("--reason", default="Explicit cancellation requested")
+    rcancel.add_argument("--json", action="store_true", dest="json_output")
     return p
 
 
@@ -825,6 +866,14 @@ def _cmd_review(args) -> int:
     # failure to import it is the one import failure no banner can report.
     from .trust import banner_failure
 
+    def emit_result(text, code, metadata=None, reason_code=None):
+        if getattr(args, "json", False):
+            import json
+            from .review_results import project
+            return _emit(json.dumps(project(code, metadata, reason_code=reason_code),
+                                    sort_keys=True, allow_nan=False), code)
+        return _emit(text, code)
+
     try:
         # Inside the guard: an import error here -- a partial install, a syntax
         # error introduced in `services.py`, a missing stdlib module in a
@@ -832,7 +881,7 @@ def _cmd_review(args) -> int:
         # stderr and leaves stdout without the verdict line the contract
         # promises. 2, not 4: nothing ran, so this is a refusal, not a review
         # that came back badly.
-        from .services import svc_review
+        from .services import svc_review, svc_review_detailed
         from .store import Store
     except KeyboardInterrupt:
         # Ctrl-C during the import itself: nothing ran, but that is not what
@@ -840,8 +889,8 @@ def _cmd_review(args) -> int:
         # BaseException` immediately below would otherwise give it.
         raise
     except BaseException as e:
-        return _emit(banner_failure(
-            f"could not load the review pipeline: {e!r}; no review ran"), 2)
+        return emit_result(banner_failure(
+            f"could not load the review pipeline: {e!r}; no review ran"), 2, reason_code="pipeline_unavailable")
 
     try:
         store = Store.open(_store_path())
@@ -849,7 +898,7 @@ def _cmd_review(args) -> int:
         raise
     except BaseException as e:
         # No store means no record, which is exactly what 4 says.
-        return _emit(banner_failure(f"could not open the review store: {e!r}"), 4)
+        return emit_result(banner_failure(f"could not open the review store: {e!r}"), 4, reason_code="persistence_failed")
 
     with store:
         # `svc_review` re-raises `KeyboardInterrupt` past every one of its own
@@ -860,18 +909,62 @@ def _cmd_review(args) -> int:
         # this seam has not read, and the MCP tool must be refused in the same
         # words. `getattr` because `_cmd_review` is called by name in the suite
         # with hand-built argument objects that predate the flag.
-        code, text = svc_review(
+        invoke = svc_review_detailed if getattr(args, "json", False) else svc_review
+        response = invoke(
             store, Path(args.repo),
             reviewer=getattr(args, "reviewer", None),
             client_family=getattr(args, "client_family", None),
             recover=getattr(args, "recover", False),
             max_attempts=getattr(args, "max_attempts", None),
             max_wall_seconds=getattr(args, "max_wall_seconds", None),
+            max_queue_seconds=getattr(args, "max_queue_seconds", None),
+            max_review_seconds=getattr(args, "max_review_seconds", None),
+            max_provider_wait_seconds=getattr(args, "max_provider_wait_seconds", None),
             reuse_trusted=getattr(args, "reuse_trusted", False),
             fresh=getattr(args, "fresh", False),
             batch_target_bytes=getattr(args, "batch_target_bytes", None),
-            stack_manifest=getattr(args, "stack_manifest", None))
+            batch_concurrency=getattr(args, "batch_concurrency", 1),
+            stack_manifest=getattr(args, "stack_manifest", None),
+            request_key=getattr(args, "request_key", None), request_source="cli",
+            continue_compatible=getattr(args, "continue_compatible", False))
+    code, text = response[:2]
+    return emit_result(text, code, response[2] if len(response) == 3 else None)
+
+
+def _cmd_review_plan(args) -> int:
+    from contextlib import ExitStack
+    import sqlite3
+    from .services import svc_review_plan
+    from .store import Store, SchemaLifecycleError
+    options = {key: getattr(args, key) for key in (
+        "mode", "reviewer", "client_family", "batch_target_bytes", "batch_concurrency", "target_source",
+        "target_latency_seconds", "stack_manifest", "local_ref", "local_oid",
+        "remote_ref", "remote_oid", "review_id")}
+    with ExitStack() as stack:
+        store, reason = None, None
+        try:
+            store = stack.enter_context(Store.open_readonly(_store_path()))
+        except SchemaLifecycleError as exc:
+            reason = exc.reason_code
+        except (OSError, sqlite3.Error) as exc:
+            reason = type(exc).__name__
+        code, text = svc_review_plan(store, args.repo, **options,
+            history_unavailable_reason=reason, output="json" if args.json_output else "text")
     return _emit(text, code)
+
+
+def _cmd_queue(args) -> int:
+    """Inspect a read-only store snapshot; never initialize or migrate it."""
+    from .services import svc_queue
+    from .store import Store
+    try:
+        with Store.open_readonly(_store_path()) as store:
+            code, text = svc_queue(store, args.repo, request_id=args.request_id,
+                scope=args.scope, limit=args.limit,
+                output="json" if args.json_output else "text")
+        return _emit(text, code)
+    except Exception as exc:
+        return _emit(f"skodun queue: could not open read-only store: {exc}", 2)
 
 
 def _cmd_stats(args) -> int:
@@ -880,7 +973,7 @@ def _cmd_stats(args) -> int:
     from .store import Store
 
     try:
-        store = Store.open(_store_path())
+        store = Store.open_readonly(_store_path())
     except BaseException as e:
         return _emit(f"skodun stats: could not open the store: {e!r}", 2)
     with store:
@@ -1225,6 +1318,10 @@ def _cmd_retain(args) -> int:
     when the store/config/log dir cannot be used. Partial delete errors are
     reported and still exit 2 so a schedule job notices.
     """
+    request_days = getattr(args, "request_results_days", None)
+    if request_days is not None and not 1 <= request_days <= 3650:
+        return _emit("skodun retain: request-results-days must be in 1..3650", 2)
+    request_count = 0
     try:
         from .config import load_config
         from .retention import retain_worker_logs
@@ -1251,6 +1348,12 @@ def _cmd_retain(args) -> int:
                 max_count=cfg.retention.worker_log_max_count,
                 dry_run=bool(args.dry_run),
             )
+            if request_days is not None:
+                from datetime import datetime, timedelta, timezone
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=request_days))
+                request_count = store.prune_request_results(
+                    before=cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    dry_run=bool(args.dry_run))
     except BaseException as e:
         return _emit(f"skodun retain: {e}", 2)
     mode = "dry-run" if report.dry_run else "deleted"
@@ -1260,6 +1363,9 @@ def _cmd_retain(args) -> int:
         f"  policy: max_age_days={cfg.retention.worker_log_max_age_days} "
         f"max_count={cfg.retention.worker_log_max_count}",
     ]
+    if request_days is not None:
+        lines.append(f"  request results: {mode} {request_count} "
+                     "payload(s); request identities and evidence retained")
     for p in report.candidates[:20]:
         lines.append(f"  - {p.name}")
     if len(report.candidates) > 20:
@@ -1902,22 +2008,15 @@ def _cmd_review_status(args) -> int:
     """Print one status line for a review. Service owns refusals; we own Store."""
     from .services import svc_review_status
 
-    repo = None
-    if getattr(args, "repo", None) is not None and args.review_id is None:
-        from . import gitio
-        try:
-            repo = str(gitio.git_common_dir(Path(args.repo)))
-        except BaseException as e:
-            return _emit(f"skodun review-status: could not resolve --repo: "
-                         f"{e!r}", 2)
     try:
         from .store import Store
-        store = Store.open(_store_path())
+        store = Store.open_readonly(_store_path())
     except BaseException as e:
         return _emit(f"skodun review-status: could not read the store: {e!r}", 2)
     with store:
         code, text = svc_review_status(
-            store, review_id=getattr(args, "review_id", None), repo=repo,
+            store, review_id=getattr(args, "review_id", None), repo=getattr(args, "repo", "."),
+            scope=getattr(args,"scope","worktree"), limit=getattr(args,"limit",50),
             output="json" if getattr(args, "json_output", False) else "text")
     return _emit(text, code)
 
@@ -1947,7 +2046,11 @@ def _cmd_review_cancel(args) -> int:
     except BaseException as e:
         return _emit(f"skodun review-cancel: could not read the store: {e!r}", 2)
     with store:
-        code, text = svc_review_cancel(store, args.review_id)
+        from .control import GUARDS
+        code, text = svc_review_cancel(store, args.review_id,
+            **{name:getattr(args,name,None) for name in GUARDS},
+            actor=args.actor, reason=args.reason, source="cli",
+            output="json" if args.json_output else "text")
     return _emit(text, code)
 
 
@@ -2123,12 +2226,14 @@ def _cmd_triage(args) -> int:
     except BaseException as e:
         return _emit(f"skodun triage: could not open the store: {e!r}", 2)
 
+    from .control import GUARDS
+    expected = {name:getattr(args,name,None) for name in GUARDS}
     with store:
         if args.list_only:
             code, text = svc_triage_list(store, args.review_id)
         elif args.reopen:
             code, text = svc_triage_reopen(store, args.review_id,
-                                           args.finding_index, args.reason)
+                                           args.finding_index, args.reason, **expected)
         elif args.defer:
             # THE POSITIONAL REMAPPING, in the one place it happens: under
             # `--defer` the third positional is the TRACKING REFERENCE and the
@@ -2138,13 +2243,13 @@ def _cmd_triage(args) -> int:
             code, text = svc_triage_defer(store, args.review_id,
                                           args.finding_index,
                                           args.reason,        # <tracking-ref>
-                                          args.defer_reason)  # "<reason>"
+                                          args.defer_reason, **expected)  # "<reason>"
         elif args.adopt_refuter:
             code, text = svc_adopt_refuter(store, args.review_id,
-                                           args.finding_index)
+                                           args.finding_index, **expected)
         else:
             code, text = svc_triage_dismiss(store, args.review_id,
-                                            args.finding_index, args.reason)
+                                            args.finding_index, args.reason, **expected)
     # A review with no findings lists nothing and exits 0; a blank line is not
     # an empty listing.
     return _emit(text, code) if text else code
@@ -2181,6 +2286,11 @@ def main(argv: list[str] | None = None) -> int:
             # stdout -- argparse's own message goes to stderr, and a consumer
             # reading stdout would see silence where a refusal belongs.
             from .trust import banner_failure
+            raw_args = list(sys.argv[1:] if argv is None else argv)
+            if raw_args[:1] == ['review'] and '--json' in raw_args:
+                import json
+                from .review_results import project
+                return _emit(json.dumps(project(code, reason_code='invalid_input')), code)
             return _emit(banner_failure(
                 "usage error; no review ran"), code)
         if args.command == "gate":
@@ -2203,7 +2313,15 @@ def main(argv: list[str] | None = None) -> int:
                 # to 2, and a Ctrl-C during argument parsing or a subcommand
                 # this carve-out does not name is "nothing ran", which 2
                 # already says correctly.
+                if getattr(args, 'json', False):
+                    import json
+                    from .review_results import project
+                    return _emit(json.dumps(project(130, reason_code='requested_cancel')), 130)
                 return 130
+        if args.command == "review-plan":
+            return _cmd_review_plan(args)
+        if args.command == "queue":
+            return _cmd_queue(args)
         if args.command == "stats":
             return _cmd_stats(args)
         if args.command == "review-readiness":

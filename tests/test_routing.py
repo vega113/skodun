@@ -1129,7 +1129,8 @@ def test_run_review_is_the_only_production_caller_of_head_resolution():
 
     assert sites == {"pipeline.py::<module>::def",
                      "pipeline.py::_run_review::ref",
-                     "readiness.py::check::ref"}, (
+                     "readiness.py::check::ref",
+                     "plan_preview.py::preview::ref"}, (
         "`resolve_review_head` is written somewhere new. That is not "
         "automatically wrong -- it IS a decision about which surfaces "
         "auto-route. The read-only review-readiness surface intentionally "

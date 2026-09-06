@@ -11,10 +11,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from . import (batching, budget, checklist, contextpack, gitio, passes,
+from . import (batching, budget, checklist, contextpack, gitio, passes, planning_policy,
                promptbuild, triage)
 from .trust import banner, is_trustworthy
 
@@ -31,6 +31,7 @@ class ReuseIdentity:
     checklist_hash: str | None
     tree_fingerprint: str
     security_policy_hash: str
+    planning_policy: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -125,7 +126,7 @@ def _batch_threshold(defaults, reviewer) -> int:
 
 
 def _identity_for(repo: Path, cfg, base, diff, *, branch: str,
-                  reviewer_name: str | None, candidate: dict | None = None):
+                  reviewer_name: str | None, candidate: dict | None = None, batch_concurrency=1):
     root = gitio._worktree_root(repo)
     selection = checklist.select(
         diff.files, "full", _under(root, cfg.defaults.checklist_dir),
@@ -152,6 +153,7 @@ def _identity_for(repo: Path, cfg, base, diff, *, branch: str,
         checklist_hash=checklist_hash,
         tree_fingerprint=gitio.tree_fingerprint(root, paths=diff.files),
         security_policy_hash=security_policy_identity(cfg),
+        planning_policy=planning_policy.describe(cfg.defaults, reviewer, batch_concurrency=batch_concurrency),
     )
 
 
@@ -210,6 +212,9 @@ def _candidate_matches(candidate: dict, identity: ReuseIdentity) -> bool:
         return False
     if not is_trustworthy(*axes) or candidate.get("trustworthy") is not True:
         return False
+    if identity.planning_policy is not None and planning_policy.mismatch(
+            candidate.get('planning_policy'), identity.planning_policy) is not None:
+        return False
     required = (
         "repo_id", "worktree_root", "branch", "base_sha", "diff_hash",
         "checklist_hash", "tree_fingerprint", "security_policy_hash")
@@ -245,7 +250,7 @@ def find_exact_candidate(store, identity: ReuseIdentity) -> dict | None:
 
 def probe(store, repo, *, cfg, reviewer: str | None = None,
           client_family: str | None = None,
-          intent_client_family: str | None = None) -> ReuseProbe:
+          intent_client_family: str | None = None, batch_concurrency=1) -> ReuseProbe:
     """Capture current identity, probe, then recheck the tree before returning."""
     root = gitio._worktree_root(Path(repo))
     if (gitio.is_primary_checkout(root)
@@ -262,13 +267,14 @@ def probe(store, repo, *, cfg, reviewer: str | None = None,
              if entry.enabled and entry.role == "finder"), None)
         current_reviewer = None if default is None else default.name
     identity = _identity_for(
-        root, cfg, base, diff, branch=branch, reviewer_name=current_reviewer)
+        root, cfg, base, diff, branch=branch, reviewer_name=current_reviewer, batch_concurrency=batch_concurrency)
     if diff.truncated_untracked:
         return ReuseProbe(
             None, identity, "untracked scan truncated; reuse refused")
     candidates = store.reuse_candidates(
         identity.repo_id, identity.base_sha, identity.diff_hash)
     candidate = None
+    planning_reason = None
     for raw in candidates:
         try:
             loaded = triage.load_valid_artifact(raw)
@@ -283,7 +289,9 @@ def probe(store, repo, *, cfg, reviewer: str | None = None,
             continue
         candidate_identity = _identity_for(
             root, cfg, base, diff, branch=branch,
-            reviewer_name=current_reviewer, candidate=loaded)
+            reviewer_name=current_reviewer, candidate=loaded, batch_concurrency=batch_concurrency)
+        if planning_reason is None and _candidate_matches(loaded, replace(candidate_identity, planning_policy=None)):
+            planning_reason = planning_policy.mismatch(loaded.get('planning_policy'), candidate_identity.planning_policy)
         if _candidate_matches(loaded, candidate_identity):
             identity = candidate_identity
             candidate = loaded
@@ -299,7 +307,7 @@ def probe(store, repo, *, cfg, reviewer: str | None = None,
             identity.tree_fingerprint:
         return ReuseProbe(None, identity, "tree moved during reuse probe")
     if candidate is None:
-        return ReuseProbe(None, identity, "no exact trustworthy review matched")
+        return ReuseProbe(None, identity, planning_reason or "no exact trustworthy review matched")
     return ReuseProbe(candidate, identity, "exact identity match")
 
 

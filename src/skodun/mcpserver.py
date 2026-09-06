@@ -249,6 +249,10 @@ def _review_result(status: int, text: str,
     # than inferred from the current checkout on disk.
     from .provenance import cached_provenance
 
+    from .review_results import attach
+    # Readiness shares build metadata but is not a review execution.
+    if "readiness" not in (metadata or {}):
+        _, _, metadata = attach(status, text, metadata)
     build = cached_provenance() or {}
     return HandlerResult(
         status=status,
@@ -641,6 +645,12 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
     max_attempts, refusal = _int_arg(call.params, "max_attempts", "review")
     if refusal:
         return _review_result(2, refusal)
+    budgets = {}
+    for name in ("max_queue_seconds", "max_review_seconds", "max_provider_wait_seconds"):
+        value, refusal = _float_arg(call.params, name, "review")
+        if refusal:
+            return _review_result(2, refusal)
+        budgets[name] = value
     max_wall_seconds, refusal = _float_arg(
         call.params, "max_wall_seconds", "review")
     if refusal:
@@ -656,38 +666,34 @@ def _handle_review(call: "HandlerCall") -> "HandlerResult":
         call.params, "batch_target_bytes", "review")
     if refusal:
         return _review_result(2, refusal)
-    with call.store_factory() as store:
-        if recover:
-            status, text, metadata = services.svc_review_detailed(
-                store, repo, cancel=call.cancel, reviewer=reviewer,
-                client_family=family, recover=True,
-                max_attempts=max_attempts,
-                max_wall_seconds=max_wall_seconds,
-                reuse_trusted=reuse_trusted, fresh=fresh,
-                batch_target_bytes=batch_target_bytes,
-                stack_manifest=stack_manifest,
-                reuse_client_family=(
-                    family if call.params.get("client_family") is not None
-                    else None))
-        elif reuse_trusted or fresh or stack_manifest is not None:
-            status, text, metadata = services.svc_review_detailed(
-                store, repo, cancel=call.cancel, reviewer=reviewer,
-                client_family=family, reuse_trusted=reuse_trusted,
-                fresh=fresh, batch_target_bytes=batch_target_bytes,
-                stack_manifest=stack_manifest,
-                reuse_client_family=(
-                    family if call.params.get("client_family") is not None
-                    else None))
-        else:
-            status, text = services.svc_review(
-                store, repo, cancel=call.cancel, reviewer=reviewer,
-                client_family=family, reuse_trusted=reuse_trusted,
-                fresh=fresh, batch_target_bytes=batch_target_bytes,
-                stack_manifest=stack_manifest,
-                reuse_client_family=(
-                    family if call.params.get("client_family") is not None
-                    else None))
-            metadata = {}
+    batch_concurrency, refusal = _int_arg(call.params, "batch_concurrency", "review")
+    if refusal:
+        return _review_result(2, refusal)
+    batch_concurrency = 1 if batch_concurrency is None else batch_concurrency
+    from .control import client_actor
+    continue_compatible, refusal = _bool_arg(call.params, "continue_compatible", "review")
+    if refusal:
+        return _review_result(2, refusal)
+    request_key, refusal = _opt_string_arg(call.params, "request_key", "review")
+    if refusal:
+        return _review_result(2, refusal)
+    try:
+        store = call.store_factory()
+    except Exception as exc:
+        return _review_result(
+            HANDLER_FAILURE_STATUS, _handler_failure_text("review", exc),
+            {"termination": {"reason_code": "persistence_failed"}})
+    with store:
+        status, text, metadata = services.svc_review_detailed(
+            store, repo, cancel=call.cancel, reviewer=reviewer,
+            client_family=family, recover=recover,
+            max_attempts=max_attempts, max_wall_seconds=max_wall_seconds, **budgets,
+            reuse_trusted=reuse_trusted, fresh=fresh,
+            batch_target_bytes=batch_target_bytes, batch_concurrency=batch_concurrency, stack_manifest=stack_manifest,
+            request_key=request_key, request_source="mcp", request_actor=client_actor(call.client_name),
+            continue_compatible=continue_compatible,
+            reuse_client_family=(
+                family if call.params.get("client_family") is not None else None))
     return _review_result(status, text, metadata)
 
 
@@ -809,7 +815,7 @@ def _handle_triage_dismiss(call: "HandlerCall") -> "HandlerResult":
         return HandlerResult(status=2, text=refusal)
     with call.store_factory() as store:
         status, text = services.svc_triage_dismiss(store, review_id, index,
-                                                   reason)
+                                                   reason, **_expected_control(call))
     return HandlerResult(status=status, text=text)
 
 
@@ -822,7 +828,7 @@ def _handle_adopt_refuter(call: "HandlerCall") -> "HandlerResult":
     if refusal:
         return HandlerResult(status=2, text=refusal)
     with call.store_factory() as store:
-        status, text = services.svc_adopt_refuter(store, review_id, index)
+        status, text = services.svc_adopt_refuter(store, review_id, index, **_expected_control(call))
     return HandlerResult(status=status, text=text)
 
 
@@ -839,7 +845,7 @@ def _handle_triage_reopen(call: "HandlerCall") -> "HandlerResult":
         return HandlerResult(status=2, text=refusal)
     with call.store_factory() as store:
         status, text = services.svc_triage_reopen(store, review_id, index,
-                                                  reason)
+                                                  reason, **_expected_control(call))
     return HandlerResult(status=status, text=text)
 
 
@@ -867,7 +873,7 @@ def _handle_triage_defer(call: "HandlerCall") -> "HandlerResult":
         return HandlerResult(status=2, text=refusal)
     with call.store_factory() as store:
         status, text = services.svc_triage_defer(store, review_id, index,
-                                                 tracking_ref, reason)
+                                                 tracking_ref, reason, **_expected_control(call))
     return HandlerResult(status=status, text=text)
 
 
@@ -930,30 +936,71 @@ def _handle_feedback_list(call: "HandlerCall") -> "HandlerResult":
     return HandlerResult(status=status, text=text)
 
 
-def _handle_review_status(call: "HandlerCall") -> "HandlerResult":
-    """Read-only lifecycle observation. Same service the CLI calls."""
-    from . import gitio, services
-    review_id, refusal = _opt_string_arg(call.params, "review_id",
-                                         "review_status")
+def _handle_review_plan(call: "HandlerCall") -> "HandlerResult":
+    from contextlib import ExitStack
+    import sqlite3
+    from . import services
+    from .store import Store, SchemaLifecycleError
+    from .cli import _store_path
+    repo, refusal = _repo_arg(call.params, "review_plan")
     if refusal:
         return HandlerResult(status=2, text=refusal)
-    repo_path, refusal = _repo_arg(call.params, "review_status")
-    if refusal:
-        return HandlerResult(status=2, text=refusal)
-    scope = None
-    # Only resolve repo when the caller is asking for "current for repo"
-    # (no review_id). An id alone must not require a worktree.
-    if not review_id:
+    options = {key: call.params[key] for key in (
+        "mode", "reviewer", "client_family", "batch_target_bytes", "batch_concurrency", "target_source",
+        "target_latency_seconds", "stack_manifest", "local_ref", "local_oid",
+        "remote_ref", "remote_oid", "review_id") if key in call.params}
+    factory = call.store_factory
+    if factory is default_store_factory:
+        factory = lambda: Store.open_readonly(_store_path())
+    with ExitStack() as stack:
+        store, reason = None, None
         try:
-            scope = str(gitio.git_common_dir(repo_path))
-        except BaseException as e:
-            return HandlerResult(
-                status=2,
-                text=f"skodun review-status: could not resolve repo: {e!r}")
-    with call.store_factory() as store:
-        status, text = services.svc_review_status(
-            store, review_id=review_id, repo=scope,
-            output="json" if call.params.get("output") == "json" else "text")
+            store = stack.enter_context(factory())
+        except SchemaLifecycleError as exc:
+            reason = exc.reason_code
+        except (OSError, sqlite3.Error) as exc:
+            reason = type(exc).__name__
+        status, text = services.svc_review_plan(store, repo, **options,
+            output=call.params.get("output", "text"), history_unavailable_reason=reason)
+    return HandlerResult(status=status, text=text)
+
+
+def _handle_queue(call: "HandlerCall") -> "HandlerResult":
+    """Shared request inspection; production opens a migration-free snapshot."""
+    from . import services
+    request_id, refusal = _opt_string_arg(call.params, "request_id", "queue")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    repo, refusal = _repo_arg(call.params, "queue")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    factory = call.store_factory
+    if factory is default_store_factory:
+        from .cli import _store_path
+        from .store import Store
+        factory = lambda: Store.open_readonly(_store_path())
+    with factory() as store:
+        status, text = services.svc_queue(store, repo, request_id=request_id,
+            scope=call.params.get("scope", "worktree"),
+            limit=call.params.get("limit", 50), output=call.params.get("output", "text"))
+    return HandlerResult(status=status, text=text)
+
+
+def _handle_review_status(call: "HandlerCall") -> "HandlerResult":
+    """Read local worktree status; explicit broader scopes return lists."""
+    from . import services
+    review_id, refusal = _opt_string_arg(call.params, "review_id", "review_status")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    repo, refusal = _repo_arg(call.params, "review_status")
+    if refusal:
+        return HandlerResult(status=2, text=refusal)
+    factory = (default_readonly_store_factory if call.store_factory is default_store_factory
+               else call.store_factory)
+    with factory() as store:
+        status, text = services.svc_review_status(store, review_id=review_id, repo=repo,
+            scope=call.params.get("scope","worktree"), limit=call.params.get("limit",50),
+            output=call.params.get("output","text"))
     return HandlerResult(status=status, text=text)
 
 
@@ -974,12 +1021,25 @@ def _handle_evidence(call: "HandlerCall") -> "HandlerResult":
 def _handle_review_cancel(call: "HandlerCall") -> "HandlerResult":
     """Cancel-by-id. Same service the CLI calls."""
     from . import services
+    from .control import client_actor
     review_id, refusal = _string_arg(call.params, "review_id", "review_cancel")
     if refusal:
         return HandlerResult(status=2, text=refusal)
     with call.store_factory() as store:
-        status, text = services.svc_review_cancel(store, review_id)
+        status, text = services.svc_review_cancel(store, review_id,
+            **_expected_control(call), actor=call.params.get("actor") if "actor" in call.params else client_actor(call.client_name),
+            source="mcp", reason=call.params.get("reason","Explicit cancellation requested"),
+            output=call.params.get("output","text"))
     return HandlerResult(status=status, text=text)
+
+
+def _expected_control(call):
+    from .control import GUARDS
+    return {name:call.params.get(name) for name in GUARDS}
+
+
+_CONTROL_PROPERTIES = {name: {"type":"string", "description":"Expected target identity; mismatch refuses before mutation"}
+    for name in ("expected_request_id","expected_worktree","expected_head","expected_diff_hash")}
 
 
 def default_registry() -> tuple[HandlerSpec, ...]:
@@ -1064,10 +1124,30 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                     "type": "integer", "minimum": 1, "maximum": 8,
                     "description": "maximum recovery attempts including the "
                                    "first (default 3)"},
+                "continue_compatible": {
+                    "type": "boolean",
+                    "description": "Continue usable exact batch checkpoints and retry failed/dependent work.",
+                },
+                "request_key": {
+                    "type": "string",
+                    "description": "Idempotency key for this exact worktree request.",
+                },
+                "max_queue_seconds": {
+                    "type": "number", "exclusiveMinimum": 0, "maximum": 86400,
+                    "description": "Cumulative foreground admission budget; excludes model runtime.",
+                },
+                "max_review_seconds": {
+                    "type": "number", "exclusiveMinimum": 0, "maximum": 86400,
+                    "description": "Budget from first provider launch; pauses during foreground requeue.",
+                },
+                "max_provider_wait_seconds": {
+                    "type": "number", "minimum": 0, "maximum": 86400,
+                    "description": "Admission wait per pass, shared across fallbacks; runtime excluded.",
+                },
                 "max_wall_seconds": {
                     "type": "number", "exclusiveMinimum": 0,
-                    "description": "maximum recovery wall-clock budget in "
-                                   "seconds (default 900; maximum 86400)"},
+                    "description": "total execution budget including all queues in "
+                                   "seconds (recovery default 900; otherwise optional; maximum 86400)"},
                 "reuse_trusted": {
                     "type": "boolean",
                     "description": "opt into reuse of an exact trustworthy "
@@ -1078,6 +1158,7 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                     "description": "run wholly fresh, bypassing trusted reuse "
                                    "and incomplete batch checkpoints; useful "
                                    "for a second opinion"},
+                "batch_concurrency": {"type": "integer", "enum": [1, 2], "description": "Foreground independent batch workers; defaults to sequential 1."},
                 "batch_target_bytes": {
                     "type": "integer", "minimum": 0,
                     "description": "optional non-negative deterministic "
@@ -1157,7 +1238,7 @@ def default_registry() -> tuple[HandlerSpec, ...]:
         HandlerSpec(
             name="triage_dismiss", long_running=False,
             input_schema=_schema(
-                {**_REVIEW_ID_PROPERTY, **_INDEX_PROPERTY, **_REASON_PROPERTY},
+                {**_REVIEW_ID_PROPERTY, **_INDEX_PROPERTY, **_REASON_PROPERTY, **_CONTROL_PROPERTIES},
                 ("review_id", "index", "reason")),
             handler=_handle_triage_dismiss,
             description="Dismiss ONE finding with an audited reason, which is "
@@ -1169,7 +1250,7 @@ def default_registry() -> tuple[HandlerSpec, ...]:
         HandlerSpec(
             name="adopt_refuter", long_running=False,
             input_schema=_schema(
-                {**_REVIEW_ID_PROPERTY, **_INDEX_PROPERTY},
+                {**_REVIEW_ID_PROPERTY, **_INDEX_PROPERTY, **_CONTROL_PROPERTIES},
                 ("review_id", "index")),
             handler=_handle_adopt_refuter,
             description="Dismiss ONE finding by adopting its refuter "
@@ -1181,7 +1262,7 @@ def default_registry() -> tuple[HandlerSpec, ...]:
         HandlerSpec(
             name="triage_reopen", long_running=False,
             input_schema=_schema(
-                {**_REVIEW_ID_PROPERTY, **_INDEX_PROPERTY, **_REASON_PROPERTY},
+                {**_REVIEW_ID_PROPERTY, **_INDEX_PROPERTY, **_REASON_PROPERTY, **_CONTROL_PROPERTIES},
                 ("review_id", "index", "reason")),
             handler=_handle_triage_reopen,
             description="Reopen ONE previously dismissed or deferred finding, "
@@ -1194,7 +1275,7 @@ def default_registry() -> tuple[HandlerSpec, ...]:
             name="triage_defer", long_running=False,
             input_schema=_schema(
                 {**_REVIEW_ID_PROPERTY, **_INDEX_PROPERTY,
-                 **_TRACKING_REF_PROPERTY, **_REASON_PROPERTY},
+                 **_TRACKING_REF_PROPERTY, **_REASON_PROPERTY, **_CONTROL_PROPERTIES},
                 ("review_id", "index", "tracking_ref", "reason")),
             handler=_handle_triage_defer,
             description="Defer ONE finding to a FILED tracking reference: the "
@@ -1217,11 +1298,12 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                 **_REPO_PROPERTY,
                 "review_id": {
                     "type": "string",
-                    "description": "id of the review to inspect; when omitted, "
-                                   "reports the current review for `repo` "
-                                   "(newest running, else newest terminal)"},
+                    "description": "Explicit request/review ID, or unambiguous caller-worktree activity; "
+                                   "repository and host scopes return identifiable lists"},
                 "output": {"type": "string", "enum": ["text", "json"],
                            "description": "status representation (default text)"},
+                "scope":{"type":"string","enum":["worktree","repository","host"],"description":"Default local worktree; broader scopes list entries"},
+                "limit":{"type":"integer","minimum":1,"maximum":100,"description":"Maximum identifiable entries"},
             }),
             handler=_handle_review_status,
             description="Observe a review's lifecycle state without gating. "
@@ -1231,12 +1313,14 @@ def default_registry() -> tuple[HandlerSpec, ...]:
                         "gate — use `gate` for coverage of the current change."),
         HandlerSpec(
             name="review_cancel", long_running=False,
-            input_schema=_schema(_REVIEW_ID_PROPERTY, ("review_id",)),
+            input_schema=_schema({**_REVIEW_ID_PROPERTY, **_CONTROL_PROPERTIES,
+                "actor":{"type":"string","description":"Audited claim, not authentication"},
+                "reason":{"type":"string","description":"Reason for explicit cancellation"}, "output":{"type":"string","enum":["text","json"],"description":"Cancellation representation"}}, ("review_id",)),
             handler=_handle_review_cancel,
-            description="Cancel an in-flight review by id: sets the cancel "
-                        "token when this process holds it, signals a confirmed "
-                        "worker/FG process, and leaves a durable untrustworthy "
-                        "terminal when the holder is gone. Same words as "
+            description="Audit cancellation of an explicit request/review ID. Request owners "
+                        "observe an execution-fenced event; legacy targets require an exact "
+                        "local token or background-worker proof. Generic live foreground "
+                        "PIDs are refused. Same words as "
                         "`skodun review-cancel`. Refuses missing ids and "
                         "already-terminal rows."),
         # Non-gate feedback: agent/human judgment + product bugs. Appended
@@ -1305,6 +1389,44 @@ def default_registry() -> tuple[HandlerSpec, ...]:
             description="Read bounded advisory repository-evidence receipts. "
                         "Receipts never alter gate or trust; JSON matches the "
                         "CLI `skodun evidence --json` projection."),
+        HandlerSpec(
+            name="queue", long_running=False,
+            input_schema=_schema({
+                **_REPO_PROPERTY,
+                "request_id": {"type": "string", "description": "Explicit request identity to inspect."},
+                "scope": {"type": "string", "enum": ["worktree", "repository", "host"],
+                          "description": "Request selection scope; defaults to the current worktree."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100,
+                          "description": "Maximum requests to inspect (default 50)."},
+                "output": {"type": "string", "enum": ["text", "json"],
+                           "description": "Inspection representation; defaults to text."},
+            }), handler=_handle_queue,
+            description="Inspect request ownership, queues and observed costs. Same text/JSON as "
+                        "skodun queue. Historical waits are observations, not predictions. "
+                        "Missing usage is unknown. Read-only; no provider calls or migrations."),
+        HandlerSpec(
+            name="review_plan", long_running=False,
+            input_schema=_schema({
+                **_REPO_PROPERTY,
+                "mode": {"type": "string", "enum": ["now", "prepush"], "description": "Execution scope to preview; defaults to now."},
+                "reviewer": {"type": "string", "description": "Explicit foreground reviewer intent."},
+                "client_family": {"type": "string", "description": "Client family used by existing foreground routing."},
+                "batch_concurrency": {"type": "integer", "enum": [1, 2], "description": "Foreground independent batch workers; defaults to sequential 1."},
+                "batch_target_bytes": {"type": "integer", "minimum": 0, "maximum": 10000000, "description": "Explicit fixed diff-byte target; overrides measured suggestions."},
+                "target_source": {"type": "string", "enum": ["configured", "measured"], "description": "Configured target or opt-in measured recommendation."},
+                "target_latency_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 86400, "description": "Declared per-call goal required for measured selection."},
+                "stack_manifest": {"type": "string", "description": "Foreground stack annotation manifest path; never overrides the selected base."},
+                "local_ref": {"type": "string", "description": "Pushed local ref for prepush preview."},
+                "local_oid": {"type": "string", "description": "Pushed local object ID for prepush preview."},
+                "remote_ref": {"type": "string", "description": "Remote ref for prepush preview."},
+                "remote_oid": {"type": "string", "description": "Remote object ID, including zero for a new branch."},
+                "review_id": {"type": "string", "description": "Historical prepush record whose stored scope is being explained."},
+                "output": {"type": "string", "enum": ["text", "json"], "description": "Representation of the same plan; defaults to text."},
+            }), handler=_handle_review_plan,
+            description="Preview the shipped review planner without provider calls or store writes. "
+                        "Reports actual base, full diff, per-call/aggregate bytes and conditional paths. "
+                        "Measured targets need sufficient uncensored history and an explicit latency goal; "
+                        "returned fixed targets are application suggestions, not runtime adaptation."),
     )
 
 
@@ -1385,6 +1507,13 @@ def default_prompts() -> tuple[PromptSpec, ...]:
                                "covers this change, and explain the answer",
                    text=_GATE_CHECK_TEXT),
     )
+
+
+def default_readonly_store_factory():
+    """Observe an existing current-schema store without recovery/migration."""
+    from .cli import _store_path
+    from .store import Store
+    return Store.open_readonly(_store_path())
 
 
 def default_store_factory():
@@ -1617,6 +1746,7 @@ class McpServer:
         import signal
 
         from . import pipeline
+        from .request_cancel import mark_event
 
         # Resolved HERE, not in the handler: `fileno()` on a wrapped stream can
         # take that stream's lock, which is the one thing the handler must not
@@ -1631,7 +1761,7 @@ class McpServer:
             cancelled = 0
             cancel = self._worker_cancel
             if cancel is not None:
-                cancel.set()
+                mark_event(cancel, "signal")
                 cancelled += 1
             try:
                 cancelled += pipeline.request_cancel_all()
@@ -2006,7 +2136,8 @@ class McpServer:
                                             f"{name}")
         if spec.long_running:
             if not self._start_long_running(spec, arguments, id_):
-                busy = (_review_result(BUSY_STATUS, BUSY_TEXT)
+                busy = (_review_result(BUSY_STATUS, BUSY_TEXT,
+                        {"termination": {"reason_code": "mcp_busy", "retryable": True}})
                         if spec.name == "review" else
                         HandlerResult(status=BUSY_STATUS, text=BUSY_TEXT,
                                       pending_acks=[]))
@@ -2050,7 +2181,8 @@ class McpServer:
             self._note(f"the {spec.name} tool raised: {e!r}")
             if spec.name == "review":
                 return _review_result(
-                    HANDLER_FAILURE_STATUS, _handler_failure_text(spec.name, e))
+                    HANDLER_FAILURE_STATUS, _handler_failure_text(spec.name, e),
+                    {"termination": {"reason_code": "handler_failed"}})
             return HandlerResult(
                 status=HANDLER_FAILURE_STATUS,
                 text=_handler_failure_text(spec.name, e), pending_acks=[])
@@ -2326,7 +2458,8 @@ class McpServer:
                 self._note(
                     "disconnect policy=cancel; cancelling in-flight review "
                     "before exit")
-                cancel.set()
+                from .request_cancel import mark_event
+                mark_event(cancel, "disconnect")
             if _join_all(timeout=post_cancel_join_sec(), label="cancel wait"):
                 _demote_orphaned_running_rows()
             return 0
@@ -2358,7 +2491,8 @@ class McpServer:
             self._note(
                 "drain timed out; cancelling in-flight review so the "
                 "MCP process can exit")
-            cancel.set()
+            from .request_cancel import mark_event
+            mark_event(cancel, "disconnect_deadline")
             if _join_all(
                     timeout=post_cancel_join_sec(), label="post-cancel wait"):
                 _demote_orphaned_running_rows()

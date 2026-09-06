@@ -82,12 +82,12 @@ class PassIdentity:
     boundary_hash: str
 
     def __post_init__(self) -> None:
-        if self.kind not in ("batch", "integration"):
+        if self.kind not in ("batch", "integration", "security", "skeptic"):
             raise ValueError(f"unknown checkpoint pass kind {self.kind!r}")
         minimum = 1 if self.kind == "batch" else 0
         _plain_int("pass index", self.index, minimum=minimum)
-        if self.kind == "integration" and self.index != 0:
-            raise ValueError("integration pass index must be 0")
+        if self.kind != "batch" and self.index != 0:
+            raise ValueError("non-batch pass index must be 0")
         if self.kind == "batch" and self.prompt_hash is None:
             raise ValueError("a batch prompt_hash is required")
         _text("prompt_hash", self.prompt_hash, optional=True)
@@ -98,8 +98,8 @@ class PassIdentity:
 _IDENTITY_FIELDS = (
     "repo_id", "worktree_root", "branch", "head", "base_ref", "base_sha",
     "diff_hash", "tree_fingerprint", "context_hash", "checklist_hash",
-    "reviewer_hash", "config_hash", "policy_hash", "planner_version",
-    "batch_budget", "batch_count", "boundary_digest",
+    "reviewer_hash", "planning_policy", "batch_budget", "config_hash", "policy_hash", "planner_version",
+    "batch_count", "boundary_digest",
     "integration_plan_digest", "pass_identities",
 )
 
@@ -127,6 +127,8 @@ class OrchestrationIdentity:
     boundary_digest: str
     integration_plan_digest: str
     pass_identities: tuple[PassIdentity, ...]
+    continuation_source: str | None = None
+    planning_policy: dict | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -135,6 +137,9 @@ class OrchestrationIdentity:
                 "config_hash", "policy_hash", "planner_version",
                 "boundary_digest", "integration_plan_digest"):
             _text(name, getattr(self, name))
+        from .planning_policy import validate as validate_planning_policy
+        validate_planning_policy(self.planning_policy)
+        _text("continuation_source", self.continuation_source, optional=True)
         _text("context_hash", self.context_hash, optional=True)
         _text("checklist_hash", self.checklist_hash, optional=True)
         _plain_int("batch_budget", self.batch_budget, minimum=1)
@@ -146,7 +151,12 @@ class OrchestrationIdentity:
             raise ValueError("pass_identities must be a non-empty tuple of PassIdentity")
 
     def canonical_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True,
+        fields = asdict(self)
+        if self.continuation_source is None:
+            fields.pop('continuation_source')  # Preserve existing identity bytes.
+        if self.planning_policy is None:
+            fields.pop('planning_policy')  # Unknown legacy plans keep their bytes.
+        return json.dumps(fields, ensure_ascii=False, sort_keys=True,
                           separators=(",", ":"), allow_nan=False)
 
     def digest(self) -> str:
@@ -156,11 +166,14 @@ class OrchestrationIdentity:
     def from_json(cls, text: str) -> "OrchestrationIdentity":
         try:
             raw = json.loads(text)
-        except (TypeError, json.JSONDecodeError) as exc:
+        except (TypeError, json.JSONDecodeError, RecursionError) as exc:
             raise ValueError(f"invalid orchestration identity JSON: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("orchestration identity JSON must be an object")
+        raw.setdefault("planning_policy", None)
         expected = set(_IDENTITY_FIELDS)
+        if 'continuation_source' in raw:
+            expected.add('continuation_source')
         if set(raw) != expected:
             raise ValueError(
                 "orchestration identity fields differ: "
@@ -169,20 +182,33 @@ class OrchestrationIdentity:
         passes = raw.pop("pass_identities")
         if not isinstance(passes, list):
             raise ValueError("pass_identities must be an array")
-        raw["pass_identities"] = tuple(
-            PassIdentity(**value) if isinstance(value, dict) else value
-            for value in passes)
-        return cls(**raw)
+        try:
+            raw["pass_identities"] = tuple(
+                PassIdentity(**value) if isinstance(value, dict) else value
+                for value in passes)
+            return cls(**raw)
+        except TypeError as exc:
+            raise ValueError(f"invalid orchestration identity fields: {exc}") from exc
 
 
 def first_mismatch(left: OrchestrationIdentity,
                    right: OrchestrationIdentity) -> str | None:
-    """Return the first exact identity field that differs, in stable order."""
+    """Return the first exact content field that differs, in stable order.
+
+    continuation_source namespaces generation ownership and is included in the
+    digest, but is not content compatibility. Only the explicit owned fork path
+    may seed a different generation after every field below matches.
+    """
     if not isinstance(left, OrchestrationIdentity) \
             or not isinstance(right, OrchestrationIdentity):
         raise ValueError("first_mismatch requires two OrchestrationIdentity values")
     for field in _IDENTITY_FIELDS:
         if getattr(left, field) != getattr(right, field):
+            if field == "planning_policy":
+                from .planning_policy import mismatch
+                if right.planning_policy is None:
+                    return "planning_identity_missing"
+                return mismatch(left.planning_policy, right.planning_policy)
             return field
     return None
 
@@ -365,3 +391,11 @@ def sub_fields_from_payload(payload: CheckpointPayload) -> dict[str, Any]:
     if not isinstance(payload, CheckpointPayload):
         raise ValueError("payload must be a CheckpointPayload")
     return CheckpointPayload.from_mapping(payload.as_dict()).as_dict()
+
+
+
+def usable_payload(payload: CheckpointPayload) -> bool:
+    """Only validated, parsed, complete and non-degraded evidence is reusable."""
+    value = sub_fields_from_payload(payload)
+    return (value['parse_ok'] is True and value['degraded'] is False
+            and value['diff_truncated'] is False and not value['failure_reason'])

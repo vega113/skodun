@@ -33,7 +33,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from . import ids
+from . import ids, budgets
 
 if TYPE_CHECKING:
     import threading
@@ -107,6 +107,8 @@ class WaiterView:
     id: str
     status: str
     queued_at: str
+    # SQLite rowid supplied by Store; no new ID/schema or cross-maintenance promise.
+    enqueue_order: int | None = None
 
 
 @dataclass
@@ -257,12 +259,22 @@ def wait_eta_p50_ms(samples: Sequence[int], *, min_samples: int = ETA_MIN_SAMPLE
 
 
 def format_wait_progress(resource_class: str, position: int, remaining_sec: float,
-                         *, eta_sec: float | None = None) -> str:
-    """One progress line: position, wait budget, optional ETA."""
+                         *, eta_sec: float | None = None,
+                         historical_median_sec: float | None = None,
+                         sample_count: int | None = None) -> str:
+    """Observed queue position and history, never a wait-time prediction.
+
+    ``eta_sec`` is a compatibility input only; output always labels history.
+    """
+    median = historical_median_sec if historical_median_sec is not None else eta_sec
     msg = (f"{resource_class} queue position {position}; "
            f"wait budget {max(remaining_sec, 0.0):g}s remaining")
-    if eta_sec is not None and eta_sec >= 0:
-        msg += f"; eta≈{int(eta_sec)}s"
+    if median is not None or sample_count is not None:
+        shown = f"{median:g}s" if median is not None and median >= 0 else "unknown"
+        count = str(sample_count) if type(sample_count) is int and sample_count >= 0 else "unknown"
+        msg += (f"; historical median wait={shown}; samples={count}; "
+                f"window=latest-{ETA_SAMPLE_K}-terminal-admissions; "
+                "unit=s; denominator=terminal-admissions; method=median")
     return msg
 
 
@@ -288,7 +300,8 @@ def decide_admit(waiter_id: str, waiters: Sequence[WaiterView],
     """Pure FIFO admit rule.
 
     Eligible only when holders are under capacity and ``waiter_id`` is the
-    earliest ``queued`` row by ``(queued_at, id)``.
+    earliest ``queued`` row by timestamp and the current SQLite insertion tie-break.
+    Legacy pure views without insertion order retain the ID tie-break.
     """
     if capacity < 1:
         return False
@@ -297,15 +310,15 @@ def decide_admit(waiter_id: str, waiters: Sequence[WaiterView],
         return False
     queued = sorted(
         (w for w in waiters if w.status == STATUS_QUEUED),
-        key=lambda w: (w.queued_at, w.id),
+        key=lambda w: (w.queued_at, w.enqueue_order or 0, w.id),
     )
     return bool(queued) and queued[0].id == waiter_id
 
 
 def queue_position_among(waiter_id: str,
                          waiters: Sequence[WaiterView]) -> int | None:
-    """1-based position among active waiters ordered by ``(queued_at, id)``."""
-    ordered = sorted(waiters, key=lambda w: (w.queued_at, w.id))
+    """1-based position using the same SQLite insertion tie-break as admission."""
+    ordered = sorted(waiters, key=lambda w: (w.queued_at, w.enqueue_order or 0, w.id))
     for i, w in enumerate(ordered, start=1):
         if w.id == waiter_id:
             return i
@@ -432,6 +445,12 @@ def enqueue(store: "Store", *, scope: str,
         pid=os.getpid() if pid is None else pid,
     )
     ticket = _ticket_from_row(row)
+    from .requests import link_capacity
+    try:
+        link_capacity(store, aid, resource_class)
+    except BaseException:
+        finish(store, ticket, status=STATUS_REJECTED, expire_reason="request_link_failed")
+        raise
     ticket.position = store.capacity_position(aid)
     return ticket
 
@@ -529,6 +548,7 @@ def acquire(store: "Store", *, scope: str,
     noted_pos: int | None = None
     # Always allow one attempt even when wait_sec is 0 (tests + free path).
     attempted = False
+    observed_cap = None
 
     try:
         while True:
@@ -554,18 +574,24 @@ def acquire(store: "Store", *, scope: str,
 
             pos = store.capacity_position(ticket.id)
             ticket.position = pos
-            if on_progress is not None and pos is not None and pos != noted_pos:
-                noted_pos = pos
-                eta = _eta_seconds(store, resource_class, scope)
-                on_progress(format_wait_progress(
-                    resource_class, pos, max(remaining, 0.0), eta_sec=eta))
 
             attempted = True
             cap = _resolve_capacity(capacity, capacity_fn)
+            if cap != observed_cap:
+                budgets.record_capacity(store, ticket, cap, configured=capacity,
+                                        legacy=False if resource_class == RESOURCE_REVIEW_FG else None)
+                observed_cap = cap
             try_admit(store, ticket, capacity=cap)
             if ticket.status in HOLDER_STATUSES:
                 mark_started(store, ticket)
                 return ticket
+
+            if on_progress is not None and pos is not None and pos != noted_pos:
+                noted_pos = pos
+                median, count = _historical_wait(store, resource_class, scope)
+                on_progress(format_wait_progress(
+                    resource_class, pos, max(remaining, 0.0),
+                    historical_median_sec=median, sample_count=count))
 
             remaining = deadline - now()
             if remaining <= 0:
@@ -586,18 +612,22 @@ def acquire(store: "Store", *, scope: str,
         raise
 
 
-def _eta_seconds(store: "Store", resource_class: str, scope: str) -> float | None:
+def _historical_wait(store: "Store", resource_class: str, scope: str) -> tuple[float | None, int]:
     try:
-        samples = store.capacity_terminal_wait_ms(
-            resource_class, scope, limit=ETA_SAMPLE_K)
+        samples = store.capacity_terminal_wait_ms(resource_class, scope, limit=ETA_SAMPLE_K)
     except Exception:
-        return None
+        return None, 0
+    samples = [x for x in samples[:ETA_SAMPLE_K] if type(x) is int and x >= 0]
     ms = wait_eta_p50_ms(samples)
-    if ms is None:
-        return None
-    return ms / 1000.0
+    return (ms / 1000.0 if ms is not None else None), len(samples)
 
 
+def _eta_seconds(store: "Store", resource_class: str, scope: str) -> float | None:
+    """Compatibility read helper; its value is historical, not predictive."""
+    return _historical_wait(store, resource_class, scope)[0]
+
+
+@budgets.foreground_wait
 def acquire_for_fg(
         store: "Store", *, scope: str,
         capacity: int | None = None,
@@ -687,6 +717,7 @@ def _acquire_repo_fg(
     attempted = False
 
     try:
+        budgets.record_capacity(store, ticket, min(cap, 1), configured=cap, legacy=True)
         while True:
             if _cancelled(cancel):
                 finish(store, ticket, status=STATUS_REJECTED,
@@ -709,11 +740,6 @@ def _acquire_repo_fg(
 
             pos = store.capacity_position(ticket.id)
             ticket.position = pos
-            if on_progress is not None and pos is not None and pos != noted_pos:
-                noted_pos = pos
-                eta = _eta_seconds(store, RESOURCE_REVIEW_FG, scope)
-                on_progress(format_wait_progress(
-                    RESOURCE_REVIEW_FG, pos, max(remaining, 0.0), eta_sec=eta))
 
             attempted = True
             active = store.capacity_active_views(RESOURCE_REVIEW_FG, scope)
@@ -731,6 +757,13 @@ def _acquire_repo_fg(
                     _apply_row(ticket, row)
                     mark_started(store, ticket)
                     return ticket
+
+            if on_progress is not None and pos is not None and pos != noted_pos:
+                noted_pos = pos
+                median, count = _historical_wait(store, RESOURCE_REVIEW_FG, scope)
+                on_progress(format_wait_progress(
+                    RESOURCE_REVIEW_FG, pos, max(remaining, 0.0),
+                    historical_median_sec=median, sample_count=count))
 
             remaining = deadline - now()
             if remaining <= 0:

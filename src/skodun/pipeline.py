@@ -166,6 +166,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+from . import followups
 from . import (batching, budget, capacity, chain, checklist, checkpoints,
                contextpack, gitio, ids, passes, promptbuild, provenance, reuse,
                routing, runner, stack, telemetry)
@@ -1135,6 +1136,9 @@ def resolve_review_head(cfg: Config, store: Store, *,
     through the store, and a policy that lived in one of them would be a policy
     the others do not have.
 
+    Read-only readiness and review-plan also use this foreground selection
+    policy to explain the same current route without launching a provider.
+
     Three paths, in priority order:
 
     * **Pinned.** A `reviewer` name is absolute in every mode. It is not scored,
@@ -1299,6 +1303,8 @@ def run_review(repo: Path, cfg: Config, store: Store, mode: str = "now",
       availability alone. It is a HINT worth one tie-break, never a filter: see
       `routing.pick_finder`.
     """
+    if isinstance(mode, str):
+        mode = mode.strip()
     repo = Path(repo)
     d = cfg.defaults
     if progress_sink is not None:
@@ -1432,7 +1438,9 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     # the ceiling is re-derived there from the LARGER of the two plans.
     width = max_chain_width(cfg)
     estimate = _estimate_batch_count(repo, d, finder)
-    ceiling = float(budget.lock_stale_ceiling(d, width, estimate))
+    from . import budgets
+    ceiling = float(budget.lock_stale_ceiling(d, width, estimate) +
+                    budgets.provider_wait_overhead(estimate, extra_passes=2))
     stale = lock_stale if lock_stale is not None else _env_seconds(
         "SKODUN_LOCK_STALE_SECONDS", ceiling)
     wait = lock_wait if lock_wait is not None else _env_seconds(
@@ -1463,9 +1471,6 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     common_dir = gitio.git_common_dir(repo)
     scope = str(common_dir)
     admission_wait = capacity.admission_wait_from_env(wait)
-    # Shared admit+bind wall-clock deadline: review-fg wait + provider waits
-    # and hops consume the same budget (S4). Not reset per hop or phase.
-    admission_deadline = time.monotonic() + float(admission_wait)
     machine_n = capacity.resolved_machine_capacity(cfg)
     cap_n = capacity.resolved_fg_capacity(cfg)
     dual_hold = capacity.legacy_fg_lock_from_env()
@@ -1580,6 +1585,11 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         branch = gitio.current_branch(repo)
         head = gitio.head_sha(repo)
         tree_fingerprint = gitio.tree_fingerprint(repo, paths=diff.files)
+        from .requests import validate_admitted
+        validate_admitted(
+            store, repo_id=scope, worktree_root=str(root.resolve()),
+            branch=branch, head=head, base_sha=base.sha, diff_hash=diff_hash,
+            tree_fingerprint=tree_fingerprint, cfg=cfg)
         stack_validation = None
         stack_prompt_context = b""
         stack_prompt_truncated = False
@@ -1600,6 +1610,13 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         # lowered: the only thing riding on that number is a peer not reclaiming
         # a lock whose holder is still running.
         plan = batch_plan(diff.data, d, finder)
+        from .requests import current
+        request_context = current()
+        if (request_context is not None and request_context.store is store and
+                request_context.continue_compatible and plan is None):
+            from .continuation import refuse
+            refuse('continuation_plan_mismatch', 'Compatible continuation requires the existing batch plan.',
+                   first_mismatch='batch_plan')
         planned = 0 if plan is None else len(plan)
         # Republished UNCONDITIONALLY from the authoritative plan, and
         # `_grow_budget` is what makes that safe: it never lowers the value. Not
@@ -1610,7 +1627,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
         # about how long a WAITER will wait. Two runs with the same plan must
         # publish the same budget whether or not their pre-lock estimate happened
         # to guess it.
-        needs = float(budget.lock_stale_ceiling(d, width, planned))
+        needs = float(budget.lock_stale_ceiling(d, width, planned) +
+                      budgets.provider_wait_overhead(planned, extra_passes=2))
         if _grow_lock_budget(lock, needs) and planned > estimate:
             _note(f"this diff needs {planned} batch(es); the lock's published "
                   f"budget is now {int(needs)}s")
@@ -1626,13 +1644,25 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     gitio.canonical_repository_identity(root) or "unknown")
             except Exception:
                 lineage_repository_id = "unknown"
+        lineage_context_cutoff = review_started_at
+        if request_context is not None and request_context.store is store and request_context.continue_compatible:
+            source = store.find_resume_candidate(scope, str(root), branch, include_consumed=True)
+            if source is not None:
+                lineage_context_cutoff = (store.continuation_lineage_cutoff(request_context.id, source['id'])
+                                          or review_started_at)
+        lineage_context_diagnostics: dict = {}
         lineage_prompt_context, lineage_prompt_truncated = _lineage_prompt_context(
-            store, lineage_repository_id, before=review_started_at)
+            store, lineage_repository_id, before=lineage_context_cutoff,
+            changed_paths=diff.files, owner_ids=_lineage_owner_ids(stack_validation),
+            diagnostics=lineage_context_diagnostics)
         evidence_prompt_context = _evidence_prompt_context(
             store, root, base.sha, head, diff_hash)
+        from .planning_policy import describe as planning_description
         common = dict(
+            planning_policy=planning_description(d, finder, batch_concurrency=request_context.batch_concurrency if request_context is not None and request_context.store is store else 1),
             id=rid, reviewed_at=review_started_at,
             review_started_at=review_started_at,
+            lineage_context_cutoff=lineage_context_cutoff,
             source="skodun",
             branch=branch, head=head, base_ref=base.ref, base_sha=base.sha,
             diff_hash=diff_hash, mode=mode, model=finder.model,
@@ -1673,7 +1703,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             # `recover_stale` never has to recompute it from a config that may
             # since have changed — and never sweeps a live multi-batch run at
             # the single-review ceiling.
-            worst_runtime_sec=budget.worst_runtime(d, width, planned),
+            worst_runtime_sec=(budget.worst_runtime(d, width, planned) +
+                               budgets.provider_wait_overhead(planned)),
             # WHICH TREE this record is about. The shared git dir, so a repo
             # and all of its linked worktrees agree on one value -- and so a
             # scoped reader cannot tell two checkouts of the same repository
@@ -1684,6 +1715,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
             stack_context_bytes=len(stack_prompt_context),
             stack_context_truncated=stack_prompt_truncated,
             lineage_context_bytes=len(lineage_prompt_context),
+            lineage_context_diagnostics=lineage_context_diagnostics,
             lineage_context_truncated=lineage_prompt_truncated,
             worktree_root=str(root),
             # Process identity for cancel-by-id (S1). Background workers already
@@ -1817,7 +1849,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     resume=resume_checkpoints)
                 rec["batch_orchestration_id"] = \
                     checkpoint_run.orchestration_id
-                rec["batch_identity_digest"] = checkpoint_identity.digest()
+                rec["batch_identity_digest"] = checkpoint_run.identity.digest()
                 # Persisted `running` BEFORE the first model call and already
                 # carrying its BATCHED `worst_runtime_sec`: that is the only
                 # moment at which `recover_stale` can learn not to sweep this row
@@ -1838,7 +1870,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     evidence_context=evidence_prompt_context,
                     prepared_plan=prepared_plan,
                     checkpoint_run=checkpoint_run)
-                answering_provider = _answering_provider(rec, finder)
+                contributing_providers = _contributing_providers(rec)
             else:
                 # --- 6b. UNBATCHED: checklist -> context pack -> prompt ----
                 selection = checklist.select(
@@ -1867,27 +1899,10 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                           f"exceeds the {checklist.BUDGET}-byte budget after "
                           f"eviction; only undroppable sections remain")
 
-                pack = None
-                pack_body = None
-                if d.context_pack:
-                    headroom = promptbuild.context_headroom(
-                        mdb, len(diff.data), packing=True)
-                    # `pack_large_added=False`: this is the SINGLE-SHOT path, so
-                    # the diff already carries every added file whole. Packing a
-                    # large one again would spend headroom saying the same thing
-                    # twice -- and since selection is size-descending it would be
-                    # packed FIRST, crowding out the modified files whose current
-                    # contents only the packer can show. (When the diff is
-                    # truncated the copy in the prompt is incomplete, but a
-                    # truncated diff is never trustworthy anyway, so no trust
-                    # decision rides on that case.)
-                    pack = contextpack.pack(root, diff.files, diff.statuses,
-                                            headroom, pack_large_added=False)
-                    pack_body = pack.body
-
-                prompt = promptbuild.build(
-                    branch, base.ref, base.sha, f"{head} (working tree)",
-                    diff.data, mdb, selection, pack_body,
+                pack, prompt = _prepare_single_prompt(
+                    diff, d=d, root=root, finder=finder, selection=selection,
+                    branch=branch, base_ref=base.ref, base_sha=base.sha,
+                    head_label=f"{head} (working tree)",
                     stack_context=stack_prompt_context,
                     stack_context_truncated=stack_prompt_truncated,
                     lineage_context=lineage_prompt_context,
@@ -1920,7 +1935,6 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                                 f"routing: keeping {finder.name}; {candidate.name} "
                                 "requires a different batch plan")
                         else:
-                            previous_mdb = mdb
                             finder = candidate
                             mdb = candidate_mdb
                             route_meta = {
@@ -1935,21 +1949,11 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                             adapter = _adapter_for(finder)
                             common.pop("quota_pool", None)
                             common.update(model=finder.model, adapter=adapter.name,
-                                          **route_meta)
-                            if candidate_mdb != previous_mdb:
-                                pack = None
-                                pack_body = None
-                                if d.context_pack:
-                                    headroom = promptbuild.context_headroom(
-                                        mdb, len(diff.data), packing=True)
-                                    pack = contextpack.pack(
-                                        root, diff.files, diff.statuses,
-                                        headroom, pack_large_added=False)
-                                    pack_body = pack.body
-                            prompt = promptbuild.build(
-                                branch, base.ref,
-                                base.sha, f"{head} (working tree)",
-                                diff.data, mdb, selection, pack_body,
+                                          planning_policy=planning_description(d, finder, batch_concurrency=request_context.batch_concurrency if request_context is not None and request_context.store is store else 1), **route_meta)
+                            pack, prompt = _prepare_single_prompt(
+                                diff, d=d, root=root, finder=finder, selection=selection,
+                                branch=branch, base_ref=base.ref, base_sha=base.sha,
+                                head_label=f"{head} (working tree)",
                                 stack_context=stack_prompt_context,
                                 stack_context_truncated=stack_prompt_truncated,
                                 lineage_context=lineage_prompt_context,
@@ -2004,7 +2008,6 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 outcome = _run_chain(
                     finder, cfg, d, prompt.text, root, store,
                     scratch, "primary",
-                    admission_deadline=admission_deadline,
                     **_cancel_kw(cancel))
                 rec["attempts"] = outcome.attempts
                 _apply(rec, outcome)
@@ -2012,9 +2015,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 # fallback the finder's own entry may never have run, and "did a
                 # second provider look at this?" is a question about the
                 # answering provider.
-                answering_provider = (outcome.accepted["provider"]
-                                      if outcome.accepted is not None
-                                      else finder.provider)
+                contributing_providers = ([outcome.accepted.get("provider")]
+                                          if outcome.accepted is not None else None)
 
             # --- 8. THE FINDER SNAPSHOT, taken before any merge -----------
             # The refuter's eligibility, its prompt, and the meaning of every
@@ -2035,18 +2037,17 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 rec["parse_ok"], rec["degraded"], rec["diff_truncated"])
             finder_findings = list(rec["findings"])
             finder_findings_total = rec["findings_total"]
-            finder_provider = answering_provider
 
             # --- 9. the extra passes, still under the lock ----------------
-            if hold_for_security:
+            if (checkpoint_run is not None and mode == "now") or hold_for_security:
                 # Sized for the reviewer that will RUN this pass, which may not
                 # be the finder and may not be on the finder's provider: a
                 # `[reviewers]` entry with role `security` is preferred here
                 # (see `_extra_pass`), and it can be a CLI with a tighter
                 # ceiling. One `prompt_budget` call per pass, per reviewer.
                 sec_reviewer = _pass_reviewer(cfg, "security", finder)
-                rec = _extra_pass(
-                    rec, "security",
+                rec = _required_followup(
+                    checkpoint_run, hold_for_security, rec, "security",
                     lambda: passes.security_prompt(
                         branch, base.ref, base.sha, f"{head} (working tree)",
                         diff.data, budget.prompt_budget(d, sec_reviewer),
@@ -2054,14 +2055,15 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     sec_reviewer, cfg, d, root,
                     store, scratch, cancel=cancel)
 
-            if passes.should_run_skeptic(
+            run_skeptic = passes.should_run_skeptic(
                     mode,
                     is_trustworthy(rec["parse_ok"], rec["degraded"],
                                    rec["diff_truncated"]),
-                    rec["findings_total"]):
+                    rec["findings_total"])
+            if (checkpoint_run is not None and mode == "now") or run_skeptic:
                 skeptic_reviewer = _pass_reviewer(cfg, "skeptic", finder)
-                rec = _extra_pass(
-                    rec, "skeptic",
+                rec = _required_followup(
+                    checkpoint_run, run_skeptic, rec, "skeptic",
                     lambda: passes.skeptic_prompt(
                         branch, base.ref, base.sha, f"{head} (working tree)",
                         diff.data, budget.prompt_budget(d, skeptic_reviewer)),
@@ -2080,12 +2082,12 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 ref_reviewer = _pass_reviewer(cfg, "refuter", finder)
                 rec = _refuter_pass(
                     rec, finder_findings_total,
-                    lambda: passes.refuter_prompt(
+                    lambda selected: passes.refuter_prompt(
                         finder_findings, diff.data, branch, base.ref, base.sha,
                         f"{head} (working tree)",
-                        budget.prompt_budget(d, ref_reviewer)),
+                        budget.prompt_budget(d, selected)),
                     ref_reviewer, cfg, d, root,
-                    store, scratch, finder_provider, cancel=cancel)
+                    store, scratch, contributing_providers, cancel=cancel)
             elif skip_note:
                 # `skip_note` is non-empty for exactly one case: an eligible
                 # review with no refuter configured (`refuter_decision`'s own
@@ -2239,9 +2241,10 @@ def _install_fg_sigterm(cancel: "threading.Event"):
     review ends.
     """
     import signal
+    from .request_cancel import mark_event
 
     def handler(signum, frame):        # pragma: no cover - driven by a signal
-        cancel.set()
+        mark_event(cancel, "signal")
     try:
         return signal.signal(signal.SIGTERM, handler)
     except (ValueError, OSError, RuntimeError):
@@ -2398,12 +2401,15 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
     reserved = store.get_review(record_id) or {}
     review_started_at = (
         reserved.get("review_started_at") or reserved.get("reviewed_at"))
+    lineage_context_diagnostics: dict = {}
     lineage_prompt_context, lineage_prompt_truncated = _lineage_prompt_context(
-        store, lineage_repository_id, before=review_started_at)
+        store, lineage_repository_id, before=review_started_at,
+        changed_paths=diff.files, diagnostics=lineage_context_diagnostics)
     diff_hash = gitio.diff_identity(diff.data)
     evidence_prompt_context = _evidence_prompt_context(
         store, root, base.sha, local_oid, diff_hash)
-    common = dict(
+    from .planning_policy import describe as planning_description
+    common = dict(planning_policy=planning_description(d, finder),
         id=record_id, reviewed_at=reserved.get("reviewed_at") or _iso_now(),
         source="skodun", branch=branch, head=local_oid, base_ref=base.ref,
         base_sha=base.sha, diff_hash=diff_hash, mode="prepush",
@@ -2426,6 +2432,7 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
         repo_id=reserved.get("repo_id") or reserved.get("repo"),
         lineage_repository_id=lineage_repository_id,
         lineage_context_bytes=len(lineage_prompt_context),
+        lineage_context_diagnostics=lineage_context_diagnostics,
         lineage_context_truncated=lineage_prompt_truncated,
         worktree_root=str(root),
         review_started_at=review_started_at,
@@ -2493,7 +2500,7 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                     store, checkpoint_identity, rec, resume=True)
                 rec["batch_orchestration_id"] = \
                     checkpoint_run.orchestration_id
-                rec["batch_identity_digest"] = checkpoint_identity.digest()
+                rec["batch_identity_digest"] = checkpoint_run.identity.digest()
                 _note(f"reviewing {len(diff.files)} file(s) vs {base.ref} as "
                       f"{record_id} in {planned} batch(es) ...")
                 rec = _orchestrate(
@@ -2575,6 +2582,22 @@ def _empty_shell() -> dict:
     )
 
 
+def _prepare_single_prompt(diff, *, d, root, finder, selection, branch,
+                           base_ref, base_sha, head_label, context_source="wt",
+                           context_oid=None, **advisory):
+    """Prepare one exact input for preview and both execution modes; no writes."""
+    envelope = budget.prompt_budget(d, finder)
+    pack = None
+    if d.context_pack:
+        headroom = promptbuild.context_headroom(envelope, len(diff.data), packing=True)
+        kwargs = {} if context_source == "wt" else {"source": context_source, "oid": context_oid}
+        pack = contextpack.pack(root, list(diff.files), dict(diff.statuses), headroom,
+                                pack_large_added=False, **kwargs)
+    prompt = promptbuild.build(branch, base_ref, base_sha, head_label, diff.data,
+        envelope, selection, pack.body if pack is not None else None, **advisory)
+    return pack, prompt
+
+
 def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
                  store: Store, scratch: Path, finder: Reviewer, branch: str,
                  base, local_oid: str, large_prompt: tuple[int, int] | None,
@@ -2621,28 +2644,13 @@ def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
     # would ever dedup-match again.
     mdb = budget.prompt_budget(d, finder)
 
-    pack = None
-    pack_body = None
-    if d.context_pack:
-        headroom = promptbuild.context_headroom(
-            mdb, len(diff.data), packing=True)
-        # `pack_large_added=False`: the single-shot diff already carries every
-        # added file whole. This is the SAME call `dispatch.build_dedup_evidence`
-        # makes for its candidate hash, and it has to stay that way — a different
-        # headroom or a different large-added rule would be a different identity
-        # for the same commit, so nothing would ever dedup-match again.
-        pack = contextpack.pack(root, list(diff.files), dict(diff.statuses),
-                                headroom, source="oid", oid=local_oid,
-                                pack_large_added=False)
-        pack_body = pack.body
-
-    prompt = promptbuild.build(branch, base.ref, base.sha, local_oid, diff.data,
-                              mdb, selection, pack_body,
-                              stack_context=stack_context,
-                              stack_context_truncated=stack_context_truncated,
-                              lineage_context=lineage_context,
-                              lineage_context_truncated=lineage_context_truncated,
-                              evidence_context=evidence_context)
+    pack, prompt = _prepare_single_prompt(
+        diff, d=d, root=root, finder=finder, selection=selection, branch=branch,
+        base_ref=base.ref, base_sha=base.sha, head_label=local_oid,
+        context_source="oid", context_oid=local_oid,
+        stack_context=stack_context, stack_context_truncated=stack_context_truncated,
+        lineage_context=lineage_context, lineage_context_truncated=lineage_context_truncated,
+        evidence_context=evidence_context)
     if prompt.diff_truncated:
         _note(f"diff is {len(diff.data)} bytes (> {mdb}); the "
               f"prompt is truncated and this review cannot be trustworthy")
@@ -2666,8 +2674,9 @@ def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
     _note(f"reviewing {len(diff.files)} file(s) vs {base.ref} as {record_id} ...")
     # Standalone chain budget: pre-push is not on the FG admit path, so
     # run_chain starts its own shared provider wait deadline (not reset per hop).
-    outcome = _run_chain(finder, cfg,
-                         _escalated(d, prompt.prompt_bytes, large_prompt),
+    effective_d = _escalated(d, prompt.prompt_bytes, large_prompt)
+    rec["primary_timeout_seconds"] = effective_d.timeout_sec
+    outcome = _run_chain(finder, cfg, effective_d,
                          prompt.text, root, store, scratch, "primary",
                          cancel=cancel)
     rec["attempts"] = outcome.attempts
@@ -2737,21 +2746,55 @@ def _flatten_lineage_candidates(
 
 
 def _lineage_prompt_context(
-        store, repository_id: str, *, before: str | None
+        store, repository_id: str, *, before: str | None,
+        changed_paths=(), owner_ids=(), diagnostics: dict | None = None
         ) -> tuple[bytes, bool]:
-    """Bounded prior-fingerprint bytes for provider prompts. Advisory only."""
+    """Bounded relevant hints with independent retrieval and byte budgets."""
+    meta = diagnostics if diagnostics is not None else {}
+    meta.clear()
+    meta.update(status="unknown", candidate_count=0, scanned_count=0,
+                matched_count=0, selected_count=0, candidate_truncated=False,
+                prompt_bytes_truncated=False)
     if not repository_id or repository_id == "unknown" or store is None:
         return b"", False
     try:
-        from .fingerprint import CANDIDATE_LIMIT, render_prompt_context
-        if not hasattr(store, "lineage_finding_candidates_with_meta"):
+        from .fingerprint import (CANDIDATE_LIMIT, rank_prompt_candidates,
+                                  render_prompt_context)
+        if hasattr(store, "lineage_prompt_candidates"):
+            rows, retrieval = store.lineage_prompt_candidates(
+                repository_id, before_reviewed_at=before, limit=CANDIDATE_LIMIT)
+            truncated = retrieval["truncated"]
+            meta.update(scanned_count=retrieval["scanned_count"],
+                        scan_truncated=retrieval["scan_truncated"],
+                        disposition_scanned_count=retrieval["disposition_scanned_count"],
+                        disposition_truncated=retrieval["disposition_truncated"])
+        elif hasattr(store, "lineage_finding_candidates_with_meta"):
+            rows, truncated = store.lineage_finding_candidates_with_meta(
+                repository_id, before_reviewed_at=before, limit=CANDIDATE_LIMIT)
+            meta["scanned_count"] = None  # legacy doubles cannot measure scans
+        else:
             return b"", False
-        rows, truncated = store.lineage_finding_candidates_with_meta(
-            repository_id, before_reviewed_at=before, limit=CANDIDATE_LIMIT)
-        text, text_truncated = render_prompt_context(rows)
+        selected, matched = rank_prompt_candidates(
+            rows, changed_paths=changed_paths, owner_ids=owner_ids)
+        text, text_truncated = render_prompt_context(selected)
+        meta.update(status="partial" if (truncated or text_truncated) else "complete",
+                    candidate_count=len(rows), matched_count=matched,
+                    selected_count=len(selected), candidate_truncated=bool(truncated),
+                    prompt_bytes_truncated=text_truncated)
         return text, bool(truncated) or text_truncated
-    except Exception:
+    except Exception as exc:
+        meta.update(status="unavailable", error=type(exc).__name__)
         return b"", False
+
+
+def _lineage_owner_ids(stack_validation) -> tuple[str, ...]:
+    """Only validated stack identities may influence advisory ranking."""
+    if (stack_validation is None or stack_validation.status != "valid"
+            or stack_validation.manifest is None):
+        return ()
+    manifest = stack_validation.manifest
+    return (manifest.current_slice.slice_id,
+            *(item.slice_id for item in manifest.dependencies))
 
 
 def _evidence_prompt_context(store, root: Path, certification_base: str,
@@ -2785,15 +2828,69 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
     authoritative trust or gate axes.
     """
     try:
-        from .fingerprint import CANDIDATE_LIMIT, annotate_findings
+        from .fingerprint import CANDIDATE_LIMIT, annotate_findings, finding_fingerprint
         repository_id = rec.get("lineage_repository_id") or "unknown"
         previous: list[dict] = []
         # An unknown canonical remote is deliberately not a lineage scope:
         # linking two unrelated local clones would be worse than a false
         # negative.  Stack manifests and normal remotes provide this value.
         truncated = False
+        diagnostics = dict(status="unknown", exact_scanned=0, exact_matched=0,
+                           exact_truncated=False, exact_scan_truncated=False,
+                           exact_candidate_truncated=False, exact_key_truncated=False,
+                           fallback_scanned=0, fallback_scan_truncated=False,
+                           fallback_truncated=False, fallback_state="unknown",
+                           exact_state="unknown", exact_key_limit=CANDIDATE_LIMIT,
+                           exact_candidate_limit=2 * CANDIDATE_LIMIT,
+                           fallback_candidate_limit=CANDIDATE_LIMIT,
+                           raw_scan_limit=1024 + min((CANDIDATE_LIMIT + 1) * 4, 1024))
+        exact = []
+        incomplete_exact: set[str] = set()
         if repository_id != "unknown":
-            if hasattr(store, "lineage_finding_candidates_with_meta"):
+            if hasattr(store, "lineage_candidates_with_diagnostics"):
+                diagnostics["exact_state"] = "indexed"
+                digests = list(dict.fromkeys(
+                    finding_fingerprint(item) for item in rec.get("findings") or ()
+                    if isinstance(item, dict)))
+                incomplete_exact.update(digests[CANDIDATE_LIMIT:])
+                diagnostics["exact_key_truncated"] = len(digests) > CANDIDATE_LIMIT
+                diagnostics["exact_truncated"] = diagnostics["exact_key_truncated"]
+                for digest_index, digest in enumerate(digests[:CANDIDATE_LIMIT]):
+                    remaining = 1024 - diagnostics["exact_scanned"]
+                    if remaining <= 0:
+                        diagnostics["exact_truncated"] = True
+                        diagnostics["exact_scan_truncated"] = True
+                        incomplete_exact.update(digests[digest_index:CANDIDATE_LIMIT])
+                        break
+                    matches, meta = store.lineage_candidates_with_diagnostics(
+                        repository_id, before_reviewed_at=rec.get("reviewed_at"),
+                        fingerprint=digest, limit=2, scan_limit=remaining)
+                    exact.extend(matches)
+                    if meta["truncated"] and len(matches) < 2:
+                        incomplete_exact.add(digest)
+                    diagnostics["exact_scanned"] += meta["scanned_count"]
+                    diagnostics["exact_truncated"] |= meta["truncated"]
+                    diagnostics["exact_scan_truncated"] |= meta["scan_truncated"]
+                    diagnostics["exact_candidate_truncated"] |= meta["candidate_truncated"]
+                diagnostics["exact_matched"] = len(exact)
+                previous, meta = store.lineage_candidates_with_diagnostics(
+                    repository_id, before_reviewed_at=rec.get("reviewed_at"),
+                    limit=CANDIDATE_LIMIT)
+                diagnostics.update(fallback_scanned=meta["scanned_count"],
+                                   fallback_truncated=meta["truncated"],
+                                   fallback_scan_truncated=meta["scan_truncated"],
+                                   fallback_state="bounded_recency")
+                truncated = meta["truncated"] or diagnostics["exact_truncated"]
+                diagnostics["status"] = "partial" if truncated else "complete"
+                # Only duplicate provenance rows are collapsed here. Distinct
+                # occurrences retain the existing conservative ambiguity rule.
+                unique = {}
+                for item in exact + previous:
+                    if item.get("_lineage_review_id") != rec.get("id"):
+                        key = (item["_lineage_review_id"], item["_lineage_finding_index"])
+                        unique.setdefault(key, item)
+                previous = list(unique.values())
+            elif hasattr(store, "lineage_finding_candidates_with_meta"):
                 previous, truncated = store.lineage_finding_candidates_with_meta(
                     repository_id,
                     before_reviewed_at=rec.get("reviewed_at"),
@@ -2813,8 +2910,17 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
                 candidates = store.lineage_review_candidates(repository_id)
                 previous, truncated = _flatten_lineage_candidates(
                     rec, candidates, False, CANDIDATE_LIMIT)
-        rec["findings"] = annotate_findings(rec.get("findings") or (), previous)
+        rec["findings"] = annotate_findings(
+            rec.get("findings") or (), previous, incomplete_exact=incomplete_exact)
         rec["fingerprint_status"] = "complete"
+        diagnostics["candidate_count"] = len(previous)
+        diagnostics["incomplete_exact_count"] = len(incomplete_exact)
+        diagnostics["matched_count"] = sum(
+            isinstance(item, dict)
+            and item.get("finding_fingerprint_v2") not in incomplete_exact
+            and item.get("finding_lineage_v2", {}).get("match_reason") != "new"
+            for item in rec["findings"])
+        rec["fingerprint_diagnostics"] = diagnostics
         rec["fingerprint_candidate_limit"] = CANDIDATE_LIMIT
         rec["fingerprint_candidate_count"] = len(previous)
         rec["fingerprint_candidates_truncated"] = bool(truncated)
@@ -2824,6 +2930,7 @@ def annotate_lineage(store: Store, rec: dict) -> dict:
         # block persistence of the authoritative artifact.  Persist only the
         # bounded exception type, never provider output or local paths.
         rec["fingerprint_status"] = "unavailable"
+        rec["fingerprint_diagnostics"] = {"status": "unavailable"}
         rec["fingerprint_error"] = type(exc).__name__
     return rec
 
@@ -2929,20 +3036,15 @@ def _batch_budget(d: Defaults, reviewer: Reviewer | None = None) -> int:
     computed budget can arrive at zero, and splitting maximally with every unit
     flagged as an irreducible floor says strictly more than refusing to split.
     """
-    envelope = budget.prompt_budget(d, reviewer)
-    if d.context_pack:
-        envelope //= 2
-    return max(1, envelope)
+    from .planning_policy import diff_budget
+    return diff_budget(d, reviewer)
 
 
 def _effective_batch_budget(d: Defaults,
                             reviewer: Reviewer | None = None) -> int:
     """Return the provider ceiling narrowed by an optional batch hint."""
-    budget = _batch_budget(d, reviewer)
-    target = d.batch_target_bytes
-    if target > 0:
-        return min(budget, target)
-    return budget
+    from .planning_policy import effective_diff_budget
+    return effective_diff_budget(d, reviewer)
 
 
 def batch_plan(diff: bytes, d: Defaults,
@@ -2998,7 +3100,7 @@ def _estimate_batch_count(repo: Path, d: Defaults,
     return 0 if plan is None else len(plan)
 
 
-def _grow_lock_budget(lock: Lock, seconds: float) -> bool:
+def _grow_lock_budget(lock: Lock | None, seconds: float) -> bool:
     """Raise our lock's published budget, iff the lock is still OURS.
 
     The ABA guard `_release_fg_lock` uses, for the same reason: our stale window
@@ -3008,6 +3110,8 @@ def _grow_lock_budget(lock: Lock, seconds: float) -> bool:
     widen the sidecar costs at worst an early reclaim, and must never be the
     thing that fails a review.
     """
+    if lock is None:
+        return False  # store-only foreground admission has no legacy sidecar
     try:
         if _owner_pid(lock.path) != lock.pid:
             return False
@@ -3016,21 +3120,24 @@ def _grow_lock_budget(lock: Lock, seconds: float) -> bool:
         return False
 
 
-def _answering_provider(rec: dict, finder: Reviewer) -> str:
-    """Which provider actually answered a batched aggregate's sub-reviews.
+def _contributing_providers(rec: dict) -> list[str] | None:
+    """All actual aggregate contributors, including clean batches/integration.
 
-    The refuter is only worth its call when a DIFFERENT provider re-examines the
-    findings, so that question has to be asked about whoever answered rather than
-    whoever was configured. For an aggregate there can be several answers: a
-    chain that fell through to a fallback on one batch is a designed, recorded
-    outcome. When they do not agree there is no single answering provider, and
-    the configured finder is the honest fallback — it keeps the comparison
-    conservative (the refuter is more likely to be flagged as same-provider, and
-    a flag is a note, never a demotion).
+    Missing legacy checkpoint provenance cannot borrow the configured finder.
+    A partial/unknown answer makes the complete set unknown.
     """
-    seen = {b.get("provider") for b in (rec.get("batches") or ())
-            if isinstance(b.get("provider"), str) and b.get("provider")}
-    return seen.pop() if len(seen) == 1 else finder.provider
+    from .refuter_policy import contributor_families
+
+    contributors = list(rec.get("batches") or ())
+    integration = rec.get("integration")
+    if integration is not None:
+        contributors.append(integration)
+    providers = [part.get("provider") if isinstance(part, dict)
+                 and part.get("parse_ok") is True else None
+                 for part in contributors]
+    if contributor_families(providers) is None:
+        return None
+    return sorted(set(providers))
 
 
 def usable_output(batches: list | tuple | None,
@@ -3118,6 +3225,35 @@ def _begin_checkpoint_run(store: Store, identity: checkpoints.OrchestrationIdent
     except Exception as exc:
         raise PersistenceFailed(
             f"could not expire batch checkpoints: {exc!r}") from exc
+    from .requests import current
+    from .continuation import refuse
+    ctx = current()
+    if ctx is not None and ctx.store is store and ctx.continue_compatible:
+        candidate = store.find_resume_candidate(
+            identity.repo_id, identity.worktree_root, identity.branch, include_consumed=True)
+        if candidate is None:
+            refuse('continuation_not_found', 'No incomplete compatible batch work exists; request a fresh review explicitly.')
+        try:
+            stored = checkpoints.OrchestrationIdentity.from_json(candidate['identity_json'])
+        except ValueError:
+            refuse('continuation_identity_mismatch', 'Stored continuation identity is invalid.',
+                   first_mismatch='identity_json')
+        mismatch = checkpoints.first_mismatch(stored, identity)
+        if mismatch is not None:
+            refuse('continuation_identity_mismatch',
+                   f'Continuation identity differs: {mismatch}; no checkpoint reused.', first_mismatch=mismatch)
+        try:
+            child = store.fork_continuation(
+                candidate['id'], identity, request_id=ctx.id, owner_token=ctx.owner_token,
+                created_at=now, expires_at=_iso_after(CHECKPOINT_RETENTION_SEC))
+        except ValueError as exc:
+            code = getattr(exc, 'reason_code', 'continuation_source_invalid')
+            refuse(code, 'Continuation source could not be safely claimed; no checkpoint reused.')
+        child_identity = checkpoints.OrchestrationIdentity.from_json(child['identity_json'])
+        rec['continuation'] = {'policy': 'compatible', 'status': 'continued',
+                               'source_orchestration_id': candidate['id'],
+                               'orchestration_id': child['id'], 'first_mismatch': None}
+        return _CheckpointRun(child['id'], ids.new_review_id('sk_owner_'), child_identity)
     candidate = None
     if resume:
         candidate = store.find_resume_candidate(
@@ -3133,7 +3269,7 @@ def _begin_checkpoint_run(store: Store, identity: checkpoints.OrchestrationIdent
             orchestration_id = candidate["id"]
             _note(f"resuming exact batch orchestration {orchestration_id}")
             return _CheckpointRun(
-                orchestration_id, ids.new_review_id("sk_owner_"), identity)
+                orchestration_id, ids.new_review_id("sk_owner_"), stored)
         try:
             store.record_orchestration_mismatch(
                 candidate["id"], mismatch, at=now)
@@ -3165,7 +3301,8 @@ def _checkpointed_sub(
         pass_identity: checkpoints.PassIdentity, *, reviewer: Reviewer,
         cfg: Config, d: Defaults, prompt, root: Path, store: Store,
         scratch: Path, tag: str, label: str,
-        cancel: "threading.Event | None") -> _Sub:
+        cancel: "threading.Event | None", binding_hash: str | None = None,
+        preparation_failure: str | None = None) -> _Sub:
     """Reuse or exclusively run one exact pass under a fenced store claim."""
     if checkpoint_run is None:
         return _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
@@ -3177,12 +3314,13 @@ def _checkpointed_sub(
     # for large prompts. Keeping the calculation at the claim boundary makes
     # the lease cover retries plus grace, rather than a stale pre-escalation
     # default.
-    lease_seconds = _checkpoint_lease_seconds(d, width)
+    lease_seconds = _checkpoint_lease_seconds(d, width, store=store)
     try:
         claim = store.claim_checkpoint(
             checkpoint_run.orchestration_id, pass_identity,
             owner=checkpoint_run.owner, now=now,
-            lease_expires_at=_iso_after(lease_seconds))
+            lease_expires_at=_iso_after(lease_seconds),
+            **({"binding_hash": binding_hash} if binding_hash is not None else {}))
     except Exception as exc:
         raise PersistenceFailed(
             f"could not claim checkpoint for {label}: {exc!r}") from exc
@@ -3191,6 +3329,8 @@ def _checkpointed_sub(
             payload = checkpoints.CheckpointPayload(claim["payload_json"])
             fields = checkpoints.sub_fields_from_payload(payload)
             sub = _Sub(**fields)
+            if checkpoint_run.identity.continuation_source is not None:
+                sub = replace(sub, provenance={**sub.provenance, 'continuation_action': 'reused'})
         except Exception as exc:
             raise PersistenceFailed(
                 f"stored checkpoint for {label} is invalid: {exc!r}") from exc
@@ -3203,8 +3343,11 @@ def _checkpointed_sub(
     try:
         started = time.monotonic()
         started_at = _iso_now()
-        sub = _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
-                       label, cancel=cancel)
+        sub = (_Sub(False, False, "", None, False, "", [], preparation_failure, [],
+                    {"provider": None, "model": None, "effort": None}, None)
+               if preparation_failure is not None else
+               _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
+                        label, cancel=cancel))
         completed_at = _iso_now()
         capacity_timing = sub.provenance.get("capacity_timing")
         checkpoint_timing = (dict(capacity_timing)
@@ -3226,11 +3369,17 @@ def _checkpointed_sub(
                 if sub.attempts else None),
         })
         payload = checkpoints.payload_from_sub(sub)
+        if checkpoint_run.identity.continuation_source is not None:
+            usable = followups.usable(payload) if pass_identity.kind in followups.KINDS else checkpoints.usable_payload(payload)
+            action = 'executed' if usable else 'failed'
+            sub = replace(sub, provenance={**sub.provenance, 'continuation_action': action})
+            payload = checkpoints.payload_from_sub(sub)
         applied = store.complete_checkpoint(
             checkpoint_run.orchestration_id, pass_identity.kind,
             pass_identity.index, owner=checkpoint_run.owner,
             claim_token=claim["claim_token"], fence=claim["fence"],
-            payload=payload, completed_at=_iso_now())
+            payload=payload, completed_at=_iso_now(),
+            **({"binding_hash": binding_hash} if binding_hash is not None else {}))
         if not applied:
             raise CheckpointClaimLost(
                 f"lost fenced checkpoint claim for {label}; refusing to "
@@ -3248,10 +3397,13 @@ def _checkpointed_sub(
         raise
 
 
-def _checkpoint_lease_seconds(d: Defaults, chain_width: int) -> float:
-    """Cover one pass's retries plus its configured provider admission wait."""
-    return (budget.worst_runtime(d, chain_width, 0)
-            + capacity.admission_wait_from_env(30.0))
+def _checkpoint_lease_seconds(d: Defaults, chain_width: int, *, store=None) -> float:
+    """Cover retries and the same store-owned provider wait used by the chain."""
+    from . import budgets
+    controller = budgets.current(store) if store is not None else None
+    provider_wait = (controller.limits.provider_wait if controller is not None
+                     else capacity.admission_wait_from_env(30.0))
+    return budget.worst_runtime(d, chain_width, 0) + provider_wait
 
 
 def _milliseconds_to_seconds(value: object) -> float | None:
@@ -3508,6 +3660,7 @@ def _orchestration_identity(
         # checkpoints must not silently become approximately compatible.
         "config": asdict(cfg),
         "effective_defaults": asdict(d),
+        "planning_policy": rec.get("planning_policy"),
     })
     pass_identities = list(item.identity for item in prepared.batches)
     if prepared.integration_selection is not None:
@@ -3515,6 +3668,13 @@ def _orchestration_identity(
             kind="integration", index=0, prompt_hash=None,
             diff_hash=gitio.diff_identity(diff.data),
             boundary_hash=prepared.integration_plan_digest))
+    if rec.get("mode") == "now":
+        for kind in followups.KINDS:
+            pass_identities.append(checkpoints.PassIdentity(
+                kind=kind, index=0, prompt_hash=None,
+                diff_hash=gitio.diff_identity(diff.data),
+                boundary_hash=checkpoints.canonical_digest({
+                    "kind": kind, "policy": reuse.security_policy_identity(cfg)})))
     return checkpoints.OrchestrationIdentity(
         repo_id=gitio.repository_identity(root),
         worktree_root=gitio.observed_worktree_root(root),
@@ -3529,12 +3689,14 @@ def _orchestration_identity(
         reviewer_hash=reviewer_hash,
         config_hash=config_hash,
         policy_hash=reuse.security_policy_identity(cfg),
-        planner_version=checkpoints.PLANNER_VERSION,
+        planner_version=(followups.PLANNER_VERSION if rec.get("mode") == "now"
+                         else checkpoints.PLANNER_VERSION),
         batch_budget=_effective_batch_budget(d, finder),
         batch_count=len(prepared.batches),
         boundary_digest=prepared.boundary_digest,
         integration_plan_digest=prepared.integration_plan_digest,
-        pass_identities=tuple(pass_identities))
+        pass_identities=tuple(pass_identities),
+        planning_policy=rec.get("planning_policy"))
 
 
 def _revalidate_foreground_orchestration(
@@ -3671,6 +3833,25 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             checklist_notes.append(selection.note)
         checklist_degraded = checklist_degraded or selection.degraded is True
 
+    parallel_results = None
+    concurrency = (rec.get('planning_policy') or {}).get('execution_policy', {}).get('batch_concurrency', 1)
+    if concurrency == 2 and count > 1:
+        from . import parallel_batches
+        from .requests import current
+        context = current()
+        if rec.get('mode') != 'now' or context is None or context.store is not store or checkpoint_run is None:
+            raise PreflightRefused('parallel batches require a durable foreground checkpoint request')
+        def run_one(item, worker_store, worker_cancel):
+            _note(f"batch {item.identity.index}/{count}: claiming or reusing frozen input")
+            effective = _escalated(d, item.prompt.prompt_bytes, large_prompt)
+            return _checkpointed_sub(
+                checkpoint_run, item.identity, reviewer=finder, cfg=cfg, d=effective,
+                prompt=item.prompt, root=root, store=worker_store, scratch=scratch,
+                tag=f"{tag}.b{item.identity.index}", label=f"batch {item.identity.index}", cancel=worker_cancel)
+        parallel_results = parallel_batches.execute(
+            prepared_plan.batches, context=context, store_path=store._path,
+            run_one=run_one, cancel=cancel, progress=_note)
+
     for index, prepared in enumerate(prepared_plan.batches, 1):
         batch = prepared.batch
         # A BATCH BOUNDARY. The checklist selection, the context pack and the
@@ -3701,18 +3882,19 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
 
         prompt = prepared.prompt
         prompt_bytes += prompt.prompt_bytes
-        _note(f"batch {index}/{count} ({len(batch.files)} file(s), "
-              f"{len(batch.data)} bytes) ...")
+        if parallel_results is None:
+            _note(f"batch {index}/{count} ({len(batch.files)} file(s), "
+                  f"{len(batch.data)} bytes) ...")
         if prompt.diff_truncated:
             _note(f"batch {index}/{count} is {len(batch.data)} bytes "
                   f"(> {mdb}); its prompt is truncated and this "
                   f"review cannot be trustworthy")
         effective_d = _escalated(d, prompt.prompt_bytes, large_prompt)
-        sub = _checkpointed_sub(
+        sub = (parallel_results[index] if parallel_results is not None else _checkpointed_sub(
             checkpoint_run, prepared.identity, reviewer=finder, cfg=cfg,
             d=effective_d, prompt=prompt,
             root=root, store=store, scratch=scratch, tag=f"{tag}.b{index}",
-            label=f"batch {index}", cancel=cancel)
+            label=f"batch {index}", cancel=cancel))
         run_duration_sec = round(sum(
             float(a.get("duration_sec") or 0.0)
             for a in sub.attempts if isinstance(a, dict)
@@ -3806,6 +3988,9 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                                    reason, [], {"provider": None, "model": None,
                                                 "effort": None, "note": reason},
                                    None)
+            if checkpoint_run is not None and checkpoint_run.identity.continuation_source is not None:
+                integration_sub = replace(integration_sub, provenance={
+                    **integration_sub.provenance, 'continuation_action': 'failed'})
             integration = passes.integration_meta(
                 "failed", ran=False, checklist=meta_checklist, note=reason,
                 stop_reason=integration_sub.stop_reason,
@@ -4089,6 +4274,71 @@ def _failed_pass(rec: dict, name: str, reason: str, note: str) -> dict:
         "provider": None, "model": None, "effort": None, "note": note})
 
 
+def _required_followup(checkpoint_run, scheduled, rec, name, build_prompt,
+                       reviewer, cfg, d, cwd, store, scratch, *, cancel=None):
+    """Bind a conditional required role, then run/reuse its exact fenced output."""
+    if checkpoint_run is None:
+        return _extra_pass(rec, name, build_prompt, reviewer, cfg, d, cwd,
+                           store, scratch, cancel=cancel) if scheduled else rec
+    _checkpoint(cancel, rec, f"before the {name} pass")
+    prompt, preparation_failure = None, None
+    reason = ('scheduled' if scheduled else 'aggregate_not_clean'
+              if name == 'skeptic' and os.environ.get(passes.SKEPTIC_PASS_ENV, '1').strip() != '0'
+              else 'policy_not_scheduled')
+    if scheduled:
+        try:
+            prompt = build_prompt()
+        except Exception as exc:
+            preparation_failure = f"extra pass {name} could not be prepared: {exc!r}"
+            reason = 'preparation_failed'
+    prompt_identity = ({'hash': gitio.diff_identity(prompt.text),
+                        'bytes': prompt.prompt_bytes, 'diff_truncated': bool(prompt.diff_truncated)}
+                       if prompt is not None else None)
+    planned = next(p for p in checkpoint_run.identity.pass_identities if p.kind == name)
+    identity = replace(planned, prompt_hash=prompt_identity['hash'] if prompt_identity else None)
+    from .requests import current
+    ctx = current()
+    request = ({'request_id': ctx.id, 'owner_token': ctx.owner_token}
+               if ctx is not None and ctx.store is store else {})
+    try:
+        binding = followups.build_binding(
+            checkpoint_run.identity, name, store.list_checkpoints(checkpoint_run.orchestration_id), rec,
+            scheduled=scheduled, reason=reason, prompt=prompt_identity)
+        binding_hash = store.bind_followup_checkpoint(
+            checkpoint_run.orchestration_id, identity, binding=binding, now=_iso_now(), **request)
+    except Exception as exc:
+        raise PersistenceFailed(f"could not bind {name} checkpoint: {exc!r}") from exc
+    if not scheduled:
+        row = next(r for r in store.list_checkpoints(checkpoint_run.orchestration_id) if r['pass_kind'] == name)
+        if row.get('invalidation_reason'):
+            rec = {**rec, 'followup_decisions': {**(rec.get('followup_decisions') or {}),
+                name: {'scheduled': False, 'reason': row['invalidation_reason']}}}
+        return rec
+    sub = _checkpointed_sub(checkpoint_run, identity, reviewer=reviewer, cfg=cfg, d=d,
+        prompt=prompt, root=cwd, store=store, scratch=scratch, tag=name,
+        label=f"extra pass {name}", cancel=cancel, binding_hash=binding_hash,
+        preparation_failure=preparation_failure)
+    if not sub.parse_ok:
+        reason = sub.failure_reason or passes.failed_pass_reason(name)
+        if not reason.startswith('extra pass'):
+            reason = f"extra pass {name}: {reason}"
+        merged = passes.merge_failed_extra_pass(rec, name, reason)
+    else:
+        extra = {'id': f"{rec['id']}.{name}", 'parse_ok': sub.parse_ok,
+                 'degraded': sub.degraded, 'degraded_reason': sub.degraded_reason,
+                 'diff_truncated': sub.diff_truncated, 'stop_reason': sub.stop_reason,
+                 'summary': sub.summary, 'findings': sub.findings,
+                 'failure_reason': sub.failure_reason}
+        merged = passes.merge_extra_pass(rec, extra, name)
+    row = next(r for r in store.list_checkpoints(checkpoint_run.orchestration_id) if r['pass_kind'] == name)
+    metadata = {**sub.provenance, 'attempts': sub.attempts,
+                'followup_output_hash': checkpoints.canonical_digest(
+                    followups.semantic_payload(checkpoints.payload_from_sub(sub)))}
+    if row.get('invalidation_reason'):
+        metadata['continuation_reason'] = row['invalidation_reason']
+    return _with_provenance(merged, name, metadata)
+
+
 def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
                 cfg: Config, d: Defaults, cwd: Path, store: Store,
                 scratch: Path, *,
@@ -4159,7 +4409,7 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
             reason = f"extra pass {name}: {reason}"
         return _with_provenance(
             passes.merge_failed_extra_pass(rec, name, reason),
-            name, _provenance(outcome))
+            name, {**_provenance(outcome), "attempts": list(outcome.attempts)})
     p = outcome.parsed
     extra = {
         "id": f"{rec['id']}.{name}",
@@ -4175,20 +4425,14 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
         "findings": list(p.findings),
         "findings_total": len(p.findings),
         "failure_reason": ("" if p.parse_ok else passes.failed_pass_reason(name)),
-        # NO `attempts` key: `passes._merge` builds the `extra_passes[<name>]`
-        # meta dict from a fixed set of keys and never copies one, so an
-        # `attempts` list here was built, handed over, and dropped on the floor.
-        # A field that looks like telemetry and records nothing is worse than an
-        # absent one — it invites a reader to trust a number that is not there.
-        # Carrying it through means widening the meta schema `passes` owns; if
-        # that is ever wanted, add it there and populate it from
-        # `outcome.attempts` here.
+        # Runtime attempts are attached below through _with_provenance;
+        # the pure passes._merge metadata schema and trust semantics stay intact.
     }
     # WHICH provider answered this pass is not in the meta schema `passes`
     # owns, and it cannot be inferred from the reviewer that was asked: a pass
     # with its own fallback chain may have been answered by any entry in it.
     return _with_provenance(passes.merge_extra_pass(rec, extra, name), name,
-                            _provenance(outcome))
+                            {**_provenance(outcome), "attempts": list(outcome.attempts)})
 
 
 def _refuter_failed(rec: dict, finder_findings_total: int, note: str,
@@ -4205,6 +4449,8 @@ def _refuter_failed(rec: dict, finder_findings_total: int, note: str,
     other rule.
     """
     prov = dict(provenance or {"provider": None, "model": None, "effort": None})
+    prov["contributing_providers"] = (rec.get("extra_passes", {})
+                                      .get("refuter", {}).get("contributing_providers"))
     if not str(prov.get("note") or "").strip():
         prov["note"] = note
     return passes.merge_refuter_pass(rec, None, prov, finder_findings_total,
@@ -4214,7 +4460,7 @@ def _refuter_failed(rec: dict, finder_findings_total: int, note: str,
 def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
                   reviewer: Reviewer, cfg: Config, d: Defaults, cwd: Path,
                   store: Store, scratch: Path,
-                  finder_provider: str, *,
+                  contributing_providers: list[str] | None, *,
                   cancel: "threading.Event | None" = None) -> dict:
     """Run the refuter pass and annotate `rec`, returning the new record.
 
@@ -4227,16 +4473,36 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
     `build_prompt` is a callable for the same reason it is one in
     `_extra_pass`: the prompt build sits inside the guard, so a prompt that
     will not render is a failed pass rather than an exception that destroys a
-    review already in hand.
+    review already in hand. It receives the filtered head reviewer so prompt
+    sizing uses the provider that will actually be called.
 
     The chain runs under `REFUTER_CONTRACT`, which is what makes every adapter
     request, classify and validate the verdicts shape — and what gives this
     pass Task 7's fallback support for free.
     """
     _checkpoint(cancel, rec, "before the refuter pass")
+    from .refuter_policy import contributor_families, provider_family
+
+    contributors = contributor_families(contributing_providers)
+    eligible = ([entry for entry in _chain_for(cfg, reviewer)
+                 if entry.enabled and provider_family(entry.provider) is not None
+                 and provider_family(entry.provider) not in contributors]
+                if contributors is not None else [])
+    # Promote only within the configured explicit chain. A promoted fallback's
+    # own fallbacks must not introduce an unchecked contributor or provider.
+    if not eligible:
+        note = ("finding contributor provenance is unknown; independent refuter skipped"
+                if contributors is None else
+                "no independent provider remains in the configured refuter chain; "
+                "findings remain unrefuted")
+        return _with_provenance(passes.skipped_refuter_pass(rec, note), "refuter",
+                                {"contributing_providers": contributing_providers})
+    reviewer = replace(eligible[0], fallbacks=tuple(r.name for r in eligible[1:]))
+    rec = _with_provenance(rec, "refuter",
+                           {"contributing_providers": contributing_providers})
     _note("refuter pass (annotation only) ...")
     try:
-        prompt = build_prompt()
+        prompt = build_prompt(reviewer)
     except Exception as e:
         _note(f"refuter prompt build failed; the review keeps its verdict: {e!r}")
         return _refuter_failed(
@@ -4266,6 +4532,7 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
                                notes=notes)
 
     prov = _provenance(outcome)
+    prov["contributing_providers"] = contributing_providers
     p = outcome.parsed
     if p is None or not p.parse_ok or not isinstance(p.payload, dict):
         _note("the refuter produced no usable verdicts; the review is "
@@ -4275,6 +4542,16 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
             outcome.failure_reason or "the refuter produced no usable verdicts",
             prov, partial_coverage=prompt.diff_truncated, notes=notes)
 
+    actual_provider = (outcome.accepted.get("provider")
+                       if isinstance(outcome.accepted, dict) else None)
+    if (provider_family(actual_provider) is None
+            or provider_family(actual_provider) in contributors
+            or actual_provider not in {entry.provider for entry in eligible}):
+        return _refuter_failed(
+            rec, finder_findings_total,
+            "the refuter answer lacks independent accepted-provider provenance",
+            prov, partial_coverage=prompt.diff_truncated, notes=notes)
+
     if p.degraded:
         notes.append("the refuter run was degraded: %s"
                      % (p.degraded_reason or "no reason given"))
@@ -4282,14 +4559,4 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
         rec, p.payload, prov, finder_findings_total, degraded=p.degraded,
         partial_coverage=prompt.diff_truncated, notes=notes)
 
-    # The entire point of this pass is that a DIFFERENT provider looks at the
-    # findings; a model asked to check its own work is agreeable about it. A
-    # config may still put the refuter on the finder's provider — that is the
-    # operator's call, and it is better than no re-examination — but the record
-    # says so, because that is exactly what makes a verdict less worth
-    # adopting. Compared on the answering providers, not the configured ones:
-    # either side may have fallen through to a different entry.
-    if prov.get("provider") is not None and prov["provider"] == finder_provider:
-        merged = _with_provenance(merged, "refuter",
-                                  {"same_provider_as_finder": True})
     return merged

@@ -998,21 +998,19 @@ def test_a_broken_refuter_prompt_never_demotes_the_review(tmp_path, capsys,
     assert rec["trustworthy"] is True
 
 
-def test_a_same_provider_refuter_is_recorded_as_such(tmp_path, capsys):
-    """A model asked to check its own work is agreeable about it. Running the
-    refuter on the finder's provider is allowed — it is the operator's config —
-    but the record says so, because that is exactly what makes a verdict less
-    worth adopting."""
-    _fake_cli(tmp_path, "grok", _per_call(_emit(DIRTY),
-                                          _emit(json.dumps(
-                                              {"structuredOutput": REFUTED_ONE,
-                                               "stopReason": "EndTurn"}))))
+def test_a_same_provider_refuter_is_skipped_without_a_call(tmp_path, capsys):
+    _fake_cli(tmp_path, "grok", _emit(DIRTY))
     repo = _repo(tmp_path, CFG_FINDER_XAI + CFG_REFUTER_XAI)
-    rec = _run(repo, _store(tmp_path))
+    st = _store(tmp_path)
+    rec = _run(repo, st)
 
     meta = rec["extra_passes"]["refuter"]
-    assert meta["status"] == "ran" and meta["provider"] == "xai"
-    assert meta["same_provider_as_finder"] is True
+    assert meta["status"] == "skipped" and meta["ran"] is False
+    assert "independent" in meta["note"]
+    assert _calls(tmp_path) == ["grok"]
+    assert rec["trustworthy"] is True
+    assert "refuter" not in rec["findings"][0]
+    assert run_gate(st, repo, load_config(repo)).code == 1
 
 
 def test_the_refuter_runs_while_the_lock_is_still_held(tmp_path, capsys,
@@ -1066,3 +1064,175 @@ role = "{role}"
     with pytest.raises(PreflightRefused):
         _run(repo, _store(tmp_path))
     assert _calls(tmp_path) == []
+
+
+def test_refuter_filters_a_same_provider_head_before_calling_fallback(tmp_path):
+    _fake_cli(tmp_path, "grok", _emit(DIRTY))
+    _fake_cli(tmp_path, "codex", _emit(_codex_stream(REFUTED_ONE)))
+    cfg = CFG_FINDER_XAI + CFG_REFUTER_XAI + '\nfallbacks = ["independent"]\n'
+    cfg += CFG_REFUTER_OPENAI.replace('second-opinion', 'independent')
+    rec = _run(_repo(tmp_path, cfg), _store(tmp_path))
+    assert _calls(tmp_path) == ["grok", "codex"]
+    assert rec["extra_passes"]["refuter"]["contributing_providers"] == ["xai"]
+    assert rec["findings"][0]["refuter"]["provider"] == "openai"
+
+
+def test_refuter_does_not_fall_back_to_a_contributor(tmp_path):
+    _fake_cli(tmp_path, "grok", _emit(DIRTY))
+    _fake_cli(tmp_path, "codex", 'echo "usage limit reached" >&2\nexit 1\n')
+    cfg = CFG_FINDER_XAI + CFG_REFUTER_OPENAI + '\nfallbacks = ["finder"]\n'
+    rec = _run(_repo(tmp_path, cfg), _store(tmp_path))
+    assert _calls(tmp_path) == ["grok", "codex"]
+    assert "refuter" not in rec["findings"][0]
+    assert rec["trustworthy"] is True
+
+
+@pytest.mark.parametrize("mixed_batches", [False, True])
+def test_batched_contributors_include_fallbacks_and_integration(tmp_path, monkeypatch, mixed_batches):
+    from tests.test_batched_review import BATCH_CFG, _body
+
+    unavailable = 'echo "usage limit reached" >&2\nexit 1\n'
+    grok = _per_call(_emit(DIRTY), unavailable) if mixed_batches else _emit(DIRTY)
+    _fake_cli(tmp_path, "grok", grok)
+    _fake_cli(tmp_path, "codex", _emit(_codex_stream({"summary": "checked", "findings": []})))
+    finder = CFG_FINDER_XAI + ('\nfallbacks = ["integration"]\n' if mixed_batches else '')
+    integrator = CFG_REFUTER_OPENAI.replace('second-opinion', 'integration').replace('"refuter"', '"integrator"')
+    cfg = BATCH_CFG + finder + integrator + CFG_REFUTER_OPENAI
+    repo = _repo(tmp_path, cfg)
+    for index in range(3):
+        (repo / f"f{index}.txt").write_text(_body(f"f{index}"))
+    rec = _run(repo, _store(tmp_path))
+    assert len(rec["batches"]) > 1
+    if mixed_batches:
+        assert {part["provider"] for part in rec["batches"]} == {"xai", "openai"}
+    else:
+        assert {part["provider"] for part in rec["batches"]} == {"xai"}
+    assert rec["integration"]["provider"] == "openai"
+    meta = rec["extra_passes"]["refuter"]
+    assert meta["contributing_providers"] == ["openai", "xai"]
+    assert meta["status"] == "skipped"
+    assert rec["trustworthy"] is True
+    assert all("refuter" not in finding for finding in rec["findings"])
+    # Every call belongs to a batch/integration attempt, never the refuter.
+    attempts = sum(len(part["attempts"]) for part in rec["batches"])
+    attempts += len(rec["integration"]["attempts"])
+    assert len(_calls(tmp_path)) <= attempts
+
+
+@pytest.mark.parametrize("unknown", [None, "unknown-provider"])
+def test_missing_accepted_finder_provenance_skips_refuter(tmp_path, monkeypatch, unknown):
+    real = pipeline._run_chain
+
+    def without_provenance(*args, **kwargs):
+        outcome = real(*args, **kwargs)
+        if args[7] == "primary":
+            outcome.accepted = dict(outcome.accepted, provider=unknown)
+        return outcome
+
+    monkeypatch.setattr(pipeline, "_run_chain", without_provenance)
+    _fake_cli(tmp_path, "grok", _emit(DIRTY))
+    _fake_cli(tmp_path, "codex", _emit(_codex_stream(REFUTED_ONE)))
+    rec = _run(_repo(tmp_path, CFG_FINDER_XAI + CFG_REFUTER_OPENAI), _store(tmp_path))
+    assert _calls(tmp_path) == ["grok"]
+    assert rec["extra_passes"]["refuter"]["status"] == "skipped"
+    assert "unknown" in rec["extra_passes"]["refuter"]["note"]
+    assert rec["trustworthy"] is True
+
+
+def test_independent_pipeline_annotation_can_be_adopted_by_shared_service(tmp_path):
+    from skodun.services import svc_adopt_refuter
+
+    _fake_cli(tmp_path, "grok", _emit(DIRTY))
+    _fake_cli(tmp_path, "codex", _emit(_codex_stream(REFUTED_ONE)))
+    repo = _repo(tmp_path, CFG_FINDER_XAI + CFG_REFUTER_OPENAI)
+    with _store(tmp_path) as store:
+        rec = _run(repo, store)
+        assert run_gate(store, repo, load_config(repo)).code == 1
+        assert svc_adopt_refuter(store, rec["id"], 0)[0] == 0
+        assert run_gate(store, repo, load_config(repo)).code == 0
+
+
+@pytest.mark.parametrize("part", ["batch", "integration"])
+def test_missing_aggregate_provenance_never_borrows_configured_finder(tmp_path, monkeypatch, part):
+    from dataclasses import replace
+    from tests.test_batched_review import BATCH_CFG, _body
+
+    real = pipeline._run_sub
+
+    def legacy(*args, **kwargs):
+        result = real(*args, **kwargs)
+        is_integration = args[7] == passes.INTEGRATION_PASS
+        if is_integration == (part == "integration"):
+            return replace(result, provenance=dict(result.provenance, provider=None))
+        return result
+
+    monkeypatch.setattr(pipeline, "_run_sub", legacy)
+    _fake_cli(tmp_path, "grok", _emit(DIRTY))
+    _fake_cli(tmp_path, "codex", _emit(_codex_stream(REFUTED_ONE)))
+    repo = _repo(tmp_path, BATCH_CFG + CFG_FINDER_XAI + CFG_REFUTER_OPENAI)
+    for index in range(3):
+        (repo / f"f{index}.txt").write_text(_body(f"f{index}"))
+    rec = _run(repo, _store(tmp_path))
+    assert rec["trustworthy"] is True
+    assert rec["extra_passes"]["refuter"]["status"] == "skipped"
+    assert rec["extra_passes"]["refuter"]["contributing_providers"] is None
+    assert "codex" not in _calls(tmp_path)
+
+
+@pytest.mark.parametrize("accepted", [None, {"adapter_name": "grok", "provider": "xai", "model": FAKE_XAI_MODEL, "effort": None}])
+def test_refuter_requires_actual_accepted_independent_provenance(tmp_path, monkeypatch, accepted):
+    real = pipeline._run_chain
+
+    def inconsistent(*args, **kwargs):
+        outcome = real(*args, **kwargs)
+        if args[7] == "refuter":
+            outcome.accepted = accepted
+        return outcome
+
+    monkeypatch.setattr(pipeline, "_run_chain", inconsistent)
+    _fake_cli(tmp_path, "grok", _emit(DIRTY))
+    _fake_cli(tmp_path, "codex", _emit(_codex_stream(REFUTED_ONE)))
+    store = _store(tmp_path)
+    rec = _run(_repo(tmp_path, CFG_FINDER_XAI + CFG_REFUTER_OPENAI), store)
+    assert rec["extra_passes"]["refuter"]["status"] == "failed"
+    assert "provenance" in rec["extra_passes"]["refuter"]["note"]
+    assert "refuter" not in rec["findings"][0]
+    assert rec["trustworthy"] is True
+
+    meta = rec["extra_passes"]["refuter"]
+    assert meta["provider"] == (accepted["provider"] if accepted else "openai")
+    assert meta["model"] == (accepted["model"] if accepted else FAKE_OPENAI_MODEL)
+    assert meta["contributing_providers"] == ["xai"]
+    assert meta["ran"] is False
+    from skodun.services import svc_adopt_refuter
+
+    assert svc_adopt_refuter(store, rec["id"], 0)[0] == 1
+    assert store.triage_for(rec["branch"], rec["base_sha"]) == {}
+
+
+def test_refuter_compares_actual_finder_fallback_instead_of_configured_head(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKODUN_IGNORE_PROVIDER_STATE", "1")
+    unavailable = 'echo "usage limit reached" >&2\nexit 1\n'
+    response = json.dumps({"structuredOutput": REFUTED_ONE, "stopReason": "EndTurn"})
+    _fake_cli(tmp_path, "grok", _per_call(unavailable, _emit(response)))
+    _fake_cli(tmp_path, "codex", _emit(_codex_stream(json.loads(DIRTY)["structuredOutput"])))
+    answer = CFG_REFUTER_OPENAI.replace('second-opinion', 'answer').replace('"refuter"', '"finder"')
+    cfg = CFG_FINDER_XAI + '\nfallbacks = ["answer"]\n' + answer + CFG_REFUTER_XAI
+    rec = _run(_repo(tmp_path, cfg), _store(tmp_path))
+    assert _calls(tmp_path) == ["grok", "codex", "grok"]
+    meta = rec["extra_passes"]["refuter"]
+    assert meta["contributing_providers"] == ["openai"]
+    assert meta["provider"] == "xai" and meta["status"] == "ran"
+
+
+def test_promoted_refuter_never_expands_its_own_contributor_fallback(tmp_path):
+    _fake_cli(tmp_path, "grok", _emit(DIRTY))
+    _fake_cli(tmp_path, "codex", 'echo "usage limit reached" >&2\nexit 1\n')
+    cfg = CFG_FINDER_XAI + CFG_REFUTER_XAI + '\nfallbacks = ["independent"]\n'
+    cfg += CFG_REFUTER_OPENAI.replace('second-opinion', 'independent')
+    cfg += '\nfallbacks = ["finder"]\n'
+    rec = _run(_repo(tmp_path, cfg), _store(tmp_path))
+    assert _calls(tmp_path) == ["grok", "codex"]
+    assert rec["extra_passes"]["refuter"]["status"] == "failed"
+    assert "refuter" not in rec["findings"][0]
+    assert rec["trustworthy"] is True
