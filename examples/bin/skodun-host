@@ -12,7 +12,7 @@ if [ ! -f "$profile" ]; then
 fi
 # Trusted shell configuration, like a shell rc file; never store credentials here.
 # Executable and capacity come from this profile, not stale client settings.
-unset SKODUN_REAL_BIN SKODUN_REVIEW_FG_CAPACITY SKODUN_LEGACY_FG_LOCK \
+unset SKODUN_REAL_BIN SKODUN_REVIEW_MACHINE_CAPACITY SKODUN_REVIEW_FG_CAPACITY SKODUN_LEGACY_FG_LOCK \
     SKODUN_PROVIDER_MAX_IN_FLIGHT
 . "$profile"
 if [ -z "${SKODUN_REAL_BIN:-}" ] || [ ! -x "$SKODUN_REAL_BIN" ]; then

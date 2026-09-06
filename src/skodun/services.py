@@ -1074,13 +1074,33 @@ def svc_log(store, branch, limit, repo=None) -> tuple[int, str]:
     return 0, "\n".join(lines)
 
 
-def svc_stats(store, since_days=7, fmt="text") -> tuple[int, str]:
+def svc_stats(store, since_days=7, fmt="text", *, repo=None) -> tuple[int, str]:
     """Render CLI-only operational statistics from the store read model."""
     from . import stats
 
     try:
         lower = stats.since_iso(since_days)
         data = store.telemetry_stats(since_iso=lower)
+        from . import capacity as capmod
+        from .config import load_config
+        config_error = None
+        try:
+            machine_cap = capmod.resolved_machine_capacity(load_config(repo))
+        except (ValueError, TypeError, OSError) as exc:
+            machine_cap = None
+            config_error = f"{type(exc).__name__}: run skodun doctor to inspect capacity configuration"
+        live = {
+            "machine_cap": machine_cap,
+            "machine_holders": store.capacity_holder_count(
+                capmod.RESOURCE_REVIEW_MACHINE, capmod.MACHINE_SCOPE),
+            "by_repo": store.capacity_live_holders(capmod.RESOURCE_REVIEW_FG),
+            "by_provider": store.capacity_live_holders_prefix(
+                capmod.PROVIDER_CLASS_PREFIX),
+        }
+        if config_error is not None:
+            live["config_error"] = config_error
+        data = dict(data)
+        data["live_capacity"] = live
         from .queueview import augment_stats
         data = augment_stats(store, data)
         return 0, stats.render(data, fmt=fmt)

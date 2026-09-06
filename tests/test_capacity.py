@@ -549,10 +549,10 @@ def test_s4_dual_hold_off_two_concurrent_store_only_holders(store):
     """T1: dual-hold off path (try_lock=None) admits N concurrent holders."""
     t1 = acquire_for_fg(
         store, scope="/repo", capacity=2, wait_sec=0.5, poll_sec=0.01,
-        try_lock=None)
+        try_lock=None, machine_capacity=2)
     t2 = acquire_for_fg(
         store, scope="/repo", capacity=2, wait_sec=0.5, poll_sec=0.01,
-        try_lock=None)
+        try_lock=None, machine_capacity=2)
     assert t1.status == STATUS_RUNNING
     assert t2.status == STATUS_RUNNING
     assert t1.id != t2.id
@@ -572,7 +572,7 @@ def test_s4_dual_hold_on_try_lock_still_required(store):
 
     t1 = acquire_for_fg(
         store, scope="/repo", capacity=2, wait_sec=1, poll_sec=0.01,
-        try_lock=try_lock_hold)
+        try_lock=try_lock_hold, machine_capacity=2)
     assert t1.status == STATUS_RUNNING
     assert held == ["a"]
 
@@ -742,6 +742,54 @@ def test_s4_progress_eta_from_terminal_samples(store):
     finish(store, ticket, status=STATUS_RELEASED)
 
 
+# ---------------------------------------------------------------------------
+# Machine-wide outer cap (shared store, inner review-fg stays per-repo)
+# ---------------------------------------------------------------------------
+
+
+def test_machine_capacity_from_env_defaults_and_rejects_junk():
+    assert capacity.machine_capacity_from_env({}) == 1
+    assert capacity.machine_capacity_from_env(
+        {"SKODUN_REVIEW_MACHINE_CAPACITY": "2"}) == 2
+    assert capacity.machine_capacity_from_env(
+        {"SKODUN_REVIEW_MACHINE_CAPACITY": "0"}) == 1
+    assert capacity.machine_capacity_from_env(
+        {"SKODUN_REVIEW_MACHINE_CAPACITY": "nope"}) == 1
+
+
+def test_effective_fg_capacity_is_min_of_machine_and_repo():
+    assert capacity.effective_fg_capacity(8, 1) == 1
+    assert capacity.effective_fg_capacity(1, 2) == 1
+    assert capacity.effective_fg_capacity(3, 3) == 3
+
+
+def test_two_repo_scopes_cannot_both_run_when_machine_cap_is_one(store):
+    first = acquire_for_fg(
+        store, scope="/repo-a/.git", capacity=1, wait_sec=0.2, poll_sec=0.01,
+        try_lock=None, machine_capacity=1)
+    assert first.status == STATUS_RUNNING
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(
+            store, scope="/repo-b/.git", capacity=1, wait_sec=0.08,
+            poll_sec=0.02, try_lock=None, machine_capacity=1)
+    finish(store, first, status=STATUS_RELEASED)
+    second = acquire_for_fg(
+        store, scope="/repo-b/.git", capacity=1, wait_sec=0.2, poll_sec=0.01,
+        try_lock=None, machine_capacity=1)
+    assert second.status == STATUS_RUNNING
+    finish(store, second, status=STATUS_RELEASED)
+
+
+def test_repo_fg_env_cannot_exceed_machine_cap(store):
+    first = acquire_for_fg(
+        store, scope="/repo-a/.git", capacity=8, wait_sec=0.2, poll_sec=0.01,
+        try_lock=None, machine_capacity=1)
+    assert first.status == STATUS_RUNNING
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(
+            store, scope="/repo-a/.git", capacity=8, wait_sec=0.08,
+            poll_sec=0.02, try_lock=None, machine_capacity=1)
+    finish(store, first, status=STATUS_RELEASED)
 def test_same_second_fifo_uses_committed_enqueue_order(tmp_path, monkeypatch):
     from skodun import store as store_module
     monkeypatch.setattr(store_module, '_iso_now', lambda: '2026-09-05T00:00:00Z')
@@ -774,3 +822,295 @@ def test_enqueue_order_survives_new_process_and_terminal_rows(tmp_path, monkeypa
         assert store.capacity_position('z-first') is None
         assert store.capacity_position('a-second') == 1
         assert store.capacity_try_admit('0-third', capacity=1) is None
+
+
+def test_machine_holder_is_not_reclaimed_after_long_queue_or_execution(store):
+    first = acquire_for_fg(store, scope="/repo-a", capacity=1, wait_sec=0.1,
+                           poll_sec=0.01, machine_capacity=1)
+    store._c.execute("UPDATE capacity_admissions SET queued_at='2000-01-01T00:00:00Z', "
+                     "admitted_at='2000-01-02T00:00:00Z' WHERE id=?", (first.parent.id,))
+    assert capacity.reclaim_stale(store, scope=capacity.MACHINE_SCOPE,
+        resource_class=capacity.RESOURCE_REVIEW_MACHINE, stale_sec=0,
+        pid_alive_fn=lambda pid: True) == []
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope="/repo-b", capacity=1, wait_sec=0.02,
+                       poll_sec=0.01, machine_capacity=1, stale_sec=0,
+                       pid_alive_fn=lambda pid: True)
+    assert capacity.reclaim_stale(store, scope=capacity.MACHINE_SCOPE,
+        resource_class=capacity.RESOURCE_REVIEW_MACHINE, stale_sec=0,
+        pid_alive_fn=lambda pid: False) == [first.parent.id]
+    finish(store, first)
+
+
+def test_machine_ticket_released_when_inner_lock_fails(store):
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope="/repo-a", capacity=1, wait_sec=0.02,
+                       poll_sec=0.01, machine_capacity=1, try_lock=lambda _: False)
+    assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE,
+                                        capacity.MACHINE_SCOPE) == 0
+
+
+def test_machine_cap_is_shared_by_independent_processes(tmp_path):
+    import os
+    import subprocess
+    import sys
+    db = tmp_path / 'shared.db'
+    script = '''
+import sys
+from pathlib import Path
+from skodun.store import Store
+from skodun.capacity import acquire_for_fg, finish, AdmissionTimeout
+with Store.open(Path(sys.argv[1])) as store:
+    try:
+        ticket = acquire_for_fg(store, scope=sys.argv[2], capacity=8,
+            machine_capacity=1 if sys.argv[2] == "repo-a" else 4, wait_sec=.1, poll_sec=.01)
+    except AdmissionTimeout:
+        print('blocked', flush=True)
+    else:
+        print('held', flush=True)
+        if sys.argv[2] == 'repo-a':
+            sys.stdin.readline()
+        finish(store, ticket)
+'''
+    env = {**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')}
+    with Store.open(db):
+        pass
+    with subprocess.Popen([sys.executable, '-c', script, str(db), 'repo-a'],
+                          env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as holder:
+        try:
+            assert holder.stdout.readline().strip() == 'held'
+            blocked = subprocess.run([sys.executable, '-c', script, str(db), 'repo-b'],
+                                     env=env, capture_output=True, text=True, timeout=10)
+            assert blocked.returncode == 0, blocked.stderr
+            assert blocked.stdout.strip() == 'blocked'
+        finally:
+            stdout, stderr = holder.communicate('\n', timeout=10)
+        assert holder.returncode == 0, stderr
+    admitted = subprocess.run([sys.executable, '-c', script, str(db), 'repo-b'],
+                             env=env, capture_output=True, text=True, timeout=10)
+    assert admitted.returncode == 0, admitted.stderr
+    assert admitted.stdout.strip() == 'held'
+
+
+@pytest.mark.parametrize('failed_layer', ['child', 'parent'])
+def test_finish_keeps_machine_parent_retryable_on_store_failure(store, monkeypatch, failed_layer):
+    ticket = acquire_for_fg(store, scope='/repo', capacity=1, machine_capacity=1,
+                            wait_sec=.1, poll_sec=.01)
+    parent = ticket.parent
+    fail_id = ticket.id if failed_layer == 'child' else parent.id
+    original = store.capacity_finish
+    def fail(admission_id, **kwargs):
+        if admission_id == fail_id:
+            raise RuntimeError('write failed')
+        return original(admission_id, **kwargs)
+    monkeypatch.setattr(store, 'capacity_finish', fail)
+    with pytest.raises(RuntimeError, match='write failed'):
+        finish(store, ticket)
+    assert ticket.parent is parent
+    assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, capacity.MACHINE_SCOPE) == 1
+    monkeypatch.setattr(store, 'capacity_finish', original)
+    finish(store, ticket)
+    assert ticket.parent is None
+    assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, capacity.MACHINE_SCOPE) == 0
+
+
+def test_machine_holder_reclaims_proven_recycled_pid_but_retains_unknown(store, monkeypatch):
+    monkeypatch.setattr(capacity, 'process_observation', lambda pid: capacity.ProcessObservation('original-start'))
+    ticket = acquire_for_fg(store, scope='/repo', capacity=1, machine_capacity=1,
+                            wait_sec=.1, poll_sec=.01)
+    assert store.capacity_get(ticket.parent.id)['owner_start'] == 'original-start'
+    monkeypatch.setattr(capacity, 'process_observation', lambda pid: capacity.ProcessObservation())
+    assert capacity.reclaim_stale(store, scope=capacity.MACHINE_SCOPE,
+        resource_class=capacity.RESOURCE_REVIEW_MACHINE, stale_sec=0,
+        pid_alive_fn=lambda pid: True) == []
+    monkeypatch.setattr(capacity, 'process_observation', lambda pid: capacity.ProcessObservation('different-start'))
+    assert capacity.reclaim_stale(store, scope=capacity.MACHINE_SCOPE,
+        resource_class=capacity.RESOURCE_REVIEW_MACHINE, stale_sec=0,
+        pid_alive_fn=lambda pid: True) == [ticket.parent.id]
+    finish(store, ticket)
+
+
+def test_process_birth_token_is_stable_for_this_process():
+    import os
+    first = capacity.process_birth_token(os.getpid())
+    assert first is not None
+    assert capacity.process_birth_token(os.getpid()) == first
+
+
+def test_linux_birth_token_uses_boot_identity_and_ticks_not_wall_clock(monkeypatch):
+    monkeypatch.setattr(capacity.sys, 'platform', 'linux')
+    boot = '12345678-1234-1234-1234-123456789abc'
+    stat = '123 (command with ) spaces) ' + ' '.join(['S'] + ['0'] * 18 + ['987654'])
+    contents = {'/proc/123/stat': stat, '/proc/sys/kernel/random/boot_id': boot}
+    monkeypatch.setattr(capacity.Path, 'read_text', lambda path: contents[str(path)])
+    monkeypatch.setattr(capacity.subprocess, 'run', lambda *a, **k:
+                        pytest.fail('Linux identity must not depend on ps wall time'))
+    assert capacity.process_birth_token(123) == f'linux:{boot}:987654'
+    contents['/proc/123/stat'] = stat.replace('987654', '987655')
+    assert capacity.process_birth_token(123) == f'linux:{boot}:987655'
+
+
+def test_linux_unreadable_birth_token_is_unknown_without_wall_clock_fallback(monkeypatch):
+    monkeypatch.setattr(capacity.sys, 'platform', 'linux')
+    def unreadable(path):
+        raise OSError('proc unavailable')
+    monkeypatch.setattr(capacity.Path, 'read_text', unreadable)
+    monkeypatch.setattr(capacity.subprocess, 'run', lambda *a, **k:
+                        pytest.fail('do not substitute a wall-clock identity'))
+    assert capacity.process_birth_token(123) is None
+
+
+def test_tighter_machine_holder_limit_binds_other_repositories_until_release(store):
+    tight = acquire_for_fg(store, scope='/tight-repo', capacity=4, machine_capacity=1,
+                           wait_sec=.1, poll_sec=.01)
+    assert store.capacity_get(tight.parent.id)['capacity_limit'] == 1
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope='/wide-repo', capacity=4, machine_capacity=4,
+                       wait_sec=.03, poll_sec=.01)
+    finish(store, tight)
+    first = acquire_for_fg(store, scope='/wide-repo', capacity=4, machine_capacity=4,
+                           wait_sec=.1, poll_sec=.01)
+    second = acquire_for_fg(store, scope='/another-repo', capacity=4, machine_capacity=4,
+                            wait_sec=.1, poll_sec=.01)
+    assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, capacity.MACHINE_SCOPE) == 2
+    finish(store, first)
+    finish(store, second)
+
+
+def test_machine_limit_of_two_cannot_be_raised_by_later_wide_waiters(store):
+    first = acquire_for_fg(store, scope='/one', capacity=2, machine_capacity=2,
+                           wait_sec=.1, poll_sec=.01)
+    second = acquire_for_fg(store, scope='/two', capacity=4, machine_capacity=4,
+                            wait_sec=.1, poll_sec=.01)
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope='/three', capacity=4, machine_capacity=4,
+                       wait_sec=.03, poll_sec=.01)
+    finish(store, first)
+    third = acquire_for_fg(store, scope='/three', capacity=4, machine_capacity=4,
+                           wait_sec=.1, poll_sec=.01)
+    assert store.capacity_get(second.parent.id)['capacity_limit'] == 4
+    finish(store, second)
+    finish(store, third)
+
+
+def test_foreground_holder_limit_binds_other_worktrees_but_not_other_repos(store):
+    first = acquire_for_fg(store, scope='/repo', capacity=1, machine_capacity=8,
+                           wait_sec=.1, poll_sec=.01)
+    assert store.capacity_get(first.id)['capacity_limit'] == 1
+    other = acquire_for_fg(store, scope='/other-repo', capacity=4, machine_capacity=8,
+                           wait_sec=.1, poll_sec=.01)
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                       wait_sec=.03, poll_sec=.01)
+    finish(store, first)
+    second = acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                            wait_sec=.1, poll_sec=.01)
+    third = acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                           wait_sec=.1, poll_sec=.01)
+    assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_FG, '/repo') == 2
+    for ticket in (other, second, third):
+        finish(store, ticket)
+
+
+def test_foreground_holder_age_starts_at_admission_after_a_long_wait(store):
+    from datetime import datetime, timezone
+    first = acquire_for_fg(store, scope='/repo', capacity=1, machine_capacity=4,
+                           wait_sec=.1, poll_sec=.01)
+    store._c.execute("UPDATE capacity_admissions SET queued_at='2000-01-01T00:00:00Z' WHERE id=?",
+                     (first.id,))
+    started = datetime.strptime(first.started_at, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).timestamp()
+    assert capacity.reclaim_stale(store, scope='/repo', stale_sec=30,
+                                  now_epoch=started + 1, pid_alive_fn=lambda pid: True) == []
+    finish(store, first)
+
+
+def test_legacy_single_slot_and_store_only_holders_respect_each_other(store):
+    first = acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                           wait_sec=.1, poll_sec=.01)
+    attempts = []
+    def legacy_lock(seconds):
+        attempts.append(seconds)
+        return True
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                       wait_sec=.03, poll_sec=.01, try_lock=legacy_lock)
+    assert attempts == []
+    finish(store, first)
+    legacy = acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                            wait_sec=.1, poll_sec=.01, try_lock=legacy_lock)
+    assert store.capacity_get(legacy.id)['capacity_limit'] == 1
+    with pytest.raises(capacity.AdmissionTimeout):
+        acquire_for_fg(store, scope='/repo', capacity=4, machine_capacity=8,
+                       wait_sec=.03, poll_sec=.01)
+    finish(store, legacy)
+
+
+@pytest.mark.parametrize('resource', ['review-machine', 'review-fg', 'provider:xai'])
+def test_zombie_owner_is_reclaimed_even_when_pid_exists_and_token_matches(store, monkeypatch, resource):
+    monkeypatch.setattr(capacity, 'pid_alive', lambda pid: True)
+    monkeypatch.setattr(capacity, 'process_observation', lambda pid: capacity.ProcessObservation('same-start'))
+    ticket = enqueue(store, scope='scope', resource_class=resource)
+    try_admit(store, ticket, capacity=1)
+    capacity.mark_started(store, ticket)
+    monkeypatch.setattr(capacity, 'process_observation', lambda pid: capacity.ProcessObservation('same-start', True))
+    assert capacity.reclaim_stale(store, scope='scope', resource_class=resource,
+                                  stale_sec=10**9) == [ticket.id]
+
+
+def test_ps_observation_reports_zombie_without_changing_birth_identity(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(capacity.sys, 'platform', 'darwin')
+    def ps(argv, **kwargs):
+        assert 'stat=' in argv and 'lstart=' in argv
+        return subprocess.CompletedProcess(argv, 0, stdout='Z+ Sun Sep  6 12:00:00 2026\n')
+    monkeypatch.setattr(capacity.subprocess, 'run', ps)
+    assert capacity.process_observation(123) == capacity.ProcessObservation('Sun Sep 6 12:00:00 2026', True)
+
+
+def test_real_unreaped_linux_child_cannot_keep_machine_capacity(store):
+    import os
+    import sys
+    if not sys.platform.startswith('linux') or not hasattr(os, 'WNOWAIT'):
+        pytest.skip('Linux waitid WNOWAIT is needed to retain a real zombie')
+    reader, writer = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(writer)
+        os.read(reader, 1)
+        os._exit(0)
+    os.close(reader)
+    try:
+        ticket = enqueue(store, scope='*', resource_class='review-machine', pid=pid)
+        try_admit(store, ticket, capacity=1)
+        capacity.mark_started(store, ticket)
+        os.write(writer, b'x')
+        os.close(writer)
+        writer = -1
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        os.kill(pid, 0)  # PID still exists: only process-state evidence proves exit.
+        assert capacity.process_observation(pid).exited is True
+        assert capacity.reclaim_stale(store, scope='*', resource_class='review-machine',
+                                      stale_sec=10**9) == [ticket.id]
+    finally:
+        if writer >= 0:
+            os.close(writer)
+        os.waitpid(pid, 0)
+
+
+def test_attaching_review_id_preserves_first_start_and_full_run_time(store, monkeypatch):
+    from skodun import store as mod
+    from tests.test_store import REC
+    store.save_review({**REC, 'id': 'attached-review'})
+    at = ['2026-09-06T00:00:00Z']
+    monkeypatch.setattr(mod, '_iso_now', lambda: at[0])
+    ticket = acquire(store, scope='*', resource_class='review-machine', capacity=1,
+                     wait_sec=.1, poll_sec=.01)
+    at[0] = '2026-09-06T00:00:10Z'
+    capacity.mark_started(store, ticket, review_id='attached-review')
+    assert ticket.started_at == '2026-09-06T00:00:00Z'
+    at[0] = '2026-09-06T00:00:20Z'
+    finish(store, ticket)
+    row = store.capacity_get(ticket.id)
+    assert row['review_id'] == 'attached-review'
+    assert row['run_ms'] == 20000

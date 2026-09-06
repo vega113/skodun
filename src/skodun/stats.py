@@ -51,6 +51,23 @@ def render(data: Mapping, *, fmt: str = "text") -> str:
          f"never_trustworthy={data['identities']['never_trustworthy']} "
          f"reuse_hits={data['reuse']['hits']} reuse_misses={data['reuse']['misses']}"),
     ]
+    live = data.get("live_capacity")
+    if isinstance(live, Mapping):
+        repo_bit = ",".join(
+            f"{h.get('scope')}={h.get('n')}"
+            for h in (live.get("by_repo") or []) if isinstance(h, Mapping)
+        ) or "none"
+        prov_bit = ",".join(
+            f"{h.get('resource_class')}@{h.get('scope')}={h.get('n')}"
+            for h in (live.get("by_provider") or []) if isinstance(h, Mapping)
+        ) or "none"
+        machine_cap = live.get('machine_cap')
+        lines.append(
+            f"machine_cap={machine_cap if machine_cap is not None else 'unknown'} "
+            f"machine_holders={live.get('machine_holders')} "
+            f"by_repo={repo_bit} by_provider={prov_bit}")
+        if live.get('config_error'):
+            lines.append(f"capacity_config_error={live['config_error']}")
     if 'audit_denominators' in data:
         lines.append('audit_denominators=' + json.dumps(data['audit_denominators'], sort_keys=True))
         lines.append('call_observations=' + json.dumps(data['call_observations'], sort_keys=True))

@@ -1471,7 +1471,8 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
     common_dir = gitio.git_common_dir(repo)
     scope = str(common_dir)
     admission_wait = capacity.admission_wait_from_env(wait)
-    cap_n = capacity.capacity_from_env()
+    machine_n = capacity.resolved_machine_capacity(cfg)
+    cap_n = capacity.resolved_fg_capacity(cfg)
     dual_hold = capacity.legacy_fg_lock_from_env()
     lock_cell: dict = {"lock": None}
     capacity_ticket: capacity.Ticket | None = None
@@ -1509,14 +1510,16 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                 store, scope=scope, capacity=cap_n,
                 wait_sec=admission_wait, poll_sec=poll,
                 stale_sec=stale,
-                cancel=cancel, on_progress=_note, try_lock=_try_fg_lock)
+                cancel=cancel, on_progress=_note, try_lock=_try_fg_lock,
+                machine_capacity=machine_n)
         else:
             # Multi-slot path: store capacity only (S4 dual-hold off).
             capacity_ticket = capacity.acquire_for_fg(
                 store, scope=scope, capacity=cap_n,
                 wait_sec=admission_wait, poll_sec=poll,
                 stale_sec=stale,
-                cancel=cancel, on_progress=_note, try_lock=None)
+                cancel=cancel, on_progress=_note, try_lock=None,
+                machine_capacity=machine_n)
     except capacity.AdmissionTimeout as e:
         if lock_cell["lock"] is not None:
             _release_fg_lock(lock_cell["lock"])
@@ -2333,6 +2336,7 @@ def run_prepush_review(store: Store, repo: Path, record_id: str, branch: str,
                        *, cancel: "threading.Event | None" = None) -> dict:
     """Review a PUSHED ref for an already-reserved record. Persists NOTHING.
 
+    The worker owns machine admission through finalization around this call.
     The background half of `run_review`, and the list of what it does NOT do is
     the interface: no foreground lock (the reservation lease already serialised
     this branch, and a detached worker must not block on a human's review), no

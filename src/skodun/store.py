@@ -31,11 +31,14 @@ from __future__ import annotations
 import json
 import errno
 import hashlib
+import io
 import os
 import re
 import shutil
 import sqlite3
 import stat
+import subprocess
+import sys
 import tempfile
 import time
 from contextlib import closing
@@ -67,7 +70,7 @@ from .request_store import RequestStoreMixin, MIGRATION as _MIGRATION_V17
 from .control_store import ControlStoreMixin, MIGRATION as _MIGRATION_V18
 from .budget_store import BudgetStoreMixin, MIGRATION as _MIGRATION_V19
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 
 class SchemaLifecycleError(ValueError):
@@ -89,6 +92,10 @@ class SchemaInfo:
     target: int
     reason_code: str | None = None
     detail: str | None = None
+    journal_mode: str | None = None
+    wal_bytes: int | None = None
+    shm_bytes: int | None = None
+    integrity_check: str | None = None
 
     def __post_init__(self) -> None:
         if self.state not in {"missing", "invalid", "current", "older", "newer"}:
@@ -224,24 +231,228 @@ def _snapshot_database(path: Path) -> tuple[tempfile.TemporaryDirectory | None,
     return snapshot, db_path, None
 
 
-def inspect_schema(path: Path) -> SchemaInfo:
+def _header_write_version(path: Path) -> int | None:
+    """SQLite header byte 18: 1 = rollback journal, 2 = WAL.
+
+    Uses the same nofollow/nonblock open as inspection so a FIFO or
+    symlink beside the store cannot hang doctor.
+    """
+    fd, error = _open_regular_file(path)
+    if error is not None or fd is None:
+        return None
+    try:
+        header = os.read(fd, 20)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(header) < 20 or not header.startswith(b"SQLite format 3\x00"):
+        return None
+    return int(header[18])
+
+
+def _sidecar_size(path: Path) -> int | None:
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return int(st.st_size)
+
+
+def _journal_mode_from_header(path: Path) -> str | None:
+    write_ver = _header_write_version(path)
+    if write_ver == 2:
+        return "wal"
+    if write_ver == 1:
+        return "delete"
+    return None
+
+
+def _torn_wal_signature(path: Path) -> bool:
+    """WAL header plus a missing or empty ``-wal`` sidecar.
+
+    A healthy checkpointed WAL store can look like this too; callers must
+    still confirm ``integrity_check`` or a corrupt-open before treating it
+    as torn. The signature is the incident shape, not the verdict.
+    """
+    if _header_write_version(path) != 2:
+        return False
+    wal_bytes = _sidecar_size(Path(str(path) + "-wal"))
+    return wal_bytes is None or wal_bytes == 0
+
+
+def _is_busy_error(exc: BaseException) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    busy_codes = {getattr(sqlite3, "SQLITE_BUSY", 5),
+                  getattr(sqlite3, "SQLITE_LOCKED", 6)}
+    if code in busy_codes:
+        return True
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database is busy" in msg
+
+
+def _is_corrupt_error(exc: BaseException) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code == getattr(sqlite3, "SQLITE_CORRUPT", 11):
+        return True
+    return "malformed" in str(exc).lower() or "corrupt" in str(exc).lower()
+
+
+def _durability_fields(path: Path, *, journal_mode: str | None = None,
+                       integrity: str | None = None) -> dict:
+    return {
+        "journal_mode": journal_mode or _journal_mode_from_header(path),
+        "wal_bytes": _sidecar_size(Path(str(path) + "-wal")),
+        "shm_bytes": _sidecar_size(Path(str(path) + "-shm")),
+        "integrity_check": integrity,
+    }
+
+
+def _inspection_source_state(path: Path) -> tuple | None:
+    """Observe file identities and write metadata without opening live SQLite."""
+    parts = []
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            st = Path(str(path) + suffix).lstat()
+        except FileNotFoundError:
+            parts.append(None)
+            continue
+        except OSError:
+            return None
+        parts.append((st.st_dev, st.st_ino, st.st_mode, st.st_size,
+                      st.st_mtime_ns, st.st_ctime_ns))
+    return tuple(parts)
+
+
+def inspect_schema(path: Path, *, full_integrity: bool = True) -> SchemaInfo:
+    """Retry failed raw-copy checks when the source changed during inspection."""
+    for attempt in range(3):
+        info = _inspect_schema_once(path, full_integrity=full_integrity)
+        if info.reason_code != "busy" or info.detail != "source_changed":
+            return info
+        if attempt < 2:
+            time.sleep(0.05 * (attempt + 1))
+    return info
+
+
+def _inspect_schema_once(path: Path, *, full_integrity: bool) -> SchemaInfo:
     """Inspect a database without creating or mutating filesystem state."""
     path = Path(path)
+    source_state = _inspection_source_state(path)
+
+    def changed_source():
+        if source_state is not None and _inspection_source_state(path) == source_state:
+            return None
+        return SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
+                          reason_code="busy", detail="source_changed",
+                          **_durability_fields(path))
+
     snapshot, db_path, error = _snapshot_database(path)
     if error is not None:
+        extra = _durability_fields(path) if path.exists() else {}
+        if extra:
+            return SchemaInfo(
+                error.state, error.path, error.version, error.target,
+                reason_code=error.reason_code, detail=error.detail, **extra)
         return error
     assert snapshot is not None and db_path is not None
     uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
     conn = None
+    last_exc: BaseException | None = None
     try:
-        conn = sqlite3.connect(uri, uri=True, timeout=0)
-        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        state = ("current" if version == SCHEMA_VERSION else
-                 "older" if version < SCHEMA_VERSION else "newer")
-        return SchemaInfo(state, str(path), version, SCHEMA_VERSION)
-    except sqlite3.DatabaseError as exc:
+        for attempt in range(5):
+            try:
+                conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                row = conn.execute("PRAGMA journal_mode").fetchone()
+                journal_mode = (row[0] if row else None) or _journal_mode_from_header(path)
+                integrity = None
+                if full_integrity:
+                    integrity_row = conn.execute("PRAGMA integrity_check").fetchone()
+                    integrity = str(integrity_row[0]) if integrity_row else "unknown"
+                elif version == SCHEMA_VERSION:
+                    # Touch one table row, not every page/index. This catches
+                    # an unreadable incident image without scanning a healthy
+                    # checkpointed WAL store on each routine open.
+                    conn.execute("SELECT status FROM reviews NOT INDEXED LIMIT 1").fetchone()
+                extra = _durability_fields(
+                    path, journal_mode=str(journal_mode).lower(),
+                    integrity=integrity)
+                # A file-copy snapshot of a live non-empty WAL can look
+                # torn. Only an empty/missing -wal plus a bad check is the
+                # incident shape; that is safe to fail closed on.
+                if integrity is not None and integrity != "ok":
+                    unstable = changed_source()
+                    if unstable is not None:
+                        return unstable
+                    return SchemaInfo(
+                        "invalid", str(path), None, SCHEMA_VERSION,
+                        reason_code=("torn_wal" if _torn_wal_signature(path)
+                                     else "invalid_sqlite"),
+                        detail=f"integrity_check={integrity}; repairable "
+                               f"(do not replace with an empty store)",
+                        **extra)
+                if version != SCHEMA_VERSION:
+                    unstable = changed_source()
+                    if unstable is not None:
+                        return unstable
+                state = ("current" if version == SCHEMA_VERSION else
+                         "older" if version < SCHEMA_VERSION else "newer")
+                return SchemaInfo(state, str(path), version, SCHEMA_VERSION,
+                                  **extra)
+            except sqlite3.OperationalError as exc:
+                unstable = changed_source()
+                if unstable is not None:
+                    return unstable
+                last_exc = exc
+                if conn is not None:
+                    conn.close()
+                    conn = None
+                if _is_busy_error(exc) and attempt < 4:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                extra = _durability_fields(path)
+                if _is_busy_error(exc):
+                    return SchemaInfo(
+                        "invalid", str(path), None, SCHEMA_VERSION,
+                        reason_code="busy", detail=repr(exc), **extra)
+                if _is_corrupt_error(exc) and _torn_wal_signature(path):
+                    return SchemaInfo(
+                        "invalid", str(path), None, SCHEMA_VERSION,
+                        reason_code="torn_wal",
+                        detail=f"{exc!r}; repairable "
+                               "(do not replace with an empty store)",
+                        **extra)
+                return SchemaInfo(
+                    "invalid", str(path), None, SCHEMA_VERSION,
+                    reason_code="invalid_sqlite", detail=repr(exc), **extra)
+            except sqlite3.DatabaseError as exc:
+                unstable = changed_source()
+                if unstable is not None:
+                    return unstable
+                extra = _durability_fields(path)
+                if _is_busy_error(exc):
+                    return SchemaInfo(
+                        "invalid", str(path), None, SCHEMA_VERSION,
+                        reason_code="busy", detail=repr(exc), **extra)
+                if _is_corrupt_error(exc) and _torn_wal_signature(path):
+                    return SchemaInfo(
+                        "invalid", str(path), None, SCHEMA_VERSION,
+                        reason_code="torn_wal",
+                        detail=f"{exc!r}; repairable "
+                               "(do not replace with an empty store)",
+                        **extra)
+                return SchemaInfo(
+                    "invalid", str(path), None, SCHEMA_VERSION,
+                    reason_code="invalid_sqlite", detail=repr(exc), **extra)
+        extra = _durability_fields(path)
+        detail = repr(last_exc) if last_exc is not None else "inspect failed"
         return SchemaInfo("invalid", str(path), None, SCHEMA_VERSION,
-                          reason_code="invalid_sqlite", detail=repr(exc))
+                          reason_code="invalid_sqlite", detail=detail, **extra)
     finally:
         if conn is not None:
             conn.close()
@@ -995,6 +1206,11 @@ _MIGRATIONS: tuple[tuple[int, str | tuple[str, ...]], ...] = (
     (18, _MIGRATION_V18),
     (19, _MIGRATION_V19),
     (20, MIGRATION_V20),
+    (21, (
+        "ALTER TABLE capacity_admissions ADD COLUMN owner_start TEXT",
+        "ALTER TABLE capacity_admissions ADD COLUMN capacity_limit INTEGER "
+        "CHECK(capacity_limit IS NULL OR (typeof(capacity_limit)='integer' AND capacity_limit>=1))",
+    )),
 )
 
 
@@ -1227,6 +1443,7 @@ def _enable_wal(conn: sqlite3.Connection, attempts: int = 20) -> str:
             row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
             mode = (row[0] if row else "") or ""
             if mode.lower() == "wal":
+                _apply_wal_durability(conn)
                 return mode
         except sqlite3.OperationalError:
             pass        # another opener holds a lock; it is converting it too
@@ -1234,10 +1451,555 @@ def _enable_wal(conn: sqlite3.Connection, attempts: int = 20) -> str:
         try:
             row = conn.execute("PRAGMA journal_mode").fetchone()
             if row and (row[0] or "").lower() == "wal":
+                _apply_wal_durability(conn)
                 return row[0]       # a peer finished the conversion for us
         except sqlite3.OperationalError:     # pragma: no cover - defensive
             pass
     return mode
+
+
+def _apply_wal_durability(conn: sqlite3.Connection) -> None:
+    """Prefer a slower intact WAL over a fast unreadable one.
+
+    ``synchronous`` and ``wal_autocheckpoint`` are per-connection. WAL's
+    compiled default is ``NORMAL``, which can lose the last frames (and a
+    torn checkpoint) when an MCP is killed. FULL plus, on macOS, checkpoint
+    fullfsync is the documented "slower but intact" posture. This does not
+    persist, and it does not flip a DELETE-mode store back to WAL.
+    """
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
+    if sys.platform == "darwin":
+        conn.execute("PRAGMA checkpoint_fullfsync=ON")
+
+
+def _apply_open_durability(conn: sqlite3.Connection) -> None:
+    """Durability PRAGMAs for an already-current store. Never enables WAL."""
+    row = conn.execute("PRAGMA journal_mode").fetchone()
+    mode = (row[0] if row else "") or ""
+    if mode.lower() == "wal":
+        _apply_wal_durability(conn)
+    else:
+        conn.execute("PRAGMA synchronous=FULL")
+
+
+def _quarantine_path(path: Path) -> Path:
+    """One source-stamped quarantine for an unchanged database/WAL image."""
+    state = _inspection_source_state(path)
+    if state is None or state[0] is None:
+        raise SchemaLifecycleError("store_changed", "cannot identify quarantine source", version=None)
+    # SHM is a reconstructible cache; reader activity there is not a new DB image.
+    identity = hashlib.sha256(json.dumps(state[:2]).encode("ascii")).hexdigest()[:24]
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(state[0][4] // 1_000_000_000))
+    return Path(str(path) + f".malformed-{stamp}-{identity}")
+
+
+def _quarantine_image_digest(path: Path, *, private: bool = False) -> tuple:
+    """Verify authoritative bytes through regular-file descriptors before reuse."""
+    digests = []
+    for suffix in ("", "-wal"):
+        source = Path(str(path) + suffix)
+        fd, error = _open_regular_file(source)
+        if error is not None:
+            if suffix and error.state == "missing":
+                digests.append(None)
+                continue
+            raise SchemaLifecycleError(error.reason_code or "missing",
+                                       f"unsafe quarantine image: {source}", version=None)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if private and (info.st_uid != os.geteuid() or info.st_mode & 0o077):
+                raise SchemaLifecycleError("unsafe_quarantine",
+                    f"quarantine must be owned by this user with private permissions: {source}",
+                    version=None)
+            digests.append(hashlib.file_digest(stream, "sha256").hexdigest())
+    return tuple(digests)
+
+
+def _copy_store_image(src: Path, dest: Path, *, expected: os.stat_result | None = None) -> None:
+    """Copy regular files privately; failed attempts remove only their own files."""
+    created: list[tuple[Path, int]] = []
+    before = _inspection_source_state(src)
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            source = Path(str(src) + suffix)
+            fd, error = _open_regular_file(source)
+            if error is not None:
+                if suffix and error.state == "missing":
+                    continue
+                raise SchemaLifecycleError(error.reason_code or "missing",
+                                           f"unsafe quarantine source: {source}", version=None)
+            with os.fdopen(fd, "rb") as stream:
+                observed = os.fstat(stream.fileno())
+                if not suffix and expected is not None and (
+                        observed.st_dev, observed.st_ino, observed.st_mtime_ns, observed.st_size) != (
+                        expected.st_dev, expected.st_ino, expected.st_mtime_ns, expected.st_size):
+                    raise SchemaLifecycleError("store_changed", "store changed before quarantine",
+                                               version=None)
+                destination = Path(str(dest) + suffix)
+                out = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                created.append((destination, out))
+                # Retain the descriptor until cleanup finishes so an unlinked
+                # inode cannot be recycled underneath the ownership check.
+                with os.fdopen(out, "wb", closefd=False) as target:
+                    shutil.copyfileobj(stream, target, length=1024 * 1024)
+                    target.flush()
+                    os.fsync(target.fileno())
+    except BaseException:
+        after = _inspection_source_state(src)
+        # Preserve potentially unique evidence if the source itself disappeared
+        # or changed while copying. Ordinary destination I/O failures can retry.
+        if before is not None and after is not None and before[:2] == after[:2]:
+            for destination, descriptor in reversed(created):
+                try:
+                    current = destination.lstat()
+                    owned = os.fstat(descriptor)
+                    if (stat.S_ISREG(current.st_mode)
+                            and (current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino)):
+                        destination.unlink()
+                except OSError:
+                    pass  # Uncertain or failed cleanup preserves the file.
+        raise
+    finally:
+        for _, descriptor in created:
+            os.close(descriptor)
+
+
+def _schema_sql_signature(sql: str) -> tuple[str, ...]:
+    """Ignore layout/keyword case while preserving quoted SQL values exactly."""
+    pattern = r"--[^\r\n]*|/\*.*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^]]*\]|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[^\s]"
+    tokens = re.findall(pattern, sql, flags=re.DOTALL)
+    return tuple(token if token[0] in "'\"`[" else token.lower()
+                 for token in tokens if not token.startswith(("--", "/*")))
+
+
+def _recovered_schema_valid(conn: sqlite3.Connection) -> bool:
+    """Require the complete declared schema, including columns and indexes."""
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version != SCHEMA_VERSION:
+        return False
+    with closing(sqlite3.connect(":memory:", isolation_level=None)) as expected:
+        expected.executescript(_SCHEMA)
+        for target, delta in _MIGRATIONS:
+            if isinstance(delta, str):
+                expected.executescript(delta)
+            else:
+                _apply_atomic(expected, target, delta)
+        def schema(db):
+            return {(kind, name): _schema_sql_signature(sql)
+                    for kind, name, sql in db.execute(
+                        "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL")}
+        actual = schema(conn)
+        return actual == schema(expected)
+
+
+def _recovery_json_object(text):
+    """Strict object decoding for every persisted JSON payload."""
+    if not isinstance(text, str):
+        raise ValueError("recovered JSON must be text")
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate artifact key")
+            value[key] = item
+        return value
+
+    def reject_constant(value):
+        raise ValueError("non-JSON numeric constant")
+    value = json.loads(text, object_pairs_hook=unique_object, parse_constant=reject_constant)
+    if not isinstance(value, dict):
+        raise ValueError("recovered JSON must be an object")
+    return value
+
+
+def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
+    """Check artifacts and their indexed projections without rewriting history."""
+    missing = object()
+    names = ("id", *_REVIEW_COLUMNS)
+    count = 0
+    try:
+        rows = conn.execute("SELECT " + ",".join(names) + " FROM reviews")
+        for values in rows:
+            if time.monotonic() >= deadline:
+                return False
+            row = dict(zip(names, values))
+            if not isinstance(row["artifact_json"], str):
+                return False
+            artifact = _recovery_json_object(row["artifact_json"])
+            if (not isinstance(artifact, dict) or not isinstance(artifact.get("id"), str)
+                    or not artifact["id"].strip() or artifact["id"] != row["id"]):
+                return False
+            normalized = _normalize_record(artifact, label="recovery")
+            if normalized["trustworthy"] != bool(row["trustworthy"]):
+                return False
+            if "trustworthy" in artifact and (
+                    type(artifact["trustworthy"]) is not bool
+                    or artifact["trustworthy"] != normalized["trustworthy"]):
+                return False
+            projected = dict(zip(_REVIEW_COLUMNS, _review_values(artifact)))
+            for name, expected in projected.items():
+                if name == "artifact_json" or row[name] == expected:
+                    continue
+                source_key = {"sev_high": "high", "sev_medium": "medium", "sev_low": "low"}.get(name)
+                source = ((artifact.get("severity") or {}).get(source_key, missing)
+                          if source_key else artifact.get(name, missing))
+                # Additive migrations leave absent historical values NULL.
+                # Validate raw projections, not normalization's new timestamps.
+                if row[name] is None and source is missing and expected in (None, 0, ""):
+                    continue
+                return False
+            count += 1
+    except (ValueError, TypeError, AttributeError, OverflowError, RecursionError):
+        return False
+    return count > 0 and time.monotonic() < deadline
+
+
+def _recovered_receipt_projection_valid(conn, table, row, receipt) -> bool:
+    """Check the stored decision's observable invariants without inventing policy proof."""
+    from .evidence import EvidenceIdentity
+    embedded = EvidenceIdentity(receipt.repository_id, receipt.worktree_root,
+        receipt.certification_base, receipt.current_head, receipt.diff_hash,
+        receipt.stack_slice_id).digest
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", row["identity_digest"]) is None:
+        return False
+    _require_ts("ingested_at", row["ingested_at"])
+    if table == "evidence_receipt_conflicts":
+        existing = conn.execute(
+            "SELECT nonce FROM evidence_receipts WHERE identity_digest=? AND receipt_digest=?",
+            (row["identity_digest"], row["existing_receipt_digest"])).fetchone()
+        return (row["reason_code"] == "nonce_conflict" and existing is not None
+                and existing[0] == row["nonce"]
+                and row["receipt_digest"] != row["existing_receipt_digest"])
+    if row["status"] == "accepted":
+        return (row["reason_code"] == "ok" and row["identity_digest"] == embedded
+                and receipt.diagnostic_category == "ok" and receipt.terminal_state == "passed"
+                and receipt.exit_code == 0)
+    identity_failures = {"repository_mismatch", "worktree_mismatch", "base_mismatch",
+                         "head_mismatch", "diff_mismatch", "stack_slice_mismatch"}
+    other_failures = {"policy_mismatch", "command_mismatch", "evidence_kind_mismatch",
+                      "provenance_mismatch", "diagnostic_mismatch", "producer_failed"}
+    reason = row["reason_code"]
+    if row["status"] != "rejected" or reason not in identity_failures | other_failures:
+        return False
+    if (reason in identity_failures) != (row["identity_digest"] != embedded):
+        return False
+    if reason == "diagnostic_mismatch" and receipt.diagnostic_category == "ok":
+        return False
+    if reason == "producer_failed":
+        return (receipt.diagnostic_category == "ok"
+                and (receipt.terminal_state != "passed" or receipt.exit_code != 0))
+    return True
+
+
+def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool:
+    """Validate JSON-bearing control/checkpoint tables using their existing doors."""
+    from dataclasses import asdict
+    from . import request_store, checkpoints, followups
+    from .evidence import parse_receipt
+    from .followup_store import _decode_candidate
+    from .review_results import valid_replay
+
+    # Borrow a read-only validator view; the recovery caller owns this connection.
+    view = Store(conn)
+    try:
+        tables = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        for table in tables:
+            if table == "reviews":
+                continue
+            columns = {row[1]: bool(row[3]) for row in conn.execute(f'PRAGMA table_info("{table}")')
+                       if row[1].endswith("_json")}
+            if not columns:
+                continue
+            for row in conn.execute(f'SELECT * FROM "{table}"'):
+                if time.monotonic() >= deadline:
+                    return False
+                decoded = {}
+                for column, required in columns.items():
+                    if row[column] is None and not required:
+                        continue
+                    decoded[column] = _recovery_json_object(row[column])
+                if table == "review_requests":
+                    for field in ("id", "scope", "owner_token", "source"):
+                        request_store._text(field, row[field])
+                    if row["request_key"] is not None:
+                        request_store._text("request_key", row["request_key"], 128)
+                    if type(row["pid"]) is not int or row["pid"] <= 0:
+                        return False
+                    for field in ("created_at", "updated_at", "expires_at"):
+                        _require_ts(field, row[field])
+                    if request_store._identity_json(row["scope"], decoded["identity_json"]) != row["identity_json"]:
+                        return False
+                    execution = conn.execute(
+                        "SELECT request_id,owner_token,pid,source,status FROM request_executions "
+                        "WHERE request_id=? ORDER BY seq DESC LIMIT 1",
+                        (row["id"],)).fetchone()
+                    if (execution is None or execution["owner_token"] != row["owner_token"]
+                            or execution["pid"] != row["pid"] or execution["source"] != row["source"]):
+                        return False
+                    result = decoded.get("result_json")
+                    if result is not None and (
+                            row["state"] in ("accepted", "queued", "running")
+                            or not valid_replay(result) or execution["status"] != result["status"]):
+                        return False
+                elif table == "review_orchestrations":
+                    identity = checkpoints.OrchestrationIdentity.from_json(row["identity_json"])
+                    if identity.digest() != row["identity_digest"]:
+                        return False
+                    if any(row[key] != value for key, value in asdict(identity).items() if key in row.keys()):
+                        return False
+                    planned = {(item.kind, item.index): item for item in identity.pass_identities}
+                    if len(planned) != len(identity.pass_identities):
+                        return False
+                    seen = set()
+                    children = conn.execute(
+                        "SELECT pass_kind,pass_index,diff_hash,boundary_hash,prompt_hash "
+                        "FROM review_checkpoints WHERE orchestration_id=? UNION ALL "
+                        "SELECT pass_kind,pass_index,diff_hash,boundary_hash,prompt_hash "
+                        "FROM review_followup_checkpoints WHERE orchestration_id=?", (row["id"], row["id"]))
+                    for child in children:
+                        key = (child["pass_kind"], child["pass_index"])
+                        expected = planned.get(key)
+                        if (expected is None or key in seen or child["diff_hash"] != expected.diff_hash
+                                or child["boundary_hash"] != expected.boundary_hash
+                                or expected.prompt_hash is not None and child["prompt_hash"] != expected.prompt_hash):
+                            return False
+                        seen.add(key)
+                    if seen != set(planned):
+                        return False
+                elif table in ("review_checkpoints", "review_followup_checkpoints"):
+                    if row["state"] == "complete" and row["payload_json"] is None:
+                        parent = conn.execute("SELECT state FROM review_orchestrations WHERE id=?",
+                                              (row["orchestration_id"],)).fetchone()
+                        if parent is None or parent[0] != "expired":
+                            return False
+                    if "payload_json" in decoded:
+                        checkpoints.CheckpointPayload.from_mapping(decoded["payload_json"])
+                    if table == "review_followup_checkpoints":
+                        if (row["binding_json"] is None) != (row["binding_hash"] is None):
+                            return False
+                        if "binding_json" in decoded:
+                            binding = followups.validate_binding(decoded["binding_json"])
+                            if (binding["kind"] != row["pass_kind"] or
+                                    checkpoints.canonical_digest(binding) != row["binding_hash"]):
+                                return False
+                        if "candidate_json" in decoded:
+                            _decode_candidate(row["candidate_json"])
+                elif table == "request_budget_snapshots":
+                    view._read_request_budget(row)
+                elif table in ("evidence_receipts", "evidence_receipt_conflicts"):
+                    receipt = parse_receipt(row["receipt_json"])
+                    if (receipt.canonical_json != row["receipt_json"]
+                            or any(getattr(receipt, field) != row[field]
+                                   for field in ("receipt_digest", "nonce", "evidence_kind", "terminal_state"))
+                            or not _recovered_receipt_projection_valid(conn, table, row, receipt)):
+                        return False
+        return time.monotonic() < deadline
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
+        return False
+
+
+def _recovered_triage_valid(conn: sqlite3.Connection, deadline: float) -> bool:
+    """Validate clearing decisions and restore only mechanically derived ledger keys."""
+    from .triage import validate_reason, validate_tracking_ref
+    from .textnorm import finding_key, ledger_key
+    valid = False
+    conn.execute("SAVEPOINT recovered_triage")
+    try:
+        for table in ("triage", "triage_events"):
+            for row in conn.execute(f'SELECT rowid AS recovery_rowid,* FROM "{table}"'):
+                if time.monotonic() >= deadline:
+                    return False
+                event = row["event"] if table == "triage_events" else "dismiss"
+                if event not in ("dismiss", "defer", "reopen"):
+                    return False
+                reason = row["reason"] if table == "triage_events" else row["dismissed_reason"]
+                if not isinstance(reason, str):
+                    return False
+                validate_reason(reason)
+                if event == "defer":
+                    if validate_tracking_ref(row["tracking_ref"]) != row["tracking_ref"]:
+                        return False
+                elif table == "triage_events" and row["tracking_ref"] is not None:
+                    return False
+                if event in ("defer", "reopen"):
+                    _require_ts("triage at", row["at"])
+                if not isinstance(row["branch"], str) or not isinstance(row["base_sha"], str):
+                    return False
+                key = finding_key(row["file"], row["title"])
+                if row["finding_key"] != key:
+                    return False
+                expected = ledger_key(row["branch"], row["base_sha"], key)
+                if row["ledger_key"] != expected:
+                    # SQLite's CLI dump/recover truncates text at embedded NUL.
+                    # The key is derived; decision, reason and scope are not.
+                    if row["ledger_key"] != expected.split("\0", 1)[0]:
+                        return False
+                    conn.execute(f'UPDATE "{table}" SET ledger_key=? WHERE rowid=?',
+                                 (expected, row["recovery_rowid"]))
+                review = conn.execute("SELECT branch,base_sha FROM reviews WHERE id=?",
+                                      (row["review_id"],)).fetchone()
+                if review is None or (review[0], review[1]) != (row["branch"], row["base_sha"]):
+                    return False
+        valid = True
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+    finally:
+        if not valid:
+            conn.execute("ROLLBACK TO recovered_triage")
+        conn.execute("RELEASE recovered_triage")
+
+
+_RECOVERY_STATEMENT_LIMIT = 16 * 1024 * 1024
+
+
+def _replay_recovery_dump(conn: sqlite3.Connection, dump, deadline: float) -> bool:
+    """Replay native .recover statements with bounded memory and execution time."""
+    statement = ""
+    executed = 0
+    dump.seek(0)
+    # Preserve literal CR/LF and leading-dot lines inside quoted SQL values.
+    with io.TextIOWrapper(dump, encoding="utf-8", newline="") as reader:
+        for chunk in iter(lambda: reader.readline(64 * 1024), ""):
+            if time.monotonic() >= deadline:
+                return False
+            if not statement.strip() and (
+                    not chunk.strip() or chunk.startswith(".") or chunk.lstrip().startswith("--")):
+                continue
+            if len(statement) + len(chunk) > _RECOVERY_STATEMENT_LIMIT:
+                return False
+            statement += chunk
+            if chunk.rstrip().endswith(";") and sqlite3.complete_statement(statement):
+                conn.execute(statement)
+                executed += 1
+                statement = ""
+    return executed > 0 and not statement.strip() and not conn.in_transaction
+
+
+def _recover_sqlite_image(src: Path, dest: Path) -> bool:
+    """Recover through private temporary streams, never buffering the full dump."""
+    try:
+        with tempfile.TemporaryFile(dir=dest.parent) as dump, tempfile.TemporaryFile(dir=dest.parent) as errors:
+            proc = subprocess.run(
+                ["sqlite3", "-readonly",
+                 f"file:{quote(str(src.absolute()))}?mode=ro&immutable=1", ".recover"],
+                stdout=dump, stderr=errors, timeout=300,
+            )
+            dump.flush()
+            if proc.returncode != 0 or os.fstat(dump.fileno()).st_size == 0:
+                return False
+            fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+            conn = None
+            valid = False
+            try:
+                conn = sqlite3.connect(dest, isolation_level=None)
+                conn.row_factory = sqlite3.Row
+                # Native dumps may emit children before parents; validate all
+                # relationships after replay instead of depending on order.
+                conn.execute("PRAGMA foreign_keys=OFF")
+                conn.set_authorizer(lambda action, *_:
+                    sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_ATTACH else sqlite3.SQLITE_OK)
+                deadline = time.monotonic() + 300
+                conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
+                if not _replay_recovery_dump(conn, dump, deadline):
+                    return False
+                check = conn.execute("PRAGMA integrity_check").fetchone()
+                valid = (check is not None and check[0] == "ok"
+                         and _recovered_schema_valid(conn)
+                         and conn.execute("PRAGMA foreign_key_check").fetchone() is None
+                         and _recovered_reviews_valid(conn, deadline)
+                         and _recovered_payloads_valid(conn, deadline)
+                         and _recovered_triage_valid(conn, deadline))
+                return valid
+            except (sqlite3.DatabaseError, OSError, ValueError):
+                return False
+            finally:
+                if conn is not None:
+                    conn.close()
+                if not valid:
+                    dest.unlink(missing_ok=True)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _live_image_is_corrupt(path: Path) -> bool:
+    """Check the quarantined incident image without changing bytes or sidecars."""
+    conn = None
+    try:
+        uri = f"file:{quote(str(path.absolute()))}?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True, timeout=30)
+        conn.execute("PRAGMA user_version")
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+        return (row[0] if row else "") != "ok"
+    except sqlite3.DatabaseError as exc:
+        if _is_busy_error(exc):
+            return False
+        return True
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _repair_malformed_store(path: Path, info: SchemaInfo) -> None:
+    """Serialize recovery with migration and recheck before replacing authority."""
+    lock = Path(str(path) + ".migration.lock")
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise SchemaLifecycleError("migration_busy", f"lifecycle lock is held: {lock}",
+                                   version=None) from exc
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+    finally:
+        os.close(fd)
+    try:
+        current = inspect_schema(path)
+        if current.state == "current":
+            return  # A preceding repair already installed the authority.
+        if current.reason_code != "torn_wal":
+            raise SchemaLifecycleError(current.reason_code or "invalid_schema",
+                                       f"store recovery refused: {path}", version=None)
+        original = path.lstat()
+        quarantine = _quarantine_path(path)
+        try:
+            quarantine.lstat()
+        except FileNotFoundError:
+            _copy_store_image(path, quarantine, expected=original)
+        else:
+            if _quarantine_image_digest(path) != _quarantine_image_digest(quarantine, private=True):
+                raise SchemaLifecycleError("quarantine_conflict",
+                    f"existing quarantine differs from source: {quarantine}; preserved both images",
+                    version=None)
+        if not _live_image_is_corrupt(quarantine):
+            raise SchemaLifecycleError("store_changed", "quarantine does not confirm corruption",
+                                       version=None)
+        # Recovery scratch files stay in a private directory on the same device.
+        with tempfile.TemporaryDirectory(prefix=".skodun-recover-", dir=path.parent) as tmp:
+            recovered = Path(tmp) / "recovered.db"
+            if _recover_sqlite_image(quarantine, recovered):
+                observed = path.lstat()
+                if (observed.st_dev, observed.st_ino, observed.st_mtime_ns, observed.st_size) != (
+                        original.st_dev, original.st_ino, original.st_mtime_ns, original.st_size):
+                    raise SchemaLifecycleError("store_changed", "store changed during recovery",
+                                               version=None)
+                if not _torn_wal_signature(path):
+                    raise SchemaLifecycleError("store_changed", "WAL changed during recovery",
+                                               version=None)
+                os.chmod(recovered, stat.S_IMODE(original.st_mode) & 0o600)
+                os.replace(recovered, path)
+                for suffix in ("-wal", "-shm"):
+                    Path(str(path) + suffix).unlink(missing_ok=True)
+                return
+        raise SchemaLifecycleError(
+            info.reason_code or "torn_wal",
+            f"store cannot be opened: {path}; quarantined copy at {quarantine}; "
+            "not replaced with an empty or incomplete store; restore from backup",
+            version=None)
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -1547,7 +2309,11 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                 "migration_busy", f"migration lock is held: {migration_lock}",
                 version=None)
         if existed:
-            info = inspect_schema(path)
+            info = inspect_schema(path, full_integrity=False)
+            if (info.state == "invalid"
+                    and info.reason_code == "torn_wal"):
+                _repair_malformed_store(path, info)
+                info = inspect_schema(path)
             if info.state == "newer":
                 raise SchemaLifecycleError(
                     "schema_too_new", schema_too_new_message(int(info.version)),
@@ -1581,6 +2347,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                 # Connection-local; unlike WAL/DDL this does not alter the
                 # store bytes and is safe for an already-current authority.
                 conn.execute("PRAGMA foreign_keys=ON")
+                _apply_open_durability(conn)
             return cls(conn, path)
         except BaseException:
             if conn is not None:
@@ -1596,7 +2363,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
     @classmethod
     def open_readonly(cls, path: Path) -> "Store":
         """Open an existing current store with SQLite's `mode=ro` policy."""
-        info = inspect_schema(path)
+        info = inspect_schema(path, full_integrity=False)
         if info.state == "missing":
             raise SchemaLifecycleError(
                 "missing", f"store does not exist: {path}", version=None)
@@ -3681,11 +4448,15 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
         resource_class = _require_text("resource_class", resource_class)
         scope = _require_text("scope", scope)
         queued_at = _iso_now()
+        owner_start = None
+        if resource_class == "review-machine" and pid:
+            from .capacity import process_birth_token
+            owner_start = process_birth_token(int(pid))
         self._c.execute(
             """INSERT INTO capacity_admissions
-                 (id, resource_class, scope, status, queued_at, pid)
-               VALUES (?,?,?,?,?,?)""",
-            (admission_id, resource_class, scope, "queued", queued_at, pid))
+                 (id, resource_class, scope, status, queued_at, pid, owner_start)
+               VALUES (?,?,?,?,?,?,?)""",
+            (admission_id, resource_class, scope, "queued", queued_at, pid, owner_start))
         row = self.capacity_get(admission_id)
         assert row is not None
         return row
@@ -3761,6 +4532,29 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
             (resource_class, scope, "admitted", "running")).fetchone()
         return int(row["n"]) if row is not None else 0
 
+    def capacity_live_holders(self, resource_class: str) -> list[dict]:
+        """Admitted+running holder counts grouped by scope for one class."""
+        resource_class = _require_text("resource_class", resource_class)
+        rows = self._c.execute(
+            """SELECT scope, COUNT(*) AS n FROM capacity_admissions
+               WHERE resource_class=? AND status IN (?,?)
+               GROUP BY scope ORDER BY scope""",
+            (resource_class, "admitted", "running")).fetchall()
+        return [{"scope": str(r["scope"]), "n": int(r["n"])} for r in rows]
+
+    def capacity_live_holders_prefix(self, prefix: str) -> list[dict]:
+        """Admitted+running holder counts for every class starting with prefix."""
+        prefix = _require_text("prefix", prefix)
+        rows = self._c.execute(
+            """SELECT resource_class, scope, COUNT(*) AS n
+                 FROM capacity_admissions
+                WHERE resource_class LIKE ? AND status IN (?,?)
+                GROUP BY resource_class, scope
+                ORDER BY resource_class, scope""",
+            (prefix + "%", "admitted", "running")).fetchall()
+        return [{"resource_class": str(r["resource_class"]),
+                 "scope": str(r["scope"]), "n": int(r["n"])} for r in rows]
+
     def capacity_reclaim_stale(
             self, resource_class: str, scope: str, *, stale_sec: float,
             now_epoch: float | None = None,
@@ -3786,14 +4580,28 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                 (resource_class, scope, *self._CAPACITY_ACTIVE)).fetchall()
             ended_at = _iso_now()
             for row in rows:
-                reason = should_reclaim_admission(
-                    status=row["status"],
-                    pid=row["pid"],
-                    queued_at=row["queued_at"],
-                    stale_sec=stale_sec,
-                    now_epoch=now_epoch,
-                    pid_alive_fn=pid_alive_fn,
-                )
+                reason = None
+                if row["pid"] and (resource_class == "review-machine" or pid_alive_fn is None):
+                    from .capacity import pid_alive, process_observation, REASON_STALE_PID
+                    alive = pid_alive if pid_alive_fn is None else pid_alive_fn
+                    if alive(int(row["pid"])):
+                        observed = process_observation(int(row["pid"]))
+                        if observed.exited:
+                            reason = REASON_STALE_PID
+                        elif resource_class == "review-machine":
+                            if (not row["owner_start"] or not observed.token
+                                    or observed.token == row["owner_start"]):
+                                continue  # Same owner or insufficient evidence: retain.
+                            reason = REASON_STALE_PID  # Proven PID reuse, never signal it.
+                if reason is None:
+                    age_from = row["queued_at"]
+                    if resource_class == "review-fg" and row["status"] in ("admitted", "running"):
+                        # Holder TTL starts at admission; queueing has its own budget.
+                        age_from = row["started_at"] or row["admitted_at"] or age_from
+                    reason = should_reclaim_admission(
+                        status=row["status"], pid=row["pid"],
+                        queued_at=age_from, stale_sec=stale_sec,
+                        now_epoch=now_epoch, pid_alive_fn=pid_alive_fn)
                 if reason is None:
                     continue
                 queue_wait_ms, run_ms, total_admission_ms = _capacity_metrics(
@@ -3824,6 +4632,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
         from .capacity import WaiterView, decide_admit
 
         admission_id = _require_text("admission_id", admission_id)
+        declared_capacity = capacity
         if capacity < 1:
             return None
         self._c.execute("BEGIN IMMEDIATE")
@@ -3835,21 +4644,26 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                 self._c.execute("COMMIT")
                 return None if row is None else dict(row)
             peers = self._c.execute(
-                """SELECT rowid AS enqueue_order, id, status, queued_at FROM capacity_admissions
+                """SELECT rowid AS enqueue_order, id, status, queued_at, capacity_limit FROM capacity_admissions
                    WHERE resource_class=? AND scope=? AND status IN (?,?,?)""",
                 (row["resource_class"], row["scope"],
                  *self._CAPACITY_ACTIVE)).fetchall()
             views = [WaiterView(id=p["id"], status=p["status"],
                                 queued_at=p["queued_at"], enqueue_order=p["enqueue_order"]) for p in peers]
+            if row["resource_class"] in ("review-machine", "review-fg"):
+                holder_limits = [p["capacity_limit"] or 1 for p in peers
+                                 if p["status"] in ("admitted", "running")]
+                capacity = min([capacity, *holder_limits])
             if not decide_admit(admission_id, views, capacity):
                 self._c.execute("COMMIT")
                 return None
             admitted_at = _iso_now()
             self._c.execute(
                 """UPDATE capacity_admissions
-                   SET status='admitted', admitted_at=?
+                   SET status='admitted', admitted_at=?, capacity_limit=?
                    WHERE id=? AND status='queued'""",
-                (admitted_at, admission_id))
+                (admitted_at, declared_capacity if row["resource_class"] in ("review-machine", "review-fg")
+                 else None, admission_id))
             self._c.execute("COMMIT")
         except BaseException:
             try:
@@ -3881,10 +4695,15 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
             if row["status"] != "queued":
                 self._c.execute("COMMIT")
                 return None
+            if (row["resource_class"] == "review-fg"
+                    and self.capacity_holder_count("review-fg", row["scope"]) > 0):
+                self._c.execute("COMMIT")
+                return None
             admitted_at = _iso_now()
             self._c.execute(
                 """UPDATE capacity_admissions
-                   SET status='admitted', admitted_at=?
+                   SET status='admitted', admitted_at=?,
+                       capacity_limit=CASE WHEN resource_class='review-fg' THEN 1 ELSE capacity_limit END
                    WHERE id=? AND status='queued'""",
                 (admitted_at, admission_id))
             self._c.execute("COMMIT")
@@ -3898,7 +4717,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
 
     def capacity_mark_started(self, admission_id: str,
                               review_id: str | None = None) -> dict:
-        """``admitted`` (or ``queued``) → ``running``; set ``started_at``."""
+        """Start once; repeated calls can attach review_id without resetting timing."""
         admission_id = _require_text("admission_id", admission_id)
         started_at = _iso_now()
         self._c.execute("BEGIN IMMEDIATE")
@@ -3915,7 +4734,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
             admitted_at = row["admitted_at"] or started_at
             self._c.execute(
                 """UPDATE capacity_admissions
-                   SET status='running', admitted_at=?, started_at=?,
+                   SET status='running', admitted_at=?, started_at=COALESCE(started_at,?),
                        review_id=COALESCE(?, review_id)
                    WHERE id=?""",
                 (admitted_at, started_at, review_id, admission_id))

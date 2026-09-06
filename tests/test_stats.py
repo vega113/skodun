@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 
+import pytest
+
 from skodun.cli import build_parser
 from skodun.stats import render, since_iso
 from skodun.store import SCHEMA_VERSION, Store
@@ -128,6 +130,23 @@ def test_stats_does_not_count_reuse_bypasses_or_errors_as_misses(tmp_path):
     assert data["reuse"] == {"hits": 0, "misses": 0}
 
 
+def test_stats_machine_cap_follows_toml_when_env_is_unset(tmp_path, monkeypatch):
+    from skodun.capacity import resolved_machine_capacity
+    from skodun.config import load_config
+    from skodun.services import svc_stats
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text("[capacity]\nmachine = 2\n", encoding="utf-8")
+    monkeypatch.delenv("SKODUN_REVIEW_MACHINE_CAPACITY", raising=False)
+    monkeypatch.setenv("SKODUN_CONFIG", str(cfg_path))
+    expected = resolved_machine_capacity(load_config(None, global_path=cfg_path))
+    with Store.open(tmp_path / "stats.db") as st:
+        code, text = svc_stats(st, since_days=7, fmt="text")
+    assert code == 0
+    assert f"machine_cap={expected}" in text
+    assert expected == 2
+
+
 def test_stats_rejects_bool_days_and_parser_exposes_json(tmp_path):
     assert since_iso(0, now=0) == "1970-01-01T00:00:00Z"
     try:
@@ -139,3 +158,88 @@ def test_stats_rejects_bool_days_and_parser_exposes_json(tmp_path):
     args = build_parser().parse_args(["stats", "--since-days", "3", "--json"])
     assert args.command == "stats" and args.since_days == 3
     assert args.json_output is True
+
+
+def test_cli_stats_uses_repository_capacity_from_nested_directory(tmp_path, monkeypatch, capsys):
+    from skodun.cli import main
+    from tests.test_gitio import _git
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _git(repo, 'init')
+    (repo / '.skodun.toml').write_text('[capacity]\nmachine = 1\n')
+    nested = repo / 'nested'
+    nested.mkdir()
+    cfg = tmp_path / 'global.toml'
+    cfg.write_text('[capacity]\nmachine = 3\n')
+    db = tmp_path / 'db'
+    with Store.open(db):
+        pass
+    monkeypatch.setenv('SKODUN_CONFIG', str(cfg))
+    monkeypatch.setenv('SKODUN_DB', str(db))
+    monkeypatch.chdir(nested)
+    assert main(['stats', '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['live_capacity']['machine_cap'] == 1
+
+
+def test_cli_stats_outside_git_uses_global_capacity(tmp_path, monkeypatch, capsys):
+    from skodun.cli import main
+    cfg = tmp_path / 'global.toml'
+    cfg.write_text('[capacity]\nmachine = 3\n')
+    db = tmp_path / 'db'
+    with Store.open(db):
+        pass
+    monkeypatch.setenv('SKODUN_CONFIG', str(cfg))
+    monkeypatch.setenv('SKODUN_DB', str(db))
+    monkeypatch.chdir(tmp_path)
+    assert main(['stats', '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['live_capacity']['machine_cap'] == 3
+
+
+@pytest.mark.parametrize('layer', ['global', 'repo'])
+@pytest.mark.parametrize('json_output', [False, True])
+def test_cli_stats_keeps_readable_telemetry_when_config_is_invalid(
+        tmp_path, monkeypatch, capsys, layer, json_output):
+    from skodun.cli import main
+    from tests.test_gitio import _git
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _git(repo, 'init')
+    global_path = tmp_path / 'global.toml'
+    global_path.write_text('')
+    bad = global_path if layer == 'global' else repo / '.skodun.toml'
+    bad.write_text('capacity = false\n')
+    db = tmp_path / 'db'
+    with Store.open(db) as store:
+        store.capacity_enqueue(admission_id='observed-holder', resource_class='review-machine', scope='*')
+        store.capacity_try_admit('observed-holder', capacity=1)
+    monkeypatch.setenv('SKODUN_CONFIG', str(global_path))
+    monkeypatch.setenv('SKODUN_DB', str(db))
+    monkeypatch.chdir(repo)
+    assert main(['stats', *(['--json'] if json_output else [])]) == 0
+    output = capsys.readouterr().out
+    if json_output:
+        data = json.loads(output)
+        assert data['live_capacity']['machine_cap'] is None
+        assert data['live_capacity']['machine_holders'] == 1
+        assert 'config_error' in data['live_capacity']
+        assert 'timing' in data and 'audit_denominators' in data
+    else:
+        assert 'machine_cap=unknown' in output
+        assert 'machine_holders=1' in output
+        assert 'capacity_config_error=' in output
+
+
+def test_cli_stats_survives_unavailable_optional_git_lookup(tmp_path, monkeypatch, capsys):
+    from skodun import cli
+    db = tmp_path / 'db'
+    with Store.open(db):
+        pass
+    config = tmp_path / 'global.toml'
+    config.write_text('[capacity]\nmachine=3\n')
+    monkeypatch.setenv('SKODUN_DB', str(db))
+    monkeypatch.setenv('SKODUN_CONFIG', str(config))
+    def unavailable(repo):
+        raise OSError('git is unavailable')
+    monkeypatch.setattr(cli, '_repo_root', unavailable)
+    assert cli.main(['stats', '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['live_capacity']['machine_cap'] == 3

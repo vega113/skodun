@@ -1,0 +1,195 @@
+# Machine-wide review capacity (follow-up to S3/S4)
+
+Date: 2026-08-16. Status: **implement** (semantics fixed by owner; remaining
+1-vs-2 default is a conservative pick, not a product fork).
+Parent incident: one machine-wide SQLite store plus many `skodun mcp` / CLI
+reviewers. S3 left “full host multi-MCP fair queue” out of scope; this
+follow-up puts **reviews only** in scope. `gate.py` / `trust.py` unchanged.
+
+## Goal
+
+One number for this Mac that bounds concurrent **reviews** across every repo
+that shares the default store, while today’s per-repo `review-fg` stays an
+**inner** limit. Same store; `SKODUN_DB` remains the isolation hatch and
+**opts out** of machine protection.
+
+## Decisions
+
+| Topic | Decision | Why |
+|---|---|---|
+| Default store | Still one file per machine (`~/.local/share/skodun/skodun.db`) | Fragmenting per repo would defeat the cap |
+| Outer resource | `review-machine` in `capacity_admissions`, scope `*` | Existing admission table; does not mix with per-repo `review-fg` rows |
+| Outer default | **1** (`SKODUN_REVIEW_MACHINE_CAPACITY`) | Conservative; owner can raise. Junk / missing → 1 |
+| Inner limit | Today’s `review-fg` per `git_common_dir` | S3/S4 and the legacy FG lock stay intact |
+| Binding rule | `effective_fg = min(machine, repo_fg)` and the outer ticket still binds | A repo env `SKODUN_REVIEW_FG_CAPACITY=8` cannot exceed the machine cap |
+| Acquire order | Machine ticket first, then per-repo `review-fg` (then legacy lock) | One order everywhere; reverse on release |
+| Cross-MCP | Store FIFO, not in-process memory | Two MCP processes must see each other |
+| Same-server MCP | Keep refuse-if-busy | Tree-moved hazard from S3 |
+| Provider caps | Unchanged, already machine-wide **on the shared store** | `SKODUN_DB=/tmp/other.db` opts out of provider and review caps |
+| Config | Env + optional `[capacity]` in `~/.config/skodun/config.toml`; repo `.skodun.toml` may only **tighten** | Global / env set the machine ceiling |
+| Surfaces | CLI/MCP foreground via `acquire_for_fg`; dispatched workers acquire the same outer resource through finalization | Shared store authority |
+| Diagnostics | `skodun stats` and `skodun doctor` show machine cap, holders by repo, holders by provider | Operator-visible |
+| Schema | Additive v21 ownership and holder-limit columns | Detect recycled PIDs and retain tighter active caps |
+
+## Knobs
+
+```text
+SKODUN_REVIEW_MACHINE_CAPACITY=1          # outer; default 1
+SKODUN_REVIEW_FG_CAPACITY=1               # inner per git_common_dir; min()'d
+SKODUN_PROVIDER_MAX_IN_FLIGHT=2           # already machine-wide on shared DB
+SKODUN_OPENAI_API_SPEND_LIMIT_USD_PER_DAY=5
+SKODUN_DB=/path/to/other.db               # opts out of machine protection
+```
+
+`~/.config/skodun/config.toml`:
+
+```toml
+[capacity]
+machine = 1
+```
+
+Repo `.skodun.toml` (tighten only):
+
+```toml
+[capacity]
+review_fg = 1
+```
+
+A repo value **above** the machine cap is clipped. A repo cannot raise the
+host machine cap. When neither the environment nor the global file sets that
+cap, the ceiling is the shipped default of 1, not the repo's number. Repository
+tightening is applied after host environment resolution, so an environment
+override cannot erase an explicit repository ceiling.
+`skodun doctor` / `skodun stats` print `resolved_machine_capacity` (env,
+then file, then default), the same value `run_review` uses.
+
+## Admit
+
+```text
+1. enqueue + FIFO-admit review-machine / scope=* / capacity=machine
+2. enqueue + FIFO-admit review-fg / scope=git_common_dir / capacity=min(machine, repo)
+3. optional legacy mkdir FG lock (unchanged dual-hold)
+4. on any failure after (1): finish the machine ticket
+5. on release: drop repo ticket, then machine ticket
+```
+
+MCP: a second `review` **on the same server** still refuses in-process. A
+`review` on server B while server A holds the machine ticket waits or expires
+via the store (same bounded `SKODUN_ADMISSION_WAIT_SECONDS` as today).
+
+## Rejected
+
+- Per-repo default databases (defeats the cap).
+- Making the machine cap a new store enum / trust axis.
+- Queuing non-review MCP tools.
+- Default 2: owner can set 2; shipping 1 is the conservative pick.
+- New resource tables: reuse `capacity_admissions`; v21 adds nullable process ownership.
+
+## Verification
+
+- Two different repo scopes sharing one store cannot both run when machine=1.
+- Repo `SKODUN_REVIEW_FG_CAPACITY` higher than the machine cap still binds to
+  the machine cap.
+- Existing same-scope S3/S4 FIFO tests keep passing (inner rule unchanged).
+- `SKODUN_DB` pointing at a second file is a separate admission universe.
+
+## Delivery safety refinements
+
+Machine admission retains a slot while its owner PID is live. Queue age and
+execution age alone cannot prove that a cross-repo holder has stopped; dead
+owners remain reclaimable. Machine and repo tickets both link to the durable
+request and use the same foreground queue deadline.
+
+Malformed recovery is restricted to the torn-WAL incident shape, serialized
+with schema migration, and rechecked under the lifecycle lock. Private regular
+file quarantine preserves original bytes. Replacement requires the complete
+current declared schema and at least one review; older, partial, or failed
+recoveries remain quarantined for manual restoration. Every observed failed
+integrity check is invalid. Routine opens use a bounded table probe instead of a full scan, including
+cleanly closed WAL stores; doctor requests a full integrity check.
+
+The v21 migration adds nullable `owner_start` to admission rows. New machine
+tickets record process birth identity; a live PID with a different observed
+identity is reclaimable without signalling that process. Missing identity
+evidence retains the ticket conservatively. Terminal cleanup retries transient
+SQLite operational failures three times with bounded backoff.
+
+Each admitted machine ticket persists its requested capacity limit. Admission
+uses the minimum of the incoming limit and every active machine holder limit
+inside the same write transaction. A repo's tighter limit remains binding until
+its ticket is released; later clients cannot raise it while that holder runs.
+
+A failed check on a copied image is not classified as corruption when source
+file identity or write metadata changed during inspection. Inspection retries
+with fresh snapshots up to three times, then reports busy if the source keeps
+moving. Genuine unchanged corruption still follows the existing refusal or
+quarantine path.
+
+The inner `review_fg` limit follows the same host-first, repository-minimum
+precedence. Repository values cannot raise a host file/default foreground
+ceiling, and a host environment override cannot erase repository tightening.
+
+Foreground holders also retain their declared inner limits across worktrees.
+Legacy dual-hold admissions remain single-slot and respect store-only holders.
+Foreground holder age starts at admission, keeping queue time out of its TTL.
+
+Detached pre-push workers acquire the same machine resource after validating
+the reserved identity, and recheck ownership/status after waiting. They retain
+the ticket through conditional finalization and cancellation audit. Their
+reservation budget includes the bounded machine wait. Background branch leases
+remain their inner coordination mechanism; they do not acquire foreground locks.
+
+Process observations include zombie state. A proven exited owner is reclaimable
+even while its PID and birth token remain visible; missing observation evidence
+remains conservative. Identity and state are read together.
+
+Failed recovery reuses a deterministic source-stamped quarantine while the
+database/WAL identity is unchanged. Reuse verifies content and private ownership
+and permissions; a conflicting copy is preserved and refused. SQLite reads the
+quarantine immutably, and recovery SQL cannot attach another database. Linking
+a review ID to an admission preserves its original start time.
+
+Capacity diagnostics remain advisory: malformed configuration must not discard
+readable statistics. Stats renders the store data with an unknown capacity and
+a configuration warning; doctor likewise marks an unresolved cap unknown.
+
+Copy failures clean up only files created by that attempt, verified through
+retained file descriptors. Pre-existing or replaced paths are preserved. If
+the authoritative source changed or disappeared, copied evidence is retained
+instead of being deleted.
+
+Recovery output is written to private temporary files and replayed one native
+SQL statement at a time. Replay limits statements to 16 Mi characters and has
+a 300-second execution budget. Oversized statements, unfinished transactions,
+and failed validation refuse replacement while preserving original evidence.
+
+Recovery validates foreign-key relationships after replay, so child-before-parent
+dump order is supported but orphaned checkpoints or evidence cannot replace the
+authority even when SQLite physical integrity reports ok.
+
+Recovered schema objects must match the declared object set exactly. Comparison
+ignores SQL layout and keyword case while preserving quoted values, so extra
+triggers/tables or altered constraint literals cannot become authoritative.
+
+Each recovered review must have a valid object artifact, unambiguous JSON,
+valid store trust fields, and indexed values matching the writer projection.
+Legacy absent/null additive metadata remains valid without rewriting history.
+
+Recovery checks every declared JSON-bearing payload column. Request identity
+uses the same canonical scope/size validation as request creation; owner and
+execution projections and replayable results must agree. Existing checkpoint,
+follow-up, budget, and evidence validators guard their recovered payloads.
+
+Recovered receipt decisions must agree with their payloads and indexed identity:
+accepted receipts require the embedded identity, reason ok, and successful
+producer facts. Rejection and nonce-conflict projections retain their existing
+invariants without inventing unavailable historical policy proof.
+
+Recovered orchestration checkpoint keys and fixed identities must match the
+declared pass plan. Runtime-bound integration prompts remain supported, and
+expired checkpoint envelopes may retain their intentionally cleared payloads.
+
+Recovered triage decisions must satisfy the existing audit-reason and filed-ref
+floors and retain consistent finding/scope keys. Only the mechanically derived
+ledger-key NUL separators truncated by SQLite's dump format are reconstructed;
+decisions, reasons, references, and scope are never invented.

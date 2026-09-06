@@ -158,3 +158,17 @@ def test_cli_doctor_exit_codes(tmp_path, monkeypatch, capsys):
     assert "skodun doctor:" in out
     assert "store" in out
     assert "mcp" in out
+
+
+def test_invalid_config_keeps_store_readable_and_marks_capacity_unknown(tmp_path):
+    from skodun.store import Store
+    db = tmp_path / 'db'
+    with Store.open(db):
+        pass
+    config = tmp_path / 'invalid.toml'
+    config.write_text('[capacity]\nmachine=false\n')
+    report = run_doctor(repo=tmp_path, store_path=db, config_path=config)
+    checks = {check.name: check for check in report.checks}
+    assert checks['config'].ok is False
+    assert checks['store'].ok is True
+    assert 'machine_cap=unknown' in checks['capacity'].detail

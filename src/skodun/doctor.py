@@ -45,6 +45,31 @@ class DoctorReport:
         return "\n".join(lines)
 
 
+def _format_sidecar(nbytes: int | None) -> str:
+    if nbytes is None:
+        return "missing"
+    return f"{int(nbytes)}B"
+
+
+def _machine_capacity_display(cfg: Any) -> int | str:
+    from . import capacity as capmod
+    return "unknown" if cfg is None else capmod.resolved_machine_capacity(cfg)
+
+
+def _capacity_env_clause(cfg: Any = None) -> str:
+    return (f"machine_cap={_machine_capacity_display(cfg)} "
+            f"machine_holders=unknown by_repo=unknown by_provider=unknown")
+
+
+def _store_durability_clause(info: Any) -> str:
+    journal = getattr(info, "journal_mode", None) or "unknown"
+    wal = _format_sidecar(getattr(info, "wal_bytes", None))
+    shm = _format_sidecar(getattr(info, "shm_bytes", None))
+    integrity = getattr(info, "integrity_check", None) or "unknown"
+    return (f"journal_mode={journal} -wal={wal} -shm={shm} "
+            f"integrity_check={integrity}")
+
+
 def _binary_status(binary: str) -> str:
     from .runner import _is_path_shaped
 
@@ -147,36 +172,67 @@ def run_doctor(
         from .store import SCHEMA_VERSION, Store, inspect_schema
 
         info = inspect_schema(store_path)
+        durability = _store_durability_clause(info)
         if info.state == "missing":
             report.add("store", True,
                        f"missing path={store_path}; no store bytes inspected")
+            report.add("capacity", True, _capacity_env_clause(cfg))
             report.add("worker_logs", True,
                        f"not created for missing store {store_path}")
         elif info.state == "older":
             report.add("store", False,
                        f"schema state=older path={store_path} version={info.version} "
                        f"(build expects v{SCHEMA_VERSION}); explicit migration "
-                       "required")
+                       f"required {durability}")
+            report.add("capacity", True, _capacity_env_clause(cfg))
             report.add("worker_logs", True, "not inspected by read-only doctor")
         elif info.state == "newer":
             report.add("store", False,
                        f"schema state=newer path={store_path} version={info.version} "
                        f"(build expects v{SCHEMA_VERSION}); upgrade this process "
                        "because the store is newer than this skodun, then restart "
-                       "every MCP client")
+                       f"every MCP client {durability}")
+            report.add("capacity", True, _capacity_env_clause(cfg))
             report.add("worker_logs", True, "not inspected by read-only doctor")
         elif info.state == "invalid":
+            repair = ""
+            if info.reason_code == "torn_wal":
+                repair = (" do not replace with an empty store; a writable open "
+                          "may attempt quarantined recovery; restore from a "
+                          "verified backup if recovery is unavailable")
+            elif info.reason_code == "invalid_sqlite":
+                repair = " preserve the original; restore manually from a verified backup"
+            elif info.reason_code == "busy":
+                repair = " store is busy or changed during inspection; retry"
             report.add("store", False,
                        f"schema state=invalid path={store_path} "
                        f"reason_code={info.reason_code or 'invalid_schema'}; "
-                       "repair or restore the store before use")
+                       f"{durability}{repair}")
+            report.add("capacity", True, _capacity_env_clause(cfg))
             report.add("worker_logs", True, "not inspected by read-only doctor")
         else:
+            from . import capacity as capmod
             with Store.open_readonly(store_path) as st:
                 n = st._c.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+                machine_holders = st.capacity_holder_count(
+                    capmod.RESOURCE_REVIEW_MACHINE, capmod.MACHINE_SCOPE)
+                by_repo = st.capacity_live_holders(capmod.RESOURCE_REVIEW_FG)
+                by_provider = st.capacity_live_holders_prefix(
+                    capmod.PROVIDER_CLASS_PREFIX)
             report.add("store", True,
                        f"read-only ok path={store_path} schema_v={SCHEMA_VERSION} "
-                       f"(build expects v{SCHEMA_VERSION}) reviews={n}")
+                       f"(build expects v{SCHEMA_VERSION}) reviews={n} "
+                       f"{durability}")
+            repo_bit = ",".join(
+                f"{h['scope']}={h['n']}" for h in by_repo) or "none"
+            prov_bit = ",".join(
+                f"{h['resource_class']}@{h['scope']}={h['n']}"
+                for h in by_provider) or "none"
+            report.add(
+                "capacity", True,
+                f"machine_cap={_machine_capacity_display(cfg)} "
+                f"machine_holders={machine_holders} "
+                f"by_repo={repo_bit} by_provider={prov_bit}")
             report.add("worker_logs", True, "not created by read-only doctor")
     except Exception as e:
         detail = f"open failed: {e!r}"

@@ -102,6 +102,42 @@ quota_pool = "   "
         load_config(None, global_path=bad)
 
 
+def test_repo_capacity_can_only_tighten_machine_cap(tmp_path):
+    g = _write(tmp_path / "g.toml", """
+[capacity]
+machine = 2
+review_fg = 2
+""")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write(repo / ".skodun.toml", """
+[capacity]
+machine = 8
+review_fg = 1
+""")
+    cfg = load_config(repo, global_path=g)
+    assert cfg.capacity.machine == 2
+    assert cfg.capacity.review_fg == 1
+
+
+def test_repo_capacity_machine_cannot_raise_the_default_ceiling(tmp_path):
+    """A repo file with no global [capacity] machine may only tighten default 1."""
+    from skodun.capacity import resolved_fg_capacity, resolved_machine_capacity
+
+    g = _write(tmp_path / "g.toml", "")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write(repo / ".skodun.toml", """
+[capacity]
+machine = 8
+review_fg = 8
+""")
+    cfg = load_config(repo, global_path=g)
+    assert cfg.capacity.machine == 1
+    assert resolved_machine_capacity(cfg, env={}) == 1
+    assert resolved_fg_capacity(cfg, env={}) == 1
+
+
 def test_unknown_defaults_key_rejected(tmp_path):
     g = _write(tmp_path / "g.toml", """
 [defaults]
@@ -1643,3 +1679,60 @@ def test_dogfood_pin_and_fallback_graph_are_unchanged(tmp_path):
     assert openai.provider == "openai"
     assert openai.model == "gpt-5.6-luna"
     assert openai.effort == "high"
+
+
+@pytest.mark.parametrize("value", ["false", "0", '""', "[]"])
+@pytest.mark.parametrize("layer", ["global", "repo"])
+def test_falsey_capacity_non_tables_are_rejected(tmp_path, value, layer):
+    global_path = _write(tmp_path / "global.toml", "")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = global_path if layer == "global" else repo / ".skodun.toml"
+    _write(target, f"capacity = {value}\n")
+    with pytest.raises(ValueError, match="capacity.*must be a table"):
+        load_config(repo, global_path=global_path)
+
+
+def test_global_fg_capacity_is_clipped_after_machine_env_resolution(tmp_path):
+    from skodun.capacity import resolved_fg_capacity
+    global_path = _write(tmp_path / 'global.toml', '[capacity]\nreview_fg = 4\n')
+    cfg = load_config(None, global_path=global_path)
+    assert resolved_fg_capacity(cfg, env={'SKODUN_REVIEW_MACHINE_CAPACITY': '4'}) == 4
+    assert resolved_fg_capacity(cfg, env={}) == 1
+
+
+@pytest.mark.parametrize('global_machine', [None, 2, 8])
+@pytest.mark.parametrize('repo_machine, expected', [(1, 1), (3, 3), (8, 4)])
+def test_repo_machine_ceiling_survives_host_environment_override(
+        tmp_path, global_machine, repo_machine, expected):
+    from skodun.capacity import resolved_machine_capacity
+    text = '' if global_machine is None else f'[capacity]\nmachine = {global_machine}\n'
+    global_path = _write(tmp_path / 'global.toml', text)
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _write(repo / '.skodun.toml', f'[capacity]\nmachine = {repo_machine}\n')
+    cfg = load_config(repo, global_path=global_path)
+    assert resolved_machine_capacity(cfg, env={'SKODUN_REVIEW_MACHINE_CAPACITY': '4'}) == expected
+
+
+@pytest.mark.parametrize("key", ["_repo_machine", "_repo_review_fg"])
+def test_internal_repo_capacity_metadata_is_not_a_config_key(tmp_path, key):
+    global_path = _write(tmp_path / 'global.toml', f'[capacity]\n{key} = 8\n')
+    with pytest.raises(ValueError, match=r'unknown.*capacity'):
+        load_config(None, global_path=global_path)
+
+
+@pytest.mark.parametrize('global_fg', [None, 2, 8])
+@pytest.mark.parametrize('repo_fg', [1, 3, 8])
+def test_repo_fg_only_tightens_host_file_default_and_environment(tmp_path, global_fg, repo_fg):
+    from skodun.capacity import resolved_fg_capacity
+    text = '[capacity]\nmachine=8\n'
+    if global_fg is not None:
+        text += f'review_fg={global_fg}\n'
+    global_path = _write(tmp_path / 'global.toml', text)
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _write(repo / '.skodun.toml', f'[capacity]\nreview_fg={repo_fg}\n')
+    cfg = load_config(repo, global_path=global_path)
+    assert resolved_fg_capacity(cfg, env={}) == min(global_fg or 1, repo_fg)
+    assert resolved_fg_capacity(cfg, env={'SKODUN_REVIEW_FG_CAPACITY': '4'}) == min(4, repo_fg)
