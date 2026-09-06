@@ -1055,9 +1055,6 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     r_fg = (_cap_int("[capacity]", "review_fg", cap_repo["review_fg"])
             if "review_fg" in cap_repo else None)
     review_fg = r_fg if r_fg is not None else g_fg
-    if review_fg is not None:
-        fg_ceiling = machine if machine is not None else DEFAULT_MACHINE_CAPACITY
-        review_fg = min(review_fg, fg_ceiling)
 
     return Config(defaults=Defaults(**dvals), reviewers=reviewers,
                   dispatch=Dispatch(**pvals),

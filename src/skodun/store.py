@@ -1525,10 +1525,11 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
 
 
 def _live_image_is_corrupt(path: Path) -> bool:
-    """True only when the live file (not a snapshot) is proven unreadable."""
+    """Check the quarantined incident image without changing bytes or sidecars."""
     conn = None
     try:
-        conn = sqlite3.connect(path, timeout=30)
+        uri = f"file:{quote(str(path.absolute()))}?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True, timeout=30)
         conn.execute("PRAGMA user_version")
         row = conn.execute("PRAGMA integrity_check").fetchone()
         return (row[0] if row else "") != "ok"
@@ -1557,12 +1558,15 @@ def _repair_malformed_store(path: Path, info: SchemaInfo) -> None:
         current = inspect_schema(path)
         if current.state == "current":
             return  # A preceding repair already installed the authority.
-        if (current.reason_code != "torn_wal" or not _live_image_is_corrupt(path)):
+        if current.reason_code != "torn_wal":
             raise SchemaLifecycleError(current.reason_code or "invalid_schema",
                                        f"store recovery refused: {path}", version=None)
         original = path.lstat()
         quarantine = _quarantine_path(path)
         _copy_store_image(path, quarantine, expected=original)
+        if not _live_image_is_corrupt(quarantine):
+            raise SchemaLifecycleError("store_changed", "quarantine does not confirm corruption",
+                                       version=None)
         # Recovery scratch files stay in a private directory on the same device.
         with tempfile.TemporaryDirectory(prefix=".skodun-recover-", dir=path.parent) as tmp:
             recovered = Path(tmp) / "recovered.db"
@@ -1898,8 +1902,7 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
         if existed:
             info = inspect_schema(path, full_integrity=False)
             if (info.state == "invalid"
-                    and info.reason_code == "torn_wal"
-                    and _live_image_is_corrupt(path)):
+                    and info.reason_code == "torn_wal"):
                 _repair_malformed_store(path, info)
                 info = inspect_schema(path)
             if info.state == "newer":

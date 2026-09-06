@@ -192,10 +192,12 @@ def run_doctor(
             report.add("worker_logs", True, "not inspected by read-only doctor")
         elif info.state == "invalid":
             repair = ""
-            if info.reason_code in {"torn_wal", "invalid_sqlite"}:
+            if info.reason_code == "torn_wal":
                 repair = (" repairable: do not replace with an empty store; "
                           "quarantine is *.malformed-<utc> on the next writable "
                           "open")
+            elif info.reason_code == "invalid_sqlite":
+                repair = " preserve the original; restore manually from a verified backup"
             elif info.reason_code == "busy":
                 repair = " writers hold the file; retry, this is not malformed"
             report.add("store", False,

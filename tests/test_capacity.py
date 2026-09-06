@@ -891,3 +891,25 @@ with Store.open(Path(sys.argv[1])) as store:
                              env=env, capture_output=True, text=True, timeout=10)
     assert admitted.returncode == 0, admitted.stderr
     assert admitted.stdout.strip() == 'held'
+
+
+@pytest.mark.parametrize('failed_layer', ['child', 'parent'])
+def test_finish_keeps_machine_parent_retryable_on_store_failure(store, monkeypatch, failed_layer):
+    ticket = acquire_for_fg(store, scope='/repo', capacity=1, machine_capacity=1,
+                            wait_sec=.1, poll_sec=.01)
+    parent = ticket.parent
+    fail_id = ticket.id if failed_layer == 'child' else parent.id
+    original = store.capacity_finish
+    def fail(admission_id, **kwargs):
+        if admission_id == fail_id:
+            raise RuntimeError('write failed')
+        return original(admission_id, **kwargs)
+    monkeypatch.setattr(store, 'capacity_finish', fail)
+    with pytest.raises(RuntimeError, match='write failed'):
+        finish(store, ticket)
+    assert ticket.parent is parent
+    assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, capacity.MACHINE_SCOPE) == 1
+    monkeypatch.setattr(store, 'capacity_finish', original)
+    finish(store, ticket)
+    assert ticket.parent is None
+    assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, capacity.MACHINE_SCOPE) == 0

@@ -156,3 +156,24 @@ def test_stats_rejects_bool_days_and_parser_exposes_json(tmp_path):
     args = build_parser().parse_args(["stats", "--since-days", "3", "--json"])
     assert args.command == "stats" and args.since_days == 3
     assert args.json_output is True
+
+
+def test_cli_stats_uses_repository_capacity_from_nested_directory(tmp_path, monkeypatch, capsys):
+    from skodun.cli import main
+    from tests.test_gitio import _git
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _git(repo, 'init')
+    (repo / '.skodun.toml').write_text('[capacity]\nmachine = 1\n')
+    nested = repo / 'nested'
+    nested.mkdir()
+    cfg = tmp_path / 'global.toml'
+    cfg.write_text('[capacity]\nmachine = 3\n')
+    db = tmp_path / 'db'
+    with Store.open(db):
+        pass
+    monkeypatch.setenv('SKODUN_CONFIG', str(cfg))
+    monkeypatch.setenv('SKODUN_DB', str(db))
+    monkeypatch.chdir(nested)
+    assert main(['stats', '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['live_capacity']['machine_cap'] == 1

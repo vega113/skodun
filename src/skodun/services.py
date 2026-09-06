@@ -1074,7 +1074,7 @@ def svc_log(store, branch, limit, repo=None) -> tuple[int, str]:
     return 0, "\n".join(lines)
 
 
-def svc_stats(store, since_days=7, fmt="text") -> tuple[int, str]:
+def svc_stats(store, since_days=7, fmt="text", *, repo=None) -> tuple[int, str]:
     """Render CLI-only operational statistics from the store read model."""
     from . import stats
 
@@ -1084,7 +1084,7 @@ def svc_stats(store, since_days=7, fmt="text") -> tuple[int, str]:
         from . import capacity as capmod
         from .config import load_config
         live = {
-            "machine_cap": capmod.resolved_machine_capacity(load_config(None)),
+            "machine_cap": capmod.resolved_machine_capacity(load_config(repo)),
             "machine_holders": store.capacity_holder_count(
                 capmod.RESOURCE_REVIEW_MACHINE, capmod.MACHINE_SCOPE),
             "by_repo": store.capacity_live_holders(capmod.RESOURCE_REVIEW_FG),

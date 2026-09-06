@@ -7,6 +7,7 @@ paths. They never open the live default store.
 from __future__ import annotations
 
 import os
+from contextlib import closing
 import sqlite3
 import subprocess
 import sys
@@ -252,7 +253,7 @@ def test_recovery_rejects_incomplete_current_schema(tmp_path, monkeypatch, damag
     import skodun.store as mod
     good = tmp_path / "good.db"
     _write_review(good, "retained")
-    with sqlite3.connect(good) as conn:
+    with closing(sqlite3.connect(good, isolation_level=None)) as conn:
         if damage == "table":
             conn.execute("DROP TABLE capacity_admissions")
         elif damage == "index":
@@ -271,7 +272,7 @@ def test_verified_recovery_preserves_review_and_private_permissions(tmp_path, mo
     import skodun.store as mod
     good = tmp_path / "good.db"
     _write_review(good, "retained")
-    with sqlite3.connect(good) as conn:
+    with closing(sqlite3.connect(good, isolation_level=None)) as conn:
         sql = '\n'.join(conn.iterdump()) + f'\nPRAGMA user_version={SCHEMA_VERSION};'
     db = tmp_path / "broken.db"
     original = _make_torn_wal(db)
@@ -345,7 +346,7 @@ def test_repair_refuses_when_lifecycle_lock_is_held(tmp_path):
 def test_delete_store_failed_integrity_is_invalid(tmp_path):
     db = tmp_path / "s.db"
     _write_review(db, "retained")
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db, isolation_level=None)) as conn:
         conn.execute("PRAGMA journal_mode=DELETE")
         index = conn.execute("SELECT name FROM sqlite_master WHERE type='index' "
                              "AND tbl_name='reviews' AND sql IS NOT NULL LIMIT 1").fetchone()[0]
@@ -360,7 +361,7 @@ def test_ordinary_delete_open_skips_full_integrity_scan(tmp_path, monkeypatch):
     import skodun.store as mod
     db = tmp_path / "s.db"
     _write_review(db, "retained")
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db, isolation_level=None)) as conn:
         conn.execute("PRAGMA journal_mode=DELETE")
     statements = []
     real = mod.sqlite3.connect
@@ -386,3 +387,26 @@ def test_quarantine_rejects_replaced_regular_inode(tmp_path):
     with pytest.raises(SchemaLifecycleError, match="changed before quarantine"):
         mod._copy_store_image(source, tmp_path / "quarantine", expected=original)
     assert not (tmp_path / "quarantine").exists()
+
+
+def test_corruption_probe_preserves_bytes_and_missing_sidecars(tmp_path):
+    import skodun.store as mod
+    db = tmp_path / 'broken.db'
+    original = _make_torn_wal(db)
+    Path(str(db) + '-wal').unlink(missing_ok=True)
+    Path(str(db) + '-shm').unlink(missing_ok=True)
+    assert mod._live_image_is_corrupt(db)
+    assert db.read_bytes() == original
+    assert not Path(str(db) + '-wal').exists()
+    assert not Path(str(db) + '-shm').exists()
+
+
+def test_doctor_other_corruption_directs_manual_restore(tmp_path, monkeypatch):
+    db = tmp_path / 'broken.db'
+    db.write_bytes(b'not a sqlite database')
+    monkeypatch.setenv('SKODUN_CONFIG', str(tmp_path / 'absent.toml'))
+    report = run_doctor(repo=tmp_path, store_path=db)
+    check = next(c for c in report.checks if c.name == 'store')
+    assert not check.ok
+    assert 'restore manually' in check.detail
+    assert 'next writable' not in check.detail

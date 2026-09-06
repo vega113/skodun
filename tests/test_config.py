@@ -1691,3 +1691,11 @@ def test_falsey_capacity_non_tables_are_rejected(tmp_path, value, layer):
     _write(target, f"capacity = {value}\n")
     with pytest.raises(ValueError, match="capacity.*must be a table"):
         load_config(repo, global_path=global_path)
+
+
+def test_global_fg_capacity_is_clipped_after_machine_env_resolution(tmp_path):
+    from skodun.capacity import resolved_fg_capacity
+    global_path = _write(tmp_path / 'global.toml', '[capacity]\nreview_fg = 4\n')
+    cfg = load_config(None, global_path=global_path)
+    assert resolved_fg_capacity(cfg, env={'SKODUN_REVIEW_MACHINE_CAPACITY': '4'}) == 4
+    assert resolved_fg_capacity(cfg, env={}) == 1

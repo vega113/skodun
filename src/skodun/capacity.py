@@ -480,14 +480,12 @@ def finish(store: "Store", ticket: Ticket, *, status: str = STATUS_RELEASED,
     the same status so two repos cannot leak the outer slot.
     """
     parent = ticket.parent
-    try:
-        row = store.capacity_finish(
-            ticket.id, status=status, expire_reason=expire_reason)
-        _apply_row(ticket, row)
-    finally:
-        if parent is not None:
-            ticket.parent = None
-            finish(store, parent, status=status, expire_reason=expire_reason)
+    row = store.capacity_finish(
+        ticket.id, status=status, expire_reason=expire_reason)
+    _apply_row(ticket, row)
+    if parent is not None:
+        finish(store, parent, status=status, expire_reason=expire_reason)
+        ticket.parent = None
     return ticket
 
 
