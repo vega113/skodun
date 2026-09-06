@@ -1,0 +1,30 @@
+#!/bin/sh
+# Operator-owned CLI/MCP entry point. Never source project-local configuration.
+set -eu
+profile="${SKODUN_HOST_PROFILE:-${XDG_CONFIG_HOME:-${HOME:?HOME is required}/.config}/skodun/host-profile.sh}"
+case "$profile" in
+    /*) ;;
+    *) echo 'skodun-host: host profile path must be absolute' >&2; exit 2 ;;
+esac
+if [ ! -f "$profile" ]; then
+    echo "skodun-host: missing host profile: $profile" >&2
+    exit 2
+fi
+# Trusted shell configuration, like a shell rc file; never store credentials here.
+# Executable and capacity come from this profile, not stale client settings.
+unset SKODUN_REAL_BIN SKODUN_REVIEW_FG_CAPACITY SKODUN_LEGACY_FG_LOCK \
+    SKODUN_PROVIDER_MAX_IN_FLIGHT
+. "$profile"
+if [ -z "${SKODUN_REAL_BIN:-}" ] || [ ! -x "$SKODUN_REAL_BIN" ]; then
+    echo 'skodun-host: set SKODUN_REAL_BIN to the absolute installed executable' >&2
+    exit 2
+fi
+case "$SKODUN_REAL_BIN" in
+    /*) ;;
+    *) echo 'skodun-host: SKODUN_REAL_BIN must be absolute' >&2; exit 2 ;;
+esac
+if [ "$SKODUN_REAL_BIN" -ef "$0" ]; then
+    echo 'skodun-host: SKODUN_REAL_BIN points back to this launcher' >&2
+    exit 2
+fi
+exec "$SKODUN_REAL_BIN" "$@"

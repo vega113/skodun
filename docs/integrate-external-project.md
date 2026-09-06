@@ -24,6 +24,9 @@ behaviour.
 
 ---
 
+For consistent CLI/MCP capacity and installed-build checks across clients, see
+[the shared host profile](shared-host-profile.md).
+
 ## What skodun is (and is not) for a client
 
 | Is | Is not |
