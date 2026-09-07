@@ -1930,3 +1930,28 @@ def test_save_does_not_swallow_typeerror_from_annotator_capable_store():
         pipeline._save(Capable(), {"id": "r1"},
                        lineage_annotator=lambda *_a, **_k: None)
     assert saved == []
+
+
+def test_git_capture_timeout_releases_machine_capacity(tmp_path, monkeypatch):
+    from skodun import gitio
+    repo = _repo(tmp_path)
+    _fake_grok(tmp_path, _emit(CLEAN))
+    fake_bin = tmp_path / 'hung-git'
+    fake_bin.mkdir()
+    executable = fake_bin / 'git'
+    executable.write_text('#!/bin/sh\nexec sleep 30\n')
+    executable.chmod(0o755)
+    original = gitio.resolve_base
+    with _store(tmp_path) as store:
+        def hung_capture(path):
+            if store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, '*') == 0:
+                return original(path)  # Readiness probes run before admission.
+            with monkeypatch.context() as scoped:
+                scoped.setattr(gitio, '_GIT_TIMEOUT_SECONDS', .05)
+                scoped.setenv('PATH', str(fake_bin) + os.pathsep + os.environ['PATH'])
+                return original(path)
+        monkeypatch.setattr(gitio, 'resolve_base', hung_capture)
+        with pytest.raises(gitio.GitError, match='timed out'):
+            _run(repo, store)
+        assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, '*') == 0
+        assert _calls(tmp_path) == 0

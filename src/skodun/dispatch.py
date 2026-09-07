@@ -123,7 +123,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from . import budget, contextpack, promptbuild
+from . import budget, capacity, contextpack, promptbuild
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .config import Config, Defaults, Dispatch, Reviewer
@@ -633,8 +633,16 @@ def reserved_budget(cfg: "Config", diff_bytes: bytes) -> int:
     from . import pipeline
     d = reservation_defaults(cfg.defaults, cfg.dispatch)
     plan = pipeline.batch_plan(diff_bytes, d, pipeline._reviewer_for(cfg, "finder"))
-    return budget.worst_runtime(d, pipeline.max_chain_width(cfg),
-                                0 if plan is None else len(plan))
+    import math
+    return (budget.worst_runtime(d, pipeline.max_chain_width(cfg),
+                                 0 if plan is None else len(plan))
+            + math.ceil(_machine_wait_seconds()))
+
+
+
+def _machine_wait_seconds() -> float:
+    """One bounded admission allowance shared by reservation and worker."""
+    return capacity.admission_wait_from_env(30.0)
 
 
 # ===========================================================================
@@ -1145,7 +1153,8 @@ def run_worker(record_id: str, repo: Path, branch: str, local_oid: str,
        process's first git call, and the record's `diff_hash` is what dedup and
        the gate match on. Reviewing the new content under the old hash would
        certify a diff nobody reviewed.
-    5. **Review** (`pipeline.run_prepush_review`, which persists nothing).
+    5. **Acquire machine capacity and review** (`pipeline.run_prepush_review`).
+       The machine ticket stays held through finalization and cancellation audit.
     6. **Check the token immediately before finalizing.** `run_prepush_review`
        cannot do this -- it does not persist, so there is nothing for a check
        inside it to protect.
@@ -1168,19 +1177,31 @@ def run_worker(record_id: str, repo: Path, branch: str, local_oid: str,
         with store:
             owner_context = {}
             try:
-                result = _work(store, cancel, record_id, repo, branch, local_oid,
-                               base_sha, base_ref, owner_context=owner_context)
-            except pipeline.ReviewCancelled as exc:
-                result = _record_cancellation(store, record_id, exc)
-            except BaseException as exc:
-                reason = f"the background review failed: {exc!r}"
-                _note(reason)
                 try:
-                    store.fail_if_running(record_id, reason)
-                except BaseException:
-                    pass
-                result = WorkerOutcome(0, _banner_failure(reason))
-            return _complete_worker_control(store, record_id, owner_context, result)
+                    result = _work(store, cancel, record_id, repo, branch, local_oid,
+                                   base_sha, base_ref, owner_context=owner_context)
+                except pipeline.ReviewCancelled as exc:
+                    result = _record_cancellation(store, record_id, exc)
+                except BaseException as exc:
+                    reason = f"the background review failed: {exc!r}"
+                    _note(reason)
+                    try:
+                        store.fail_if_running(record_id, reason)
+                    except BaseException:
+                        pass
+                    result = WorkerOutcome(0, _banner_failure(reason))
+                return _complete_worker_control(store, record_id, owner_context, result)
+            finally:
+                ticket = owner_context.get("machine_ticket")
+                if ticket is not None:
+                    token = owner_context.get("cancel")
+                    cancelled = bool(token is not None and token.cancel_latched)
+                    try:
+                        capacity.finish(store, ticket,
+                            status=capacity.STATUS_REJECTED if cancelled else capacity.STATUS_RELEASED,
+                            expire_reason=capacity.REASON_CANCELLED if cancelled else None)
+                    except Exception as exc:
+                        _note(f"machine admission cleanup failed: {exc!r}")
     finally:
         _restore_sigterm(previous)
 
@@ -1290,6 +1311,26 @@ def _work(store: "Store", cancel: threading.Event, record_id: str, repo: Path,
 
     cfg = _load_config(repo)
     d = effective_defaults(cfg.defaults, cfg.dispatch)
+    if owner_context is None:
+        raise RuntimeError("worker admission requires its cleanup context")
+    try:
+        ticket = capacity.acquire(
+            store, scope=capacity.MACHINE_SCOPE,
+            resource_class=capacity.RESOURCE_REVIEW_MACHINE,
+            capacity=capacity.resolved_machine_capacity(cfg),
+            wait_sec=_machine_wait_seconds(), poll_sec=0.05,
+            cancel=cancel, on_progress=_note)
+    except capacity.AdmissionCancelled as exc:
+        raise pipeline.ReviewCancelled(str(exc)) from exc
+    owner_context["machine_ticket"] = ticket
+    # The immutable pushed diff stays valid, but its reservation may have
+    # been superseded or reclaimed while the worker waited for the machine.
+    if cancel.is_set():
+        raise pipeline.ReviewCancelled("cancelled while waiting for machine capacity")
+    current = store.get_review(record_id) or {}
+    if current.get("status") != "running" or not cancel.owner.matches(current):
+        return WorkerOutcome(0, _banner_failure("reservation changed during machine admission; no review ran"))
+    capacity.mark_started(store, ticket, review_id=record_id)
     rec = pipeline.run_prepush_review(store, repo, record_id, branch, local_oid,
                                       base, diff, d, cfg, cancel=cancel)
 

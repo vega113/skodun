@@ -73,7 +73,7 @@ def test_real_fg_queue_longer_than_review_budget_keeps_complete_allowance(tmp_pa
         assert snapshot['timing']['review_active_ms'] == 500
         assert snapshot['timing']['review_wall_ms'] == 500
         assert snapshot['limits']['max_review_seconds'] == 2
-        assert {layer['resource_class'] for layer in snapshot['capacity_layers']} == {'review-fg', 'provider:xai'}
+        assert {layer['resource_class'] for layer in snapshot['capacity_layers']} == {'review-machine', 'review-fg', 'provider:xai'}
         assert all(layer['execution_seq'] == meta['request']['execution_seq']
                    for layer in snapshot['capacity_layers'])
         assert snapshot['phase'] == 'finished'

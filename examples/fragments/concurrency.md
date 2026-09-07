@@ -11,26 +11,29 @@ junie / codex).
 
 ## skodun concurrency (read this)
 
-### Three layers (do not conflate)
+### Four layers (do not conflate)
 
 | Layer | Scope | Limit |
 |---|---|---|
 | MCP process | One `skodun mcp` process | **1** in-flight `review` tool call (**refuse-if-busy**, not queued) |
+| `review-machine` | **Store-wide** (foreground and detached reviews across repos) | `SKODUN_REVIEW_MACHINE_CAPACITY` (default **1**) |
 | `review-fg` | **Per repository** (`git_common_dir`; all worktrees of that clone share it) | `SKODUN_REVIEW_FG_CAPACITY` (default **1**) |
 | `provider:<id>` | **Store-wide** (all repos on that DB) | `SKODUN_PROVIDER_MAX_IN_FLIGHT` (default **1** per provider) |
 
 Env knobs are process-wide **defaults**; **counting** for FG is per repo, for
-providers is global to the store. “3 providers × 2 = 6 concurrent reviews” is
+machine reviews and providers is global to the store. Repository `[capacity]`
+settings can only tighten host limits. `SKODUN_DB` selects a separate admission
+universe. “3 providers × 2 = 6 concurrent reviews” is
 **not** how skodun multiplies slots.
 
 ### What is concurrent today
 
 | Resource | Concurrency |
 |---|---|
-| Foreground `review` (CLI) | **FIFO `review-fg` capacity** (default **1** per repository). Default **dual-hold** also takes the legacy `grok-reviews-foreground.lock` (effective single physical mutex with tubescribes). Waiters are ordered; bounded wait then exit `3`. Progress reports **queue position**, **remaining wait budget**, and **ETA** (`eta≈Xs`) when ≥3 terminal samples exist. |
+| Foreground `review` (CLI) | **FIFO `review-machine` capacity** (default **1** across the store), then **`review-fg` capacity** (default **1** per repository). Default **dual-hold** also takes the legacy `grok-reviews-foreground.lock` (effective single physical mutex with tubescribes). Waiters are ordered; bounded wait then exit `3`. Progress reports **queue position**, **remaining wait budget**, and **ETA** (`eta≈Xs`) when ≥3 terminal samples exist. |
 | MCP `review` | **One per MCP server process.** Second call is **refused** (`"review already in flight"`), not queued (S3 choice: stale tree risk). Same process can still target many repos/worktrees **sequentially** via `repo`. |
 | Provider adapters | **Sequential fallback chain** + per-provider **`provider:<id>` max_in_flight** (default **1**). Not parallel multi-provider voting on one diff. |
-| Background pre-push workers | One **running** reservation per branch+repo; newer push **supersedes**. |
+| Background pre-push workers | Share **`review-machine` capacity** through finalization; one **running** reservation per branch+repo; newer push **supersedes**. |
 
 Having multiple providers configured does **not** mean N simultaneous reviews
 of the same diff. Multi-slot FG is for **independent** reviews (separate
@@ -40,10 +43,11 @@ processes / worktrees), subject to the layers above.
 
 | Knob | Default | Meaning |
 |---|---|---|
+| `SKODUN_REVIEW_MACHINE_CAPACITY` | `1` | Max concurrent review holders across the shared store, including detached workers. |
 | `SKODUN_REVIEW_FG_CAPACITY` | `1` | Max concurrent admitted+running `review-fg` holders per repo (store). |
-| `SKODUN_LEGACY_FG_LOCK` | on (`1`) | **on** (unset/empty/`1`/junk): dual-hold store + mkdir lock. **`0` only**: store capacity only (true multi-slot when capacity ≥2). Do **not** turn off until legacy scripts no longer share the repo (see cutover doc). |
+| `SKODUN_LEGACY_FG_LOCK` | on (`1`) | **on** (unset/empty/`1`/junk): dual-hold store + mkdir lock. **`0` only**: store capacity only (true multi-slot when both machine and FG capacity are ≥2). Do **not** turn off until legacy scripts no longer share the repo (see cutover doc). |
 | `SKODUN_PROVIDER_MAX_IN_FLIGHT` | `1` | Max concurrent inference holders per `provider:<id>` (global default). |
-| `SKODUN_ADMISSION_WAIT_SECONDS` | same as lock wait | Shared budget for repo admit + provider-slot waits |
+| `SKODUN_ADMISSION_WAIT_SECONDS` | same as lock wait | Bounds machine/repo admission and provider-slot waits |
 | `SKODUN_LOCK_WAIT_SECONDS` | stale ceiling | Dual-hold lock wait (interop) |
 | `SKODUN_LOCK_POLL_SECONDS` | `10` | Poll cadence |
 | `SKODUN_LOCK_STALE_SECONDS` | ceiling | Waiter reclaim ceiling |
@@ -52,8 +56,12 @@ processes / worktrees), subject to the layers above.
 
 ```bash
 export SKODUN_LEGACY_FG_LOCK=0
-export SKODUN_REVIEW_FG_CAPACITY=2   # or higher
+export SKODUN_REVIEW_MACHINE_CAPACITY=2
+export SKODUN_REVIEW_FG_CAPACITY=2   # effective FG limit is min(machine, repo)
 ```
+
+Provider limits still apply: two reviews using the same provider also need
+`SKODUN_PROVIDER_MAX_IN_FLIGHT` ≥2.
 
 **Provider slots:** each chain entry acquires `provider:<id>` before the
 provider process starts and releases on success, hop, cancel, or fail. On

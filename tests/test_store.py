@@ -2496,6 +2496,7 @@ _STORE_TOUCHING_MODULES = (
     "tests/test_readiness.py",
     "tests/test_schema_lifecycle.py",
     "tests/test_fingerprint.py",
+    "tests/test_store_durability.py",
     "tests/test_queueview.py",
     "tests/test_plan_preview.py",
 )
@@ -2630,10 +2631,8 @@ def test_store_touching_modules_run_clean_under_resourcewarning_error(tmp_path):
         f"(exit {proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
 
 
-# ===========================================================================
-# Phase 3 Task 10: the reservation lease, conditional finalize, atomic failure
-# ===========================================================================
-#
+# ====================================================================# Phase 3 Task 10: the reservation lease, conditional finalize, atomic failure
+# ====================================================================#
 # `set_status` is GONE, and its two tests above went with it. It wrote a status
 # and nothing else, so every caller of it left a row whose status said `failed`
 # beside `trustworthy=1` -- a row the gate still honours and dedup still

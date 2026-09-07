@@ -119,7 +119,8 @@ def _environment(root, database, binary, events, delay, profile):
         SKODUN_DB=str(database), SKODUN_CONFIG=str(root / 'absent-global.toml'),
         SKODUN_GROK_BIN=str(binary), SKODUN_SECURITY_PASS='0', SKODUN_SKEPTIC_PASS='0',
         SKODUN_LEGACY_FG_LOCK='1' if legacy else '0',
-        SKODUN_REVIEW_FG_CAPACITY=str(fg), SKODUN_PROVIDER_MAX_IN_FLIGHT=str(provider),
+        SKODUN_REVIEW_FG_CAPACITY=str(fg), SKODUN_REVIEW_MACHINE_CAPACITY=str(fg),
+        SKODUN_PROVIDER_MAX_IN_FLIGHT=str(provider),
         SKODUN_ADMISSION_WAIT_SECONDS='30', SKODUN_LOCK_POLL_SECONDS='0.02',
         SKODUN_PILOT_EVENTS=str(events), SKODUN_PILOT_DELAY=str(delay))
     return env

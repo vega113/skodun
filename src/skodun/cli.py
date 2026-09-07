@@ -969,6 +969,7 @@ def _cmd_queue(args) -> int:
 
 def _cmd_stats(args) -> int:
     """Read operational telemetry; this command never mutates gate/trust."""
+    from . import gitio
     from .services import svc_stats
     from .store import Store
 
@@ -977,9 +978,13 @@ def _cmd_stats(args) -> int:
     except BaseException as e:
         return _emit(f"skodun stats: could not open the store: {e!r}", 2)
     with store:
+        try:
+            repo = _repo_root(Path.cwd())
+        except (gitio.GitError, OSError):
+            repo = None
         code, text = svc_stats(
             store, getattr(args, "since_days", 7),
-            "json" if getattr(args, "json_output", False) else "text")
+            "json" if getattr(args, "json_output", False) else "text", repo=repo)
     return _emit(text, code)
 
 

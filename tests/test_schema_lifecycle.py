@@ -26,6 +26,9 @@ from skodun.store import (SCHEMA_VERSION, SchemaInfo, SchemaLifecycleError,
 
 def _downgrade(path, version=12):
     with closing(sqlite3.connect(path)) as conn:
+        if version < 21:
+            conn.execute("ALTER TABLE capacity_admissions DROP COLUMN owner_start")
+            conn.execute("ALTER TABLE capacity_admissions DROP COLUMN capacity_limit")
         if version < 20:
             conn.execute("DROP TABLE IF EXISTS review_followup_checkpoints")
         if version < 18:
@@ -434,7 +437,7 @@ def test_unreadable_blocker_snapshot_refuses_migration(tmp_path, monkeypatch):
     _downgrade(db)
     info = inspect_schema(db)
     import skodun.store as store_mod
-    monkeypatch.setattr(store_mod, "inspect_schema", lambda path: info)
+    monkeypatch.setattr(store_mod, "inspect_schema", lambda path, **kwargs: info)
     monkeypatch.setattr(
         store_mod, "_snapshot_database",
         lambda path: (None, None, SchemaInfo(
@@ -455,3 +458,26 @@ def test_open_readonly_does_not_create_shm_beside_original(tmp_path):
     with Store.open_readonly(db):
         pass
     assert not shm.exists()
+
+
+def test_v20_upgrade_adds_nullable_machine_owner_without_rewriting_admissions(tmp_path):
+    db = tmp_path / 'v20.db'
+    with Store.open(db) as store:
+        store.capacity_enqueue(admission_id='historical', resource_class='review-machine',
+                               scope='*', pid=12345)
+        store.capacity_finish('historical', status='released')
+        before = store.capacity_get('historical')
+        before.pop('owner_start')
+        before.pop('capacity_limit')
+    _downgrade(db, version=20)
+    image = db.read_bytes()
+    with pytest.raises(SchemaLifecycleError, match='migration'):
+        Store.open(db)
+    assert db.read_bytes() == image
+    receipt = Store.migrate_existing(db, build_commit='a' * 40)
+    assert receipt['schema_from'] == 20 and receipt['schema_to'] == SCHEMA_VERSION
+    with Store.open(db) as store:
+        after = store.capacity_get('historical')
+        assert after.pop('owner_start') is None
+        assert after.pop('capacity_limit') is None
+        assert after == before

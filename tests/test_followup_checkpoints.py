@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from skodun import checkpoints, runner, services
-from skodun.store import Store
+from skodun.store import SCHEMA_VERSION, Store
 from tests.test_batched_review import _body
 from tests.test_requests import _ready_repo
 
@@ -70,7 +70,7 @@ def test_followup_pass_identity_has_exact_zero_index():
 
 def test_followup_schema_is_additive_and_declared(lane):
     _, store, _, _ = lane
-    assert store._c.execute('PRAGMA user_version').fetchone()[0] == 20
+    assert store._c.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
     sql = store._c.execute("SELECT sql FROM sqlite_master WHERE name='review_checkpoints'").fetchone()[0]
     assert "('batch','integration')" in sql
     assert store._c.execute("SELECT sql FROM sqlite_master WHERE name='review_followup_checkpoints'").fetchone()
@@ -328,6 +328,8 @@ def test_v19_inspection_does_not_migrate_and_explicit_upgrade_is_additive(tmp_pa
         pass
     with closing(sqlite3.connect(db)) as connection:
         connection.execute('DROP TABLE review_followup_checkpoints')
+        connection.execute('ALTER TABLE capacity_admissions DROP COLUMN owner_start')
+        connection.execute('ALTER TABLE capacity_admissions DROP COLUMN capacity_limit')
         connection.execute('PRAGMA user_version=19')
         connection.commit()
         old_objects = set(connection.execute("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))
@@ -337,7 +339,7 @@ def test_v19_inspection_does_not_migrate_and_explicit_upgrade_is_additive(tmp_pa
         Store.open(db)
     assert db.read_bytes() == before
     receipt = Store.migrate_existing(db, build_commit='a' * 40)
-    assert receipt['schema_from'] == 19 and receipt['schema_to'] == 20
+    assert receipt['schema_from'] == 19 and receipt['schema_to'] == SCHEMA_VERSION
     with Store.open(db) as store:
         objects = set(tuple(r) for r in store._c.execute("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))
         assert objects - old_objects == {('table', 'review_followup_checkpoints'),

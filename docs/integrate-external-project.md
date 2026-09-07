@@ -316,6 +316,7 @@ Do not conflate layers (see also
 | Layer | Scope | Limit |
 |---|---|---|
 | MCP process | One `skodun mcp` | **1** in-flight `review` (refuse-if-busy) |
+| `review-machine` | Whole store (foreground and detached reviews across repos) | `SKODUN_REVIEW_MACHINE_CAPACITY` (default 1) |
 | `review-fg` | Per repository (`git_common_dir`; all worktrees share it) | `SKODUN_REVIEW_FG_CAPACITY` (default 1) |
 | `provider:<id>` | Whole store (all repos) | `SKODUN_PROVIDER_MAX_IN_FLIGHT` (default 1) |
 
@@ -326,16 +327,19 @@ finder with a free slot instead. A pin (`--reviewer` / MCP `reviewer`) still
 wins, and agents should **omit** it so routing has something to choose. Full
 knobs and scoring: [`examples/fragments/concurrency.md`](../examples/fragments/concurrency.md).
 
-1. **CLI foreground reviews:** FIFO **review-fg** capacity (default **1** per
-   repository). Default **dual-hold** also takes the legacy
+1. **CLI foreground reviews:** acquire FIFO **review-machine** capacity first
+   (default **1** across the shared store), then **review-fg** capacity (default
+   **1** per repository). Default **dual-hold** also takes the legacy
    `grok-reviews-foreground.lock` (effective single physical mutex while
    tubescribes/legacy scripts coexist). Waiters are ordered; progress reports
    **queue position**, **remaining wait budget**, and **ETA** when enough
    samples exist; bounded wait then exit **`3`**. Raise capacity with
-   `SKODUN_REVIEW_FG_CAPACITY`. For **true multi-slot** after legacy is gone:
-   `SKODUN_LEGACY_FG_LOCK=0` (exact `0` only) plus capacity ≥2. Telemetry is
-   persisted (`capacity_admissions`). Env is a global default; **counting** is
-   still per repo.
+   both `SKODUN_REVIEW_MACHINE_CAPACITY` and `SKODUN_REVIEW_FG_CAPACITY`.
+   For **true multi-slot** after legacy is gone, set both to at least `2` and
+   `SKODUN_LEGACY_FG_LOCK=0` (exact `0` only). Repository `[capacity]` settings
+   may only tighten host limits. Detached workers share the outer machine cap;
+   `SKODUN_DB` selects a separate capacity universe. Telemetry is persisted
+   (`capacity_admissions`); machine counting is store-wide and FG counting is per repo.
 2. **Provider concurrency (S4):** each chain entry acquires `provider:<id>`
    (default max_in_flight **1**, override `SKODUN_PROVIDER_MAX_IN_FLIGHT`)
    before inference and releases on every terminal. Quota/429 marks
@@ -468,6 +472,6 @@ Last reviewed against skodun **0.4.x** / post-epic-#23 main:
 
 S1, S3, and S4 are shipped: §2 concurrency,
 `examples/fragments/concurrency.md`, and
-`examples/fragments/mcp-review-topology.md` match the product (FIFO review-fg,
+`examples/fragments/mcp-review-topology.md` match the product (outer FIFO review-machine, inner review-fg,
 optional multi-slot, provider max_in_flight, MCP refuse-if-busy; MCP process ≠
 per-repo queue).

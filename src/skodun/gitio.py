@@ -39,8 +39,10 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import selectors
 import stat
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -54,6 +56,9 @@ _DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
 # diff.noprefix or custom prefix configuration cannot turn a real path into a
 # header label that the parser cannot resolve.
 _DIFF_PREFIX_FLAGS = ("--src-prefix=a/", "--dst-prefix=b/")
+# Git may consult filters or remote object stores. A wedged command must not
+# retain a machine-wide review ticket indefinitely.
+_GIT_TIMEOUT_SECONDS = 60
 
 
 class GitError(RuntimeError):
@@ -61,7 +66,11 @@ class GitError(RuntimeError):
 
 
 def _run(repo: Path, *args: str, ok_codes: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess:
-    cp = subprocess.run(["git", "-C", str(repo), *args], capture_output=True)
+    try:
+        cp = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                            timeout=_GIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"git operation timed out after {_GIT_TIMEOUT_SECONDS} seconds") from exc
     if cp.returncode not in ok_codes:
         raise GitError(
             f"git {' '.join(args)}: rc={cp.returncode} "
@@ -425,9 +434,10 @@ def _cat_file(repo: Path, *args: str) -> subprocess.CompletedProcess | None:
     be run (git absent, un-encodable argument), otherwise the result."""
     try:
         return subprocess.run(
-            ["git", "-C", str(repo), "cat-file", *args], capture_output=True
+            ["git", "-C", str(repo), "cat-file", *args], capture_output=True,
+            timeout=_GIT_TIMEOUT_SECONDS
         )
-    except (OSError, ValueError):
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
 
 
@@ -525,15 +535,36 @@ def blob_bytes(
         )
     except (OSError, ValueError):
         return None
+    data = None
     try:
-        data = proc.stdout.read(max_bytes) if proc.stdout else b""
-    except OSError:
-        data = b""
+        deadline = time.monotonic() + _GIT_TIMEOUT_SECONDS
+        prefix = bytearray()
+        if proc.stdout is not None:
+            with selectors.DefaultSelector() as ready:
+                ready.register(proc.stdout, selectors.EVENT_READ)
+                while len(prefix) < max_bytes:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not ready.select(remaining):
+                        break
+                    chunk = os.read(proc.stdout.fileno(), min(65536, max_bytes - len(prefix)))
+                    if not chunk:
+                        data = bytes(prefix)
+                        break
+                    prefix.extend(chunk)
+                else:
+                    data = bytes(prefix)
+    except (OSError, ValueError):
+        data = None
     finally:
+        try:
+            proc.kill()  # A blob longer than the peek leaves git still writing.
+            proc.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            data = None
         if proc.stdout:
             proc.stdout.close()
-        proc.kill()  # a blob longer than the peek leaves git still writing
-        proc.wait()
+    if data is None:
+        return None  # A timed-out partial prefix is not a successful read.
     if data:
         return data
     # Nothing on stdout: an empty blob, a missing path and a tree all look the

@@ -29,6 +29,14 @@ from __future__ import annotations
 import os
 import time
 import math
+import sqlite3
+import subprocess
+import sys
+import threading
+from contextlib import closing
+from urllib.parse import quote
+from pathlib import Path
+from uuid import UUID
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -36,19 +44,24 @@ from typing import TYPE_CHECKING
 from . import ids, budgets
 
 if TYPE_CHECKING:
-    import threading
-
     from .store import Store
 
 #: Foreground review capacity class (S3/S4).
 RESOURCE_REVIEW_FG = "review-fg"
+#: Machine-wide outer bound across every repo that shares this store.
+RESOURCE_REVIEW_MACHINE = "review-machine"
+#: Scope for the outer ticket; one row universe per store file.
+MACHINE_SCOPE = "*"
 #: Optional name reserved for later; not wired.
 RESOURCE_REVIEW_BG = "review-bg"
 #: Prefix for per-provider slots: ``provider:xai``, ``provider:openai``, …
 PROVIDER_CLASS_PREFIX = "provider:"
 
 DEFAULT_CAPACITY = 1
+MAX_CAPACITY = (1 << 63) - 1  # Persisted in SQLite INTEGER capacity_limit.
 CAPACITY_ENV = "SKODUN_REVIEW_FG_CAPACITY"
+DEFAULT_MACHINE_CAPACITY = 1
+MACHINE_CAPACITY_ENV = "SKODUN_REVIEW_MACHINE_CAPACITY"
 ADMISSION_WAIT_ENV = "SKODUN_ADMISSION_WAIT_SECONDS"
 LEGACY_FG_LOCK_ENV = "SKODUN_LEGACY_FG_LOCK"
 PROVIDER_MAX_IN_FLIGHT_ENV = "SKODUN_PROVIDER_MAX_IN_FLIGHT"
@@ -122,6 +135,8 @@ class Ticket:
     expire_reason: str | None = None
     position: int | None = None
     review_id: str | None = None
+    #: Outer machine ticket when this is a per-repo ``review-fg`` holder.
+    parent: "Ticket | None" = None
 
 
 def capacity_from_env(env: Mapping[str, str] | None = None) -> int:
@@ -134,9 +149,68 @@ def capacity_from_env(env: Mapping[str, str] | None = None) -> int:
         value = int(str(raw).strip(), 10)
     except ValueError:
         return DEFAULT_CAPACITY
-    if value < 1:
+    if not 1 <= value <= MAX_CAPACITY:
         return DEFAULT_CAPACITY
     return value
+
+
+def machine_capacity_from_env(env: Mapping[str, str] | None = None) -> int:
+    """``SKODUN_REVIEW_MACHINE_CAPACITY`` ≥ 1; junk / missing → default 1."""
+    env = os.environ if env is None else env
+    raw = env.get(MACHINE_CAPACITY_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_MACHINE_CAPACITY
+    try:
+        value = int(str(raw).strip(), 10)
+    except ValueError:
+        return DEFAULT_MACHINE_CAPACITY
+    if not 1 <= value <= MAX_CAPACITY:
+        return DEFAULT_MACHINE_CAPACITY
+    return value
+
+
+def resolved_machine_capacity(cfg: object | None = None,
+                              env: Mapping[str, str] | None = None) -> int:
+    """Resolve the host ceiling, then apply any explicit repository tightening."""
+    env = os.environ if env is None else env
+    settings = getattr(cfg, "capacity", None)
+    if str(env.get(MACHINE_CAPACITY_ENV) or "").strip():
+        machine = machine_capacity_from_env(env)
+    else:
+        machine = getattr(settings, "machine", None)
+        if not isinstance(machine, int) or isinstance(machine, bool) or machine < 1:
+            machine = machine_capacity_from_env(env)
+    repo = getattr(settings, "_repo_machine", None)
+    if isinstance(repo, int) and not isinstance(repo, bool) and repo >= 1:
+        machine = min(machine, repo)
+    return machine
+
+
+def resolved_fg_capacity(cfg: object | None = None,
+                         env: Mapping[str, str] | None = None) -> int:
+    """Resolve host FG capacity, apply repo tightening, then the machine ceiling."""
+    env = os.environ if env is None else env
+    if str(env.get(CAPACITY_ENV) or "").strip():
+        repo = capacity_from_env(env)
+    else:
+        review_fg = getattr(getattr(cfg, "capacity", None), "review_fg", None)
+        if (isinstance(review_fg, int) and not isinstance(review_fg, bool)
+                and review_fg >= 1):
+            repo = review_fg
+        else:
+            repo = capacity_from_env(env)
+    repo_limit = getattr(getattr(cfg, "capacity", None), "_repo_review_fg", None)
+    if isinstance(repo_limit, int) and not isinstance(repo_limit, bool) and repo_limit >= 1:
+        repo = min(repo, repo_limit)
+    return effective_fg_capacity(repo, resolved_machine_capacity(cfg, env))
+
+
+def effective_fg_capacity(repo_capacity: int, machine_capacity: int) -> int:
+    """Inner FG slots cannot exceed the machine-wide outer cap."""
+    repo = DEFAULT_CAPACITY if int(repo_capacity) < 1 else int(repo_capacity)
+    machine = (DEFAULT_MACHINE_CAPACITY if int(machine_capacity) < 1
+               else int(machine_capacity))
+    return min(repo, machine)
 
 
 def legacy_fg_lock_from_env(env: Mapping[str, str] | None = None) -> bool:
@@ -162,7 +236,7 @@ def provider_max_in_flight_from_env(env: Mapping[str, str] | None = None) -> int
         value = int(str(raw).strip(), 10)
     except ValueError:
         return DEFAULT_PROVIDER_MAX_IN_FLIGHT
-    if value < 1:
+    if not 1 <= value <= MAX_CAPACITY:
         return DEFAULT_PROVIDER_MAX_IN_FLIGHT
     return value
 
@@ -408,6 +482,9 @@ def try_admit(store: "Store", ticket: Ticket, *, capacity: int) -> Ticket:
 def mark_started(store: "Store", ticket: Ticket,
                  review_id: str | None = None) -> Ticket:
     """Mark an admitted ticket as ``running`` (review body under way)."""
+    if ticket.parent is not None:
+        row = store.capacity_mark_started(ticket.parent.id, review_id=review_id)
+        _apply_row(ticket.parent, row)
     row = store.capacity_mark_started(ticket.id, review_id=review_id)
     _apply_row(ticket, row)
     return ticket
@@ -415,11 +492,130 @@ def mark_started(store: "Store", ticket: Ticket,
 
 def finish(store: "Store", ticket: Ticket, *, status: str = STATUS_RELEASED,
            expire_reason: str | None = None) -> Ticket:
-    """Terminal transition: released / expired / rejected."""
-    row = store.capacity_finish(
-        ticket.id, status=status, expire_reason=expire_reason)
-    _apply_row(ticket, row)
-    return ticket
+    """Terminal transition: released / expired / rejected.
+
+    If this ticket holds a machine-wide parent, the parent is finished with
+    the same status so two repos cannot leak the outer slot.
+    """
+    for attempt in range(3):
+        try:
+            parent = ticket.parent
+            for current in (ticket, parent):
+                if current is None:
+                    continue
+                try:
+                    row = store.capacity_finish(
+                        current.id, status=status, expire_reason=expire_reason)
+                except ValueError:
+                    if store.capacity_get(current.id) is not None:
+                        raise
+                    current.status = status  # No durable holder remains to release.
+                else:
+                    _apply_row(current, row)
+            ticket.parent = None
+            return ticket
+        except sqlite3.Error:
+            if attempt == 2:
+                _retain_release_retry(store, ticket, status, expire_reason)
+                raise
+            time.sleep(0.05 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+_RELEASE_RETRY_LOCK = threading.Lock()
+_RELEASE_RETRIES: dict[tuple, threading.Thread] = {}
+
+
+def _retain_release_retry(store: "Store", ticket: Ticket, status: str, reason: str | None) -> None:
+    """Keep failed cleanup alive; owner exit falls back to durable PID reclamation."""
+    path = getattr(store, "_path", None)
+    if path is None:
+        return  # No persistent authority to strand for an in-memory test store.
+    path = Path(path).absolute()
+    admissions = (ticket.id,) + ((ticket.parent.id,) if ticket.parent is not None else ())
+    key = (str(path), admissions)
+    with _RELEASE_RETRY_LOCK:
+        if key in _RELEASE_RETRIES:
+            return
+        worker = threading.Thread(target=_release_retry_worker,
+            args=(key, path, admissions, status, reason), daemon=True,
+            name="skodun-capacity-release")
+        _RELEASE_RETRIES[key] = worker
+        try:
+            worker.start()
+        except BaseException:
+            _RELEASE_RETRIES.pop(key, None)
+            raise
+
+
+def _release_retry_worker(key, path: Path, admissions: tuple[str, ...], status: str, reason: str | None) -> None:
+    from .store import Store, SCHEMA_VERSION, _apply_open_durability
+    uri = f"file:{quote(str(path))}?mode=rw"
+    try:
+        while True:
+            try:
+                # Never recreate a deleted authority or share the caller's
+                # thread-bound connection. Each attempt closes before waiting.
+                with closing(sqlite3.connect(uri, uri=True, isolation_level=None, timeout=1)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                        raise sqlite3.OperationalError("release retry requires current schema")
+                    _apply_open_durability(conn)
+                    view = Store(conn, path)
+                    for admission_id in admissions:
+                        if view.capacity_get(admission_id) is not None:
+                            view.capacity_finish(admission_id, status=status, expire_reason=reason)
+                return
+            except (sqlite3.Error, OSError):
+                time.sleep(1)
+    finally:
+        with _RELEASE_RETRY_LOCK:
+            _RELEASE_RETRIES.pop(key, None)
+
+
+@dataclass(frozen=True)
+class ProcessObservation:
+    """A birth identity and positive exit evidence; missing data proves neither."""
+    token: str | None = None
+    exited: bool = False
+
+
+def process_observation(pid: int) -> ProcessObservation:
+    """Observe identity and zombie state together without signalling a process."""
+    if pid <= 0:
+        return ProcessObservation()
+    exited = False
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text()
+            fields = raw.rsplit(")", 1)[1].split()
+            exited = fields[0] == "Z"
+            ticks = fields[19]
+            if not ticks.isascii() or not ticks.isdigit():
+                return ProcessObservation(exited=exited)
+            boot = UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+            return ProcessObservation(f"linux:{boot}:{ticks}", exited)
+        except (OSError, ValueError, IndexError):
+            return ProcessObservation(exited=exited)
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat=", "-o", "lstart="],
+            capture_output=True, text=True, timeout=1,
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+        parts = proc.stdout.split()
+        if proc.returncode or not parts:
+            return ProcessObservation()
+        exited = parts[0].startswith("Z")
+        token = " ".join(parts[1:])
+        time.strptime(token, "%a %b %d %H:%M:%S %Y")
+        return ProcessObservation(token, exited)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return ProcessObservation(exited=exited)
+
+
+def process_birth_token(pid: int) -> str | None:
+    """Observe process creation identity; missing evidence never proves reuse."""
+    return process_observation(pid).token
 
 
 def _cancelled(cancel: "threading.Event | None") -> bool:
@@ -570,15 +766,65 @@ def acquire_for_fg(
         try_lock: Callable[[float], bool] | None = None,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
-        pid_alive_fn: Callable[[int], bool] | None = None) -> Ticket:
-    """FG admission: store FIFO, optionally dual-hold via ``try_lock``.
+        pid_alive_fn: Callable[[int], bool] | None = None,
+        machine_capacity: int | None = None) -> Ticket:
+    """FG admission: machine outer cap, then per-repo FIFO, optional dual-hold.
 
     When ``try_lock`` is ``None``, this is store-only multi-slot admit (S4
     dual-hold off): same as :func:`acquire` for ``review-fg``.
 
     When ``try_lock`` is set, only the FIFO head may call it; success force-
     admits and marks running (S3 dual-hold).
+
+    The machine ticket is always acquired first (scope ``*``, class
+    ``review-machine``) so two MCP/CLI processes sharing the store cannot
+    both run when the outer cap is 1. The inner ``review-fg`` capacity is
+    ``min(repo, machine)``.
     """
+    now = time.monotonic if clock is None else clock
+    machine_cap = (machine_capacity_from_env() if machine_capacity is None
+                   else int(machine_capacity))
+    if machine_cap < 1:
+        machine_cap = DEFAULT_MACHINE_CAPACITY
+    repo_cap = DEFAULT_CAPACITY if capacity is None else int(capacity)
+    if repo_cap < 1:
+        repo_cap = DEFAULT_CAPACITY
+    inner_cap = effective_fg_capacity(repo_cap, machine_cap)
+    deadline = now() + float(wait_sec)
+    machine_ticket = acquire(
+        store, scope=MACHINE_SCOPE, resource_class=RESOURCE_REVIEW_MACHINE,
+        capacity=machine_cap, wait_sec=wait_sec, poll_sec=poll_sec,
+        stale_sec=stale_sec, cancel=cancel, on_progress=on_progress,
+        clock=clock, sleep=sleep, pid_alive_fn=pid_alive_fn)
+    remaining = deadline - now()
+    try:
+        ticket = _acquire_repo_fg(
+            store, scope=scope, capacity=inner_cap,
+            wait_sec=max(remaining, 0.0), poll_sec=poll_sec,
+            stale_sec=stale_sec, cancel=cancel, on_progress=on_progress,
+            try_lock=try_lock, clock=clock, sleep=sleep,
+            pid_alive_fn=pid_alive_fn)
+    except BaseException:
+        finish(store, machine_ticket, status=STATUS_REJECTED,
+               expire_reason="inner_admit_failed")
+        raise
+    ticket.parent = machine_ticket
+    return ticket
+
+
+def _acquire_repo_fg(
+        store: "Store", *, scope: str,
+        capacity: int,
+        wait_sec: float,
+        poll_sec: float,
+        stale_sec: float,
+        cancel: "threading.Event | None",
+        on_progress: Callable[[str], None] | None,
+        try_lock: Callable[[float], bool] | None,
+        clock: Callable[[], float] | None,
+        sleep: Callable[[float], None] | None,
+        pid_alive_fn: Callable[[int], bool] | None) -> Ticket:
+    """Inner per-repo ``review-fg`` admit (legacy dual-hold unchanged)."""
     if try_lock is None:
         return acquire(
             store, scope=scope, resource_class=RESOURCE_REVIEW_FG,
@@ -624,7 +870,7 @@ def acquire_for_fg(
 
             attempted = True
             active = store.capacity_active_views(RESOURCE_REVIEW_FG, scope)
-            if decide_admit(ticket.id, active, cap):
+            if decide_admit(ticket.id, active, min(cap, 1)):
                 slice_sec = max(min(float(poll_sec), max(remaining, 0.0)), 0.0)
                 got = try_lock(slice_sec)
                 if got:

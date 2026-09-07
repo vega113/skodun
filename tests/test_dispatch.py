@@ -1015,7 +1015,7 @@ def test_a_multi_batch_push_reserves_a_multi_batch_budget(tmp_path):
         for i in range(40)))
     assert big > small
     rd = reservation_defaults(d, cfg.dispatch)
-    assert small == budget.worst_runtime(rd, 1, 0)
+    assert small == budget.worst_runtime(rd, 1, 0) + 30
 
 
 # --------------------------------------------------------------------------
@@ -3239,7 +3239,7 @@ def test_a_backdated_running_record_is_recovered_by_its_OWN_persisted_budget(
     # over `[defaults]` alone -- the unmodified `[dispatch] timeout_sec` (240)
     # is what actually dominates this small config.
     assert small_budget == pipeline.worst_runtime_sec(
-        reservation_defaults(small_cfg.defaults, small_cfg.dispatch))
+        reservation_defaults(small_cfg.defaults, small_cfg.dispatch)) + 30
 
     # The config changes to a much larger timeout BEFORE the sweep runs. The
     # record's own persisted budget must not move with it.
@@ -3796,3 +3796,124 @@ def test_prepush_primary_evidence_preserves_actual_escalated_timeout(tmp_path, m
         legacy = json.loads(text)
         assert legacy['measurements']['incomplete_rows'] == 20
         assert legacy['selection']['target_source'] == 'configured'
+
+
+def test_worker_obeys_foreground_machine_holder_and_releases_its_ticket(tmp_path, monkeypatch):
+    repo = _bg_repo(tmp_path)
+    db = tmp_path / 'db'
+    rid, ident = _reserve(db, repo)
+    monkeypatch.setenv('SKODUN_ADMISSION_WAIT_SECONDS', '.05')
+    with Store.open(db) as observer:
+        holder = capacity.acquire_for_fg(observer, scope='/foreground-repo',
+            capacity=1, machine_capacity=1, wait_sec=.1, poll_sec=.01)
+        try:
+            out = run_worker(rid, repo, 'feat', ident['head'], ident['base_sha'], ident['base_ref'], db)
+            assert out.code == 0
+            assert _calls(tmp_path) == 0
+            assert observer.get_review(rid)['trustworthy'] is False
+            assert observer.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, '*') == 1
+        finally:
+            capacity.finish(observer, holder)
+    rid, ident = _reserve(db, repo)
+    assert run_worker(rid, repo, 'feat', ident['head'], ident['base_sha'], ident['base_ref'], db).code == 0
+    assert _calls(tmp_path) == 1
+    with Store.open(db) as observer:
+        assert observer.get_review(rid)['trustworthy'] is True
+        assert observer.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, '*') == 0
+
+
+def test_two_dispatched_refs_share_one_machine_slot(tmp_path, monkeypatch, spawned):
+    import time
+    body = 'touch "$D/provider-started"\nwhile [ ! -f "$D/provider-release" ]; do sleep .02; done\n' + _emit(CLEAN)
+    repo = _bg_repo(tmp_path, body=body)
+    _git(repo, 'checkout', '-b', 'other')
+    (repo / 'c.txt').write_text('other\n')
+    _git(repo, 'add', '.')
+    _git(repo, 'commit', '-m', 'other')
+    monkeypatch.setenv('SKODUN_REVIEW_MACHINE_CAPACITY', '1')
+    monkeypatch.setenv('SKODUN_PROVIDER_MAX_IN_FLIGHT', '4')
+    db = tmp_path / 'db'
+    try:
+        assert run_dispatch(_push_line(repo, 'feat') + _push_line(repo, 'other'), repo, db) == 0
+        deadline = time.monotonic() + 10
+        observed = False
+        while time.monotonic() < deadline:
+            with Store.open(db) as store:
+                rows = store.capacity_active_views(capacity.RESOURCE_REVIEW_MACHINE, '*')
+                states = [row.status for row in rows]
+            if states.count('running') == 1 and states.count('queued') == 1 and _calls(tmp_path) == 1:
+                observed = True
+                break
+            time.sleep(.02)
+        assert observed, 'both detached workers must participate in machine admission'
+    finally:
+        (tmp_path / 'bin' / 'provider-release').touch()
+    for rid in _ids(db):
+        assert _await(db, rid)['trustworthy'] is True
+    assert _calls(tmp_path) == 2
+    with Store.open(db) as store:
+        assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, '*') == 0
+
+
+def test_worker_cancellation_during_machine_admission_never_launches_provider(tmp_path, monkeypatch):
+    repo = _bg_repo(tmp_path)
+    db = tmp_path / 'db'
+    rid, ident = _reserve(db, repo)
+    real = capacity.acquire
+    def cancel_before_admit(store, **kwargs):
+        if kwargs['resource_class'] == capacity.RESOURCE_REVIEW_MACHINE:
+            kwargs['cancel'].set()
+        return real(store, **kwargs)
+    monkeypatch.setattr(capacity, 'acquire', cancel_before_admit)
+    out = run_worker(rid, repo, 'feat', ident['head'], ident['base_sha'], ident['base_ref'], db)
+    assert out.code == 0
+    assert _calls(tmp_path) == 0
+    with Store.open(db) as store:
+        rec = store.get_review(rid)
+        assert rec['trustworthy'] is False
+        assert 'cancelled' in rec['failure_reason'].lower()
+        assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, '*') == 0
+
+
+def test_worker_rechecks_reservation_after_machine_wait(tmp_path, monkeypatch):
+    repo = _bg_repo(tmp_path)
+    db = tmp_path / 'db'
+    rid, ident = _reserve(db, repo)
+    real = capacity.acquire
+    def retire_after_admit(store, **kwargs):
+        ticket = real(store, **kwargs)
+        if kwargs['resource_class'] == capacity.RESOURCE_REVIEW_MACHINE:
+            store.fail_if_running(rid, 'retired while waiting')
+        return ticket
+    monkeypatch.setattr(capacity, 'acquire', retire_after_admit)
+    assert run_worker(rid, repo, 'feat', ident['head'], ident['base_sha'], ident['base_ref'], db).code == 0
+    assert _calls(tmp_path) == 0
+    with Store.open(db) as store:
+        assert store.get_review(rid)['failure_reason'] == 'retired while waiting'
+        assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, '*') == 0
+
+
+def test_worker_holds_machine_capacity_through_conditional_finalize(tmp_path, monkeypatch):
+    repo = _bg_repo(tmp_path)
+    db = tmp_path / 'db'
+    rid, ident = _reserve(db, repo)
+    real = Store.finalize_review
+    observed = []
+    def finalize(store, *args, **kwargs):
+        observed.append(store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, '*'))
+        return real(store, *args, **kwargs)
+    monkeypatch.setattr(Store, 'finalize_review', finalize)
+    assert run_worker(rid, repo, 'feat', ident['head'], ident['base_sha'], ident['base_ref'], db).code == 0
+    assert observed == [1]
+    with Store.open(db) as store:
+        assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, '*') == 0
+
+
+def test_reservation_includes_the_machine_admission_allowance(tmp_path, monkeypatch):
+    repo = _bg_repo(tmp_path)
+    cfg = load_config(repo)
+    diff = b'diff --git a/a b/a\n@@ -1 +1 @@\n-a\n+b\n'
+    monkeypatch.setenv('SKODUN_ADMISSION_WAIT_SECONDS', '0')
+    base = reserved_budget(cfg, diff)
+    monkeypatch.setenv('SKODUN_ADMISSION_WAIT_SECONDS', '12.1')
+    assert reserved_budget(cfg, diff) == base + 13

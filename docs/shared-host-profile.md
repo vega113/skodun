@@ -9,7 +9,7 @@ The optional [host launcher](../examples/bin/skodun-host) reads one trusted,
 operator-owned shell file before starting the installed executable. It does not
 install Skodun, restart clients, change product defaults, load credentials, or
 select providers. It clears inherited executable and foreground/legacy/provider
-capacity settings before sourcing the profile, so omitted capacity settings use
+capacity settings (including machine capacity) before sourcing the profile, so omitted capacity settings use
 product defaults. Use it for both CLI and MCP startup.
 
 ## Prepare and activate
@@ -32,6 +32,7 @@ product defaults. Use it for both CLI and MCP startup.
 
    ```sh
    SKODUN_REAL_BIN="$HOME/.local/pipx/venvs/skodun/bin/skodun"
+   export SKODUN_REVIEW_MACHINE_CAPACITY=2
    export SKODUN_REVIEW_FG_CAPACITY=2
    export SKODUN_LEGACY_FG_LOCK=0
    # This example assumes an existing, explicitly approved provider limit of 2:

@@ -154,7 +154,9 @@ def test_real_review_links_provider_capacity_and_final_artifact(tmp_path, monkey
         assert status == 0
         request = store.get_request(meta['request']['id'])
         links = request['links']
-        assert len([l for l in links if l['kind'] == 'capacity']) == 2
+        assert {store.capacity_get(l['target_id'])['resource_class']
+                for l in links if l['kind'] == 'capacity'} == {
+                    'review-machine', 'review-fg', 'provider:xai'}
         review_id = next(l['target_id'] for l in links if l['kind'] == 'review')
         rec = store.get_review(review_id)
         assert rec['request_id'] == request['id']
@@ -244,6 +246,8 @@ def test_request_schema_upgrade_is_explicit_and_preserves_reviews(tmp_path):
         c.execute('DROP TABLE request_executions')
         c.execute('DROP TABLE request_links')
         c.execute('DROP TABLE review_requests')
+        c.execute('ALTER TABLE capacity_admissions DROP COLUMN owner_start')
+        c.execute('ALTER TABLE capacity_admissions DROP COLUMN capacity_limit')
         c.execute('PRAGMA user_version=16')
         c.commit()
     before = db.read_bytes()
@@ -468,3 +472,23 @@ def test_continuation_claim_rechecks_target_before_reactivating(tmp_path, monkey
         assert decision == 'continuation_unavailable'
         assert row['owner_token'] == prior['owner_token']
         assert len(row['executions']) == 1
+
+
+def test_real_review_retries_transient_machine_parent_release(tmp_path, monkeypatch):
+    import sqlite3
+    repo = _ready_repo(tmp_path, monkeypatch)
+    with Store.open(tmp_path / 'db') as store:
+        original = store.capacity_finish
+        failures = []
+        def finish(admission_id, **kwargs):
+            row = store.capacity_get(admission_id)
+            if row['resource_class'] == 'review-machine' and not failures:
+                failures.append(admission_id)
+                raise sqlite3.OperationalError('database is locked')
+            return original(admission_id, **kwargs)
+        monkeypatch.setattr(store, 'capacity_finish', finish)
+        code, text, meta = services.svc_review_detailed(store, repo)
+        assert code == 0, text
+        assert len(failures) == 1
+        assert store.capacity_holder_count('review-machine', '*') == 0
+        assert store.get_review(meta['result']['ids']['review_id'])['trustworthy']
