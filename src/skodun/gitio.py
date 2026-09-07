@@ -39,8 +39,10 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import selectors
 import stat
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -533,15 +535,36 @@ def blob_bytes(
         )
     except (OSError, ValueError):
         return None
+    data = None
     try:
-        data = proc.stdout.read(max_bytes) if proc.stdout else b""
-    except OSError:
-        data = b""
+        deadline = time.monotonic() + _GIT_TIMEOUT_SECONDS
+        prefix = bytearray()
+        if proc.stdout is not None:
+            with selectors.DefaultSelector() as ready:
+                ready.register(proc.stdout, selectors.EVENT_READ)
+                while len(prefix) < max_bytes:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not ready.select(remaining):
+                        break
+                    chunk = os.read(proc.stdout.fileno(), min(65536, max_bytes - len(prefix)))
+                    if not chunk:
+                        data = bytes(prefix)
+                        break
+                    prefix.extend(chunk)
+                else:
+                    data = bytes(prefix)
+    except (OSError, ValueError):
+        data = None
     finally:
+        try:
+            proc.kill()  # A blob longer than the peek leaves git still writing.
+            proc.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            data = None
         if proc.stdout:
             proc.stdout.close()
-        proc.kill()  # a blob longer than the peek leaves git still writing
-        proc.wait()
+    if data is None:
+        return None  # A timed-out partial prefix is not a successful read.
     if data:
         return data
     # Nothing on stdout: an empty blob, a missing path and a tree all look the

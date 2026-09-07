@@ -1147,3 +1147,18 @@ def test_failed_cleanup_retries_until_sqlite_writer_releases(store, monkeypatch,
         assert not worker.is_alive()
     assert store.capacity_get(ticket.id)['status'] == 'released'
     assert store.capacity_get(parent_id)['status'] == 'released'
+
+
+@pytest.mark.parametrize('missing', ['child', 'parent', 'both'])
+def test_finish_releases_surviving_parent_when_child_was_lost(store, missing):
+    ticket = acquire_for_fg(store, scope='/repo', capacity=1, machine_capacity=1,
+                            wait_sec=.1, poll_sec=.01)
+    parent_id = ticket.parent.id
+    if missing in ('child', 'both'):
+        store._c.execute('DELETE FROM capacity_admissions WHERE id=?', (ticket.id,))
+    if missing in ('parent', 'both'):
+        store._c.execute('DELETE FROM capacity_admissions WHERE id=?', (parent_id,))
+    finish(store, ticket)
+    assert ticket.status == capacity.STATUS_RELEASED
+    assert ticket.parent is None
+    assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, '*') == 0

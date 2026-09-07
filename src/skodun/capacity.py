@@ -499,14 +499,19 @@ def finish(store: "Store", ticket: Ticket, *, status: str = STATUS_RELEASED,
     for attempt in range(3):
         try:
             parent = ticket.parent
-            row = store.capacity_finish(
-                ticket.id, status=status, expire_reason=expire_reason)
-            _apply_row(ticket, row)
-            if parent is not None:
-                row = store.capacity_finish(
-                    parent.id, status=status, expire_reason=expire_reason)
-                _apply_row(parent, row)
-                ticket.parent = None
+            for current in (ticket, parent):
+                if current is None:
+                    continue
+                try:
+                    row = store.capacity_finish(
+                        current.id, status=status, expire_reason=expire_reason)
+                except ValueError:
+                    if store.capacity_get(current.id) is not None:
+                        raise
+                    current.status = status  # No durable holder remains to release.
+                else:
+                    _apply_row(current, row)
+            ticket.parent = None
             return ticket
         except sqlite3.Error:
             if attempt == 2:
