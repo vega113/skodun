@@ -1897,6 +1897,8 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                             or row["total_tokens"] < row["prompt_tokens"] + row["completion_tokens"]):
                         return False
                 elif table == "review_requests":
+                    if not isinstance(row["intent_digest"], str) or re.fullmatch(r"[0-9a-f]{64}", row["intent_digest"]) is None:
+                        return False
                     for field in ("id", "scope", "owner_token", "source"):
                         request_store._text(field, row[field])
                     if row["request_key"] is not None:

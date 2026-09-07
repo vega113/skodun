@@ -1725,3 +1725,15 @@ def test_recovery_preserves_complete_operator_audit_streams(tmp_path, monkeypatc
         with Store.open(dest) as store:
             rows = store.feedback_list() if table == 'feedback_events' else store.reuse_events()
             assert len(rows) == 3
+
+
+@pytest.mark.parametrize('digest', ['x', 'A'*64, 'g'*64, '0'*63])
+def test_recovery_rejects_malformed_request_intent_digest(tmp_path, monkeypatch, digest):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_control_fixture(source)
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute("UPDATE review_requests SET request_key='stable-key',intent_digest=?", (digest,))
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
