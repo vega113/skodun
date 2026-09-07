@@ -1695,3 +1695,33 @@ def test_recovery_accounts_for_foreground_machine_parents(tmp_path, monkeypatch,
             store._c.execute('DELETE FROM capacity_admissions WHERE id=?', (ticket.parent.id,))
     _stream_source_dump(monkeypatch, source)
     assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db') is (not remove_parent)
+
+
+@pytest.mark.parametrize('table', ['feedback_events', 'reuse_events'])
+@pytest.mark.parametrize('damage', ['none', 'latest', 'middle', 'all', 'invalid_body'])
+def test_recovery_preserves_complete_operator_audit_streams(tmp_path, monkeypatch, table, damage):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        for _ in range(3):
+            if table == 'feedback_events':
+                store.feedback_append(at='2026-09-07T00:00:00Z', actor='human', kind='product_note',
+                                      body='Please preserve this operator audit note.')
+            else:
+                store.append_reuse_event(at='2026-09-07T00:00:00Z', outcome='miss', reason='no matching review')
+    with closing(sqlite3.connect(source)) as raw:
+        if damage == 'invalid_body':
+            field = 'body' if table == 'feedback_events' else 'reason'
+            raw.execute(f"UPDATE {table} SET {field}=''")
+        elif damage != 'none':
+            suffix = '' if damage == 'all' else f" WHERE seq={3 if damage == 'latest' else 2}"
+            raw.execute(f'DELETE FROM {table}' + suffix)
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest) is (damage == 'none')
+    if damage == 'none':
+        with Store.open(dest) as store:
+            rows = store.feedback_list() if table == 'feedback_events' else store.reuse_events()
+            assert len(rows) == 3

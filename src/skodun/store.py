@@ -1722,11 +1722,11 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
         for table in tables:
             if table == "reviews":
                 continue
-            if table in ("api_spend_events", "cancellation_audit", "request_executions") and not _recovered_sequence_valid(conn, table):
+            if table in ("api_spend_events", "cancellation_audit", "request_executions", "feedback_events", "reuse_events") and not _recovered_sequence_valid(conn, table):
                 return False
             columns = {row[1]: bool(row[3]) for row in conn.execute(f'PRAGMA table_info("{table}")')
                        if row[1].endswith("_json")}
-            if not columns and table not in ("api_spend_events", "capacity_admissions", "provider_state", "deliveries"):
+            if not columns and table not in ("api_spend_events", "capacity_admissions", "provider_state", "deliveries", "feedback_events", "reuse_events"):
                 continue
             for row in conn.execute(f'SELECT * FROM "{table}"'):
                 if time.monotonic() >= deadline:
@@ -1736,7 +1736,29 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                     if row[column] is None and not required:
                         continue
                     decoded[column] = _recovery_json_object(row[column])
-                if table == "cancellation_audit":
+                if table in ("feedback_events", "reuse_events"):
+                    _require_ts("audit at", row["at"])
+                    if row["at"] > _iso_now():
+                        return False
+                    if table == "feedback_events":
+                        from . import feedback
+                        feedback.validate_actor(row["actor"])
+                        feedback.validate_kind(row["kind"])
+                        feedback.validate_body(row["body"])
+                        feedback.validate_fields(row["kind"], review_id=row["review_id"],
+                                                 finding_index=row["finding_index"])
+                        if row["finding_index"] is not None:
+                            _plain_nonnegative_int("feedback finding_index", row["finding_index"])
+                        fields = ("review_id", "provider", "repo", "source")
+                    else:
+                        if row["outcome"] not in _REUSE_OUTCOMES:
+                            return False
+                        _require_text("reuse reason", row["reason"])
+                        fields = tuple(key for key in row.keys() if key not in ("seq", "at", "outcome", "reason"))
+                    for field in fields:
+                        if row[field] is not None:
+                            _require_text(f"audit {field}", row[field])
+                elif table == "cancellation_audit":
                     from .control import audit_text, review_identity
                     for field, limit in (("actor", 120), ("source", 80), ("reason", 500), ("cause", 80)):
                         audit_text(row[field], field, limit)
@@ -2001,7 +2023,7 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
 def _recovered_sequence_valid(conn: sqlite3.Connection, table: str) -> bool:
     """Append-only ledgers cannot discard events their high-water evidence records."""
     column = {"triage_events": "seq", "api_spend_events": "seq", "cancellation_audit": "id",
-              "request_executions": "seq"}[table]
+              "request_executions": "seq", "feedback_events": "seq", "reuse_events": "seq"}[table]
     count, first, last = conn.execute(f'SELECT COUNT(*),MIN({column}),MAX({column}) FROM "{table}"').fetchone()
     watermarks = conn.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (table,)).fetchall()
     if len(watermarks) > 1:
