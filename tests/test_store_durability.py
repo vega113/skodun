@@ -1148,6 +1148,7 @@ def test_recovery_preserves_valid_triage_and_its_audit_history(tmp_path, monkeyp
     'claim_token', 'claim_owner', 'claimed_at', 'lease_expires_at',
     'empty_owner', 'zero_fence', 'backward_lease', 'payload', 'completed_at',
     'failure_reason', 'pending_claim', 'complete_time',
+    'beyond_parent', 'future_claim',
 ])
 def test_recovery_rejects_inconsistent_checkpoint_claims(tmp_path, monkeypatch, damage):
     from dataclasses import replace
@@ -1171,6 +1172,8 @@ def test_recovery_rejects_inconsistent_checkpoint_claims(tmp_path, monkeypatch, 
                 'failure_reason': "UPDATE review_checkpoints SET failure_reason='stale failure' WHERE state='running'",
                 'pending_claim': "UPDATE review_checkpoints SET state='pending' WHERE state='running'",
                 'complete_time': "UPDATE review_checkpoints SET completed_at=NULL WHERE state='complete'",
+                'beyond_parent': "UPDATE review_checkpoints SET lease_expires_at='9999-12-31T23:59:59Z' WHERE state='running'",
+                'future_claim': "UPDATE review_checkpoints SET claimed_at='9999-12-31T23:59:58Z',lease_expires_at='9999-12-31T23:59:59Z' WHERE state='running'",
             }[damage]
             raw.execute(sql)
         raw.commit()

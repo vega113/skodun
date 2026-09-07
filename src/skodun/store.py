@@ -1847,6 +1847,13 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                         _require_ts("checkpoint lease_expires_at", row["lease_expires_at"])
                         if row["fence"] < 1 or row["lease_expires_at"] <= row["claimed_at"]:
                             return False
+                        parent = conn.execute("SELECT expires_at FROM review_orchestrations WHERE id=?",
+                                              (row["orchestration_id"],)).fetchone()
+                        if parent is None:
+                            return False
+                        _require_ts("orchestration expires_at", parent[0])
+                        if row["lease_expires_at"] > parent[0] or row["claimed_at"] > _iso_now():
+                            return False
                     elif any(row[field] is not None for field in claim_fields):
                         return False
                     if row["state"] == "complete":
