@@ -1634,6 +1634,19 @@ def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
                 return False
             normalized = _normalize_record(artifact, label="recovery")
             load_valid_artifact(artifact)
+            request_id = artifact.get("request_id")
+            if request_id is not None and not (
+                    request_id == artifact["id"] and artifact.get("mode") == PREPUSH_MODE
+                    and artifact.get("source") == SKODUN_SOURCE):
+                if conn.execute("SELECT 1 FROM review_requests WHERE id=?", (request_id,)).fetchone() is None:
+                    return False
+                for kind, target in (("review", artifact["id"]),
+                                     ("batch_orchestration", artifact.get("batch_orchestration_id")),
+                                     ("recovery_orchestration", artifact.get("orchestration_id"))):
+                    if target and conn.execute(
+                            "SELECT 1 FROM request_links WHERE request_id=? AND kind=? AND target_id=?",
+                            (request_id, kind, target)).fetchone() is None:
+                        return False
             if normalized.get("status") == RUNNING:
                 holder = conn.execute(
                     "SELECT 1 FROM capacity_admissions WHERE resource_class='review-machine' "

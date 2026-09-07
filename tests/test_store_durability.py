@@ -1737,3 +1737,26 @@ def test_recovery_rejects_malformed_request_intent_digest(tmp_path, monkeypatch,
         raw.commit()
     _stream_source_dump(monkeypatch, source)
     assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('missing', ['none', 'review', 'batch_orchestration', 'recovery_orchestration', 'all'])
+def test_recovery_preserves_projected_request_links(tmp_path, monkeypatch, missing):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    rid = _recovery_control_fixture(source)
+    with Store.open(source) as store:
+        record = store.get_review('kept')
+        record.update(request_id=rid, batch_orchestration_id='orch-1', orchestration_id='recovery-1')
+        store.save_review(record)
+        for kind, target in [('review','kept'), ('batch_orchestration','orch-1'), ('recovery_orchestration','recovery-1')]:
+            store.link_request(rid, kind, target)
+        if missing == 'all':
+            store._c.execute('DELETE FROM request_links')
+        elif missing != 'none':
+            store._c.execute('DELETE FROM request_links WHERE kind=?', (missing,))
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest) is (missing == 'none')
+    if missing == 'none':
+        with Store.open(dest) as store:
+            assert store.request_for_orchestration('orch-1', store.get_request(rid)['identity']) == rid

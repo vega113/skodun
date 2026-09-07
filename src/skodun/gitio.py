@@ -54,6 +54,9 @@ _DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
 # diff.noprefix or custom prefix configuration cannot turn a real path into a
 # header label that the parser cannot resolve.
 _DIFF_PREFIX_FLAGS = ("--src-prefix=a/", "--dst-prefix=b/")
+# Git may consult filters or remote object stores. A wedged command must not
+# retain a machine-wide review ticket indefinitely.
+_GIT_TIMEOUT_SECONDS = 60
 
 
 class GitError(RuntimeError):
@@ -61,7 +64,11 @@ class GitError(RuntimeError):
 
 
 def _run(repo: Path, *args: str, ok_codes: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess:
-    cp = subprocess.run(["git", "-C", str(repo), *args], capture_output=True)
+    try:
+        cp = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                            timeout=_GIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"git operation timed out after {_GIT_TIMEOUT_SECONDS} seconds") from exc
     if cp.returncode not in ok_codes:
         raise GitError(
             f"git {' '.join(args)}: rc={cp.returncode} "
@@ -425,9 +432,10 @@ def _cat_file(repo: Path, *args: str) -> subprocess.CompletedProcess | None:
     be run (git absent, un-encodable argument), otherwise the result."""
     try:
         return subprocess.run(
-            ["git", "-C", str(repo), "cat-file", *args], capture_output=True
+            ["git", "-C", str(repo), "cat-file", *args], capture_output=True,
+            timeout=_GIT_TIMEOUT_SECONDS
         )
-    except (OSError, ValueError):
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
 
 

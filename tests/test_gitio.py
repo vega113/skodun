@@ -1287,3 +1287,13 @@ def test_blob_reads_accept_a_ref_not_only_a_sha(tmp_path):
     repo = _mkrepo(tmp_path)
     for rev in ("HEAD", "main", _git(repo, "rev-parse", "HEAD")[:8]):
         assert blob_bytes(repo, rev, "a.txt") == b"one\n", rev
+
+
+def test_cat_file_timeout_keeps_optional_object_read_bounded(tmp_path, monkeypatch):
+    from skodun import gitio
+    executable = tmp_path / 'git'
+    executable.write_text('#!/bin/sh\nexec sleep 30\n')
+    executable.chmod(0o755)
+    monkeypatch.setenv('PATH', str(tmp_path) + os.pathsep + os.environ['PATH'])
+    monkeypatch.setattr(gitio, '_GIT_TIMEOUT_SECONDS', .05)
+    assert gitio._cat_file(tmp_path, '-s', 'HEAD:a.txt') is None

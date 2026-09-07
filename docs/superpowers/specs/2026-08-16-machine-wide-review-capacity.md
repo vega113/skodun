@@ -204,3 +204,9 @@ After bounded synchronous release retries fail, the owner retains the ticket IDs
 in a daemon retry worker using separate, existing-only SQLite connections.
 Cleanup keeps child-before-parent ordering until success. If the owner exits,
 the durable admission rows remain eligible for the existing dead-PID reclamation.
+
+Git identity and object-read subprocesses have a 60-second timeout. A stalled
+capture raises through the foreground cleanup path and releases the machine
+slot; optional object reads return no result on timeout. Recovered review
+artifacts that name a logical request must retain the request and the review/
+orchestration links published by the writer.
