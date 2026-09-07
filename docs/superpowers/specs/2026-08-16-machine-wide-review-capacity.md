@@ -193,3 +193,9 @@ Recovered triage decisions must satisfy the existing audit-reason and filed-ref
 floors and retain consistent finding/scope keys. Only the mechanically derived
 ledger-key NUL separators truncated by SQLite's dump format are reconstructed;
 decisions, reasons, references, and scope are never invented.
+
+Installing a recovered image uses SQLite's atomic backup restore while retaining
+an exclusive SQLite lock. The authority inode is never replaced under existing
+connections; active readers cause a bounded refusal, and idle clients resume on
+the same file after restoration. The validated image retains WAL mode. Source
+identity and incident shape are rechecked under the exclusive lock before restore.

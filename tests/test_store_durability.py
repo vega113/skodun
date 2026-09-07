@@ -1428,3 +1428,41 @@ def test_recovery_preserves_request_cancellation_state(tmp_path, monkeypatch, co
     assert mod._recover_sqlite_image(source, dest)
     with Store.open(dest) as store:
         assert bool(store.request_cancel_event(rid, request['owner_token'])) is (not complete)
+
+
+def test_recovery_restores_wal_and_keeps_authority_inode(tmp_path, monkeypatch):
+    import skodun.store as mod
+    good = tmp_path / 'good.db'
+    _write_review(good, 'retained')
+    db = tmp_path / 'broken.db'
+    _make_torn_wal(db)
+    inode = db.stat().st_ino
+    _stream_source_dump(monkeypatch, good)
+    # A connection which has not accessed the file must resume on the same
+    # authority after recovery, not write to an unlinked replacement inode.
+    with closing(sqlite3.connect(db)) as idle:
+        with Store.open(db) as store:
+            assert store._c.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
+        assert db.stat().st_ino == inode
+        idle.execute("UPDATE reviews SET summary='peer resumed' WHERE id='retained'")
+        idle.commit()
+    with Store.open(db) as store:
+        assert store._c.execute("SELECT summary FROM reviews WHERE id='retained'").fetchone()[0] == 'peer resumed'
+
+
+def test_recovery_refuses_existing_sqlite_reader(tmp_path, monkeypatch):
+    good = tmp_path / 'good.db'
+    _write_review(good, 'retained')
+    db = tmp_path / 'broken.db'
+    original = _make_torn_wal(db)
+    inode = db.stat().st_ino
+    _stream_source_dump(monkeypatch, good)
+    with closing(sqlite3.connect(db)) as reader:
+        reader.execute('PRAGMA user_version').fetchone()
+        with pytest.raises(SchemaLifecycleError) as caught:
+            Store.open(db)
+        assert caught.value.reason_code == 'busy'
+        assert db.stat().st_ino == inode
+        assert db.read_bytes() == original
+    with Store.open(db) as store:
+        assert store.get_review('retained') is not None

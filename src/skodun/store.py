@@ -2062,6 +2062,9 @@ def _recover_sqlite_image(src: Path, dest: Path) -> bool:
                          and _recovered_reviews_valid(conn, deadline)
                          and _recovered_payloads_valid(conn, deadline)
                          and _recovered_triage_valid(conn, deadline))
+                if valid:
+                    valid = False
+                    valid = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
                 return valid
             except (sqlite3.DatabaseError, OSError, ValueError):
                 return False
@@ -2129,18 +2132,7 @@ def _repair_malformed_store(path: Path, info: SchemaInfo) -> None:
         with tempfile.TemporaryDirectory(prefix=".skodun-recover-", dir=path.parent) as tmp:
             recovered = Path(tmp) / "recovered.db"
             if _recover_sqlite_image(quarantine, recovered):
-                observed = path.lstat()
-                if (observed.st_dev, observed.st_ino, observed.st_mtime_ns, observed.st_size) != (
-                        original.st_dev, original.st_ino, original.st_mtime_ns, original.st_size):
-                    raise SchemaLifecycleError("store_changed", "store changed during recovery",
-                                               version=None)
-                if not _torn_wal_signature(path):
-                    raise SchemaLifecycleError("store_changed", "WAL changed during recovery",
-                                               version=None)
-                os.chmod(recovered, stat.S_IMODE(original.st_mode) & 0o600)
-                os.replace(recovered, path)
-                for suffix in ("-wal", "-shm"):
-                    Path(str(path) + suffix).unlink(missing_ok=True)
+                _restore_recovered_image(path, recovered, original)
                 return
         raise SchemaLifecycleError(
             info.reason_code or "torn_wal",
@@ -2149,6 +2141,35 @@ def _repair_malformed_store(path: Path, info: SchemaInfo) -> None:
             version=None)
     finally:
         lock.unlink(missing_ok=True)
+
+
+def _restore_recovered_image(path: Path, recovered: Path, original: os.stat_result) -> None:
+    """Restore atomically under SQLite exclusivity without unlinking live authority."""
+    uri = f"file:{quote(str(path.absolute()))}?mode=rw"
+    try:
+        with closing(sqlite3.connect(uri, uri=True, isolation_level=None, timeout=1)) as target:
+            target.execute("PRAGMA synchronous=FULL")
+            target.execute("PRAGMA locking_mode=EXCLUSIVE")
+            # Exclusive locking mode retains the lock after COMMIT, allowing
+            # backup() to own its transaction while every peer stays excluded.
+            target.execute("BEGIN EXCLUSIVE")
+            target.execute("COMMIT")
+            observed = path.lstat()
+            if (observed.st_dev, observed.st_ino, observed.st_mtime_ns, observed.st_size) != (
+                    original.st_dev, original.st_ino, original.st_mtime_ns, original.st_size):
+                raise SchemaLifecycleError("store_changed", "store changed during recovery", version=None)
+            if not _torn_wal_signature(path):
+                raise SchemaLifecycleError("store_changed", "WAL changed during recovery", version=None)
+            deadline = time.monotonic() + 300
+            def bounded_restore(*_):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("store restore exceeded its execution budget")
+            source_uri = f"file:{quote(str(recovered.absolute()))}?mode=ro&immutable=1"
+            with closing(sqlite3.connect(source_uri, uri=True)) as source:
+                source.backup(target, pages=256, progress=bounded_restore)
+    except sqlite3.Error as exc:
+        raise SchemaLifecycleError("busy" if _is_busy_error(exc) else "restore_failed",
+                                   "store restore refused; preserved quarantine", version=None) from exc
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
