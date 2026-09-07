@@ -1838,9 +1838,13 @@ def _recovered_triage_valid(conn: sqlite3.Connection, deadline: float) -> bool:
                         return False
                     conn.execute(f'UPDATE "{table}" SET ledger_key=? WHERE rowid=?',
                                  (expected, row["recovery_rowid"]))
-                review = conn.execute("SELECT branch,base_sha FROM reviews WHERE id=?",
+                review = conn.execute("SELECT branch,base_sha,artifact_json FROM reviews WHERE id=?",
                                       (row["review_id"],)).fetchone()
                 if review is None or (review[0], review[1]) != (row["branch"], row["base_sha"]):
+                    return False
+                artifact = _recovery_json_object(review[2])
+                if not any(finding_key(f.get("file", ""), f.get("title", "")) == key
+                           for f in artifact.get("findings", [])):
                     return False
         valid = True
         return True
