@@ -1841,6 +1841,15 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                                 return False
                     if row["resource_class"] == "review-machine" and row["scope"] != "*":
                         return False
+                    if row["resource_class"] == "review-fg" and row["status"] in Store._CAPACITY_ACTIVE:
+                        children = conn.execute(
+                            "SELECT COUNT(*) FROM capacity_admissions WHERE resource_class='review-fg' "
+                            "AND status IN ('queued','admitted','running') AND pid IS ?", (row["pid"],)).fetchone()[0]
+                        parents = conn.execute(
+                            "SELECT COUNT(*) FROM capacity_admissions WHERE resource_class='review-machine' "
+                            "AND scope='*' AND status IN ('admitted','running') AND pid IS ?", (row["pid"],)).fetchone()[0]
+                        if parents < children:
+                            return False
                     if (row["status"] == "queued" and any(row[f] is not None for f in ("admitted_at", "started_at"))
                             or row["status"] in ("admitted", "running") and row["admitted_at"] is None
                             or row["status"] == "admitted" and row["started_at"] is not None
@@ -1853,6 +1862,8 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                             _plain_nonnegative_int(f"capacity {field}", row[field])
                 elif table == "api_spend_events":
                     _require_ts("spend at", row["at"])
+                    if row["at"] > _iso_now():
+                        return False
                     _require_text("spend provider", row["provider"])
                     for field in ("model", "review_id", "request_id"):
                         if row[field] is not None:

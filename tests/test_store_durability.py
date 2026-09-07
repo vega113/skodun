@@ -1200,7 +1200,7 @@ def test_recovery_preserves_writer_produced_checkpoint_claims(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize('damage', [
-    'negative_cost', 'infinite_cost', 'text_cost', 'timestamp', 'provider',
+    'negative_cost', 'infinite_cost', 'text_cost', 'timestamp', 'future_timestamp', 'provider',
     'prompt_tokens', 'completion_tokens', 'total_tokens', 'fractional_tokens', 'total_relationship',
 ])
 def test_recovery_rejects_invalid_spend_ledger(tmp_path, monkeypatch, damage):
@@ -1213,6 +1213,7 @@ def test_recovery_rejects_invalid_spend_ledger(tmp_path, monkeypatch, damage):
     column, value = {
         'negative_cost': ('cost_usd', -100), 'infinite_cost': ('cost_usd', float('inf')),
         'text_cost': ('cost_usd', 'not a cost'), 'timestamp': ('at', 'not a timestamp'),
+        'future_timestamp': ('at', '9999-12-31T23:59:59Z'),
         'provider': ('provider', ''), 'prompt_tokens': ('prompt_tokens', -1),
         'completion_tokens': ('completion_tokens', -1), 'total_tokens': ('total_tokens', -1),
         'fractional_tokens': ('prompt_tokens', 1.5), 'total_relationship': ('total_tokens', 14),
@@ -1677,3 +1678,20 @@ def test_recovery_rejects_missing_request_execution_sequences(tmp_path, monkeypa
         assert raw.execute('PRAGMA foreign_key_check').fetchone() is None
     _stream_source_dump(monkeypatch, source)
     assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('children,remove_parent', [(1, True), (2, True), (2, False)])
+def test_recovery_accounts_for_foreground_machine_parents(tmp_path, monkeypatch, children, remove_parent):
+    from skodun import capacity
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    monkeypatch.setattr(capacity, 'process_birth_token', lambda pid: None)
+    with Store.open(source) as store:
+        for i in range(children):
+            ticket = capacity.acquire_for_fg(store, scope=f'/repo-{i}', capacity=2,
+                machine_capacity=2, wait_sec=.1, poll_sec=.01)
+        if remove_parent:
+            store._c.execute('DELETE FROM capacity_admissions WHERE id=?', (ticket.parent.id,))
+    _stream_source_dump(monkeypatch, source)
+    assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db') is (not remove_parent)
