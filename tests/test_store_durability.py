@@ -1781,3 +1781,35 @@ def test_recovery_rejects_request_execution_completion_mismatch(tmp_path, monkey
             store._c.execute('UPDATE request_executions SET status=4')
     _stream_source_dump(monkeypatch, source)
     assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('damage', ['none', 'missing_id', 'missing_review', 'wrong_review', 'wrong_digest', 'pending_checkpoint', 'not_consumed'])
+def test_recovery_validates_consumed_orchestration_final_review(tmp_path, monkeypatch, damage):
+    from tests.test_checkpoints import _created, _complete_all, _review
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        _created(store)
+        _complete_all(store)
+        store.save_checkpointed_review(_review())
+        if damage == 'missing_id':
+            store._c.execute('UPDATE review_orchestrations SET final_review_id=NULL')
+        elif damage == 'missing_review':
+            store._c.execute("DELETE FROM reviews WHERE id='sk-final'")
+        elif damage == 'wrong_review':
+            store._c.execute("UPDATE review_orchestrations SET final_review_id='kept'")
+        elif damage == 'wrong_digest':
+            record = store.get_review('sk-final')
+            record['batch_identity_digest'] = 'wrong'
+            store.save_review(record)
+        elif damage == 'pending_checkpoint':
+            store._c.execute("UPDATE review_checkpoints SET state='pending',payload_json=NULL,completed_at=NULL")
+        elif damage == 'not_consumed':
+            store._c.execute("UPDATE review_orchestrations SET state='active'")
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest) is (damage == 'none')
+    if damage == 'none':
+        with Store.open(dest) as store:
+            assert store.get_orchestration('orch-1')['final_review_id'] == 'sk-final'

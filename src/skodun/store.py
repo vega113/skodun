@@ -1968,6 +1968,17 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                     identity = checkpoints.OrchestrationIdentity.from_json(row["identity_json"])
                     if identity.digest() != row["identity_digest"]:
                         return False
+                    if row["state"] == "consumed":
+                        final = view.get_review(row["final_review_id"]) if row["final_review_id"] else None
+                        if (final is None or final.get("status") == RUNNING
+                                or final.get("batch_orchestration_id") != row["id"]
+                                or final.get("batch_identity_digest") != row["identity_digest"]):
+                            return False
+                        if conn.execute("SELECT 1 FROM review_checkpoints WHERE orchestration_id=? AND state!='complete' LIMIT 1",
+                                        (row["id"],)).fetchone() is not None:
+                            return False
+                    elif row["final_review_id"] is not None:
+                        return False
                     if any(row[key] != value for key, value in asdict(identity).items() if key in row.keys()):
                         return False
                     planned = {(item.kind, item.index): item for item in identity.pass_identities}
