@@ -1711,7 +1711,7 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
         for table in tables:
             if table == "reviews":
                 continue
-            if table == "api_spend_events" and not _recovered_sequence_valid(conn, table):
+            if table in ("api_spend_events", "cancellation_audit") and not _recovered_sequence_valid(conn, table):
                 return False
             columns = {row[1]: bool(row[3]) for row in conn.execute(f'PRAGMA table_info("{table}")')
                        if row[1].endswith("_json")}
@@ -1970,8 +1970,8 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
 
 def _recovered_sequence_valid(conn: sqlite3.Connection, table: str) -> bool:
     """Append-only ledgers cannot discard events their high-water evidence records."""
-    assert table in ("triage_events", "api_spend_events")
-    count, first, last = conn.execute(f'SELECT COUNT(*),MIN(seq),MAX(seq) FROM "{table}"').fetchone()
+    column = {"triage_events": "seq", "api_spend_events": "seq", "cancellation_audit": "id"}[table]
+    count, first, last = conn.execute(f'SELECT COUNT(*),MIN({column}),MAX({column}) FROM "{table}"').fetchone()
     watermarks = conn.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (table,)).fetchall()
     if len(watermarks) > 1:
         return False

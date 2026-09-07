@@ -1557,3 +1557,26 @@ def test_recovery_rejects_missing_spend_sequence_entries(tmp_path, monkeypatch, 
         raw.commit()
     _stream_source_dump(monkeypatch, source)
     assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('missing', ['latest', 'middle', 'all'])
+def test_recovery_rejects_missing_cancellation_sequence_entries(tmp_path, monkeypatch, missing):
+    from tests.test_budget_store import begin, NOW
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        rid, _ = begin(store)
+        request = store.get_request(rid)
+        for _ in range(3):
+            store.record_cancellation(target_id=rid, request=request,
+                identity={**request['identity'], 'request_id':rid}, actor='test', source='test',
+                caller_pid=123, caller_worktree='/work', reason='cancel this review',
+                cause='requested_cancel', now=NOW)
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute({'latest': 'DELETE FROM cancellation_audit WHERE id=3',
+                     'middle': 'DELETE FROM cancellation_audit WHERE id=2',
+                     'all': 'DELETE FROM cancellation_audit'}[missing])
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
