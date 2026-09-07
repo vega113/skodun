@@ -1597,3 +1597,41 @@ def test_recovery_accounts_for_running_review_capacity(tmp_path, monkeypatch, ho
                 store.capacity_finish('ticket', status='released')
     _stream_source_dump(monkeypatch, source)
     assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db') is (holder == 'matching')
+
+
+@pytest.mark.parametrize('holder', ['missing', 'unlinked', 'wrong_pid', 'released', 'matching'])
+def test_recovery_accounts_for_running_request_capacity(tmp_path, monkeypatch, holder):
+    from tests.test_budget_store import begin, NOW
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        rid, _ = begin(store)
+        request = store.get_request(rid)
+        assert store.advance_request(rid, owner_token=request['owner_token'], state='running', now=NOW)
+        if holder != 'missing':
+            store.capacity_enqueue(admission_id='ticket', resource_class='review-machine', scope='*')
+            assert store.capacity_try_admit('ticket', capacity=1)
+            store._c.execute('UPDATE capacity_admissions SET pid=?',
+                             (request['pid'] + 1 if holder == 'wrong_pid' else request['pid'],))
+            if holder != 'unlinked':
+                store.link_request(rid, 'capacity', 'ticket')
+            if holder == 'released':
+                store.capacity_finish('ticket', status='released')
+    _stream_source_dump(monkeypatch, source)
+    assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db') is (holder == 'matching')
+
+
+def test_recovery_preserves_foreground_parent_review_link(tmp_path, monkeypatch):
+    from skodun import capacity
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    monkeypatch.setattr(capacity, 'process_birth_token', lambda pid: None)
+    with Store.open(source) as store:
+        ticket = capacity.acquire_for_fg(store, scope='/repo', capacity=1, machine_capacity=1,
+                                         wait_sec=.1, poll_sec=.01)
+        store.save_review({**REC, 'id':'running-review', 'status':'running', 'pid':os.getpid()})
+        capacity.mark_started(store, ticket, review_id='running-review')
+        assert store.capacity_get(ticket.parent.id)['review_id'] == 'running-review'
+    _stream_source_dump(monkeypatch, source)
+    assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db')

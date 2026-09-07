@@ -481,6 +481,9 @@ def try_admit(store: "Store", ticket: Ticket, *, capacity: int) -> Ticket:
 def mark_started(store: "Store", ticket: Ticket,
                  review_id: str | None = None) -> Ticket:
     """Mark an admitted ticket as ``running`` (review body under way)."""
+    if ticket.parent is not None:
+        row = store.capacity_mark_started(ticket.parent.id, review_id=review_id)
+        _apply_row(ticket.parent, row)
     row = store.capacity_mark_started(ticket.id, review_id=review_id)
     _apply_row(ticket, row)
     return ticket

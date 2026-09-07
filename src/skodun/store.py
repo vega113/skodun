@@ -1866,6 +1866,14 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                         request_store._text("request_key", row["request_key"], 128)
                     if type(row["pid"]) is not int or row["pid"] <= 0:
                         return False
+                    if row["state"] == "running":
+                        holder = conn.execute(
+                            "SELECT 1 FROM request_links l JOIN capacity_admissions a ON a.id=l.target_id "
+                            "WHERE l.request_id=? AND l.kind='capacity' AND a.resource_class='review-machine' "
+                            "AND a.scope='*' AND a.status IN ('admitted','running') AND a.pid=? LIMIT 1",
+                            (row["id"], row["pid"])).fetchone()
+                        if holder is None:
+                            return False
                     for field in ("created_at", "updated_at", "expires_at"):
                         _require_ts(field, row[field])
                     if request_store._identity_json(row["scope"], decoded["identity_json"]) != row["identity_json"]:
