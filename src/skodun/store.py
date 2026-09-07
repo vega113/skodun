@@ -1730,6 +1730,11 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                     for field in ("admitted_at", "started_at", "ended_at"):
                         if row[field] is not None:
                             _require_ts(f"capacity {field}", row[field])
+                    timeline = [row[field] for field in
+                                ("queued_at", "admitted_at", "started_at", "ended_at")
+                                if row[field] is not None]
+                    if timeline != sorted(timeline) or timeline[-1] > _iso_now():
+                        return False
                     for field in ("pid", "capacity_limit"):
                         if row[field] is not None and _plain_nonnegative_int(field, row[field]) < 1:
                             return False

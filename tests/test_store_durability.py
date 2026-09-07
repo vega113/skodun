@@ -1239,6 +1239,7 @@ def test_recovery_preserves_daily_spend_total(tmp_path, monkeypatch):
 @pytest.mark.parametrize('damage', [
     'queued_at', 'pid', 'owner', 'owner_without_pid', 'status', 'scope',
     'admitted_at', 'started_at', 'ended_at', 'wait_ms',
+    'future_holder', 'backward_admission', 'backward_start',
 ])
 def test_recovery_rejects_invalid_capacity_holder(tmp_path, monkeypatch, damage):
     import skodun.store as mod
@@ -1253,6 +1254,9 @@ def test_recovery_rejects_invalid_capacity_holder(tmp_path, monkeypatch, damage)
         'owner': "owner_start=''", 'owner_without_pid': "pid=NULL,owner_start='birth-token'",
         'status': "status='unknown'", 'scope': "scope='wrong'", 'admitted_at': 'admitted_at=NULL',
         'started_at': 'started_at=NULL', 'ended_at': 'ended_at=queued_at', 'wait_ms': 'wait_ms=-1',
+        'future_holder': "pid=NULL,owner_start=NULL,queued_at='9999-12-31T23:59:59Z',admitted_at='9999-12-31T23:59:59Z',started_at='9999-12-31T23:59:59Z'",
+        'backward_admission': "admitted_at='2000-01-01T00:00:00Z'",
+        'backward_start': "started_at='2000-01-01T00:00:00Z'",
     }
     with closing(sqlite3.connect(source)) as raw:
         raw.execute('UPDATE capacity_admissions SET ' + assignments[damage])
