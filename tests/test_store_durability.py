@@ -1284,3 +1284,40 @@ def test_recovery_preserves_capacity_lifecycle_states(tmp_path, monkeypatch, sta
     assert mod._recover_sqlite_image(source, dest)
     with Store.open(dest) as store:
         assert store.capacity_get('ticket') == expected
+
+
+@pytest.mark.parametrize('damage', ['future_ttl', 'future_recorded', 'backward_ttl', 'timestamp', 'provider', 'reason', 'category'])
+def test_recovery_rejects_invalid_provider_blackouts(tmp_path, monkeypatch, damage):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        store.mark_provider_unavailable('openai', 'quota exhausted', 'quota',
+            '2026-09-07T00:30:00Z', recorded_at='2026-09-07T00:00:00Z')
+    assignments = {
+        'future_ttl': "unavailable_until='9999-12-31T23:59:59Z'",
+        'future_recorded': "recorded_at='9999-12-31T23:30:00Z',unavailable_until='9999-12-31T23:59:59Z'",
+        'backward_ttl': "unavailable_until='2026-09-06T00:00:00Z'",
+        'timestamp': "recorded_at='broken'", 'provider': "provider=''",
+        'reason': 'reason=NULL', 'category': "category=''",
+    }
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute('UPDATE provider_state SET ' + assignments[damage])
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+def test_recovery_preserves_provider_blackout(tmp_path, monkeypatch):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        store.mark_provider_unavailable('openai', 'quota exhausted', 'quota',
+            '2026-09-07T00:30:00Z', recorded_at='2026-09-07T00:00:00Z')
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest)
+    with Store.open(dest) as store:
+        assert store.provider_unavailable_reason('openai', '2026-09-07T00:10:00Z', env={}) == 'quota exhausted'
+        assert store.provider_unavailable_reason('openai', '2026-09-07T00:30:00Z', env={}) is None

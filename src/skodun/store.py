@@ -1711,7 +1711,7 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                 continue
             columns = {row[1]: bool(row[3]) for row in conn.execute(f'PRAGMA table_info("{table}")')
                        if row[1].endswith("_json")}
-            if not columns and table not in ("api_spend_events", "capacity_admissions"):
+            if not columns and table not in ("api_spend_events", "capacity_admissions", "provider_state"):
                 continue
             for row in conn.execute(f'SELECT * FROM "{table}"'):
                 if time.monotonic() >= deadline:
@@ -1721,7 +1721,18 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                     if row[column] is None and not required:
                         continue
                     decoded[column] = _recovery_json_object(row[column])
-                if table == "capacity_admissions":
+                if table == "provider_state":
+                    from datetime import datetime
+                    from .pipeline import PROVIDER_UNAVAILABLE_TTL_SEC
+                    for field in ("provider", "reason", "category"):
+                        _require_text(f"provider state {field}", row[field])
+                    for field in ("recorded_at", "unavailable_until"):
+                        _require_ts(f"provider state {field}", row[field])
+                    duration = (datetime.fromisoformat(row["unavailable_until"])
+                                - datetime.fromisoformat(row["recorded_at"])).total_seconds()
+                    if not 0 <= duration <= PROVIDER_UNAVAILABLE_TTL_SEC or row["recorded_at"] > _iso_now():
+                        return False
+                elif table == "capacity_admissions":
                     for field in ("id", "resource_class", "scope"):
                         _require_text(f"capacity {field}", row[field])
                     if row["status"] not in (*Store._CAPACITY_ACTIVE, *Store._CAPACITY_TERMINAL):
