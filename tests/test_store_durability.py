@@ -1580,3 +1580,20 @@ def test_recovery_rejects_missing_cancellation_sequence_entries(tmp_path, monkey
         raw.commit()
     _stream_source_dump(monkeypatch, source)
     assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('holder', ['missing', 'wrong_review', 'wrong_pid', 'released', 'matching'])
+def test_recovery_accounts_for_running_review_capacity(tmp_path, monkeypatch, holder):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    with Store.open(source) as store:
+        store.save_review({**REC, 'id':'running-review', 'status':'running', 'pid':123})
+        if holder != 'missing':
+            store.capacity_enqueue(admission_id='ticket', resource_class='review-machine', scope='*')
+            assert store.capacity_try_admit('ticket', capacity=1)
+            store.capacity_mark_started('ticket', review_id='other' if holder == 'wrong_review' else 'running-review')
+            store._c.execute('UPDATE capacity_admissions SET pid=?', (456 if holder == 'wrong_pid' else 123,))
+            if holder == 'released':
+                store.capacity_finish('ticket', status='released')
+    _stream_source_dump(monkeypatch, source)
+    assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db') is (holder == 'matching')

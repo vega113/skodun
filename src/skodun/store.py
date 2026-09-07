@@ -1634,6 +1634,13 @@ def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
                 return False
             normalized = _normalize_record(artifact, label="recovery")
             load_valid_artifact(artifact)
+            if normalized.get("status") == RUNNING:
+                holder = conn.execute(
+                    "SELECT 1 FROM capacity_admissions WHERE resource_class='review-machine' "
+                    "AND scope='*' AND status IN ('admitted','running') AND review_id=? "
+                    "AND pid IS ? LIMIT 1", (artifact["id"], artifact.get("pid"))).fetchone()
+                if holder is None:
+                    return False
             if normalized["trustworthy"] != bool(row["trustworthy"]):
                 return False
             if "trustworthy" in artifact and (
