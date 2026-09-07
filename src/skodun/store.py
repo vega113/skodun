@@ -1769,6 +1769,25 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                     if seen != set(planned):
                         return False
                 elif table in ("review_checkpoints", "review_followup_checkpoints"):
+                    _plain_nonnegative_int("checkpoint fence", row["fence"])
+                    claim_fields = ("claim_token", "claim_owner", "claimed_at", "lease_expires_at")
+                    if row["state"] == "running":
+                        _require_text("checkpoint claim_token", row["claim_token"])
+                        _checkpoint_text("checkpoint claim_owner", row["claim_owner"])
+                        _require_ts("checkpoint claimed_at", row["claimed_at"])
+                        _require_ts("checkpoint lease_expires_at", row["lease_expires_at"])
+                        if row["fence"] < 1 or row["lease_expires_at"] <= row["claimed_at"]:
+                            return False
+                    elif any(row[field] is not None for field in claim_fields):
+                        return False
+                    if row["state"] == "complete":
+                        _require_ts("checkpoint completed_at", row["completed_at"])
+                    elif row["payload_json"] is not None or row["completed_at"] is not None:
+                        return False
+                    if row["failure_reason"] is not None:
+                        _checkpoint_text("checkpoint failure_reason", row["failure_reason"])
+                        if row["state"] in ("running", "complete"):
+                            return False
                     if row["state"] == "complete" and row["payload_json"] is None:
                         parent = conn.execute("SELECT state FROM review_orchestrations WHERE id=?",
                                               (row["orchestration_id"],)).fetchone()

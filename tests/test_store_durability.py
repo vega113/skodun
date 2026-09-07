@@ -1142,3 +1142,55 @@ def test_recovery_preserves_valid_triage_and_its_audit_history(tmp_path, monkeyp
     with Store.open(dest) as store:
         assert len(store.triage_for(REC['branch'], REC['base_sha'])) == 1
         assert len(store.triage_history(decision['ledger_key'])) == 1
+
+
+@pytest.mark.parametrize('damage', [
+    'claim_token', 'claim_owner', 'claimed_at', 'lease_expires_at',
+    'empty_owner', 'zero_fence', 'backward_lease', 'payload', 'completed_at',
+    'failure_reason', 'pending_claim', 'complete_time',
+])
+def test_recovery_rejects_inconsistent_checkpoint_claims(tmp_path, monkeypatch, damage):
+    from dataclasses import replace
+    from tests.test_checkpoints import _identity, NOW, LATER
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_control_fixture(source)
+    with Store.open(source) as store:
+        store.claim_checkpoint('orch-1', replace(_identity().pass_identities[1], prompt_hash='z'*64),
+                               owner='integrator', now=NOW, lease_expires_at=LATER)
+    with closing(sqlite3.connect(source)) as raw:
+        if damage in ('claim_token', 'claim_owner', 'claimed_at', 'lease_expires_at'):
+            raw.execute(f"UPDATE review_checkpoints SET {damage}=NULL WHERE state='running'")
+        else:
+            sql = {
+                'empty_owner': "UPDATE review_checkpoints SET claim_owner='' WHERE state='running'",
+                'zero_fence': "UPDATE review_checkpoints SET fence=0 WHERE state='running'",
+                'backward_lease': "UPDATE review_checkpoints SET lease_expires_at=claimed_at WHERE state='running'",
+                'payload': "UPDATE review_checkpoints SET payload_json=(SELECT payload_json FROM review_checkpoints WHERE state='complete') WHERE state='running'",
+                'completed_at': "UPDATE review_checkpoints SET completed_at=claimed_at WHERE state='running'",
+                'failure_reason': "UPDATE review_checkpoints SET failure_reason='stale failure' WHERE state='running'",
+                'pending_claim': "UPDATE review_checkpoints SET state='pending' WHERE state='running'",
+                'complete_time': "UPDATE review_checkpoints SET completed_at=NULL WHERE state='complete'",
+            }[damage]
+            raw.execute(sql)
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('release', [False, True])
+def test_recovery_preserves_writer_produced_checkpoint_claims(tmp_path, monkeypatch, release):
+    from dataclasses import replace
+    from tests.test_checkpoints import _identity, NOW, LATER
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_control_fixture(source)
+    with Store.open(source) as store:
+        claim = store.claim_checkpoint('orch-1', replace(_identity().pass_identities[1], prompt_hash='z'*64),
+                                       owner='integrator', now=NOW, lease_expires_at=LATER)
+        if release:
+            assert store.release_checkpoint('orch-1', 'integration', claim['pass_index'],
+                owner='integrator', claim_token=claim['claim_token'], fence=claim['fence'],
+                reason='retry this pass', at=NOW)
+    _stream_source_dump(monkeypatch, source)
+    assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
