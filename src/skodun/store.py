@@ -32,6 +32,7 @@ import json
 import errno
 import hashlib
 import io
+import math
 import os
 import re
 import shutil
@@ -1710,7 +1711,7 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                 continue
             columns = {row[1]: bool(row[3]) for row in conn.execute(f'PRAGMA table_info("{table}")')
                        if row[1].endswith("_json")}
-            if not columns:
+            if not columns and table != "api_spend_events":
                 continue
             for row in conn.execute(f'SELECT * FROM "{table}"'):
                 if time.monotonic() >= deadline:
@@ -1720,7 +1721,19 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                     if row[column] is None and not required:
                         continue
                     decoded[column] = _recovery_json_object(row[column])
-                if table == "review_requests":
+                if table == "api_spend_events":
+                    _require_ts("spend at", row["at"])
+                    _require_text("spend provider", row["provider"])
+                    for field in ("model", "review_id", "request_id"):
+                        if row[field] is not None:
+                            _require_text(f"spend {field}", row[field])
+                    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        _plain_nonnegative_int(f"spend {field}", row[field])
+                    cost = row["cost_usd"]
+                    if (type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0
+                            or row["total_tokens"] < row["prompt_tokens"] + row["completion_tokens"]):
+                        return False
+                elif table == "review_requests":
                     for field in ("id", "scope", "owner_token", "source"):
                         request_store._text(field, row[field])
                     if row["request_key"] is not None:

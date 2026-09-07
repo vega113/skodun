@@ -1194,3 +1194,43 @@ def test_recovery_preserves_writer_produced_checkpoint_claims(tmp_path, monkeypa
                 reason='retry this pass', at=NOW)
     _stream_source_dump(monkeypatch, source)
     assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('damage', [
+    'negative_cost', 'infinite_cost', 'text_cost', 'timestamp', 'provider',
+    'prompt_tokens', 'completion_tokens', 'total_tokens', 'fractional_tokens', 'total_relationship',
+])
+def test_recovery_rejects_invalid_spend_ledger(tmp_path, monkeypatch, damage):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        store.api_spend_append(at='2026-09-07T00:00:00Z', provider='openai-api', model='model',
+            prompt_tokens=10, completion_tokens=5, total_tokens=15, cost_usd=0.25)
+    column, value = {
+        'negative_cost': ('cost_usd', -100), 'infinite_cost': ('cost_usd', float('inf')),
+        'text_cost': ('cost_usd', 'not a cost'), 'timestamp': ('at', 'not a timestamp'),
+        'provider': ('provider', ''), 'prompt_tokens': ('prompt_tokens', -1),
+        'completion_tokens': ('completion_tokens', -1), 'total_tokens': ('total_tokens', -1),
+        'fractional_tokens': ('prompt_tokens', 1.5), 'total_relationship': ('total_tokens', 14),
+    }[damage]
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute(f'UPDATE api_spend_events SET {column}=?', (value,))
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+def test_recovery_preserves_daily_spend_total(tmp_path, monkeypatch):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        for cost in (0.0, 0.25, 1.5):
+            store.api_spend_append(at='2026-09-07T00:00:00Z', provider='openai-api', model='model',
+                prompt_tokens=10, completion_tokens=5, total_tokens=15, cost_usd=cost)
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest)
+    with Store.open(dest) as store:
+        assert store.api_spend_sum_usd('openai-api', day_prefix='2026-09-07') == 1.75
