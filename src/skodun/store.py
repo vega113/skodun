@@ -1805,6 +1805,25 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                             _require_text(f"capacity {field}", row[field])
                     if row["owner_start"] is not None and row["pid"] is None:
                         return False
+                    if row["owner_start"] is not None:
+                        from uuid import UUID
+                        from .capacity import process_observation, pid_alive
+                        token = row["owner_start"]
+                        if token.startswith("linux:"):
+                            parts = token.split(":")
+                            if (len(parts) != 3 or str(UUID(parts[1])) != parts[1]
+                                    or not parts[2].isascii() or not parts[2].isdigit()):
+                                return False
+                        else:
+                            time.strptime(token, "%a %b %d %H:%M:%S %Y")
+                            if " ".join(token.split()) != token:
+                                return False
+                        if row["status"] in Store._CAPACITY_ACTIVE:
+                            observed = process_observation(row["pid"])
+                            if not observed.exited and (
+                                    observed.token is not None and observed.token != token
+                                    or observed.token is None and pid_alive(row["pid"])):
+                                return False
                     if row["resource_class"] == "review-machine" and row["scope"] != "*":
                         return False
                     if (row["status"] == "queued" and any(row[f] is not None for f in ("admitted_at", "started_at"))

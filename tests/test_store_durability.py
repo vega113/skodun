@@ -1500,3 +1500,27 @@ def test_recovery_preserves_complete_reopened_triage_history(tmp_path, monkeypat
     with Store.open(dest) as store:
         assert store.triage_for(REC['branch'], REC['base_sha']) == {}
         assert len(store.triage_history(decision['ledger_key'])) == 2
+
+
+@pytest.mark.parametrize('token,observed,expected', [
+    ('garbage', 'Mon Sep 07 07:00:00 2026', False),
+    ('Mon Sep 07 06:00:00 2026', 'Mon Sep 07 07:00:00 2026', False),
+    ('Mon Sep 07 07:00:00 2026', None, False),
+    ('Mon Sep 07 07:00:00 2026', 'Mon Sep 07 07:00:00 2026', True),
+    ('linux:00000000-0000-0000-0000-000000000001:123', 'linux:00000000-0000-0000-0000-000000000001:123', True),
+    ('linux:broken:123', None, False),
+])
+def test_recovery_validates_live_capacity_birth_identity(tmp_path, monkeypatch, token, observed, expected):
+    from skodun import capacity
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    monkeypatch.setattr(capacity, 'process_birth_token', lambda pid: token)
+    with Store.open(source) as store:
+        store.capacity_enqueue(admission_id='ticket', resource_class='review-machine', scope='*', pid=123)
+        assert store.capacity_try_admit('ticket', capacity=1)
+        store.capacity_mark_started('ticket')
+    monkeypatch.setattr(capacity, 'process_observation', lambda pid: capacity.ProcessObservation(observed))
+    monkeypatch.setattr(capacity, 'pid_alive', lambda pid: True)
+    _stream_source_dump(monkeypatch, source)
+    assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db') is expected
