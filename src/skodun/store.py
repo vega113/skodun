@@ -1813,6 +1813,16 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                             or not valid_replay(result) or execution["status"] != result["status"]):
                         return False
                 elif table == "review_orchestrations":
+                    from datetime import datetime
+                    from .pipeline import CHECKPOINT_RETENTION_SEC
+                    for field in ("created_at", "updated_at", "expires_at"):
+                        _require_ts(f"orchestration {field}", row[field])
+                    if (not row["created_at"] <= row["updated_at"] <= _iso_now()
+                            or row["expires_at"] <= row["created_at"]
+                            or (datetime.fromisoformat(row["expires_at"])
+                                - datetime.fromisoformat(row["updated_at"])).total_seconds()
+                            > CHECKPOINT_RETENTION_SEC + 1):
+                        return False
                     identity = checkpoints.OrchestrationIdentity.from_json(row["identity_json"])
                     if identity.digest() != row["identity_digest"]:
                         return False

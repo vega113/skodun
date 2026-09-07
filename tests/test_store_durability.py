@@ -1363,3 +1363,28 @@ def test_recovery_preserves_valid_delivery_acknowledgements(tmp_path, monkeypatc
     assert mod._recover_sqlite_image(source, dest)
     with Store.open(dest) as store:
         assert delivery.undelivered(store, 'b', REPO_A) == []
+
+
+@pytest.mark.parametrize('damage', ['far_future_expiry', 'future_update', 'backward_update', 'before_creation', 'invalid_time'])
+def test_recovery_rejects_invalid_orchestration_lifecycle(tmp_path, monkeypatch, damage):
+    from dataclasses import replace
+    from tests.test_checkpoints import _identity, NOW, LATER
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_control_fixture(source)
+    with Store.open(source) as store:
+        store.claim_checkpoint('orch-1', replace(_identity().pass_identities[1], prompt_hash='z'*64),
+                               owner='integrator', now=NOW, lease_expires_at=LATER)
+    assignments = {
+        'far_future_expiry': "expires_at='9999-12-31T23:59:59Z'",
+        'future_update': "updated_at='9999-12-31T23:59:58Z',expires_at='9999-12-31T23:59:59Z'",
+        'backward_update': "updated_at='2000-01-01T00:00:00Z'",
+        'before_creation': 'expires_at=created_at', 'invalid_time': "created_at='broken'",
+    }
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute('UPDATE review_orchestrations SET ' + assignments[damage])
+        if damage in ('far_future_expiry', 'future_update'):
+            raw.execute("UPDATE review_checkpoints SET lease_expires_at='9999-12-31T23:59:59Z' WHERE state='running'")
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
