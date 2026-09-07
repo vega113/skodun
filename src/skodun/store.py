@@ -1637,8 +1637,12 @@ def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
             if normalized.get("status") == RUNNING:
                 holder = conn.execute(
                     "SELECT 1 FROM capacity_admissions WHERE resource_class='review-machine' "
-                    "AND scope='*' AND status IN ('admitted','running') AND review_id=? "
-                    "AND pid IS ? LIMIT 1", (artifact["id"], artifact.get("pid"))).fetchone()
+                    "AND scope='*' AND pid IS ? AND ("
+                    "(status IN ('admitted','running') AND review_id=?) OR "
+                    "(? AND status IN ('queued','admitted','running') AND review_id IS NULL)) LIMIT 1",
+                    (artifact.get("pid"), artifact["id"],
+                     artifact.get("mode") == PREPUSH_MODE and artifact.get("source") == SKODUN_SOURCE
+                     and type(artifact.get("pid")) is int and artifact["pid"] > 0)).fetchone()
                 if holder is None:
                     return False
             if normalized["trustworthy"] != bool(row["trustworthy"]):
@@ -1718,7 +1722,7 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
         for table in tables:
             if table == "reviews":
                 continue
-            if table in ("api_spend_events", "cancellation_audit") and not _recovered_sequence_valid(conn, table):
+            if table in ("api_spend_events", "cancellation_audit", "request_executions") and not _recovered_sequence_valid(conn, table):
                 return False
             columns = {row[1]: bool(row[3]) for row in conn.execute(f'PRAGMA table_info("{table}")')
                        if row[1].endswith("_json")}
@@ -1985,7 +1989,8 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
 
 def _recovered_sequence_valid(conn: sqlite3.Connection, table: str) -> bool:
     """Append-only ledgers cannot discard events their high-water evidence records."""
-    column = {"triage_events": "seq", "api_spend_events": "seq", "cancellation_audit": "id"}[table]
+    column = {"triage_events": "seq", "api_spend_events": "seq", "cancellation_audit": "id",
+              "request_executions": "seq"}[table]
     count, first, last = conn.execute(f'SELECT COUNT(*),MIN({column}),MAX({column}) FROM "{table}"').fetchone()
     watermarks = conn.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (table,)).fetchall()
     if len(watermarks) > 1:

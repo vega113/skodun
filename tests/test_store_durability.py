@@ -1638,3 +1638,42 @@ def test_recovery_preserves_foreground_parent_review_link(tmp_path, monkeypatch)
         assert store.capacity_get(ticket.parent.id)['review_id'] == 'running-review'
     _stream_source_dump(monkeypatch, source)
     assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('state', ['queued', 'admitted', 'running'])
+@pytest.mark.parametrize('same_pid', [False, True])
+def test_recovery_preserves_background_prelink_capacity(tmp_path, monkeypatch, state, same_pid):
+    from tests.test_delivery import _rec
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    with Store.open(source) as store:
+        store.save_review(_rec(id='background', status='running', pid=123))
+        store.capacity_enqueue(admission_id='ticket', resource_class='review-machine', scope='*')
+        if state in ('admitted', 'running'):
+            assert store.capacity_try_admit('ticket', capacity=1)
+        if state == 'running':
+            store.capacity_mark_started('ticket')
+        store._c.execute('UPDATE capacity_admissions SET pid=?', (123 if same_pid else 456,))
+    _stream_source_dump(monkeypatch, source)
+    assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db') is same_pid
+
+
+@pytest.mark.parametrize('missing', ['latest', 'middle', 'all'])
+def test_recovery_rejects_missing_request_execution_sequences(tmp_path, monkeypatch, missing):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        for i in range(1, 4):
+            store.begin_request(request_id=f'request-{i}', scope='/work', request_key=f'key-{i}',
+                identity={'worktree_root':'/work'}, intent={}, owner_token=f'owner-{i}', pid=123,
+                source='cli', now='2026-09-06T00:00:00Z', expires_at='2026-09-07T00:00:00Z')
+    with closing(sqlite3.connect(source)) as raw:
+        ids = [1,2,3] if missing == 'all' else [3 if missing == 'latest' else 2]
+        for i in ids:
+            raw.execute('DELETE FROM request_executions WHERE request_id=?', (f'request-{i}',))
+            raw.execute('DELETE FROM review_requests WHERE id=?', (f'request-{i}',))
+        raw.commit()
+        assert raw.execute('PRAGMA foreign_key_check').fetchone() is None
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
