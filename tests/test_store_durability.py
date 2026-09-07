@@ -1524,3 +1524,18 @@ def test_recovery_validates_live_capacity_birth_identity(tmp_path, monkeypatch, 
     monkeypatch.setattr(capacity, 'pid_alive', lambda pid: True)
     _stream_source_dump(monkeypatch, source)
     assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db') is expected
+
+
+@pytest.mark.parametrize('findings,total', [('oops', 0), ([42], 1), ([], 1), ([], False)])
+def test_recovery_rejects_malformed_complete_artifacts(tmp_path, monkeypatch, findings, total):
+    import json
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with closing(sqlite3.connect(source)) as raw:
+        artifact = json.loads(raw.execute('SELECT artifact_json FROM reviews').fetchone()[0])
+        artifact['findings'], artifact['findings_total'] = findings, total
+        raw.execute('UPDATE reviews SET artifact_json=?,findings_total=?', (json.dumps(artifact), int(total)))
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')

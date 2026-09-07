@@ -199,3 +199,8 @@ an exclusive SQLite lock. The authority inode is never replaced under existing
 connections; active readers cause a bounded refusal, and idle clients resume on
 the same file after restoration. The validated image retains WAL mode. Source
 identity and incident shape are rechecked under the exclusive lock before restore.
+
+After bounded synchronous release retries fail, the owner retains the ticket IDs
+in a daemon retry worker using separate, existing-only SQLite connections.
+Cleanup keeps child-before-parent ordering until success. If the owner exits,
+the durable admission rows remain eligible for the existing dead-PID reclamation.

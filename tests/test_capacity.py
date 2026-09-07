@@ -1114,3 +1114,36 @@ def test_attaching_review_id_preserves_first_start_and_full_run_time(store, monk
     row = store.capacity_get(ticket.id)
     assert row['review_id'] == 'attached-review'
     assert row['run_ms'] == 20000
+
+
+@pytest.mark.parametrize('failed_layer', ['child', 'parent'])
+def test_failed_cleanup_retries_until_sqlite_writer_releases(store, monkeypatch, failed_layer):
+    import sqlite3
+    import time
+    from contextlib import closing
+    ticket = acquire_for_fg(store, scope='/repo', capacity=1, machine_capacity=1,
+                            wait_sec=.1, poll_sec=.01)
+    parent_id = ticket.parent.id
+    fail_id = ticket.id if failed_layer == 'child' else parent_id
+    original = store.capacity_finish
+    store._c.execute('PRAGMA busy_timeout=1')
+    with closing(sqlite3.connect(store._path, isolation_level=None)) as blocker:
+        locked = False
+        def contend(admission_id, **kwargs):
+            nonlocal locked
+            if admission_id == fail_id and not locked:
+                blocker.execute('BEGIN IMMEDIATE')
+                locked = True
+            return original(admission_id, **kwargs)
+        monkeypatch.setattr(store, 'capacity_finish', contend)
+        with pytest.raises(sqlite3.OperationalError):
+            finish(store, ticket)
+        assert store.capacity_get(parent_id)['status'] in ('admitted', 'running')
+        key = (str(store._path.absolute()), (ticket.id, parent_id))
+        with capacity._RELEASE_RETRY_LOCK:
+            worker = capacity._RELEASE_RETRIES[key]
+        blocker.execute('COMMIT')
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+    assert store.capacity_get(ticket.id)['status'] == 'released'
+    assert store.capacity_get(parent_id)['status'] == 'released'

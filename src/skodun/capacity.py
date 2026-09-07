@@ -32,6 +32,9 @@ import math
 import sqlite3
 import subprocess
 import sys
+import threading
+from contextlib import closing
+from urllib.parse import quote
 from pathlib import Path
 from uuid import UUID
 from collections.abc import Callable, Mapping, Sequence
@@ -41,8 +44,6 @@ from typing import TYPE_CHECKING
 from . import ids, budgets
 
 if TYPE_CHECKING:
-    import threading
-
     from .store import Store
 
 #: Foreground review capacity class (S3/S4).
@@ -504,11 +505,63 @@ def finish(store: "Store", ticket: Ticket, *, status: str = STATUS_RELEASED,
                 _apply_row(parent, row)
                 ticket.parent = None
             return ticket
-        except sqlite3.OperationalError:
+        except sqlite3.Error:
             if attempt == 2:
+                _retain_release_retry(store, ticket, status, expire_reason)
                 raise
             time.sleep(0.05 * (attempt + 1))
     raise AssertionError("unreachable")
+
+
+_RELEASE_RETRY_LOCK = threading.Lock()
+_RELEASE_RETRIES: dict[tuple, threading.Thread] = {}
+
+
+def _retain_release_retry(store: "Store", ticket: Ticket, status: str, reason: str | None) -> None:
+    """Keep failed cleanup alive; owner exit falls back to durable PID reclamation."""
+    path = getattr(store, "_path", None)
+    if path is None:
+        return  # No persistent authority to strand for an in-memory test store.
+    path = Path(path).absolute()
+    admissions = (ticket.id,) + ((ticket.parent.id,) if ticket.parent is not None else ())
+    key = (str(path), admissions)
+    with _RELEASE_RETRY_LOCK:
+        if key in _RELEASE_RETRIES:
+            return
+        worker = threading.Thread(target=_release_retry_worker,
+            args=(key, path, admissions, status, reason), daemon=True,
+            name="skodun-capacity-release")
+        _RELEASE_RETRIES[key] = worker
+        try:
+            worker.start()
+        except BaseException:
+            _RELEASE_RETRIES.pop(key, None)
+            raise
+
+
+def _release_retry_worker(key, path: Path, admissions: tuple[str, ...], status: str, reason: str | None) -> None:
+    from .store import Store, SCHEMA_VERSION, _apply_open_durability
+    uri = f"file:{quote(str(path))}?mode=rw"
+    try:
+        while True:
+            try:
+                # Never recreate a deleted authority or share the caller's
+                # thread-bound connection. Each attempt closes before waiting.
+                with closing(sqlite3.connect(uri, uri=True, isolation_level=None, timeout=1)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                        raise sqlite3.OperationalError("release retry requires current schema")
+                    _apply_open_durability(conn)
+                    view = Store(conn, path)
+                    for admission_id in admissions:
+                        if view.capacity_get(admission_id) is not None:
+                            view.capacity_finish(admission_id, status=status, expire_reason=reason)
+                return
+            except (sqlite3.Error, OSError):
+                time.sleep(1)
+    finally:
+        with _RELEASE_RETRY_LOCK:
+            _RELEASE_RETRIES.pop(key, None)
 
 
 @dataclass(frozen=True)

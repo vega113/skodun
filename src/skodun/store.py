@@ -1616,6 +1616,7 @@ def _recovery_json_object(text):
 
 def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
     """Check artifacts and their indexed projections without rewriting history."""
+    from .triage import load_valid_artifact
     missing = object()
     names = ("id", *_REVIEW_COLUMNS)
     count = 0
@@ -1632,6 +1633,7 @@ def _recovered_reviews_valid(conn: sqlite3.Connection, deadline: float) -> bool:
                     or not artifact["id"].strip() or artifact["id"] != row["id"]):
                 return False
             normalized = _normalize_record(artifact, label="recovery")
+            load_valid_artifact(artifact)
             if normalized["trustworthy"] != bool(row["trustworthy"]):
                 return False
             if "trustworthy" in artifact and (
