@@ -58,6 +58,7 @@ RESOURCE_REVIEW_BG = "review-bg"
 PROVIDER_CLASS_PREFIX = "provider:"
 
 DEFAULT_CAPACITY = 1
+MAX_CAPACITY = (1 << 63) - 1  # Persisted in SQLite INTEGER capacity_limit.
 CAPACITY_ENV = "SKODUN_REVIEW_FG_CAPACITY"
 DEFAULT_MACHINE_CAPACITY = 1
 MACHINE_CAPACITY_ENV = "SKODUN_REVIEW_MACHINE_CAPACITY"
@@ -148,7 +149,7 @@ def capacity_from_env(env: Mapping[str, str] | None = None) -> int:
         value = int(str(raw).strip(), 10)
     except ValueError:
         return DEFAULT_CAPACITY
-    if value < 1:
+    if not 1 <= value <= MAX_CAPACITY:
         return DEFAULT_CAPACITY
     return value
 
@@ -163,7 +164,7 @@ def machine_capacity_from_env(env: Mapping[str, str] | None = None) -> int:
         value = int(str(raw).strip(), 10)
     except ValueError:
         return DEFAULT_MACHINE_CAPACITY
-    if value < 1:
+    if not 1 <= value <= MAX_CAPACITY:
         return DEFAULT_MACHINE_CAPACITY
     return value
 
@@ -235,7 +236,7 @@ def provider_max_in_flight_from_env(env: Mapping[str, str] | None = None) -> int
         value = int(str(raw).strip(), 10)
     except ValueError:
         return DEFAULT_PROVIDER_MAX_IN_FLIGHT
-    if value < 1:
+    if not 1 <= value <= MAX_CAPACITY:
         return DEFAULT_PROVIDER_MAX_IN_FLIGHT
     return value
 

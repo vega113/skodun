@@ -1162,3 +1162,20 @@ def test_finish_releases_surviving_parent_when_child_was_lost(store, missing):
     assert ticket.status == capacity.STATUS_RELEASED
     assert ticket.parent is None
     assert store.capacity_holder_count(capacity.RESOURCE_REVIEW_MACHINE, '*') == 0
+
+
+@pytest.mark.parametrize('parser,key', [
+    (capacity.capacity_from_env, capacity.CAPACITY_ENV),
+    (capacity.machine_capacity_from_env, capacity.MACHINE_CAPACITY_ENV),
+    (capacity.provider_max_in_flight_from_env, capacity.PROVIDER_MAX_IN_FLIGHT_ENV),
+])
+def test_capacity_environment_values_fit_sqlite(parser, key):
+    assert parser({key:str(capacity.MAX_CAPACITY)}) == capacity.MAX_CAPACITY
+    assert parser({key:str(capacity.MAX_CAPACITY + 1)}) == 1
+
+
+def test_store_admission_checks_sqlite_capacity_bound(store):
+    store.capacity_enqueue(admission_id='ticket', resource_class='review-machine', scope='*')
+    with pytest.raises(ValueError, match='capacity must be an integer'):
+        store.capacity_try_admit('ticket', capacity=capacity.MAX_CAPACITY + 1)
+    assert store.capacity_try_admit('ticket', capacity=capacity.MAX_CAPACITY)['capacity_limit'] == capacity.MAX_CAPACITY

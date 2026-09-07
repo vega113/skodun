@@ -1931,12 +1931,24 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                     if request_store._identity_json(row["scope"], decoded["identity_json"]) != row["identity_json"]:
                         return False
                     execution = conn.execute(
-                        "SELECT request_id,owner_token,pid,source,status FROM request_executions "
+                        "SELECT request_id,owner_token,pid,source,status,started_at,completed_at FROM request_executions "
                         "WHERE request_id=? ORDER BY seq DESC LIMIT 1",
                         (row["id"],)).fetchone()
                     if (execution is None or execution["owner_token"] != row["owner_token"]
                             or execution["pid"] != row["pid"] or execution["source"] != row["source"]):
                         return False
+                    active = row["state"] in ("accepted", "queued", "running")
+                    if active != (execution["completed_at"] is None):
+                        return False
+                    _require_ts("execution started_at", execution["started_at"])
+                    if active:
+                        if execution["status"] is not None:
+                            return False
+                    else:
+                        _require_ts("execution completed_at", execution["completed_at"])
+                        if (not execution["started_at"] <= execution["completed_at"] <= _iso_now()
+                                or type(execution["status"]) is not int):
+                            return False
                     result = decoded.get("result_json")
                     if result is not None and (
                             row["state"] in ("accepted", "queued", "running")
@@ -4904,9 +4916,11 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
 
     def capacity_try_admit(self, admission_id: str, *, capacity: int) -> dict | None:
         """Transactionally admit if FIFO-eligible. Returns row or None."""
-        from .capacity import WaiterView, decide_admit
+        from .capacity import WaiterView, decide_admit, MAX_CAPACITY
 
         admission_id = _require_text("admission_id", admission_id)
+        if type(capacity) is not int or capacity > MAX_CAPACITY:
+            raise ValueError(f"capacity must be an integer <= {MAX_CAPACITY}")
         declared_capacity = capacity
         if capacity < 1:
             return None

@@ -1760,3 +1760,24 @@ def test_recovery_preserves_projected_request_links(tmp_path, monkeypatch, missi
     if missing == 'none':
         with Store.open(dest) as store:
             assert store.request_for_orchestration('orch-1', store.get_request(rid)['identity']) == rid
+
+
+@pytest.mark.parametrize('damage', ['revived', 'unfinished_terminal', 'active_status'])
+def test_recovery_rejects_request_execution_completion_mismatch(tmp_path, monkeypatch, damage):
+    from tests.test_budget_store import begin, NOW
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        rid, _ = begin(store)
+        if damage != 'active_status':
+            assert store.finish_request(rid, owner_token='private-owner', state='failed',
+                                        reason_code='test_failed', result=None, now=NOW)
+        if damage == 'revived':
+            store._c.execute("UPDATE review_requests SET state='accepted'")
+        elif damage == 'unfinished_terminal':
+            store._c.execute('UPDATE request_executions SET completed_at=NULL')
+        else:
+            store._c.execute('UPDATE request_executions SET status=4')
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')

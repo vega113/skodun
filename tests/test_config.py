@@ -1736,3 +1736,15 @@ def test_repo_fg_only_tightens_host_file_default_and_environment(tmp_path, globa
     cfg = load_config(repo, global_path=global_path)
     assert resolved_fg_capacity(cfg, env={}) == min(global_fg or 1, repo_fg)
     assert resolved_fg_capacity(cfg, env={'SKODUN_REVIEW_FG_CAPACITY': '4'}) == min(4, repo_fg)
+
+
+@pytest.mark.parametrize('key', ['machine', 'review_fg'])
+@pytest.mark.parametrize('layer', ['global', 'repo'])
+def test_capacity_rejects_sqlite_integer_overflow(tmp_path, key, layer):
+    global_path = _write(tmp_path / 'global.toml', '')
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    path = global_path if layer == 'global' else repo / '.skodun.toml'
+    _write(path, f'[capacity]\n{key} = {1 << 63}\n')
+    with pytest.raises(ValueError, match='must be <='):
+        load_config(repo, global_path=global_path)

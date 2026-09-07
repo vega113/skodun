@@ -1031,6 +1031,8 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
     if bad:
         raise ValueError(f"unknown [capacity] keys: {sorted(bad)}")
 
+    from .capacity import MAX_CAPACITY
+
     def _cap_int(table: str, key: str, value: object) -> int:
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(
@@ -1038,6 +1040,8 @@ def load_config(repo_root: Path | None, global_path: Path | None = None) -> Conf
                 f"{type(value).__name__}")
         if value < 1:
             raise ValueError(f"[capacity] {key}: must be >= 1, got {value}")
+        if value > MAX_CAPACITY:
+            raise ValueError(f"[capacity] {key}: must be <= {MAX_CAPACITY}")
         return value
 
     g_machine = (_cap_int("[capacity]", "machine", cap_global["machine"])
