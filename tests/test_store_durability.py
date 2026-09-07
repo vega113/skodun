@@ -1539,3 +1539,21 @@ def test_recovery_rejects_malformed_complete_artifacts(tmp_path, monkeypatch, fi
         raw.commit()
     _stream_source_dump(monkeypatch, source)
     assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('missing', ['latest', 'middle', 'all'])
+def test_recovery_rejects_missing_spend_sequence_entries(tmp_path, monkeypatch, missing):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        for cost in (1.0, 9.0, 0.5):
+            store.api_spend_append(at='2026-09-07T00:00:00Z', provider='openai-api', model='model',
+                prompt_tokens=10, completion_tokens=5, total_tokens=15, cost_usd=cost)
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute({'latest': 'DELETE FROM api_spend_events WHERE seq=3',
+                     'middle': 'DELETE FROM api_spend_events WHERE seq=2',
+                     'all': 'DELETE FROM api_spend_events'}[missing])
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')

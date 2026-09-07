@@ -1711,6 +1711,8 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
         for table in tables:
             if table == "reviews":
                 continue
+            if table == "api_spend_events" and not _recovered_sequence_valid(conn, table):
+                return False
             columns = {row[1]: bool(row[3]) for row in conn.execute(f'PRAGMA table_info("{table}")')
                        if row[1].endswith("_json")}
             if not columns and table not in ("api_spend_events", "capacity_admissions", "provider_state", "deliveries"):
@@ -1966,6 +1968,18 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
         return False
 
 
+def _recovered_sequence_valid(conn: sqlite3.Connection, table: str) -> bool:
+    """Append-only ledgers cannot discard events their high-water evidence records."""
+    assert table in ("triage_events", "api_spend_events")
+    count, first, last = conn.execute(f'SELECT COUNT(*),MIN(seq),MAX(seq) FROM "{table}"').fetchone()
+    watermarks = conn.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (table,)).fetchall()
+    if len(watermarks) > 1:
+        return False
+    high_water = watermarks[0][0] if watermarks else 0
+    return (type(high_water) is int and high_water >= 0 and count == high_water
+            and (not count or first == 1 and last == high_water))
+
+
 def _recovered_triage_valid(conn: sqlite3.Connection, deadline: float) -> bool:
     """Validate clearing decisions and restore only mechanically derived ledger keys."""
     from .triage import validate_reason, validate_tracking_ref
@@ -1973,13 +1987,7 @@ def _recovered_triage_valid(conn: sqlite3.Connection, deadline: float) -> bool:
     valid = False
     conn.execute("SAVEPOINT recovered_triage")
     try:
-        count, first, last = conn.execute("SELECT COUNT(*),MIN(seq),MAX(seq) FROM triage_events").fetchone()
-        watermarks = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='triage_events'").fetchall()
-        if len(watermarks) > 1:
-            return False
-        high_water = watermarks[0][0] if watermarks else 0
-        if (type(high_water) is not int or high_water < 0 or count != high_water
-                or count and (first != 1 or last != high_water)):
+        if not _recovered_sequence_valid(conn, "triage_events"):
             return False
         for table in ("triage", "triage_events"):
             for row in conn.execute(f'SELECT rowid AS recovery_rowid,* FROM "{table}"'):
