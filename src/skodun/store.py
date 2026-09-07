@@ -1711,7 +1711,7 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                 continue
             columns = {row[1]: bool(row[3]) for row in conn.execute(f'PRAGMA table_info("{table}")')
                        if row[1].endswith("_json")}
-            if not columns and table != "api_spend_events":
+            if not columns and table not in ("api_spend_events", "capacity_admissions"):
                 continue
             for row in conn.execute(f'SELECT * FROM "{table}"'):
                 if time.monotonic() >= deadline:
@@ -1721,7 +1721,36 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                     if row[column] is None and not required:
                         continue
                     decoded[column] = _recovery_json_object(row[column])
-                if table == "api_spend_events":
+                if table == "capacity_admissions":
+                    for field in ("id", "resource_class", "scope"):
+                        _require_text(f"capacity {field}", row[field])
+                    if row["status"] not in (*Store._CAPACITY_ACTIVE, *Store._CAPACITY_TERMINAL):
+                        return False
+                    _require_ts("capacity queued_at", row["queued_at"])
+                    for field in ("admitted_at", "started_at", "ended_at"):
+                        if row[field] is not None:
+                            _require_ts(f"capacity {field}", row[field])
+                    for field in ("pid", "capacity_limit"):
+                        if row[field] is not None and _plain_nonnegative_int(field, row[field]) < 1:
+                            return False
+                    for field in ("owner_start", "review_id"):
+                        if row[field] is not None:
+                            _require_text(f"capacity {field}", row[field])
+                    if row["owner_start"] is not None and row["pid"] is None:
+                        return False
+                    if row["resource_class"] == "review-machine" and row["scope"] != "*":
+                        return False
+                    if (row["status"] == "queued" and any(row[f] is not None for f in ("admitted_at", "started_at"))
+                            or row["status"] in ("admitted", "running") and row["admitted_at"] is None
+                            or row["status"] == "admitted" and row["started_at"] is not None
+                            or row["status"] == "running" and row["started_at"] is None
+                            or row["started_at"] is not None and row["admitted_at"] is None
+                            or (row["ended_at"] is not None) != (row["status"] in Store._CAPACITY_TERMINAL)):
+                        return False
+                    for field in ("wait_ms", "queue_wait_ms", "run_ms", "total_admission_ms"):
+                        if row[field] is not None:
+                            _plain_nonnegative_int(f"capacity {field}", row[field])
+                elif table == "api_spend_events":
                     _require_ts("spend at", row["at"])
                     _require_text("spend provider", row["provider"])
                     for field in ("model", "review_id", "request_id"):

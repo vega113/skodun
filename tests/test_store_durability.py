@@ -1234,3 +1234,49 @@ def test_recovery_preserves_daily_spend_total(tmp_path, monkeypatch):
     assert mod._recover_sqlite_image(source, dest)
     with Store.open(dest) as store:
         assert store.api_spend_sum_usd('openai-api', day_prefix='2026-09-07') == 1.75
+
+
+@pytest.mark.parametrize('damage', [
+    'queued_at', 'pid', 'owner', 'owner_without_pid', 'status', 'scope',
+    'admitted_at', 'started_at', 'ended_at', 'wait_ms',
+])
+def test_recovery_rejects_invalid_capacity_holder(tmp_path, monkeypatch, damage):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        store.capacity_enqueue(admission_id='ticket', resource_class='review-machine', scope='*', pid=123)
+        assert store.capacity_try_admit('ticket', capacity=1)
+        store.capacity_mark_started('ticket')
+    assignments = {
+        'queued_at': "queued_at='broken',pid=NULL,owner_start=NULL", 'pid': "pid='broken'",
+        'owner': "owner_start=''", 'owner_without_pid': "pid=NULL,owner_start='birth-token'",
+        'status': "status='unknown'", 'scope': "scope='wrong'", 'admitted_at': 'admitted_at=NULL',
+        'started_at': 'started_at=NULL', 'ended_at': 'ended_at=queued_at', 'wait_ms': 'wait_ms=-1',
+    }
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute('UPDATE capacity_admissions SET ' + assignments[damage])
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('state', ['queued', 'admitted', 'running', 'released', 'expired', 'rejected'])
+def test_recovery_preserves_capacity_lifecycle_states(tmp_path, monkeypatch, state):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        store.capacity_enqueue(admission_id='ticket', resource_class='review-machine', scope='*')
+        if state in ('admitted', 'running', 'released'):
+            assert store.capacity_try_admit('ticket', capacity=1)
+        if state in ('running', 'released'):
+            store.capacity_mark_started('ticket')
+        if state in ('released', 'expired', 'rejected'):
+            store.capacity_finish('ticket', status=state)
+        expected = store.capacity_get('ticket')
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest)
+    with Store.open(dest) as store:
+        assert store.capacity_get('ticket') == expected
