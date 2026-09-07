@@ -133,11 +133,12 @@ review(repo="/work/projB")      → OK next
 
 ## Capacity (one paragraph — details in concurrency.md)
 
-Three **different** limits:
+Four **different** limits:
 
 1. **MCP process** — refuse-if-busy (1 `review`). Not a capacity env knob.  
-2. **`review-fg`** — env `SKODUN_REVIEW_FG_CAPACITY`, counted **per repository** (`git_common_dir`). Multi-slot needs `SKODUN_LEGACY_FG_LOCK=0`.  
-3. **`provider:<id>`** — env `SKODUN_PROVIDER_MAX_IN_FLIGHT`, counted **per provider across the whole store** (all repos).
+2. **`review-machine`** — env `SKODUN_REVIEW_MACHINE_CAPACITY` (default 1), counted across foreground and detached reviews on the shared store.
+3. **`review-fg`** — env `SKODUN_REVIEW_FG_CAPACITY`, counted **per repository** (`git_common_dir`). Multi-slot needs both machine and FG capacity ≥2 and `SKODUN_LEGACY_FG_LOCK=0`.
+4. **`provider:<id>`** — env `SKODUN_PROVIDER_MAX_IN_FLIGHT`, counted **per provider across the whole store** (all repos).
 
 “3 providers × 2 slots = 6 concurrent reviews” is **not** how skodun multiplies concurrency. See [`concurrency.md`](concurrency.md).
 

@@ -97,7 +97,7 @@ skodun review --repo /abs/worktree --reviewer finder-junie-luna
 
 ## Capacity / multi-agent
 
-See [`concurrency.md`](concurrency.md) and [`mcp-review-topology.md`](mcp-review-topology.md). Defaults stay serial; multi-slot needs `SKODUN_LEGACY_FG_LOCK=0` + capacity ≥2. MCP is still one in-flight `review` per process.
+See [`concurrency.md`](concurrency.md) and [`mcp-review-topology.md`](mcp-review-topology.md). Defaults stay serial; multi-slot needs `SKODUN_LEGACY_FG_LOCK=0` plus both `SKODUN_REVIEW_MACHINE_CAPACITY` and `SKODUN_REVIEW_FG_CAPACITY` ≥2. MCP is still one in-flight `review` per process.
 
 ---
 
