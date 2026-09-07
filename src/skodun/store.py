@@ -1721,7 +1721,47 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                     if row[column] is None and not required:
                         continue
                     decoded[column] = _recovery_json_object(row[column])
-                if table == "deliveries":
+                if table == "cancellation_audit":
+                    from .control import audit_text, review_identity
+                    for field, limit in (("actor", 120), ("source", 80), ("reason", 500), ("cause", 80)):
+                        audit_text(row[field], field, limit)
+                    _require_text("cancellation target", row["target_id"])
+                    if len(row["target_id"]) > 4096 or type(row["caller_pid"]) is not int or row["caller_pid"] <= 0:
+                        return False
+                    if row["caller_worktree"] is not None and (
+                            not isinstance(row["caller_worktree"], str) or len(row["caller_worktree"]) > 4096):
+                        return False
+                    _require_ts("cancellation created_at", row["created_at"])
+                    active = row["outcome"] in ("requested", "observed")
+                    if not active and row["outcome"] not in (
+                            "cancelled", "completed_before_cancel", "failed_after_cancel", "finished", "failed", "expired"):
+                        return False
+                    if active != (row["completed_at"] is None) or row["created_at"] > _iso_now():
+                        return False
+                    if not active:
+                        _require_ts("cancellation completed_at", row["completed_at"])
+                        if not row["created_at"] <= row["completed_at"] <= _iso_now():
+                            return False
+                    if row["request_id"] is not None:
+                        request = conn.execute("SELECT identity_json FROM review_requests WHERE id=?",
+                                               (row["request_id"],)).fetchone()
+                        execution = conn.execute("SELECT completed_at FROM request_executions WHERE request_id=? AND owner_token=?",
+                                                 (row["request_id"], row["execution_token"])).fetchone()
+                        if request is None or execution is None or active and execution[0] is not None:
+                            return False
+                        expected = _recovery_json_object(request[0])
+                        if decoded["identity_json"] not in (expected, {**expected, "request_id": row["request_id"]}):
+                            return False
+                        if row["target_id"] != row["request_id"]:
+                            target = view.get_review(row["target_id"])
+                            if target is None or target.get("request_id") != row["request_id"]:
+                                return False
+                    else:
+                        target = view.get_review(row["target_id"])
+                        if (row["execution_token"] is not None or target is None
+                                or decoded["identity_json"] != review_identity(target)):
+                            return False
+                elif table == "deliveries":
                     from .delivery import CHANNELS, TERMINAL_STATUSES
                     _require_text("delivery review_id", row["review_id"])
                     _require_ts("delivery delivered_at", row["delivered_at"])

@@ -1388,3 +1388,43 @@ def test_recovery_rejects_invalid_orchestration_lifecycle(tmp_path, monkeypatch,
         raw.commit()
     _stream_source_dump(monkeypatch, source)
     assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('damage', ['revived', 'outcome', 'timestamp', 'token', 'request', 'identity', 'pid'])
+def test_recovery_rejects_invalid_cancellation_audit(tmp_path, monkeypatch, damage):
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_control_fixture(source)
+    assignments = {
+        'revived': "outcome='requested'", 'outcome': "outcome='unknown'",
+        'timestamp': "completed_at='broken'", 'token': "execution_token='missing'",
+        'request': "request_id='missing'", 'identity': "identity_json='{}'", 'pid': 'caller_pid=-1',
+    }
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute('UPDATE cancellation_audit SET ' + assignments[damage])
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('complete', [False, True])
+def test_recovery_preserves_request_cancellation_state(tmp_path, monkeypatch, complete):
+    from tests.test_budget_store import begin, NOW
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _write_review(source, 'kept')
+    with Store.open(source) as store:
+        rid, _ = begin(store)
+        request = store.get_request(rid)
+        store.record_cancellation(target_id=rid, request=request,
+            identity={**request['identity'], 'request_id':rid}, actor='test', source='test',
+            caller_pid=123, caller_worktree='/work', reason='cancel this review',
+            cause='requested_cancel', now=NOW)
+        if complete:
+            assert store.finish_request(rid, owner_token=request['owner_token'], state='cancelled',
+                reason_code='requested_cancel', result={'status':130,'text':'cancelled','metadata':{}}, now=NOW)
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest)
+    with Store.open(dest) as store:
+        assert bool(store.request_cancel_event(rid, request['owner_token'])) is (not complete)
