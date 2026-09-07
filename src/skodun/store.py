@@ -1952,6 +1952,14 @@ def _recovered_triage_valid(conn: sqlite3.Connection, deadline: float) -> bool:
     valid = False
     conn.execute("SAVEPOINT recovered_triage")
     try:
+        count, first, last = conn.execute("SELECT COUNT(*),MIN(seq),MAX(seq) FROM triage_events").fetchone()
+        watermarks = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='triage_events'").fetchall()
+        if len(watermarks) > 1:
+            return False
+        high_water = watermarks[0][0] if watermarks else 0
+        if (type(high_water) is not int or high_water < 0 or count != high_water
+                or count and (first != 1 or last != high_water)):
+            return False
         for table in ("triage", "triage_events"):
             for row in conn.execute(f'SELECT rowid AS recovery_rowid,* FROM "{table}"'):
                 if time.monotonic() >= deadline:

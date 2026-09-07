@@ -1466,3 +1466,37 @@ def test_recovery_refuses_existing_sqlite_reader(tmp_path, monkeypatch):
         assert db.read_bytes() == original
     with Store.open(db) as store:
         assert store.get_review('retained') is not None
+
+
+@pytest.mark.parametrize('missing', ['latest', 'middle', 'all'])
+def test_recovery_rejects_missing_triage_sequence_entries(tmp_path, monkeypatch, missing):
+    from skodun import triage
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    _recovery_triage_fixture(source, 'dismiss')
+    with Store.open(source) as store:
+        review = store.get_review('kept')
+        triage.reopen(store, review, 0, 'This finding still needs a reviewed correction.', '2026-09-07T00:00:00Z')
+        if missing == 'middle':
+            triage.dismiss(store, review, 0, 'The correction has now been independently verified.', '2026-09-07T00:01:00Z')
+    with closing(sqlite3.connect(source)) as raw:
+        raw.execute('DELETE FROM triage_events' if missing == 'all' else 'DELETE FROM triage_events WHERE seq=2')
+        raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+def test_recovery_preserves_complete_reopened_triage_history(tmp_path, monkeypatch):
+    from skodun import triage
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    decision = _recovery_triage_fixture(source, 'dismiss')
+    with Store.open(source) as store:
+        triage.reopen(store, store.get_review('kept'), 0,
+            'This finding still needs a reviewed correction.', '2026-09-07T00:00:00Z')
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest)
+    with Store.open(dest) as store:
+        assert store.triage_for(REC['branch'], REC['base_sha']) == {}
+        assert len(store.triage_history(decision['ledger_key'])) == 2
