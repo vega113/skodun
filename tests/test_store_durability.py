@@ -1599,8 +1599,9 @@ def test_recovery_accounts_for_running_review_capacity(tmp_path, monkeypatch, ho
     assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db') is (holder == 'matching')
 
 
-@pytest.mark.parametrize('holder', ['missing', 'unlinked', 'wrong_pid', 'released', 'matching'])
-def test_recovery_accounts_for_running_request_capacity(tmp_path, monkeypatch, holder):
+@pytest.mark.parametrize('holder', ['missing', 'unlinked', 'wrong_pid', 'released', 'matching', 'queued_ticket'])
+@pytest.mark.parametrize('state', ['queued', 'running'])
+def test_recovery_accounts_for_running_request_capacity(tmp_path, monkeypatch, holder, state):
     from tests.test_budget_store import begin, NOW
     import skodun.store as mod
     source = tmp_path / 'source.db'
@@ -1608,10 +1609,11 @@ def test_recovery_accounts_for_running_request_capacity(tmp_path, monkeypatch, h
     with Store.open(source) as store:
         rid, _ = begin(store)
         request = store.get_request(rid)
-        assert store.advance_request(rid, owner_token=request['owner_token'], state='running', now=NOW)
+        assert store.advance_request(rid, owner_token=request['owner_token'], state=state, now=NOW)
         if holder != 'missing':
             store.capacity_enqueue(admission_id='ticket', resource_class='review-machine', scope='*')
-            assert store.capacity_try_admit('ticket', capacity=1)
+            if holder != 'queued_ticket':
+                assert store.capacity_try_admit('ticket', capacity=1)
             store._c.execute('UPDATE capacity_admissions SET pid=?',
                              (request['pid'] + 1 if holder == 'wrong_pid' else request['pid'],))
             if holder != 'unlinked':
@@ -1619,7 +1621,8 @@ def test_recovery_accounts_for_running_request_capacity(tmp_path, monkeypatch, h
             if holder == 'released':
                 store.capacity_finish('ticket', status='released')
     _stream_source_dump(monkeypatch, source)
-    assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db') is (holder == 'matching')
+    assert mod._recover_sqlite_image(source, tmp_path / 'recovered.db') is (
+        holder == 'matching' or holder == 'queued_ticket' and state == 'queued')
 
 
 def test_recovery_preserves_foreground_parent_review_link(tmp_path, monkeypatch):
