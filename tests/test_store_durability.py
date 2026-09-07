@@ -1321,3 +1321,42 @@ def test_recovery_preserves_provider_blackout(tmp_path, monkeypatch):
     with Store.open(dest) as store:
         assert store.provider_unavailable_reason('openai', '2026-09-07T00:10:00Z', env={}) == 'quota exhausted'
         assert store.provider_unavailable_reason('openai', '2026-09-07T00:30:00Z', env={}) is None
+
+
+@pytest.mark.parametrize('damage', ['timestamp', 'future', 'channel', 'orphan', 'ineligible'])
+def test_recovery_rejects_invalid_delivery_acknowledgements(tmp_path, monkeypatch, damage):
+    from skodun import delivery
+    from tests.test_delivery import _rec
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    with Store.open(source) as store:
+        store.save_review(_rec())
+        delivery.acknowledge(store, ['sk_1'], 'mcp', now='2026-09-07T00:00:00Z')
+        if damage == 'ineligible':
+            store.save_review(_rec(mode='foreground'))
+    if damage != 'ineligible':
+        field, value = {
+            'timestamp': ('delivered_at', 'broken'), 'future': ('delivered_at', '9999-12-31T23:59:59Z'),
+            'channel': ('channel', 'unknown'), 'orphan': ('review_id', 'missing'),
+        }[damage]
+        with closing(sqlite3.connect(source)) as raw:
+            raw.execute(f'UPDATE deliveries SET {field}=?', (value,))
+            raw.commit()
+    _stream_source_dump(monkeypatch, source)
+    assert not mod._recover_sqlite_image(source, tmp_path / 'recovered.db')
+
+
+@pytest.mark.parametrize('channel', ['cli-text', 'cli-claude', 'mcp', 'quiet'])
+def test_recovery_preserves_valid_delivery_acknowledgements(tmp_path, monkeypatch, channel):
+    from skodun import delivery
+    from tests.test_delivery import _rec, REPO_A
+    import skodun.store as mod
+    source = tmp_path / 'source.db'
+    with Store.open(source) as store:
+        store.save_review(_rec())
+        delivery.acknowledge(store, ['sk_1'], channel, now='2026-09-07T00:00:00Z')
+    _stream_source_dump(monkeypatch, source)
+    dest = tmp_path / 'recovered.db'
+    assert mod._recover_sqlite_image(source, dest)
+    with Store.open(dest) as store:
+        assert delivery.undelivered(store, 'b', REPO_A) == []

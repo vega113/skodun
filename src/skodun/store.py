@@ -1711,7 +1711,7 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                 continue
             columns = {row[1]: bool(row[3]) for row in conn.execute(f'PRAGMA table_info("{table}")')
                        if row[1].endswith("_json")}
-            if not columns and table not in ("api_spend_events", "capacity_admissions", "provider_state"):
+            if not columns and table not in ("api_spend_events", "capacity_admissions", "provider_state", "deliveries"):
                 continue
             for row in conn.execute(f'SELECT * FROM "{table}"'):
                 if time.monotonic() >= deadline:
@@ -1721,7 +1721,18 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                     if row[column] is None and not required:
                         continue
                     decoded[column] = _recovery_json_object(row[column])
-                if table == "provider_state":
+                if table == "deliveries":
+                    from .delivery import CHANNELS, TERMINAL_STATUSES
+                    _require_text("delivery review_id", row["review_id"])
+                    _require_ts("delivery delivered_at", row["delivered_at"])
+                    if row["channel"] not in CHANNELS or row["delivered_at"] > _iso_now():
+                        return False
+                    review = conn.execute("SELECT mode,source,status FROM reviews WHERE id=?",
+                                          (row["review_id"],)).fetchone()
+                    if (review is None or review[0] != PREPUSH_MODE or review[1] != SKODUN_SOURCE
+                            or review[2] not in TERMINAL_STATUSES):
+                        return False
+                elif table == "provider_state":
                     from datetime import datetime
                     from .pipeline import PROVIDER_UNAVAILABLE_TTL_SEC
                     for field in ("provider", "reason", "category"):
