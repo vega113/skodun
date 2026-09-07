@@ -1896,10 +1896,13 @@ def _recovered_payloads_valid(conn: sqlite3.Connection, deadline: float) -> bool
                         if row[field] is not None:
                             _plain_nonnegative_int(f"capacity {field}", row[field])
                 elif table == "api_spend_events":
+                    from .adapters.openai_api import PROVIDER_ID
                     _require_ts("spend at", row["at"])
                     if row["at"] > _iso_now():
                         return False
                     _require_text("spend provider", row["provider"])
+                    if row["provider"] != PROVIDER_ID:
+                        return False
                     for field in ("model", "review_id", "request_id"):
                         if row[field] is not None:
                             _require_text(f"spend {field}", row[field])

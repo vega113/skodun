@@ -1200,7 +1200,7 @@ def test_recovery_preserves_writer_produced_checkpoint_claims(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize('damage', [
-    'negative_cost', 'infinite_cost', 'text_cost', 'timestamp', 'future_timestamp', 'provider',
+    'negative_cost', 'infinite_cost', 'text_cost', 'timestamp', 'future_timestamp', 'provider', 'unknown_provider',
     'prompt_tokens', 'completion_tokens', 'total_tokens', 'fractional_tokens', 'total_relationship',
 ])
 def test_recovery_rejects_invalid_spend_ledger(tmp_path, monkeypatch, damage):
@@ -1215,6 +1215,7 @@ def test_recovery_rejects_invalid_spend_ledger(tmp_path, monkeypatch, damage):
         'text_cost': ('cost_usd', 'not a cost'), 'timestamp': ('at', 'not a timestamp'),
         'future_timestamp': ('at', '9999-12-31T23:59:59Z'),
         'provider': ('provider', ''), 'prompt_tokens': ('prompt_tokens', -1),
+        'unknown_provider': ('provider', 'damaged-provider'),
         'completion_tokens': ('completion_tokens', -1), 'total_tokens': ('total_tokens', -1),
         'fractional_tokens': ('prompt_tokens', 1.5), 'total_relationship': ('total_tokens', 14),
     }[damage]
