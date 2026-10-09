@@ -107,9 +107,13 @@ Setup for external projects: [`../docs/integrate-external-project.md`](../docs/i
 
 ### When to fix and when to defer
 
-Judge every finding by its **consequence**, never by its severity label — labels
-are wrong in both directions. Fix before merging only if the finding meets one
-of these:
+Reserve severity `high` for behavior that can ship broken or unsafe. Style or
+scope notes are `medium` or `low`. Treat a `high` finding as ship-blocking: fix
+it before merge, or triage it with an audited reason that names why this
+behavior can still ship.
+
+Judge every other finding by its consequence. Fix before merging only if the
+finding meets one of these:
 
 | Fix now | Defer (`triage --defer`), with a filed issue |
 |---|---|

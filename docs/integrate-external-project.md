@@ -359,11 +359,15 @@ knobs and scoring: [`examples/fragments/concurrency.md`](../examples/fragments/c
 6. Providers are a **fallback chain**, not parallel voting on one diff. If the
    **entire** finder chain is known unavailable via `provider_state`, the run
    fails fast (exit 2) without burning the full admission wait.
-7. **Skeptic on a clean finder** uses the selected finder entry and its fallback
-   chain. If that chain is on quota, the extra pass **demotes** an otherwise
-   clean review. The `role = "refuter"` provider is separate and annotation-only;
-   its outage does not demote the review. Temporarily set
-   `SKODUN_SKEPTIC_PASS=0` when the selected finder chain is unavailable. Details:
+7. **Skeptic on a risky path.** A trustworthy clean finder (`findings_total == 0`,
+   mode `now`) launches the skeptic only when the diff touches a configured risky
+   path. The pass uses the selected finder entry and its fallback chain. A quota
+   or parse failure records `extra_passes.skeptic.failed` and keeps finder trust.
+   The security pass still demotes on failure. The `role = "refuter"` provider is
+   separate and annotation-only; its outage does not demote the review.
+   `SKODUN_SKEPTIC_PASS=0` disables the skeptic. Reserve severity `high` for
+   behavior that can ship broken or unsafe; style or scope notes are `medium` or
+   `low`. Details:
    [`review-troubleshooting.md`](../examples/fragments/review-troubleshooting.md).
 
 ---

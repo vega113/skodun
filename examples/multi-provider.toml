@@ -173,18 +173,20 @@ role     = "finder"
 # model re-examining its own work tends to agree with itself, and
 # `triage --adopt-refuter` prints a WARNING when it detects this.
 #
-# GIVE THE FINDER A FALLBACK -- the skeptic reuses that selected chain. The
-# refuter has its own chain and treats a dead provider differently:
+# GIVE THE FINDER A FALLBACK -- the skeptic reuses that selected chain when the
+# diff touches a configured risky path. The refuter has its own chain and
+# treats a dead provider differently:
 #
 #   refuter pass  annotation-only. `merge_refuter_pass` cannot make a review
 #                 untrustworthy, so a refuter whose provider is unavailable
-#                 leaves the review exactly as the finder left it. Nothing to
-#                 protect against here.
-#   skeptic pass  runs on a trustworthy CLEAN finder through the selected
-#                 finder's chain, and a pass that produces NOTHING at all --
-#                 quota, auth, a missing binary -- goes through
-#                 `merge_failed_extra_pass`, which demotes. The refuter's
-#                 outage cannot cause this demotion.
+#                 leaves the review exactly as the finder left it.
+#   skeptic pass  runs only on a trustworthy clean finder whose diff touches a
+#                 configured risky path, through the selected finder's chain.
+#                 Quota, auth, or a missing binary records
+#                 extra_passes.skeptic.failed and keeps finder trust. A
+#                 security-pass failure still demotes.
+#   severity      reserve "high" for behavior that can ship broken or unsafe.
+#                 Style or scope notes are "medium" or "low".
 #
 [[reviewers]]
 name      = "refuter"

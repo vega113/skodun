@@ -14,9 +14,9 @@ semantics:
 
 - **Diff-identity review tracking** — one review per exact content hash; a rebase or edit
   invalidates coverage, never silently.
-- **Adversarial passes** — a skeptic pass that attacks clean results, a security pass for
-  risky paths, and an optional refuter pass where a *different* provider re-examines the
-  finder's findings.
+- **Adversarial passes** — a skeptic pass that attacks a clean result on a configured
+  risky path, a security pass for those same paths, and an optional refuter pass where a
+  *different* provider re-examines the finder's findings. A skeptic failure keeps finder trust.
 - **A gate you can trust** — exit `0` (clean or every finding triaged with an audited reason),
   `1` (findings open), `2` (no trustworthy review); every unexpected error is `2`, and every
   bypass is a recorded decision.
@@ -538,16 +538,25 @@ took a skodun provider slot.
 
 ### The skeptic
 
-On a trustworthy clean finder (`findings_total == 0`, mode `now`), skodun may
-run a skeptic pass to attack the clean result. The skeptic uses the selected
-finder entry and its configured fallback chain, so a Codex-routed review uses
-the Codex subscription for both calls. It is a fail-closed coverage pass: an
-unavailable or unparseable skeptic demotes the review.
+On a trustworthy clean finder (`findings_total == 0`, mode `now`) whose diff
+touches a configured risky path, skodun runs a skeptic pass to attack that
+clean result. A diff that stays outside those tables, including a doc-only
+diff, does not launch it. The skeptic uses the selected finder entry and its
+configured fallback chain, so a Codex-routed review uses the Codex subscription
+for both calls. An unavailable or unparseable skeptic records
+`extra_passes.skeptic.failed` and leaves the finder's trust axes unchanged.
+The security pass is what still demotes the review when it fails.
 
 This is separate from `role = "refuter"`. The refuter is scheduled when the
 finder has findings and is an annotation-only, cross-provider re-examination;
-its quota outage does not demote the finder. Keeping the two paths separate
-means a Google refuter blackout cannot block a clean Codex review's skeptic.
+its quota outage does not demote the finder.
+
+### Severity
+
+Reserve severity `high` for behavior that can ship broken or unsafe. Style or
+scope notes are severity `medium` or `low`. The finder prompt carries this
+rule. Treat a `high` finding as ship-blocking: fix it before merge, or triage
+it with an audited reason that names why this behavior can still ship.
 
 ### The refuter
 
@@ -871,7 +880,8 @@ the fix commit had just written.
 **`examples/AGENTS.md`** is a template to paste into your repository's own
 `AGENTS.md` / `CLAUDE.md`. It covers the loop (freeze the diff, one review per
 head, stop when `gate` exits 0 — not when findings reach zero), a fix-now vs
-defer table judged on consequence rather than severity label, the conditions
+defer table, the rule that `high` is reserved for behavior that can ship broken
+or unsafe while style or scope stays `medium` or `low`, the conditions
 that mean "escalate to a human instead of running another round", and the rule
 that an agent never dismisses a finding by itself.
 
