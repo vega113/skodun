@@ -712,6 +712,17 @@ def test_recovery_terminal_class_ignores_cancel_and_a_moved_tree():
         "attempts": [{"classification": {"category": "prompt_size", "detail": ""},
                       "input_eligibility": {"reason": "prompt_too_large"}}],
     }) == "prompt_too_large"
+    assert services.recovery_terminal_class({
+        "trustworthy": False, "parse_ok": False,
+        "failure_reason": "the reviewer produced no parseable review",
+        "attempts": [
+            {"classification": {"category": "prompt_size", "detail": "too big"},
+             "input_eligibility": {"reason": "prompt_too_large"},
+             "skipped": "prompt too large for this provider"},
+            {"provider": "openai",
+             "classification": {"category": "ok", "detail": ""}},
+        ],
+    }) == "unparseable"
 
 
 def test_two_identical_dead_attempts_do_not_launch_a_third(tmp_path, monkeypatch):
@@ -784,6 +795,50 @@ def test_a_different_terminal_class_may_still_retry(tmp_path, monkeypatch):
     assert status == 0
     assert len(calls) == 3
     assert metadata["recovery"]["attempts"] == 3
+    assert metadata["recovery"]["recovered"] is True
+
+
+def test_an_earlier_prompt_skip_does_not_stop_a_later_size_failure(tmp_path, monkeypatch):
+    from skodun.trust import banner
+
+    identity = ("repo", "worktree", "feat", "h" * 20, "s" * 40, "d" * 40)
+    monkeypatch.setattr(services, "_recovery_identity", lambda repo: identity)
+    pending = [
+        _dead_attempt(
+            "mixed",
+            failure_reason="the reviewer produced no parseable review",
+            attempts=[
+                {"classification": {"category": "prompt_size", "detail": "too big"},
+                 "input_eligibility": {"reason": "prompt_too_large"},
+                 "skipped": "prompt too large for this provider"},
+                {"provider": "openai",
+                 "classification": {"category": "ok", "detail": ""}},
+            ]),
+        _dead_attempt(
+            "size",
+            failure_reason="all providers unavailable: prompt too large",
+            attempts=[{"classification": {"category": "prompt_size", "detail": ""},
+                       "input_eligibility": {"reason": "prompt_too_large"}}]),
+        _artifact([], review_id="third", trustworthy=True, status="clean",
+                  attempts=[{"provider": "google"}],
+                  repo_id="repo", worktree_root="worktree", branch="feat",
+                  head="h" * 20, base_sha="s" * 40, diff_hash="d" * 40),
+    ]
+    calls = []
+
+    def fake_once(store, repo, **kwargs):
+        calls.append(kwargs)
+        rec = pending.pop(0)
+        store.save_review(rec)
+        return (0 if rec["trustworthy"] is True else 4), banner(rec)
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "skip.db") as store:
+        status, _text, metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True, max_attempts=3, max_wall_seconds=30)
+
+    assert status == 0
+    assert len(calls) == 3
     assert metadata["recovery"]["recovered"] is True
 
 

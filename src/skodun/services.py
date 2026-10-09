@@ -600,14 +600,37 @@ _REPEATED_DEAD_CLASSES = frozenset({
 })
 
 
-def recovery_terminal_class(rec: dict) -> str | None:
-    """Class of a stored untrustworthy attempt, or None when it may be retried.
+def _attempt_terminal_class(attempt: dict) -> str | None:
+    """Class of one hop, ignoring every hop that ran before it."""
+    classification = attempt.get("classification")
+    category = ""
+    detail = ""
+    if isinstance(classification, dict):
+        category = str(classification.get("category") or "")
+        detail = str(classification.get("detail") or "").lower()
+    eligibility = attempt.get("input_eligibility")
+    reason = ""
+    if isinstance(eligibility, dict):
+        reason = str(eligibility.get("reason") or "")
+    text = " ".join((category, detail, reason, str(attempt.get("skipped") or "").lower()))
+    if (category == "prompt_size" or "prompt_too_large" in text
+            or "prompt too large" in text):
+        return "prompt_too_large"
+    if "quota" in text or "billing" in text:
+        return "quota_or_billing"
+    return None
 
-    ``quota_or_billing`` and ``prompt_too_large`` win over ``unparseable``:
-    a quota body can also say the response did not parse. A cancelled review
-    and a tree that moved are not one of the three classes. ``parse_ok is
-    False`` with no earlier class is ``unparseable``. A degraded review that
-    still parsed is not.
+
+def recovery_terminal_class(rec: dict) -> str | None:
+    """Class of the failure that ended a stored attempt, or None when it may be retried.
+
+    The last ``attempts[]`` row is the hop that ended the review. An earlier
+    prompt-size skip stays in that list and does not relabel a later
+    unparseable result. On the ending row, ``quota_or_billing`` and
+    ``prompt_too_large`` win over ``unparseable``: a quota body can also say
+    the response did not parse. A cancelled review and a tree that moved are
+    not one of the three classes. ``parse_ok is False`` with no ending class
+    is ``unparseable``. A degraded review that still parsed is not.
     """
     if not isinstance(rec, dict) or rec.get("trustworthy") is True:
         return None
@@ -620,24 +643,15 @@ def recovery_terminal_class(rec: dict) -> str | None:
         return None
     if "identity" in blob and ("moved" in blob or "changed" in blob):
         return None
-    categories: list[str] = []
-    details: list[str] = []
-    for attempt in rec.get("attempts") or ():
-        if not isinstance(attempt, dict):
-            continue
-        classification = attempt.get("classification")
-        if isinstance(classification, dict):
-            categories.append(str(classification.get("category") or ""))
-            details.append(str(classification.get("detail") or "").lower())
-        eligibility = attempt.get("input_eligibility")
-        if isinstance(eligibility, dict):
-            details.append(str(eligibility.get("reason") or ""))
-    detail = " ".join(details)
-    if ("prompt_size" in categories or "prompt_too_large" in detail
-            or "prompt_too_large" in blob or "prompt too large" in blob):
+    attempts = [item for item in rec.get("attempts") or () if isinstance(item, dict)]
+    if attempts:
+        ending = _attempt_terminal_class(attempts[-1])
+        if ending:
+            return ending
+    elif ("prompt_size" in blob or "prompt_too_large" in blob
+            or "prompt too large" in blob):
         return "prompt_too_large"
-    if ("quota" in categories or "quota" in blob or "billing" in blob
-            or "quota" in detail or "billing" in detail):
+    elif "quota" in blob or "billing" in blob:
         return "quota_or_billing"
     if rec.get("parse_ok") is False or "unparseable" in blob:
         return "unparseable"
