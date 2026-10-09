@@ -350,7 +350,8 @@ def _api_spend_block_detail(store: Store, provider: str) -> str:
 
 
 def _record_api_usage(store: Store, adapter, entry: Reviewer,
-                      stderr: bytes, *, review_tag: str) -> dict | None:
+                      stderr: bytes, *, review_tag: str,
+                      review_id: str | None = None) -> dict | None:
     """Persist usage from metered runners; attach dict for attempts[]."""
     if entry.provider != "openai-api":
         return None
@@ -377,7 +378,7 @@ def _record_api_usage(store: Store, adapter, entry: Reviewer,
             completion_tokens=ct,
             total_tokens=tt,
             cost_usd=cost_f,
-            review_id=None,  # pre-id wait may not have review id; tag only
+            review_id=review_id,
             request_id=(str(raw["request_id"])
                         if raw.get("request_id") else None),
         )
@@ -447,7 +448,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
               cwd: Path, store: Store, scratch: Path, tag: str,
               contract: OutputContract = REVIEW_CONTRACT,
               cancel: "threading.Event | None" = None,
-              admission_deadline: float | None = None) -> _Outcome:
+              admission_deadline: float | None = None,
+              review_id: str | None = None) -> _Outcome:
     """Run a reviewer chain to a verdict: entry by entry, retry by retry.
 
     Every retry is a FRESH run of the same prompt — never a resumed session —
@@ -815,7 +817,8 @@ def run_chain(head: Reviewer, cfg: Config, d: Defaults, prompt: bytes,
                 stdout, stderr = _read(out_path), _read(err_path)
                 verdict = adapter.classify(result.rc, stdout, stderr, contract)
                 usage = _record_api_usage(
-                    store, adapter, entry, stderr, review_tag=tag)
+                    store, adapter, entry, stderr, review_tag=tag,
+                    review_id=review_id)
                 if (usage is not None and entry.max_cost_usd is not None
                         and float(usage.get("cost_usd") or 0)
                         > float(entry.max_cost_usd) + 1e-12):

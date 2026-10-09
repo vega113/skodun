@@ -164,7 +164,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="provider admission allowance per pass, shared across fallbacks")
     review.add_argument(
         "--reuse-trusted", action="store_true", dest="reuse_trusted",
-        help="reuse an exact trustworthy foreground review when available")
+        help="normal invocation when --fresh was not passed; reuse an exact "
+             "trustworthy foreground review when available (default off)")
     review.add_argument(
         "--fresh", action="store_true", dest="fresh",
         help="run wholly fresh, bypassing trusted reuse and incomplete batch "

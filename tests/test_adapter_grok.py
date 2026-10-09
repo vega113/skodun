@@ -188,7 +188,7 @@ def test_effort_appended_when_set(tmp_path, effort):
 
 
 def test_shipped_grok_finder_command_passes_model_and_medium_effort(tmp_path):
-    """The published default finder must emit `-m grok-4.6 --effort medium`.
+    """The published default finder must emit `-m grok-4.7 --effort medium`.
 
     Driven through `load_config` on the committed example, then `build_cmd`,
     so a docs-only edit cannot claim the adapter still gets the old id.
@@ -204,7 +204,7 @@ def test_shipped_grok_finder_command_passes_model_and_medium_effort(tmp_path):
     cfg = load_config(repo, global_path=tmp_path / "absent.toml")
     finder = next(r for r in cfg.reviewers if r.name == "finder")
     cmd = GrokAdapter().build_cmd(tmp_path / "p.txt", finder, D, tmp_path)
-    assert cmd[cmd.index("-m") + 1] == "grok-4.6"
+    assert cmd[cmd.index("-m") + 1] == "grok-4.7"
     assert cmd[cmd.index("--effort") + 1] == "medium"
 
 

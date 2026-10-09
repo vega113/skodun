@@ -23,7 +23,7 @@ import pytest
 from skodun.checklist import Selection
 from skodun.contextpack import pack
 from skodun.promptbuild import (
-    DIFF_BEGIN, DIFF_END, Prompt, build, context_headroom,
+    DIFF_BEGIN, DIFF_END, Prompt, SEVERITY_GUIDANCE, build, context_headroom,
 )
 from tests.conftest import oracle_dir
 
@@ -72,20 +72,32 @@ GOLDEN_HEADER_ON = (
 # Instruction text: byte-exact, and not vacuously present
 # --------------------------------------------------------------------------
 
+def _oracle_header(text: bytes) -> bytes:
+    """Drop the one finder severity block. It sits inside the intro, before
+    the JSON contract, and is not part of the oracle golden."""
+    assert text.count(SEVERITY_GUIDANCE) == 1
+    assert text.index(SEVERITY_GUIDANCE) < text.index(b"Branch: ")
+    return text.replace(SEVERITY_GUIDANCE, b"", 1)
+
+
 def test_instruction_header_is_oracle_text_verbatim_packing_off():
     p = build("b", "origin/main", "s" * 40, "h" * 40, b"d", 400_000, SEL, None)
-    assert p.text.startswith(GOLDEN_HEADER_OFF)
+    stripped = _oracle_header(p.text)
+    assert stripped.startswith(GOLDEN_HEADER_OFF)
     # The header must be substantial — an emptied or stubbed instruction block
     # would still satisfy a naive `startswith(b"")`.
     assert len(GOLDEN_HEADER_OFF) > 600
-    assert p.text[len(GOLDEN_HEADER_OFF):].startswith(b"Branch: b\n")
+    assert b'Reserve severity "high" for behavior that can ship broken or unsafe.\n' in p.text
+    assert b'Style or scope notes are severity "medium" or "low".\n' in p.text
+    assert stripped[len(GOLDEN_HEADER_OFF):].startswith(b"Branch: b\n")
 
 
 def test_instruction_header_is_oracle_text_verbatim_packing_on():
     p = build("b", "origin/main", "s" * 40, "h" * 40, b"d", 400_000, SEL, b"CTX\n")
-    assert p.text.startswith(GOLDEN_HEADER_ON)
+    stripped = _oracle_header(p.text)
+    assert stripped.startswith(GOLDEN_HEADER_ON)
     assert len(GOLDEN_HEADER_ON) > len(GOLDEN_HEADER_OFF)
-    assert p.text[len(GOLDEN_HEADER_ON):].startswith(b"Branch: b\n")
+    assert stripped[len(GOLDEN_HEADER_ON):].startswith(b"Branch: b\n")
 
 
 def test_context_instruction_block_only_when_pack_body_is_not_none():
@@ -541,13 +553,14 @@ def test_prompt_parity_with_oracle(tmp_path, context, max_diff_bytes):
     mine = build(branch, base_ref, base_sha, head, diff, max_diff_bytes,
                  sel, pack if context else None).text
 
-    # Required assertion: the instruction header (everything above the
-    # branch/base/head block) matches byte-for-byte.
+    # The finder prompt adds ship-blocking severity guidance the oracle does
+    # not emit. Strip that one block, then the rest must still match.
+    assert SEVERITY_GUIDANCE in mine
+    stripped = mine.replace(SEVERITY_GUIDANCE, b"", 1)
     cut = raw.index(b"Branch: ")
-    assert mine[:cut] == raw[:cut]
+    assert stripped[:cut] == raw[:cut]
     assert len(raw[:cut]) > 600  # never vacuously equal
-    # Stronger: the whole prompt matches byte-for-byte.
-    assert mine == raw
+    assert stripped == raw
 
 
 def test_headroom_parity_with_oracle_across_the_inclusion_boundary(tmp_path):

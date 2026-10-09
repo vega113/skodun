@@ -29,7 +29,8 @@ from skodun.config import (SECURITY_PATH_SEGMENTS, SECURITY_PROMPT_SLOT_NAMES,
                            load_config)
 from skodun.passes import (_SECURITY_LEAD_TEMPLATE, failed_pass_reason,
                            merge_extra_pass, merge_failed_extra_pass,
-                           merge_refuter_pass, security_lead, security_prompt,
+                           merge_refuter_pass, merge_skeptic_pass,
+                           security_lead, security_prompt,
                            should_run_refuter, should_run_security,
                            should_run_skeptic, skeptic_prompt)
 from tests.conftest import oracle_dir
@@ -108,22 +109,36 @@ def test_security_kill_switch(monkeypatch):
 
 
 def test_skeptic_only_on_clean_trustworthy_now():
-    assert should_run_skeptic("now", True, 0)
-    assert not should_run_skeptic("now", True, 1)
-    assert not should_run_skeptic("now", False, 0)
-    assert not should_run_skeptic("prepush", True, 0)
+    risky = ["app/auth/Login.scala"]
+    assert should_run_skeptic("now", True, 0, risky)
+    assert not should_run_skeptic("now", True, 0, ["docs/guide.md"])
+    assert not should_run_skeptic("now", True, 0)
+    assert not should_run_skeptic("now", True, 1, risky)
+    assert not should_run_skeptic("now", False, 0, risky)
+    assert not should_run_skeptic("prepush", True, 0, risky)
+
+
+def test_skeptic_runs_on_a_configured_risky_table():
+    segments = ("auth", "session", "migration", "concurrency", "secrets")
+    for path in ("src/session/store.py", "db/migration/001.sql",
+                 "app/concurrency/lock.py", "deploy/secrets/key.txt"):
+        assert should_run_skeptic("now", True, 0, [path], segments), path
+    assert not should_run_skeptic(
+        "now", True, 0, ["docs/guide.md"], segments)
 
 
 def test_skeptic_non_numeric_findings_total_never_fires():
-    assert not should_run_skeptic("now", True, "nope")  # type: ignore[arg-type]
-    assert not should_run_skeptic("now", True, None)  # type: ignore[arg-type]
+    risky = ["app/auth/Login.scala"]
+    assert not should_run_skeptic("now", True, "nope", risky)  # type: ignore[arg-type]
+    assert not should_run_skeptic("now", True, None, risky)  # type: ignore[arg-type]
 
 
 def test_skeptic_kill_switch(monkeypatch):
+    risky = ["app/auth/Login.scala"]
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "0")
-    assert not should_run_skeptic("now", True, 0)
+    assert not should_run_skeptic("now", True, 0, risky)
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
-    assert should_run_skeptic("now", True, 0)
+    assert should_run_skeptic("now", True, 0, risky)
 
 
 def test_each_pass_has_its_own_kill_switch(monkeypatch):
@@ -141,7 +156,7 @@ def test_each_pass_has_its_own_kill_switch(monkeypatch):
                                      role="refuter")))
     monkeypatch.setenv("SKODUN_REFUTER_PASS", "0")
     assert not should_run_refuter("now", True, 1, cfg)
-    assert should_run_skeptic("now", True, 0)
+    assert should_run_skeptic("now", True, 0, ["app/auth/Login.scala"])
     assert should_run_security("now", ["app/auth/Login.scala"])
 
     monkeypatch.setenv("SKODUN_REFUTER_PASS", "1")
@@ -185,6 +200,29 @@ def _primary() -> dict:
     return dict(id="r", parse_ok=True, degraded=False, diff_truncated=False,
                 trustworthy=True, findings_total=0, findings=[], summary="ok",
                 severity={"high": 0, "medium": 0, "low": 0}, extra_passes={})
+
+
+def test_a_failed_skeptic_keeps_the_finders_trust_axes():
+    primary = _primary()
+    primary["failure_reason"] = ""
+    dead = {"parse_ok": False, "failure_reason": "skeptic timed out",
+            "findings": [{"title": "should not land", "detail": "x",
+                          "severity": "high", "file": "a", "line": 1,
+                          "category": "bug"}]}
+    out = merge_skeptic_pass(primary, dead)
+    for key in ("parse_ok", "degraded", "trustworthy", "failure_reason",
+                "diff_truncated"):
+        assert out[key] == primary[key]
+    assert out["extra_passes"]["skeptic"]["failed"] is True
+    assert out["findings"] == []
+    parsed = {"parse_ok": True, "degraded": True, "findings": [{
+        "title": "real", "detail": "x", "severity": "high", "file": "a",
+        "line": 1, "category": "bug"}]}
+    kept = merge_skeptic_pass(primary, parsed, "scheduled")
+    assert kept["trustworthy"] is True and kept["degraded"] is False
+    assert kept["parse_ok"] is True
+    assert kept["extra_passes"]["skeptic"]["failed"] is False
+    assert kept["findings_total"] == 1
 
 
 def test_failed_extra_pass_clears_parse_ok():

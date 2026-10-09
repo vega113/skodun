@@ -113,6 +113,35 @@ def test_run_doctor_reports_store_and_adapters(tmp_path, monkeypatch):
         c.detail for c in report.checks if c.name == "adapters_registered")
 
 
+def test_doctor_names_a_malformed_sibling_without_deleting_it(tmp_path, monkeypatch):
+    db = tmp_path / "skodun.db"
+    monkeypatch.setenv("SKODUN_DB", str(db))
+    monkeypatch.setenv("SKODUN_CONFIG", str(tmp_path / "nope.toml"))
+    with Store.open(db) as st:
+        assert st is not None
+    before = run_doctor(repo=tmp_path, store_path=db)
+    stamp = "skodun.db.malformed-20260816T120000Z-abc"
+    kept = [tmp_path / stamp, tmp_path / f"{stamp}-wal", tmp_path / f"{stamp}-shm"]
+    for path in kept:
+        path.write_bytes(b"quarantine")
+    live_wal = tmp_path / "skodun.db-wal"
+    live_wal.write_bytes(b"live")
+    report = run_doctor(repo=tmp_path, store_path=db)
+    snap = next(c for c in report.checks if c.name == "store_snapshots")
+    store_check = next(c for c in report.checks if c.name == "store")
+    assert snap.ok is True
+    assert "20260816" in snap.detail
+    assert stamp in snap.detail
+    assert f"{stamp}-wal" in snap.detail
+    assert f"{stamp}-shm" in snap.detail
+    assert "skodun.db-wal" not in snap.detail
+    assert "not deleted" in snap.detail
+    assert store_check.ok is True
+    assert report.exit_code == before.exit_code
+    assert all(path.is_file() for path in kept)
+    assert live_wal.is_file()
+
+
 def test_doctor_store_open_failure_for_schema_behind_mentions_restart_mcp(
         tmp_path, monkeypatch):
     import sqlite3

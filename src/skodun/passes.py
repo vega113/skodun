@@ -381,6 +381,22 @@ def any_path_risky(
     return any(path_is_risky(p, path_segments, basename_patterns) for p in paths)
 
 
+def context_reserve_paths(
+    files: Iterable[str],
+    path_segments: Sequence[str] = SECURITY_PATH_SEGMENTS,
+    basename_patterns: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Risky paths the context pack should keep ahead of larger files.
+
+    The same tables `should_run_security` uses. An empty table reserves nothing.
+    Callers that hash a pack must pass the same tuple or the context identity
+    diverges from the review that will actually run.
+    """
+    return tuple(
+        path for path in files
+        if path_is_risky(path, path_segments, basename_patterns))
+
+
 # ---------------------------------------------------------------------------
 # Scheduling decisions
 # ---------------------------------------------------------------------------
@@ -413,14 +429,19 @@ def should_run_skeptic(
     mode: str,
     trustworthy: bool,
     findings_total: int,
+    files: Sequence[str] = (),
+    path_segments: Sequence[str] = SECURITY_PATH_SEGMENTS,
+    basename_patterns: Sequence[str] = (),
     env: Mapping[str, str] | None = None,
 ) -> bool:
-    """Foreground clean-check, only when the review would clear the gate.
+    """Foreground clean-check on a configured risky path.
 
-    Not when the review is dirty (something already has to be fixed) and not
-    when it is untrustworthy (it is being redone anyway). A `findings_total`
-    that will not parse as an integer is treated as "unknown", which is not
-    zero, so the pass does not fire.
+    Not when the review is dirty (something already has to be fixed), not when
+    it is untrustworthy (it is being redone anyway), and not when the diff
+    touches only paths outside the configured risky tables. A doc-only diff
+    therefore does not launch this pass. A `findings_total` that will not parse
+    as an integer is treated as "unknown", which is not zero, so the pass does
+    not fire. `files` defaults to empty, which does not match any path.
     """
     if _killed(env, SKEPTIC_PASS_ENV):
         return False
@@ -432,7 +453,9 @@ def should_run_skeptic(
         n = int(findings_total)
     except (TypeError, ValueError):
         n = -1
-    return n == 0
+    if n != 0:
+        return False
+    return any_path_risky(files, path_segments, basename_patterns)
 
 
 def _enabled_refuter(cfg: Any) -> bool:
@@ -1311,6 +1334,59 @@ def merge_extra_pass(
         raise TypeError(
             "extra must be a mapping, got %s" % type(extra).__name__)
     return _merge(primary, extra, pass_name, "")
+
+
+def merge_skeptic_pass(
+    primary: Mapping[str, Any],
+    extra: Mapping[str, Any] | None,
+    failure_reason: str = "",
+) -> dict:
+    """Fold a skeptic pass without changing the finder's trust axes.
+
+    A parsed skeptic may append findings. A missing, unparsed, or failed
+    skeptic records ``extra_passes.skeptic.failed`` and a note. ``parse_ok``,
+    ``degraded``, ``trustworthy``, ``failure_reason``, and ``diff_truncated``
+    stay as the finder left them. Security still uses ``merge_extra_pass``.
+    """
+    if not isinstance(primary, dict):
+        raise TypeError("primary must be a dict")
+    if extra is not None and not isinstance(extra, Mapping):
+        raise TypeError("extra must be a mapping, got %s" % type(extra).__name__)
+    out = dict(primary)
+    findings = _as_findings(out.get("findings"))
+    meta: dict = {"ran": extra is not None, "pass": "skeptic"}
+    parsed = extra is not None and extra.get("parse_ok") is True
+    if not parsed:
+        meta["failed"] = True
+        note = str(failure_reason or "").strip()
+        if extra is not None and not note:
+            note = str(extra.get("failure_reason") or "").strip()
+        meta["note"] = note or failed_pass_reason("skeptic")
+    else:
+        assert extra is not None
+        added = _as_findings(extra.get("findings"))
+        findings.extend(_tag(f, "skeptic") for f in added)
+        meta.update({
+            "parse_ok": True,
+            "degraded": extra.get("degraded") is True,
+            "diff_truncated": extra.get("diff_truncated") is True,
+            "findings_total": len(added),
+            "id": extra.get("id", ""),
+            "failed": False,
+        })
+    out["findings"] = findings
+    out["findings_total"] = len(findings)
+    out["severity"] = _severity_counts(findings)
+    out["rule_ids"] = _rule_ids(findings)
+    extras = out.get("extra_passes")
+    extras = dict(extras) if isinstance(extras, dict) else {}
+    extras["skeptic"] = meta
+    out["extra_passes"] = extras
+    for key in ("parse_ok", "degraded", "trustworthy", "failure_reason",
+                "diff_truncated"):
+        if key in primary:
+            out[key] = primary[key]
+    return out
 
 
 def merge_failed_extra_pass(

@@ -143,7 +143,7 @@ cross_model = true
 [[reviewers]]
 name      = "finder"
 provider  = "xai"
-model     = "grok-4.6"        # verify with `grok models` -- ids are retired without notice
+model     = "grok-4.7"        # verify with `grok models` -- ids are retired without notice
 effort    = "medium"
 role      = "finder"
 fallbacks = ["finder-openai"]  # up to 3 names; each must exist, be enabled, and not cycle
@@ -151,7 +151,7 @@ fallbacks = ["finder-openai"]  # up to 3 names; each must exist, be enabled, and
 [[reviewers]]
 name     = "finder-openai"
 provider = "openai"
-model    = "gpt-5.6-luna"     # the codex CLI has no `list models` subcommand -- see README
+model    = "gpt-6-luna"     # the codex CLI has no `list models` subcommand -- see README
 effort   = "high"
 role     = "finder"
 fallbacks = ["finder-gemini"]
@@ -173,23 +173,25 @@ role     = "finder"
 # model re-examining its own work tends to agree with itself, and
 # `triage --adopt-refuter` prints a WARNING when it detects this.
 #
-# GIVE THE FINDER A FALLBACK -- the skeptic reuses that selected chain. The
-# refuter has its own chain and treats a dead provider differently:
+# GIVE THE FINDER A FALLBACK -- the skeptic reuses that selected chain when the
+# diff touches a configured risky path. The refuter has its own chain and
+# treats a dead provider differently:
 #
 #   refuter pass  annotation-only. `merge_refuter_pass` cannot make a review
 #                 untrustworthy, so a refuter whose provider is unavailable
-#                 leaves the review exactly as the finder left it. Nothing to
-#                 protect against here.
-#   skeptic pass  runs on a trustworthy CLEAN finder through the selected
-#                 finder's chain, and a pass that produces NOTHING at all --
-#                 quota, auth, a missing binary -- goes through
-#                 `merge_failed_extra_pass`, which demotes. The refuter's
-#                 outage cannot cause this demotion.
+#                 leaves the review exactly as the finder left it.
+#   skeptic pass  runs only on a trustworthy clean finder whose diff touches a
+#                 configured risky path, through the selected finder's chain.
+#                 Quota, auth, or a missing binary records
+#                 extra_passes.skeptic.failed and keeps finder trust. A
+#                 security-pass failure still demotes.
+#   severity      reserve "high" for behavior that can ship broken or unsafe.
+#                 Style or scope notes are "medium" or "low".
 #
 [[reviewers]]
 name      = "refuter"
 provider  = "openai"
-model     = "gpt-5.6-luna"
+model     = "gpt-6-luna"
 effort    = "high"
 role      = "refuter"
 fallbacks = ["finder"]
@@ -262,7 +264,7 @@ fallbacks = ["finder"]
 #        [[reviewers]]
 #        name           = "finder-openai"
 #        provider       = "openai"
-#        model          = "gpt-5.6-luna"
+#        model          = "gpt-6-luna"
 #        max_diff_bytes = 600000       # this entry only
 #
 #    It replaces the global for that entry, in either direction, and is still
@@ -308,7 +310,7 @@ fallbacks = ["finder"]
 # [[reviewers]]
 # name     = "finder-openai-api"
 # provider = "openai-api"
-# model    = "gpt-5.6-luna"    # any model id the OpenAI API accepts
+# model    = "gpt-6-luna"    # any model id the OpenAI API accepts
 # effort   = "medium"
 # role     = "finder"
 # max_cost_usd = 0.50

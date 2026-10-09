@@ -474,6 +474,8 @@ def test_cancellation_during_an_extra_pass_never_finalizes_the_primary(tmp_path,
     # sequence asserted below is legible.
     _fake_cli(tmp_path, "grok", _per_call(_emit(CLEAN), _hang("skeptic")))
     repo = _repo(tmp_path)
+    (repo / "auth").mkdir()
+    (repo / "auth" / "session.py").write_text("token = 1\n", encoding="utf-8")
 
     with _Run(repo, tmp_path / "s.db") as run:
         pgid = _wait_for(lambda: _pgid(tmp_path, "skeptic"),
@@ -781,14 +783,20 @@ def test_a_pass_that_fails_for_any_other_reason_still_demotes_rather_than_raises
     reviewer = Reviewer(name="f", provider="xai", model="m", role="finder")
     cfg = Config(defaults=Defaults(), reviewers=(reviewer,))
     with Store.open(tmp_path / "s.db") as store:
-        merged = pipeline._extra_pass(_bare_rec(), "skeptic", _prompt, reviewer,
-                                      cfg, cfg.defaults, tmp_path, store,
-                                      tmp_path)
+        security = pipeline._extra_pass(_bare_rec(), "security", _prompt,
+                                        reviewer, cfg, cfg.defaults, tmp_path,
+                                        store, tmp_path)
+        skeptic = pipeline._extra_pass(_bare_rec(), "skeptic", _prompt,
+                                       reviewer, cfg, cfg.defaults, tmp_path,
+                                       store, tmp_path)
         annotated = pipeline._refuter_pass(_bare_rec(), 1, lambda selected: _prompt(),
                                    reviewer, cfg,
                                            cfg.defaults, tmp_path, store,
                                            tmp_path, ["openai"])
-    assert merged["extra_passes"]["skeptic"]["failed"] is True
-    assert merged["parse_ok"] is False, "an exploded extra pass must demote"
+    assert security["extra_passes"]["security"]["failed"] is True
+    assert security["parse_ok"] is False, "an exploded security pass must demote"
+    assert skeptic["extra_passes"]["skeptic"]["failed"] is True
+    assert skeptic["parse_ok"] is True
+    assert "adapter exploded" not in (skeptic.get("failure_reason") or "")
     assert annotated["parse_ok"] is True, "the refuter demotes nothing, ever"
     assert annotated["extra_passes"]["refuter"]["status"] == "failed"

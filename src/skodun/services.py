@@ -595,6 +595,76 @@ def _recovery_attempt_provider(rec: dict) -> str | None:
     return None
 
 
+_REPEATED_DEAD_CLASSES = frozenset({
+    "quota_or_billing", "prompt_too_large", "unparseable",
+})
+
+
+def _attempt_terminal_class(attempt: dict) -> str | None:
+    """Class of one hop, ignoring every hop that ran before it."""
+    classification = attempt.get("classification")
+    category = ""
+    detail = ""
+    if isinstance(classification, dict):
+        category = str(classification.get("category") or "")
+        detail = str(classification.get("detail") or "").lower()
+    eligibility = attempt.get("input_eligibility")
+    reason = ""
+    if isinstance(eligibility, dict):
+        reason = str(eligibility.get("reason") or "")
+    text = " ".join((category, detail, reason, str(attempt.get("skipped") or "").lower()))
+    if (category == "prompt_size" or "prompt_too_large" in text
+            or "prompt too large" in text):
+        return "prompt_too_large"
+    if "quota" in text or "billing" in text:
+        return "quota_or_billing"
+    return None
+
+
+def recovery_terminal_class(rec: dict) -> str | None:
+    """Class of the failure that ended a stored attempt, or None when it may be retried.
+
+    The last ``attempts[]`` row is the hop that ended the review. An earlier
+    prompt-size skip stays in that list and does not relabel a later
+    unparseable result. On the ending row, ``quota_or_billing`` and
+    ``prompt_too_large`` win over ``unparseable``: a quota body can also say
+    the response did not parse. An ending hop whose kind is ``unavailable``
+    and is neither of those two classes is not ``unparseable``: a missing
+    binary and an authentication failure are different deaths and may retry.
+    A cancelled review and a tree that moved are not one of the three
+    classes. ``parse_ok is False`` with no ending class is ``unparseable``.
+    A degraded review that still parsed is not.
+    """
+    if not isinstance(rec, dict) or rec.get("trustworthy") is True:
+        return None
+    blob = " ".join(
+        str(rec.get(key) or "")
+        for key in ("failure_reason", "stop_reason", "terminal_reason",
+                    "degraded_reason")
+    ).lower()
+    if "cancel" in blob:
+        return None
+    if "identity" in blob and ("moved" in blob or "changed" in blob):
+        return None
+    attempts = [item for item in rec.get("attempts") or () if isinstance(item, dict)]
+    if attempts:
+        ending = _attempt_terminal_class(attempts[-1])
+        if ending:
+            return ending
+        classification = attempts[-1].get("classification")
+        if (isinstance(classification, dict)
+                and classification.get("kind") == "unavailable"):
+            return None
+    elif ("prompt_size" in blob or "prompt_too_large" in blob
+            or "prompt too large" in blob):
+        return "prompt_too_large"
+    elif "quota" in blob or "billing" in blob:
+        return "quota_or_billing"
+    if rec.get("parse_ok") is False or "unparseable" in blob:
+        return "unparseable"
+    return None
+
+
 def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         reviewer=None, client_family=None, recover=False,
                         max_attempts=None, max_wall_seconds=None,
@@ -806,6 +876,7 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
     terminal_reason = ""
     terminal_code = None
     result_metadata = {}
+    dead_classes: list[str | None] = []
     for ordinal in range(max_attempts):
         reason = cancellation_reason()
         if reason is not None:
@@ -830,6 +901,13 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
         if time.monotonic() >= deadline:
             terminal_reason = "recovery wall budget exhausted"
             terminal_code = "budget_expired"
+            break
+        if (len(dead_classes) >= 2
+                and dead_classes[-1] in _REPEATED_DEAD_CLASSES
+                and dead_classes[-1] == dead_classes[-2]):
+            terminal_reason = (
+                f"repeated {dead_classes[-1]}; no further provider attempt")
+            terminal_code = "repeated_terminal_class"
             break
 
         attempt_count += 1
@@ -926,6 +1004,7 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
         provider = _recovery_attempt_provider(last_rec)
         if provider and reviewer is None:
             terminal_providers.add(provider)
+        dead_classes.append(recovery_terminal_class(last_rec))
         if ordinal + 1 < max_attempts:
             terminal_reason = "recovery attempt was untrustworthy"
         else:

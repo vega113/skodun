@@ -233,7 +233,7 @@ Agent tool call (absolute `repo`):
 [[reviewers]]
 name     = "finder-openai-api"
 provider = "openai-api"
-model    = "gpt-5.6-luna"   # any model id the OpenAI API accepts
+model    = "gpt-6-luna"   # any model id the OpenAI API accepts
 effort   = "medium"
 role     = "finder"
 # max_cost_usd = 0.50
@@ -254,11 +254,14 @@ in the process env of whichever surface is running.
   the limit if a *single day* needs more headroom
 - At the daily cap, `openai-api` is skipped so the chain can hop
 
-Optional rate overrides (USD per 1M tokens):
+The built-in table estimates `gpt-6-luna` at $0.10 input and $0.50 output per
+1M tokens, and `gpt-6-sol` at $2 input and $10 output. Prompts over 272K input
+tokens cost more than that flat table (2× input and 1.5× output for the whole
+request). Optional rate overrides replace the table (USD per 1M tokens):
 
 ```bash
-export SKODUN_OPENAI_API_INPUT_USD_PER_1M=1.0
-export SKODUN_OPENAI_API_OUTPUT_USD_PER_1M=4.0
+export SKODUN_OPENAI_API_INPUT_USD_PER_1M=0.10
+export SKODUN_OPENAI_API_OUTPUT_USD_PER_1M=0.50
 ```
 
 ---

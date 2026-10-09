@@ -113,7 +113,10 @@ def _context_hash(root: Path, diff, cfg, reviewer):
         max_bytes, len(diff.data), packing=True)
     pack = contextpack.pack(
         root, list(diff.files), dict(diff.statuses), headroom,
-        pack_large_added=False)
+        pack_large_added=False,
+        reserve_paths=passes.context_reserve_paths(
+            diff.files, cfg.defaults.security_path_segments,
+            cfg.defaults.security_basename_patterns))
     value = pack.sha256
     return value if isinstance(value, str) and value.strip() else ""
 
@@ -182,7 +185,10 @@ def _batched_identities(root: Path, diff, cfg, reviewer):
                 root, list(batch.files),
                 {f: diff.statuses[f] for f in batch.files
                  if f in diff.statuses}, headroom,
-                pack_large_added=not sole)
+                pack_large_added=not sole,
+                reserve_paths=passes.context_reserve_paths(
+                    batch.files, defaults.security_path_segments,
+                    defaults.security_basename_patterns))
             context_hashes.append(
                 pack.sha256 if isinstance(pack.sha256, str) else None)
     if passes.should_run_integration(len(batches)):

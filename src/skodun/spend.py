@@ -39,8 +39,16 @@ API_SPEND_LIMIT_ENV = "SKODUN_API_SPEND_LIMIT_USD"
 
 # Approximate USD per 1_000_000 tokens (input, output). Conservative defaults
 # for unknown models; override with env for dogfood accuracy.
+#
+# gpt-6-luna and gpt-6-sol are the published short-context standard rates
+# (https://developers.openai.com/api/docs/models/gpt-6-luna and the 22 Sep 2026
+# changelog). Prompts over 272K input tokens cost more than this flat table:
+# 2× input and 1.5× output for the whole request. The numbers below are that
+# short-context estimate, not the long-context price.
 _MODEL_RATES_USD_PER_1M: dict[str, tuple[float, float]] = {
-    # Placeholders — operators should override via env when metering matters.
+    "gpt-6-luna": (0.10, 0.50),
+    "gpt-6-sol": (2.0, 10.0),
+    # Older placeholders — operators should override via env when metering matters.
     "gpt-5.6-luna": (1.0, 4.0),
     "gpt-5.4": (2.0, 8.0),
     "gpt-5.4-mini": (0.5, 2.0),

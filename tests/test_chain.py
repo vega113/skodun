@@ -315,6 +315,8 @@ def test_a_prompt_over_the_ceiling_advances_to_the_fallback(tmp_path, monkeypatc
     head_row, backup_row = out.attempts
     assert head_row["provider"] == "google"
     assert head_row["classification"]["kind"] == "unavailable"
+    assert head_row["classification"]["category"] == "prompt_size"
+    assert head_row["input_eligibility"]["reason"] == "prompt_too_large"
     # NOT `quota`: that is the one category cached provider-wide, and caching
     # this would take a healthy provider out of every later chain in the run
     # over a fact about ONE prompt.
@@ -411,6 +413,56 @@ def test_a_non_utf8_prompt_is_still_FATAL(tmp_path, monkeypatch):
     assert out.parsed is None and calls == []
     assert len(out.attempts) == 1
     assert "could not be invoked" in out.failure_reason
+
+
+def test_in_review_openai_api_spend_is_summed_and_a_null_id_is_unattributed(
+        tmp_path, monkeypatch):
+    """Spend rows come from ``run_chain``, and stats reads those rows back."""
+    import json
+
+    from skodun import runner, services
+    from skodun.adapters.openai_api import USAGE_PREFIX
+    from skodun.config import Config, Defaults, Reviewer
+    from skodun.store import Store
+
+    usage = {
+        "model": "gpt-6-luna",
+        "prompt_tokens": 1_000_000,
+        "completion_tokens": 1_000_000,
+        "total_tokens": 2_000_000,
+    }
+
+    def fake(cmd, timeout_sec, cwd, out, err, stdin_path=None, cancel=None):
+        out.write_bytes(GROK_CLEAN)
+        err.write_bytes((USAGE_PREFIX + json.dumps(usage) + "\n").encode())
+        return runner.RunResult(rc=0, timed_out=False, duration_sec=0.1,
+                                first_output_sec=0.05)
+
+    monkeypatch.setattr(chain.runner, "run_with_watchdog", fake)
+    head = Reviewer(name="meter", provider="openai-api", model="gpt-6-luna",
+                    role="finder")
+    cfg = Config(defaults=Defaults(), reviewers=(head,))
+    store = Store.open(tmp_path / "spend.db")
+    with store:
+        chain.run_chain(head, cfg, cfg.defaults, b"review this", tmp_path,
+                        store, tmp_path, "primary", review_id="sk_metered")
+        code, text = services.svc_stats(store, since_days=7, fmt="text")
+        assert code == 0
+        assert "api_spend_review=sk_metered" in text
+        assert "unattributed_rows=0" in text
+        chain.run_chain(head, cfg, cfg.defaults, b"no review id", tmp_path,
+                        store, tmp_path, "primary", review_id=None)
+        code, text = services.svc_stats(store, since_days=7, fmt="text")
+        assert code == 0
+        assert "api_spend_review=sk_metered" in text
+        assert "unattributed" in text
+        assert "unattributed_rows=1" in text
+        data = store.telemetry_stats(since_iso="2000-01-01T00:00:00Z")
+    attributed = data["api_spend"]["by_review"]
+    assert [row["review_id"] for row in attributed] == ["sk_metered"]
+    assert attributed[0]["cost_usd"] > 0
+    assert data["api_spend"]["unattributed_rows"] == 1
+    assert data["api_spend"]["unattributed_cost_usd"] > 0
 
 
 # --------------------------------------------------------------------------

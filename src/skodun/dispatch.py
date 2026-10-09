@@ -331,9 +331,13 @@ def build_dedup_evidence(store: "Store", repo: Path, diff: "Diff", oid: str,
                                  candidate_context_hash=None, planning_policy=policy)
         headroom = promptbuild.context_headroom(
             budget.prompt_budget(d, finder), len(diff.data), packing=True)
-        pack = contextpack.pack(Path(repo), list(diff.files), dict(diff.statuses),
-                                headroom, source="oid", oid=oid,
-                                pack_large_added=False)
+        from .passes import context_reserve_paths
+        pack = contextpack.pack(
+            Path(repo), list(diff.files), dict(diff.statuses),
+            headroom, source="oid", oid=oid, pack_large_added=False,
+            reserve_paths=context_reserve_paths(
+                diff.files, d.security_path_segments,
+                d.security_basename_patterns))
         candidate = pack.sha256
         if not isinstance(candidate, str) or not candidate.strip():
             raise ValueError(

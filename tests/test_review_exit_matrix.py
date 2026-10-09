@@ -3,9 +3,10 @@
 Issue #79 reported the one failure this file exists to make impossible: a
 review that ends `trustworthy=false` reporting process exit **0**, so that an
 agent keying on the exit code treats it as success and only a later `skodun
-gate` reveals there is no coverage. The three shapes it named were a degraded
-grok run, an agy run that came back `status: ERROR`, and a clean finder whose
-skeptic pass could not run and demoted the record to `failed`.
+gate` reveals there is no coverage. The shapes it named were a degraded grok
+run, an agy run that came back `status: ERROR`, and a clean finder whose
+skeptic pass could not run. That last shape used to demote the record. A
+skeptic failure now keeps the finder's trust; security demotion is unchanged.
 
 The behaviour is correct today -- `services.svc_review` returns 4 whenever the
 persisted record is not `trustworthy is True`, and it has since the services
@@ -61,10 +62,8 @@ DEGRADED = json.dumps({"structuredOutput": {"summary": "s", "findings": []},
 
 #: The selected finder is Codex, and its hermetic binary answers the primary
 #: review once before refusing the skeptic call. The skeptic deliberately uses
-#: that same selected finder entry, so the second call produces nothing and
-#: `passes.merge_failed_extra_pass` demotes the whole record -- #79's third
-#: shape, reported as "finder clean + skeptic fail ... status=failed,
-#: findings=0, good summary".
+#: that same selected finder entry. The second call produces nothing. Finder
+#: trust stays; the skeptic failure is recorded on ``extra_passes.skeptic``.
 CFG_WITH_DEAD_SKEPTIC = """
 [[reviewers]]
 name     = "finder-codex"
@@ -117,8 +116,9 @@ def _degraded(tmp_path, monkeypatch):
 
 
 def _skeptic_demotion(tmp_path, monkeypatch):
-    """#79 row 3: the finder was clean and an extra pass could not run."""
+    """A dead skeptic on a risky path keeps the finder's trust."""
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "0")
     stream = "\n".join([
         json.dumps({"type": "thread.started", "thread_id": "t"}),
         json.dumps({"type": "turn.started"}),
@@ -147,6 +147,8 @@ def _skeptic_demotion(tmp_path, monkeypatch):
     codex.chmod(codex.stat().st_mode | 0o111)
     monkeypatch.setenv("SKODUN_CODEX_BIN", str(codex))
     repo = _repo(tmp_path)
+    (repo / "auth").mkdir()
+    (repo / "auth" / "session.py").write_text("token = 1\n", encoding="utf-8")
     (repo / ".skodun.toml").write_text(
         CFG_WITH_DEAD_SKEPTIC, encoding="utf-8")
     return repo
@@ -185,10 +187,11 @@ _MATRIX = (
     # what made exit 0 plausible enough to be reported.
     ("degraded answer", _degraded, _UNTRUSTWORTHY_EXIT,
      lambda r: r.get("degraded") is True and r.get("parse_ok") is True),
-    # The finder was CLEAN and the pass is what demoted the record.
-    ("extra-pass demotion", _skeptic_demotion, _UNTRUSTWORTHY_EXIT,
-     lambda r: (r.get("status") == "failed" and r.get("findings_total") == 0
-                and _at(r, "extra_passes", "skeptic", "failed") is True)),
+    # The finder was CLEAN. A dead skeptic records the failure and keeps trust.
+    ("skeptic failure keeps finder trust", _skeptic_demotion, 0,
+     lambda r: (r.get("trustworthy") is True and r.get("findings_total") == 0
+                and _at(r, "extra_passes", "skeptic", "failed") is True
+                and "skeptic" not in (r.get("failure_reason") or ""))),
     # A provider process can start and still return an unusable invocation
     # result. That is a runtime failure (exit 4), distinct from the new static
     # missing-binary preflight refusal (exit 2).

@@ -952,7 +952,8 @@ def test_the_refuter_and_the_skeptic_are_mutually_exclusive(tmp_path, capsys,
 
     _fake_cli(tmp_path, "grok", _emit(CLEAN))
     (tmp_path / "second").mkdir()
-    repo2 = _repo(tmp_path / "second", CFG_FINDER_XAI + CFG_REFUTER_XAI)
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "0")
+    repo2 = _risky(_repo(tmp_path / "second", CFG_FINDER_XAI + CFG_REFUTER_XAI))
     clean = _run(repo2, _store(tmp_path / "second"))
     assert set(clean["extra_passes"]) == {"skeptic"}
 

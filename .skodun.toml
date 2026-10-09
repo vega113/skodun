@@ -27,7 +27,7 @@ max_diff_bytes = 400000
 [[reviewers]]
 name      = "finder"
 provider  = "xai"
-model     = "grok-4.6"
+model     = "grok-4.7"
 effort    = "medium"
 role      = "finder"
 fallbacks = ["finder-gemini", "finder-openai"]
@@ -41,6 +41,6 @@ role     = "finder"
 [[reviewers]]
 name     = "finder-openai"
 provider = "openai"
-model    = "gpt-5.6-luna"
+model    = "gpt-6-luna"
 effort   = "high"
 role     = "finder"

@@ -678,6 +678,225 @@ def test_bounded_recovery_stops_when_identity_moves(tmp_path, monkeypatch):
     assert "moved" in saved["terminal_reason"]
 
 
+def _dead_attempt(review_id, **extra):
+    fields = dict(repo_id="repo", worktree_root="worktree", branch="feat",
+                  head="h" * 20, base_sha="s" * 40, diff_hash="d" * 40,
+                  parse_ok=False, trustworthy=False, status="failed")
+    fields.update(extra)
+    return _artifact([], review_id=review_id, **fields)
+
+
+def test_recovery_terminal_class_ignores_cancel_and_a_moved_tree():
+    assert services.recovery_terminal_class({
+        "trustworthy": False, "parse_ok": False,
+        "failure_reason": "review cancelled",
+    }) is None
+    assert services.recovery_terminal_class({
+        "trustworthy": False, "parse_ok": False,
+        "failure_reason": "repository identity or diff moved between recovery attempts",
+    }) is None
+    assert services.recovery_terminal_class({
+        "trustworthy": False, "parse_ok": False,
+        "failure_reason": "response was unparseable",
+    }) == "unparseable"
+    assert services.recovery_terminal_class({
+        "trustworthy": False, "parse_ok": True, "degraded": True,
+        "failure_reason": "",
+    }) is None
+    assert services.recovery_terminal_class({
+        "trustworthy": False, "parse_ok": False,
+        "attempts": [{"classification": {"category": "quota", "detail": "billing"}}],
+    }) == "quota_or_billing"
+    assert services.recovery_terminal_class({
+        "trustworthy": False, "parse_ok": False,
+        "attempts": [{"classification": {"category": "prompt_size", "detail": ""},
+                      "input_eligibility": {"reason": "prompt_too_large"}}],
+    }) == "prompt_too_large"
+    assert services.recovery_terminal_class({
+        "trustworthy": False, "parse_ok": False,
+        "failure_reason": "the reviewer produced no parseable review",
+        "attempts": [
+            {"classification": {"category": "prompt_size", "detail": "too big"},
+             "input_eligibility": {"reason": "prompt_too_large"},
+             "skipped": "prompt too large for this provider"},
+            {"provider": "openai",
+             "classification": {"category": "ok", "detail": ""}},
+        ],
+    }) == "unparseable"
+    assert services.recovery_terminal_class({
+        "trustworthy": False, "parse_ok": False,
+        "failure_reason": "all providers unavailable: binary not found",
+        "attempts": [{"classification": {"kind": "unavailable",
+                                         "category": "invocation",
+                                         "detail": "binary not found"}}],
+    }) is None
+    assert services.recovery_terminal_class({
+        "trustworthy": False, "parse_ok": False,
+        "failure_reason": "all providers unavailable: auth",
+        "attempts": [{"classification": {"kind": "unavailable",
+                                         "category": "quota",
+                                         "detail": "billing"}}],
+    }) == "quota_or_billing"
+
+
+def test_two_identical_dead_attempts_do_not_launch_a_third(tmp_path, monkeypatch):
+    from skodun.trust import banner
+
+    identity = ("repo", "worktree", "feat", "h" * 20, "s" * 40, "d" * 40)
+    monkeypatch.setattr(services, "_recovery_identity", lambda repo: identity)
+    pending = [
+        _dead_attempt("first", failure_reason="response was unparseable",
+                      attempts=[{"provider": "xai"}]),
+        _dead_attempt("second", failure_reason="response was unparseable",
+                      attempts=[{"provider": "openai"}]),
+        _dead_attempt("third", failure_reason="response was unparseable",
+                      attempts=[{"provider": "google"}]),
+    ]
+    calls = []
+
+    def fake_once(store, repo, **kwargs):
+        calls.append(kwargs)
+        rec = pending.pop(0)
+        store.save_review(rec)
+        return 4, banner(rec)
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "repeat.db") as store:
+        status, text, metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True, max_attempts=3, max_wall_seconds=30)
+        saved = store.get_review("second")
+
+    assert status == 4
+    assert len(calls) == 2
+    assert pending and pending[0]["id"] == "third"
+    assert metadata["recovery"]["attempts"] == 2
+    assert saved["trustworthy"] is False
+    assert "repeated unparseable; no further provider attempt" in (
+        metadata["recovery"]["terminal_reason"])
+    assert "repeated unparseable" in text
+
+
+def test_a_different_terminal_class_may_still_retry(tmp_path, monkeypatch):
+    from skodun.trust import banner
+
+    identity = ("repo", "worktree", "feat", "h" * 20, "s" * 40, "d" * 40)
+    monkeypatch.setattr(services, "_recovery_identity", lambda repo: identity)
+    pending = [
+        _dead_attempt("quota", failure_reason="provider quota exhausted",
+                      attempts=[{"provider": "xai",
+                                 "classification": {"category": "quota",
+                                                    "detail": "billing"}}]),
+        _dead_attempt("parse", failure_reason="response was unparseable",
+                      attempts=[{"provider": "openai"}]),
+        _artifact([], review_id="third", trustworthy=True, status="clean",
+                  attempts=[{"provider": "google"}],
+                  repo_id="repo", worktree_root="worktree", branch="feat",
+                  head="h" * 20, base_sha="s" * 40, diff_hash="d" * 40),
+    ]
+    calls = []
+
+    def fake_once(store, repo, **kwargs):
+        calls.append(kwargs)
+        rec = pending.pop(0)
+        store.save_review(rec)
+        return (0 if rec["trustworthy"] is True else 4), banner(rec)
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "mixed.db") as store:
+        status, _text, metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True, max_attempts=3, max_wall_seconds=30)
+
+    assert status == 0
+    assert len(calls) == 3
+    assert metadata["recovery"]["attempts"] == 3
+    assert metadata["recovery"]["recovered"] is True
+
+
+def test_an_earlier_prompt_skip_does_not_stop_a_later_size_failure(tmp_path, monkeypatch):
+    from skodun.trust import banner
+
+    identity = ("repo", "worktree", "feat", "h" * 20, "s" * 40, "d" * 40)
+    monkeypatch.setattr(services, "_recovery_identity", lambda repo: identity)
+    pending = [
+        _dead_attempt(
+            "mixed",
+            failure_reason="the reviewer produced no parseable review",
+            attempts=[
+                {"classification": {"category": "prompt_size", "detail": "too big"},
+                 "input_eligibility": {"reason": "prompt_too_large"},
+                 "skipped": "prompt too large for this provider"},
+                {"provider": "openai",
+                 "classification": {"category": "ok", "detail": ""}},
+            ]),
+        _dead_attempt(
+            "size",
+            failure_reason="all providers unavailable: prompt too large",
+            attempts=[{"classification": {"category": "prompt_size", "detail": ""},
+                       "input_eligibility": {"reason": "prompt_too_large"}}]),
+        _artifact([], review_id="third", trustworthy=True, status="clean",
+                  attempts=[{"provider": "google"}],
+                  repo_id="repo", worktree_root="worktree", branch="feat",
+                  head="h" * 20, base_sha="s" * 40, diff_hash="d" * 40),
+    ]
+    calls = []
+
+    def fake_once(store, repo, **kwargs):
+        calls.append(kwargs)
+        rec = pending.pop(0)
+        store.save_review(rec)
+        return (0 if rec["trustworthy"] is True else 4), banner(rec)
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "skip.db") as store:
+        status, _text, metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True, max_attempts=3, max_wall_seconds=30)
+
+    assert status == 0
+    assert len(calls) == 3
+    assert metadata["recovery"]["recovered"] is True
+
+
+def test_two_unrelated_outages_may_still_try_another_provider(tmp_path, monkeypatch):
+    from skodun.trust import banner
+
+    identity = ("repo", "worktree", "feat", "h" * 20, "s" * 40, "d" * 40)
+    monkeypatch.setattr(services, "_recovery_identity", lambda repo: identity)
+    pending = [
+        _dead_attempt(
+            "binary",
+            failure_reason="all providers unavailable: binary not found",
+            attempts=[{"classification": {"kind": "unavailable",
+                                          "category": "invocation",
+                                          "detail": "binary not found"}}]),
+        _dead_attempt(
+            "auth",
+            failure_reason="all providers unavailable: authentication failed",
+            attempts=[{"classification": {"kind": "unavailable",
+                                          "category": "auth",
+                                          "detail": "authentication failed"}}]),
+        _artifact([], review_id="third", trustworthy=True, status="clean",
+                  attempts=[{"provider": "google"}],
+                  repo_id="repo", worktree_root="worktree", branch="feat",
+                  head="h" * 20, base_sha="s" * 40, diff_hash="d" * 40),
+    ]
+    calls = []
+
+    def fake_once(store, repo, **kwargs):
+        calls.append(kwargs)
+        rec = pending.pop(0)
+        store.save_review(rec)
+        return (0 if rec["trustworthy"] is True else 4), banner(rec)
+
+    monkeypatch.setattr(services, "_svc_review_once", fake_once)
+    with Store.open(tmp_path / "outage.db") as store:
+        status, _text, metadata = services.svc_review_detailed(
+            store, tmp_path, recover=True, max_attempts=3, max_wall_seconds=30)
+
+    assert status == 0
+    assert len(calls) == 3
+    assert metadata["recovery"]["recovered"] is True
+
+
 def test_bounded_recovery_rejects_bool_limits_and_preserves_explicit_pin(
         tmp_path, monkeypatch):
     from skodun.trust import banner
