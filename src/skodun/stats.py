@@ -49,7 +49,8 @@ def render(data: Mapping, *, fmt: str = "text") -> str:
         (f"first_trust={data['identities']['first_trust']} "
          f"recovered={data['identities']['recovered']} "
          f"never_trustworthy={data['identities']['never_trustworthy']} "
-         f"reuse_hits={data['reuse']['hits']} reuse_misses={data['reuse']['misses']}"),
+         f"reuse_hits={data['reuse']['hits']} reuse_misses={data['reuse']['misses']} "
+         f"reuse_bypasses={data['reuse']['bypasses']}"),
     ]
     live = data.get("live_capacity")
     if isinstance(live, Mapping):
@@ -68,6 +69,16 @@ def render(data: Mapping, *, fmt: str = "text") -> str:
             f"by_repo={repo_bit} by_provider={prov_bit}")
         if live.get('config_error'):
             lines.append(f"capacity_config_error={live['config_error']}")
+    spend = data.get("api_spend")
+    if isinstance(spend, Mapping):
+        lines.append(
+            f"api_spend_unattributed_rows={spend.get('unattributed_rows', 0)} "
+            f"unattributed_usd={spend.get('unattributed_cost_usd', 0)}")
+        for row in spend.get("by_review") or ():
+            if isinstance(row, Mapping):
+                lines.append(
+                    f"api_spend_review={row.get('review_id')} "
+                    f"usd={row.get('cost_usd')}")
     if 'audit_denominators' in data:
         lines.append('audit_denominators=' + json.dumps(data['audit_denominators'], sort_keys=True))
         lines.append('call_observations=' + json.dumps(data['call_observations'], sort_keys=True))

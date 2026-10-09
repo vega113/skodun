@@ -372,6 +372,7 @@ def pack(
     oid: str | None = None,
     per_file_cap: int | None = None,
     pack_large_added: bool = True,
+    reserve_paths: list[str] | tuple[str, ...] | None = None,
 ) -> Pack:
     """Pack full file contents for `files` into at most `headroom` bytes.
 
@@ -512,7 +513,20 @@ def pack(
 
     # Descending size, path as ascending tie-break — deterministic, and it
     # prefers the files a reviewer most needs to see in full.
-    packable.sort(key=lambda t: (-t[0], t[1]))
+    # `reserve_paths` is optional and keyword-only. None (the default) keeps
+    # that oracle order. When set, reserved paths are filled first, smallest
+    # first, so a small risky file is not crowded out by a larger neighbour.
+    # The rest stay size-descending. Inclusion is still all-or-nothing and
+    # still inside `headroom`.
+    wanted = {p for p in (reserve_paths or ()) if isinstance(p, str) and p}
+    if wanted:
+        reserved = [item for item in packable if item[1] in wanted]
+        rest = [item for item in packable if item[1] not in wanted]
+        reserved.sort(key=lambda t: (t[0], t[1]))
+        rest.sort(key=lambda t: (-t[0], t[1]))
+        packable = reserved + rest
+    else:
+        packable.sort(key=lambda t: (-t[0], t[1]))
 
     included: list[str] = []
     headroom_omit: list[tuple[str, str]] = []

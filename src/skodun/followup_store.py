@@ -206,5 +206,9 @@ class FollowupStoreMixin:
                         for key, expected_value in expected.items())
                         or metadata.get('attempts') != value['attempts']):
                     raise ValueError('follow-up publication metadata changed')
-                if rec['trustworthy'] and not followups.usable(payload):
+                # Security stays required for a trustworthy publication.
+                # A skeptic that did not parse is resumable and must not
+                # block the finder record or lower its trust.
+                if (rec['trustworthy'] and not followups.usable(payload)
+                        and row['pass_kind'] != 'skeptic'):
                     raise ValueError('required follow-up checkpoint unusable')

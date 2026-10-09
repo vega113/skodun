@@ -70,6 +70,30 @@ def _store_durability_clause(info: Any) -> str:
             f"integrity_check={integrity}")
 
 
+def _note_malformed_siblings(report: DoctorReport, store_path: Path) -> None:
+    """Name quarantined siblings. Do not delete them and do not fail a healthy db.
+
+    ``ok`` stays true: a warning must not turn the store check false or move
+    doctor off today's exit posture. Live ``-wal`` / ``-shm`` sidecars are not
+    this prefix. The quarantine copier appends those suffixes to the malformed
+    name, and those copies match ``<db>.malformed-``.
+    """
+    prefix = store_path.name + ".malformed-"
+    parent = store_path.parent
+    if not parent.is_dir():
+        return
+    try:
+        names = sorted(
+            p.name for p in parent.iterdir()
+            if p.is_file() and p.name.startswith(prefix))
+    except OSError:
+        return
+    if names:
+        report.add(
+            "store_snapshots", True,
+            "malformed snapshot kept (not deleted): " + ", ".join(names))
+
+
 def _binary_status(binary: str) -> str:
     from .runner import _is_path_shaped
 
@@ -243,6 +267,8 @@ def run_doctor(
                 "(do not keep reviewing via CLI while MCP stays schema-behind)"
             )
         report.add("store", False, detail)
+
+    _note_malformed_siblings(report, store_path)
 
     # Adapters / binaries
     try:

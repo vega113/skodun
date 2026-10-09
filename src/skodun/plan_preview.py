@@ -108,7 +108,9 @@ def _prepare(diff, *, root, cfg, defaults, finder, branch, base, head, mode, adv
         prompt = passes.security_prompt(branch, base.ref, base.sha, head_label, diff.data,
             budget.prompt_budget(defaults, reviewer), defaults.security_prompt_slots)
         calls.append(_call('security', 0, reviewer, cfg, defaults, prompt))
-    if passes.should_run_skeptic(mode, True, 0):
+    if passes.should_run_skeptic(
+            mode, True, 0, diff.files, defaults.security_path_segments,
+            defaults.security_basename_patterns):
         reviewer = pipeline._pass_reviewer(cfg, 'skeptic', finder)
         prompt = passes.skeptic_prompt(branch, base.ref, base.sha, head_label, diff.data,
             budget.prompt_budget(defaults, reviewer))

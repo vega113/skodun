@@ -595,6 +595,55 @@ def _recovery_attempt_provider(rec: dict) -> str | None:
     return None
 
 
+_REPEATED_DEAD_CLASSES = frozenset({
+    "quota_or_billing", "prompt_too_large", "unparseable",
+})
+
+
+def recovery_terminal_class(rec: dict) -> str | None:
+    """Class of a stored untrustworthy attempt, or None when it may be retried.
+
+    ``quota_or_billing`` and ``prompt_too_large`` win over ``unparseable``:
+    a quota body can also say the response did not parse. A cancelled review
+    and a tree that moved are not one of the three classes. ``parse_ok is
+    False`` with no earlier class is ``unparseable``. A degraded review that
+    still parsed is not.
+    """
+    if not isinstance(rec, dict) or rec.get("trustworthy") is True:
+        return None
+    blob = " ".join(
+        str(rec.get(key) or "")
+        for key in ("failure_reason", "stop_reason", "terminal_reason",
+                    "degraded_reason")
+    ).lower()
+    if "cancel" in blob:
+        return None
+    if "identity" in blob and ("moved" in blob or "changed" in blob):
+        return None
+    categories: list[str] = []
+    details: list[str] = []
+    for attempt in rec.get("attempts") or ():
+        if not isinstance(attempt, dict):
+            continue
+        classification = attempt.get("classification")
+        if isinstance(classification, dict):
+            categories.append(str(classification.get("category") or ""))
+            details.append(str(classification.get("detail") or "").lower())
+        eligibility = attempt.get("input_eligibility")
+        if isinstance(eligibility, dict):
+            details.append(str(eligibility.get("reason") or ""))
+    detail = " ".join(details)
+    if ("prompt_size" in categories or "prompt_too_large" in detail
+            or "prompt_too_large" in blob or "prompt too large" in blob):
+        return "prompt_too_large"
+    if ("quota" in categories or "quota" in blob or "billing" in blob
+            or "quota" in detail or "billing" in detail):
+        return "quota_or_billing"
+    if rec.get("parse_ok") is False or "unparseable" in blob:
+        return "unparseable"
+    return None
+
+
 def svc_review_detailed(store, repo, *, progress_sink=None, cancel=None,
                         reviewer=None, client_family=None, recover=False,
                         max_attempts=None, max_wall_seconds=None,
@@ -806,6 +855,7 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
     terminal_reason = ""
     terminal_code = None
     result_metadata = {}
+    dead_classes: list[str | None] = []
     for ordinal in range(max_attempts):
         reason = cancellation_reason()
         if reason is not None:
@@ -830,6 +880,13 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
         if time.monotonic() >= deadline:
             terminal_reason = "recovery wall budget exhausted"
             terminal_code = "budget_expired"
+            break
+        if (len(dead_classes) >= 2
+                and dead_classes[-1] in _REPEATED_DEAD_CLASSES
+                and dead_classes[-1] == dead_classes[-2]):
+            terminal_reason = (
+                f"repeated {dead_classes[-1]}; no further provider attempt")
+            terminal_code = "repeated_terminal_class"
             break
 
         attempt_count += 1
@@ -926,6 +983,7 @@ def _svc_review_detailed_impl(store, repo, *, progress_sink=None, cancel=None,
         provider = _recovery_attempt_provider(last_rec)
         if provider and reviewer is None:
             terminal_providers.add(provider)
+        dead_classes.append(recovery_terminal_class(last_rec))
         if ordinal + 1 < max_attempts:
             terminal_reason = "recovery attempt was untrustworthy"
         else:

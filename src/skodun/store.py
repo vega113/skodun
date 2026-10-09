@@ -1232,6 +1232,34 @@ def _is_canonical_ts(value: object) -> bool:
     return True
 
 
+def _skeptic_retry_exists(orchestration_expr: str) -> str:
+    """SQL twin of ``_scheduled_skeptic_unusable`` for one orchestration id."""
+    return (
+        "EXISTS (SELECT 1 FROM review_followup_checkpoints f"
+        f" WHERE f.orchestration_id={orchestration_expr} AND f.pass_kind='skeptic'"
+        " AND json_extract(f.binding_json,'$.decision.scheduled')=1"
+        " AND f.payload_json IS NOT NULL"
+        " AND (json_extract(f.payload_json,'$.parse_ok')=0"
+        " OR json_extract(f.payload_json,'$.degraded')=1"
+        " OR COALESCE(json_extract(f.payload_json,'$.failure_reason'),'')!=''))"
+    )
+
+
+def _scheduled_skeptic_unusable(rows) -> bool:
+    """True when a scheduled skeptic finished without reusable evidence."""
+    row = next((item for item in rows if item.get('pass_kind') == 'skeptic'), None)
+    if row is None or not row.get('binding_json') or not row.get('payload_json'):
+        return False
+    from . import followups
+    from .checkpoints import CheckpointPayload
+    try:
+        body = followups.decode_binding(row['binding_json'])
+        payload = CheckpointPayload(row['payload_json'])
+    except (ValueError, TypeError):
+        return False
+    return bool(body['decision']['scheduled']) and not followups.usable(payload)
+
+
 def _require_ts(label: str, value: object) -> str:
     if not _is_canonical_ts(value):
         raise ValueError(
@@ -3522,18 +3550,25 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
 
     def find_resume_candidate(self, repo_id: str, worktree_root: str,
                               branch: str, *, include_consumed=False) -> dict | None:
-        """Newest candidate; explicit continuation may select failed consumed work."""
+        """Newest candidate; explicit continuation may select failed consumed work.
+
+        A trustworthy consumed review is also a candidate when its scheduled
+        skeptic checkpoint is not usable. Skeptic failure does not demote the
+        finder, and that pass is still the missing follow-up.
+        """
         values = tuple(_require_text(name, value) for name, value in (
             ('repo_id', repo_id), ('worktree_root', worktree_root), ('branch', branch)))
         if type(include_consumed) is not bool:
             raise ValueError('include_consumed must be bool')
         if include_consumed:
             row = self._c.execute(
-                """SELECT o.* FROM review_orchestrations o
+                f"""SELECT o.* FROM review_orchestrations o
                    LEFT JOIN reviews r ON r.id=o.final_review_id
                    WHERE o.repo_id=? AND o.worktree_root=? AND o.branch=?
                      AND (o.state IN ('active','cancelled','failed','complete')
-                          OR (o.state='consumed' AND r.trustworthy=0 AND r.status<>'running'))
+                          OR (o.state='consumed' AND r.trustworthy=0 AND r.status<>'running')
+                          OR (o.state='consumed' AND r.trustworthy=1 AND r.status<>'running'
+                              AND {_skeptic_retry_exists('o.id')}))
                      AND o.id NOT IN (SELECT json_extract(identity_json,'$.continuation_source')
                        FROM review_orchestrations WHERE state<>'expired'
                          AND json_extract(identity_json,'$.continuation_source') IS NOT NULL)
@@ -3596,14 +3631,16 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                 raise ContinuationRefused('continuation_source_corrupt')
             if first_mismatch(source_identity, identity):
                 raise ContinuationRefused('continuation_identity_mismatch')
+            rows = self.list_checkpoints(source_id)
             if source['state'] == 'consumed':
                 review = self._c.execute('SELECT trustworthy,status FROM reviews WHERE id=?',
                                          (source['final_review_id'],)).fetchone()
-                if review is None or review['trustworthy'] != 0 or review['status'] == RUNNING:
+                if review is None or review['status'] == RUNNING:
+                    raise ContinuationRefused('continuation_source_trustworthy')
+                if review['trustworthy'] != 0 and not _scheduled_skeptic_unusable(rows):
                     raise ContinuationRefused('continuation_source_trustworthy')
             elif source['state'] not in ('active','cancelled','failed','complete'):
                 raise ContinuationRefused('continuation_source_unavailable')
-            rows = self.list_checkpoints(source_id)
             planned = {(item.kind, item.index): item for item in identity.pass_identities}
             if {(row['pass_kind'], row['pass_index']) for row in rows} != set(planned):
                 raise ContinuationRefused('continuation_source_plan_mismatch')
@@ -5255,6 +5292,20 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
         ).fetchall()
         reuse_hits = sum(r["outcome"] == "hit" for r in reuse_rows)
         reuse_misses = sum(r["outcome"] == "miss" for r in reuse_rows)
+        reuse_bypasses = sum(r["outcome"] == "bypass" for r in reuse_rows)
+        spend_rows = self._c.execute(
+            "SELECT review_id, cost_usd FROM api_spend_events WHERE at>=?",
+            (since_iso,)).fetchall()
+        by_review: dict[str, float] = {}
+        unattributed_rows = 0
+        unattributed_cost = 0.0
+        for row in spend_rows:
+            if row["review_id"] is None:
+                unattributed_rows += 1
+                unattributed_cost += float(row["cost_usd"] or 0)
+            else:
+                key = row["review_id"]
+                by_review[key] = by_review.get(key, 0.0) + float(row["cost_usd"] or 0)
         return {
             "since": since_iso,
             "reviews": {
@@ -5302,6 +5353,15 @@ class Store(RequestStoreMixin, ControlStoreMixin, BudgetStoreMixin, FollowupStor
                                         for r in review_rows),
                 "misses": reuse_misses + sum(r["outcome"] == "reuse_miss"
                                              for r in review_rows),
+                "bypasses": reuse_bypasses,
+            },
+            "api_spend": {
+                "by_review": [
+                    {"review_id": review_id, "cost_usd": cost}
+                    for review_id, cost in sorted(by_review.items())
+                ],
+                "unattributed_rows": unattributed_rows,
+                "unattributed_cost_usd": unattributed_cost,
             },
         }
 

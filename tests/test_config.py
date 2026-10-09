@@ -1615,21 +1615,21 @@ def _finder_named(cfg, name: str):
     raise AssertionError(f"no reviewer named {name!r} in { [r.name for r in cfg.reviewers] }")
 
 
-def test_example_grok_finder_defaults_to_grok_46_medium(tmp_path):
+def test_example_grok_finder_defaults_to_grok_47_medium(tmp_path):
     """The published multi-provider example is the operator-facing default."""
     cfg = _load_shipped_toml(tmp_path, _MULTI_PROVIDER_EXAMPLE)
     finder = _finder_named(cfg, "finder")
     assert finder.provider == "xai"
-    assert finder.model == "grok-4.6"
+    assert finder.model == "grok-4.7"
     assert finder.effort == "medium"
 
 
-def test_dogfood_grok_finder_defaults_to_grok_46_medium(tmp_path):
+def test_dogfood_grok_finder_defaults_to_grok_47_medium(tmp_path):
     """This repository's own `.skodun.toml` must match the shipped Grok default."""
     cfg = load_config(_REPO_ROOT, global_path=tmp_path / "absent.toml")
     finder = _finder_named(cfg, "finder")
     assert finder.provider == "xai"
-    assert finder.model == "grok-4.6"
+    assert finder.model == "grok-4.7"
     assert finder.effort == "medium"
 
 
@@ -1650,13 +1650,13 @@ def test_example_pin_and_fallback_graph_are_unchanged(tmp_path):
     assert finder.fallbacks == ("finder-openai",)
     assert [r.name for r in _chain_for(cfg, finder)] == ["finder", "finder-openai"]
     assert openai.provider == "openai"
-    assert openai.model == "gpt-5.6-luna"
+    assert openai.model == "gpt-6-luna"
     assert openai.effort == "high"
     assert openai.fallbacks == ("finder-gemini",)
     assert gemini.provider == "google"
     assert gemini.model == "gemini-3.7-flash-high"
     assert gemini.effort is None
-    assert refuter.model == "gpt-5.6-luna"
+    assert refuter.model == "gpt-6-luna"
     assert refuter.effort == "high"
     assert cfg.routing.mode == "auto"
     assert cfg.routing.pool == ("finder", "finder-openai")
@@ -1677,7 +1677,7 @@ def test_dogfood_pin_and_fallback_graph_are_unchanged(tmp_path):
     assert gemini.provider == "google"
     assert gemini.model == "gemini-3.7-flash-high"
     assert openai.provider == "openai"
-    assert openai.model == "gpt-5.6-luna"
+    assert openai.model == "gpt-6-luna"
     assert openai.effort == "high"
 
 

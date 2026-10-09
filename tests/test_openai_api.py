@@ -61,6 +61,26 @@ def test_parse_usage_line():
     assert u["cost_usd"] == 0.001
 
 
+def test_published_gpt6_short_context_rates_are_the_flat_table():
+    """Short-context published rates, not the unknown-model default.
+
+    The 272K-token long-context multiplier is a comment on the table: this
+    estimate stays flat, and a dated snapshot still prefix-matches the id.
+    """
+    assert spend.rates_for_model("gpt-6-luna", env={}) == (0.10, 0.50)
+    assert spend.rates_for_model("gpt-6-sol", env={}) == (2.0, 10.0)
+    assert spend.rates_for_model("gpt-6-luna-2026-09-22", env={}) == (0.10, 0.50)
+    luna = spend.estimate_cost_usd(
+        "gpt-6-luna", prompt_tokens=1_000_000, completion_tokens=1_000_000,
+        env={})
+    sol = spend.estimate_cost_usd(
+        "gpt-6-sol", prompt_tokens=1_000_000, completion_tokens=1_000_000,
+        env={})
+    assert luna == pytest.approx(0.60)
+    assert sol == pytest.approx(12.0)
+    assert spend.rates_for_model("not-a-published-model", env={}) == (5.0, 15.0)
+
+
 def test_estimate_cost_and_limits(tmp_path, monkeypatch):
     for k in (
         "SKODUN_OPENAI_API_SPEND_LIMIT_USD",

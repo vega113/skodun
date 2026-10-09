@@ -122,14 +122,25 @@ class RequestStoreMixin:
                         'SELECT state,final_review_id FROM review_orchestrations WHERE id=?',
                         (continuation_orchestration_id,)).fetchone()
                     consumed_failed = False
+                    skeptic_open = False
                     if allow_consumed and target is not None and target['state'] == 'consumed':
                         review = self._c.execute('SELECT trustworthy,status FROM reviews WHERE id=?',
                                                  (target['final_review_id'],)).fetchone()
                         consumed_failed = (review is not None and review['trustworthy'] == 0
                                            and review['status'] != 'running')
-                    if complete:
+                        if (review is not None and review['trustworthy'] != 0
+                                and review['status'] != 'running'
+                                and continuation_orchestration_id is not None):
+                            from .store import _scheduled_skeptic_unusable
+                            skeptic_open = _scheduled_skeptic_unusable(
+                                self.list_checkpoints(continuation_orchestration_id))
+                    # A clean finder whose scheduled skeptic did not produce
+                    # usable evidence is still the missing follow-up.
+                    if complete and not skeptic_open:
                         decision = 'existing'
-                    elif target is None or (target['state'] not in ('active', 'cancelled', 'failed', 'complete') and not consumed_failed):
+                    elif target is None or (
+                            target['state'] not in ('active', 'cancelled', 'failed', 'complete')
+                            and not consumed_failed and not skeptic_open):
                         decision = 'continuation_unavailable'
                     else:
                         self._c.execute(
@@ -182,12 +193,15 @@ class RequestStoreMixin:
 
     def request_for_orchestration(self, orchestration_id, identity):
         """Find the originating incomplete logical request; never steal it."""
+        from .store import _skeptic_retry_exists
         _text('orchestration_id', orchestration_id)
         row = self._c.execute(
-            """SELECT r.id FROM review_requests r JOIN request_links l ON l.request_id=r.id
+            f"""SELECT r.id FROM review_requests r JOIN request_links l ON l.request_id=r.id
                WHERE l.kind='batch_orchestration' AND l.target_id=? AND r.identity_json=?
                  AND (r.state IN ('accepted','queued','running','failed','cancelled','expired')
-                      OR (r.state='finished' AND json_extract(r.result_json,'$.status') > 1))
+                      OR (r.state='finished' AND json_extract(r.result_json,'$.status') > 1)
+                      OR (r.state='finished' AND json_extract(r.result_json,'$.status') IN (0, 1)
+                          AND {_skeptic_retry_exists('l.target_id')}))
                ORDER BY r.updated_at DESC,r.id DESC LIMIT 1""",
             (orchestration_id, _json(identity))).fetchone()
         return row['id'] if row else None

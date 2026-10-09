@@ -39,7 +39,8 @@ def test_required_failure_continues_only_missing_followups(lane, failed, expecte
     repo, store, calls, failures = lane
     failures.add(failed)
     code, message, original = services.svc_review_detailed(store, repo)
-    assert code == 4
+    # Security failure still demotes. A failed skeptic keeps finder trust.
+    assert code == (4 if failed == 'security' else 0)
     source_id = original['result']['ids']['batch_orchestration_id']
     assert source_id, (message, original)
     source = store.get_orchestration(source_id)
@@ -141,7 +142,8 @@ def test_cancel_after_security_completion_reuses_durable_result(lane, monkeypatc
 def test_global_policy_change_refuses_before_new_calls(lane, monkeypatch):
     repo, store, calls, failures = lane
     failures.add('skeptic')
-    assert services.svc_review_detailed(store, repo)[0] == 4
+    # A failed skeptic keeps finder trust, so the review is recorded.
+    assert services.svc_review_detailed(store, repo)[0] == 0
     calls.clear()
     monkeypatch.setenv('SKODUN_SECURITY_PASS', '0')
     code, _, result = services.svc_review_detailed(store, repo, continue_compatible=True)
@@ -155,7 +157,7 @@ def test_truncated_extra_preserves_existing_success_and_reuse_policy(lane):
     repo, store, calls, failures = lane
     failures.add('skeptic')
     code, _, initial = services.svc_review_detailed(store, repo)
-    assert code == 4
+    assert code == 0
     _, _, rows = _source(store, initial)
     sec = next(r for r in rows if r['pass_kind'] == 'security')
     payload = checkpoints.CheckpointPayload(sec['payload_json'])
@@ -211,7 +213,7 @@ def test_expiry_clears_followup_payloads(lane):
     repo, store, _, failures = lane
     failures.add('skeptic')
     code, _, initial = services.svc_review_detailed(store, repo)
-    assert code == 4
+    assert code == 0
     oid, _, _ = _source(store, initial)
     store._c.execute("UPDATE review_orchestrations SET state='failed',expires_at='2026-01-01T00:00:00Z' WHERE id=?", (oid,))
     store.expire_orchestrations(now='2026-09-05T00:00:00Z')
@@ -252,7 +254,7 @@ def test_followup_claims_require_binding_and_reject_late_fence(lane, monkeypatch
 def test_candidate_is_not_complete_before_runtime_binding(lane, monkeypatch):
     repo, store, calls, failures = lane
     failures.add('skeptic')
-    assert services.svc_review_detailed(store, repo)[0] == 4
+    assert services.svc_review_detailed(store, repo)[0] == 0
     failures.clear()
     bind = store.bind_followup_checkpoint
     observed = []
@@ -380,7 +382,7 @@ def test_racing_continuation_does_not_launch_live_followup_twice(lane, monkeypat
 def test_queue_counts_reused_base_integration_and_security_once(lane):
     repo, store, calls, failures = lane
     failures.add('skeptic')
-    assert services.svc_review_detailed(store, repo)[0] == 4
+    assert services.svc_review_detailed(store, repo)[0] == 0
     failures.clear()
     calls.clear()
     code, _, result = services.svc_review_detailed(store, repo, continue_compatible=True)

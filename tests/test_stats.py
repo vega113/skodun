@@ -117,7 +117,11 @@ def test_stats_count_append_only_reuse_events(tmp_path):
             at="2026-08-09T00:00:01Z", outcome="miss",
             reason="tree changed")
         data = st.telemetry_stats(since_iso="2026-08-08T00:00:00Z")
-    assert data["reuse"] == {"hits": 1, "misses": 1}
+    assert data["reuse"] == {"hits": 1, "misses": 1, "bypasses": 0}
+    text = render(data)
+    assert "reuse_hits=1" in text
+    assert "reuse_misses=1" in text
+    assert "reuse_bypasses=0" in text
 
 
 def test_stats_does_not_count_reuse_bypasses_or_errors_as_misses(tmp_path):
@@ -127,7 +131,8 @@ def test_stats_does_not_count_reuse_bypasses_or_errors_as_misses(tmp_path):
                 at="2026-08-09T00:00:00Z", outcome=outcome,
                 reason="explicit caller intent")
         data = st.telemetry_stats(since_iso="2026-08-08T00:00:00Z")
-    assert data["reuse"] == {"hits": 0, "misses": 0}
+    assert data["reuse"] == {"hits": 0, "misses": 0, "bypasses": 1}
+    assert "reuse_bypasses=1" in render(data)
 
 
 def test_stats_machine_cap_follows_toml_when_env_is_unset(tmp_path, monkeypatch):

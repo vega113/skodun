@@ -1388,9 +1388,9 @@ def test_everything_after_headroom_is_keyword_only(tmp_path):
     A positional caller written against the older signature therefore binds
     `per_file_cap` to `oid` and `pack_large_added` to `per_file_cap` -- silently,
     and with a consequence (`source="wt"` plus a non-empty `oid`) that this
-    module refuses only when it can see it. The four parameters whose ORDER can
-    still change are keyword-only, so the mistake is a `TypeError` at the call
-    rather than a wrong pack.
+    module refuses only when it can see it. The parameters whose ORDER can
+    still change, including `reserve_paths`, are keyword-only, so the mistake
+    is a `TypeError` at the call rather than a wrong pack.
     """
     import inspect
 
@@ -1400,7 +1400,7 @@ def test_everything_after_headroom_is_keyword_only(tmp_path):
     after = params[names.index("headroom") + 1:]
     assert after, "the point of this test is the parameters AFTER headroom"
     assert [p.name for p in after] == ["source", "oid", "per_file_cap",
-                                       "pack_large_added"]
+                                       "pack_large_added", "reserve_paths"]
     assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in after), \
         [(p.name, str(p.kind)) for p in after]
 

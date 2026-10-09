@@ -1021,6 +1021,53 @@ def _risky_repo(tmp_path: Path, extra_cfg: str = "") -> Path:
     return repo
 
 
+def test_a_fitting_diff_keeps_a_configured_risky_path_under_the_prompt_cap(
+        tmp_path):
+    """The planner's envelope still holds the diff, and the risky file is packed.
+
+    Reservation is applied inside ``_prepare_single_prompt``. Dropping that
+    keyword lets the larger neighbour take the headroom and this assertion
+    fails.
+    """
+    from skodun.adapters import get_adapter
+    from skodun.adapters.agy import MAX_PROMPT_ARG_BYTES
+    from skodun.checklist import Selection
+    from skodun.config import Defaults, Reviewer
+    from skodun.gitio import Diff
+    from skodun import budget
+    from skodun.planning_policy import describe
+
+    root = tmp_path / "packrepo"
+    risky = "src/session/store.py"
+    large = "src/notes/big.py"
+    (root / "src" / "session").mkdir(parents=True)
+    (root / "src" / "notes").mkdir()
+    (root / risky).write_bytes(b"s" * 80)
+    (root / large).write_bytes(b"L" * 1800)
+    diff = Diff(data=b"d" * 200, files=[large, risky],
+                statuses={large: "M", risky: "M"})
+    segments = ("auth", "session", "migration", "concurrency", "secrets")
+    d = Defaults(max_diff_bytes=2200, security_path_segments=segments)
+    finder = Reviewer(name="agy", provider="google", model="m", role="finder",
+                      max_diff_bytes=2200)
+    selection = Selection(sections=[], bytes_total=0, over_budget=False,
+                          dropped=[], body="")
+    pack, prompt = pipeline._prepare_single_prompt(
+        diff, d=d, root=root, finder=finder, selection=selection,
+        branch="feat", base_ref="origin/main", base_sha="a" * 40,
+        head_label="b" * 40)
+    facts = describe(d, finder)
+    assert len(diff.data) <= facts["effective_diff_budget"]
+    assert risky in pack.included
+    assert large not in pack.included
+    limit = get_adapter(finder.provider).prompt_limit()
+    cap = (limit if limit is not None else
+           budget.prompt_budget(d, finder) + budget.PROMPT_OVERHEAD_BYTES)
+    assert cap == MAX_PROMPT_ARG_BYTES
+    assert prompt.prompt_bytes <= cap
+    assert prompt.prompt_bytes > 0
+
+
 def test_security_pass_runs_on_a_risky_path_and_merges(tmp_path, capsys,
                                                        monkeypatch):
     monkeypatch.setenv("SKODUN_SECURITY_PASS", "1")
@@ -1076,8 +1123,9 @@ def test_a_timed_out_security_pass_demotes_the_review(tmp_path, capsys,
 def test_skeptic_pass_runs_on_a_clean_review_and_can_break_the_clear(
         tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "0")
     _fake_grok(tmp_path, _per_call(_emit(CLEAN), _emit(DIRTY)))
-    repo = _repo(tmp_path)
+    repo = _risky_repo(tmp_path)
     rec = _run(repo, _store(tmp_path))
     assert _calls(tmp_path) == 2
     assert rec["extra_passes"]["skeptic"]["ran"] is True
@@ -1127,22 +1175,23 @@ def test_skeptic_eligibility_is_judged_after_the_security_merge(
 
 def test_a_degraded_extra_pass_demotes_the_primary(tmp_path, capsys,
                                                    monkeypatch):
-    """A Cancelled extra pass must take the primary's clean clear away.
+    """A Cancelled security pass must take the primary's clean clear away.
 
     This is trust wiring nothing else pins END TO END: `_extra_pass` copies the
     pass's `degraded` flag into the record it hands `merge_extra_pass`, and
     hardcoding that copy to `False` leaves the rest of the suite green. A
-    cancelled adversarial pass would then leave a clean, trustworthy primary
+    cancelled security pass would then leave a clean, trustworthy primary
     standing — a false clear, which is the one outcome the gate must never be
-    handed.
+    handed. A cancelled skeptic does not use that demotion.
     """
-    monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "1")
+    monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "0")
     _fake_grok(tmp_path, _per_call(_emit(CLEAN), _emit(CANCELLED)))
-    repo = _repo(tmp_path, "\n[defaults]\ndegraded_retries = 0\n")
+    repo = _risky_repo(tmp_path, "\n[defaults]\ndegraded_retries = 0\n")
     rec = _run(repo, _store(tmp_path))
 
     assert _calls(tmp_path) == 2
-    meta = rec["extra_passes"]["skeptic"]
+    meta = rec["extra_passes"]["security"]
     assert meta["ran"] is True and meta["degraded"] is True
     assert meta["parse_ok"] is True        # it parsed; the RUN was cut short
     assert rec["degraded"] is True
@@ -1153,6 +1202,24 @@ def test_a_degraded_extra_pass_demotes_the_primary(tmp_path, capsys,
     assert rec["summary"].startswith("ok")   # the primary review is still here
     assert _verdict(rec, capsys).startswith(
         "SKODUN VERDICT: trustworthy=false findings=0 degraded=true")
+
+
+def test_a_cancelled_skeptic_does_not_demote_the_finder(tmp_path, capsys,
+                                                       monkeypatch):
+    monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "0")
+    _fake_grok(tmp_path, _per_call(_emit(CLEAN), _emit(CANCELLED)))
+    repo = _risky_repo(tmp_path, "\n[defaults]\ndegraded_retries = 0\n")
+    rec = _run(repo, _store(tmp_path))
+
+    assert _calls(tmp_path) == 2
+    meta = rec["extra_passes"]["skeptic"]
+    assert meta["ran"] is True and meta["parse_ok"] is True
+    assert meta["failed"] is False
+    assert rec["degraded"] is False
+    assert rec["parse_ok"] is True and rec["trustworthy"] is True
+    assert "skeptic" not in (rec.get("failure_reason") or "")
+    assert rec["summary"].startswith("ok")
 
 
 def test_a_size_capped_extra_pass_records_partial_coverage(tmp_path, capsys,
@@ -1212,22 +1279,24 @@ def test_extra_pass_timeout_keeps_finder_evidence_and_does_not_retry(
     finder already answered.
     """
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "0")
     _fake_grok(tmp_path, _per_call(_emit(CLEAN), _hang_silent()))
-    repo = _repo(tmp_path, "\n[defaults]\ntimeout_sec = 1\n"
-                           "timeout_retries = 1\ndegraded_retries = 0\n")
+    repo = _risky_repo(tmp_path, "\n[defaults]\ntimeout_sec = 1\n"
+                                 "timeout_retries = 1\ndegraded_retries = 0\n")
 
     rec = _run(repo, _store(tmp_path))
 
     assert rec["summary"] == "ok"
     assert rec["findings"] == []
     assert rec["findings_total"] == 0
+    assert rec["trustworthy"] is True
     extra = rec["extra_passes"]["skeptic"]
     assert extra["failed"] is True
     # Finder + one silent skeptic wait, not finder + timeout_retries+1.
     assert _calls(tmp_path) == 2
     reason = rec.get("failure_reason") or ""
     assert "timed out after 2 attempts" not in reason
-    assert "skeptic" in reason
+    assert "skeptic" not in reason
 
 
 def test_a_broken_extra_pass_demotes_the_review_instead_of_destroying_it(
@@ -1241,8 +1310,9 @@ def test_a_broken_extra_pass_demotes_the_review_instead_of_destroying_it(
     the primary review is already in hand.
     """
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "0")
     _fake_grok(tmp_path, _emit(CLEAN))
-    repo = _repo(tmp_path)
+    repo = _risky_repo(tmp_path)
     real = pipeline._run_chain
 
     def only_the_skeptic_explodes(head, cfg, d, prompt, cwd, store, scratch,
@@ -1255,16 +1325,17 @@ def test_a_broken_extra_pass_demotes_the_review_instead_of_destroying_it(
     monkeypatch.setattr(pipeline, "_run_chain", only_the_skeptic_explodes)
     rec = _run(repo, _store(tmp_path))
     assert rec["extra_passes"]["skeptic"]["failed"] is True
-    assert rec["parse_ok"] is False and rec["trustworthy"] is False
-    assert "adapter exploded mid-pass" in rec["failure_reason"]
+    assert rec["parse_ok"] is True and rec["trustworthy"] is True
+    assert "adapter exploded mid-pass" not in (rec.get("failure_reason") or "")
     assert rec["summary"] == "ok"          # the primary review is still here
 
 
 def test_a_broken_extra_pass_prompt_demotes_the_review(tmp_path, capsys,
                                                        monkeypatch):
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "0")
     _fake_grok(tmp_path, _emit(CLEAN))
-    repo = _repo(tmp_path)
+    repo = _risky_repo(tmp_path)
 
     def boom(*a, **kw):
         raise ValueError("cannot render")
@@ -1272,15 +1343,17 @@ def test_a_broken_extra_pass_prompt_demotes_the_review(tmp_path, capsys,
     monkeypatch.setattr(pipeline.passes, "skeptic_prompt", boom)
     rec = _run(repo, _store(tmp_path))
     assert rec["extra_passes"]["skeptic"]["failed"] is True
-    assert rec["trustworthy"] is False
+    assert rec["trustworthy"] is True
+    assert "cannot render" not in (rec.get("failure_reason") or "")
     assert _calls(tmp_path) == 1
 
 
 def test_extra_passes_run_while_the_lock_is_still_held(tmp_path, capsys,
                                                        monkeypatch):
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "0")
     lock_seen = []
-    repo = _repo(tmp_path)
+    repo = _risky_repo(tmp_path)
     lock = git_common_dir(repo) / "grok-reviews-foreground.lock"
     _fake_grok(tmp_path, _emit(CLEAN))
     real = pipeline.passes.skeptic_prompt

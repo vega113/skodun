@@ -106,9 +106,11 @@ impossible and otherwise leaves the normal review path eligible. A normal review
 may still return exit `4` after a provider starts and times out, emits unusable
 output, or exhausts its fallback chain; `--recover` is the bounded outer recovery
 loop for that runtime failure. Provider-chain fallback remains the inner rule and
-advances only on an `unavailable` attempt. Exact trustworthy reuse is opt-in with
-`--reuse-trusted`; `--fresh` forces a wholly new review without resuming
-incomplete batch checkpoints.
+advances only on an `unavailable` attempt. When the caller did not pass `--fresh`,
+the normal invocation is `--reuse-trusted`: it reuses an exact trustworthy review
+of this diff. The default stays off, so a review without that flag does not reuse
+a prior result. `--fresh` forces a wholly new review without resuming incomplete
+batch checkpoints.
 
 ### Stack-aware attribution
 
@@ -191,7 +193,7 @@ wins per key, reviewers merge by `name`). The store lives at
 [[reviewers]]
 name     = "finder"
 provider = "xai"        # xai | openai | openai-api | google | junie — run `skodun providers`
-model    = "grok-4.6"   # must be an id your CLI offers -- run `grok models`
+model    = "grok-4.7"   # must be an id your CLI offers -- run `grok models`
 effort   = "medium"
 role     = "finder"     # finder | refuter | security | triager | integrator
 ```
@@ -259,7 +261,7 @@ Optional pay-per-token path, separate from the Codex CLI (`provider = "openai"`)
 [[reviewers]]
 name     = "finder-openai-api"
 provider = "openai-api"
-model    = "gpt-5.6-luna"   # any model id the OpenAI API accepts
+model    = "gpt-6-luna"   # any model id the OpenAI API accepts
 effort   = "medium"
 role     = "finder"
 ```
@@ -336,7 +338,7 @@ model, or a cached provider-wide quota outage):
 [[reviewers]]
 name      = "finder"
 provider  = "xai"
-model     = "grok-4.6"
+model     = "grok-4.7"
 effort    = "medium"
 role      = "finder"
 fallbacks = ["finder-openai"]   # tried, in order, only when "finder"'s own attempt is unavailable
@@ -344,7 +346,7 @@ fallbacks = ["finder-openai"]   # tried, in order, only when "finder"'s own atte
 [[reviewers]]
 name     = "finder-openai"
 provider = "openai"
-model    = "gpt-5.6-luna"
+model    = "gpt-6-luna"
 effort   = "high"
 role     = "finder"
 ```

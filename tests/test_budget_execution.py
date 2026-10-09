@@ -190,6 +190,9 @@ def test_every_pass_receives_same_provider_wait_policy(tmp_path, monkeypatch, ba
             (repo / f'f{i}.txt').write_text(_body(f'f{i}'))
     else:
         monkeypatch.setenv('SKODUN_SKEPTIC_PASS', '1')
+        monkeypatch.setenv('SKODUN_SECURITY_PASS', '0')
+        (repo / 'auth').mkdir()
+        (repo / 'auth' / 'session.py').write_text('token = 1\n', encoding='utf-8')
     clock = controlled_clock(monkeypatch)
     calls, waits = [], []
     acquire = chain._acquire_provider_slot

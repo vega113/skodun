@@ -2007,7 +2007,7 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                       f"{rid} ...")
                 outcome = _run_chain(
                     finder, cfg, d, prompt.text, root, store,
-                    scratch, "primary",
+                    scratch, "primary", review_id=rid,
                     **_cancel_kw(cancel))
                 rec["attempts"] = outcome.attempts
                 _apply(rec, outcome)
@@ -2059,7 +2059,10 @@ def _run_review(repo: Path, cfg: Config, store: Store, mode: str,
                     mode,
                     is_trustworthy(rec["parse_ok"], rec["degraded"],
                                    rec["diff_truncated"]),
-                    rec["findings_total"])
+                    rec["findings_total"],
+                    diff.files,
+                    d.security_path_segments,
+                    d.security_basename_patterns)
             if (checkpoint_run is not None and mode == "now") or run_skeptic:
                 skeptic_reviewer = _pass_reviewer(cfg, "skeptic", finder)
                 rec = _required_followup(
@@ -2592,8 +2595,13 @@ def _prepare_single_prompt(diff, *, d, root, finder, selection, branch,
     if d.context_pack:
         headroom = promptbuild.context_headroom(envelope, len(diff.data), packing=True)
         kwargs = {} if context_source == "wt" else {"source": context_source, "oid": context_oid}
-        pack = contextpack.pack(root, list(diff.files), dict(diff.statuses), headroom,
-                                pack_large_added=False, **kwargs)
+        pack = contextpack.pack(
+            root, list(diff.files), dict(diff.statuses), headroom,
+            pack_large_added=False,
+            reserve_paths=passes.context_reserve_paths(
+                diff.files, d.security_path_segments,
+                d.security_basename_patterns),
+            **kwargs)
     prompt = promptbuild.build(branch, base_ref, base_sha, head_label, diff.data,
         envelope, selection, pack.body if pack is not None else None, **advisory)
     return pack, prompt
@@ -2679,7 +2687,7 @@ def _single_shot(common: dict, diff, *, cfg: Config, d: Defaults, root: Path,
     rec["primary_timeout_seconds"] = effective_d.timeout_sec
     outcome = _run_chain(finder, cfg, effective_d,
                          prompt.text, root, store, scratch, "primary",
-                         cancel=cancel)
+                         cancel=cancel, review_id=record_id)
     rec["attempts"] = outcome.attempts
     _apply(rec, outcome)
     rec["usable_output"] = outcome.accepted is not None
@@ -3303,11 +3311,12 @@ def _checkpointed_sub(
         cfg: Config, d: Defaults, prompt, root: Path, store: Store,
         scratch: Path, tag: str, label: str,
         cancel: "threading.Event | None", binding_hash: str | None = None,
-        preparation_failure: str | None = None) -> _Sub:
+        preparation_failure: str | None = None,
+        review_id: str | None = None) -> _Sub:
     """Reuse or exclusively run one exact pass under a fenced store claim."""
     if checkpoint_run is None:
         return _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
-                        label, cancel=cancel)
+                        label, cancel=cancel, review_id=review_id)
     now = _iso_now()
     width = max(1, len(_chain_for(cfg, reviewer)))
     # The caller passes `_escalated(d, prompt.prompt_bytes, large_prompt)`
@@ -3348,7 +3357,7 @@ def _checkpointed_sub(
                     {"provider": None, "model": None, "effort": None}, None)
                if preparation_failure is not None else
                _run_sub(reviewer, cfg, d, prompt, root, store, scratch, tag,
-                        label, cancel=cancel))
+                        label, cancel=cancel, review_id=review_id))
         completed_at = _iso_now()
         capacity_timing = sub.provenance.get("capacity_timing")
         checkpoint_timing = (dict(capacity_timing)
@@ -3446,7 +3455,8 @@ def _escalated(d: Defaults, prompt_bytes: int,
 
 def _run_sub(reviewer: Reviewer, cfg: Config, d: Defaults, prompt, root: Path,
              store: Store, scratch: Path, tag: str, label: str,
-             cancel: "threading.Event | None" = None) -> _Sub:
+             cancel: "threading.Event | None" = None,
+             review_id: str | None = None) -> _Sub:
     """Run one sub-review chain and normalise the outcome into a `_Sub`.
 
     Anything the chain raises DEMOTES the aggregate rather than destroying it,
@@ -3464,7 +3474,7 @@ def _run_sub(reviewer: Reviewer, cfg: Config, d: Defaults, prompt, root: Path,
     trunc = bool(prompt.diff_truncated)
     try:
         outcome = _run_chain(reviewer, cfg, d, prompt.text, root, store,
-                             scratch, tag, cancel=cancel)
+                             scratch, tag, cancel=cancel, review_id=review_id)
     except Exception as e:
         # `Exception`, so `ReviewCancelled` (a `BaseException`) passes straight
         # through: a cancelled sub-review must not be recorded as a sub-review
@@ -3563,7 +3573,10 @@ def _prepare_batch_plan(
                 {name: diff.statuses[name] for name in batch.files
                  if name in diff.statuses},
                 headroom, source=context_source, oid=context_oid,
-                pack_large_added=not sole)
+                pack_large_added=not sole,
+                reserve_paths=passes.context_reserve_paths(
+                    batch.files, d.security_path_segments,
+                    d.security_basename_patterns))
             context_hashes.append(
                 pack.sha256 if isinstance(pack.sha256, str) else None)
         b_branch, b_head = _batch_labels(
@@ -3848,7 +3861,8 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             return _checkpointed_sub(
                 checkpoint_run, item.identity, reviewer=finder, cfg=cfg, d=effective,
                 prompt=item.prompt, root=root, store=worker_store, scratch=scratch,
-                tag=f"{tag}.b{item.identity.index}", label=f"batch {item.identity.index}", cancel=worker_cancel)
+                tag=f"{tag}.b{item.identity.index}", label=f"batch {item.identity.index}",
+                cancel=worker_cancel, review_id=rec.get("id"))
         parallel_results = parallel_batches.execute(
             prepared_plan.batches, context=context, store_path=store._path,
             run_one=run_one, cancel=cancel, progress=_note)
@@ -3895,7 +3909,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
             checkpoint_run, prepared.identity, reviewer=finder, cfg=cfg,
             d=effective_d, prompt=prompt,
             root=root, store=store, scratch=scratch, tag=f"{tag}.b{index}",
-            label=f"batch {index}", cancel=cancel))
+            label=f"batch {index}", cancel=cancel, review_id=rec.get("id")))
         run_duration_sec = round(sum(
             float(a.get("duration_sec") or 0.0)
             for a in sub.attempts if isinstance(a, dict)
@@ -4024,7 +4038,7 @@ def _orchestrate(rec: dict, diff, *, batches: list, cfg: Config, d: Defaults,
                 cfg=cfg, d=effective_d, prompt=prompt,
                 root=root, store=store, scratch=scratch,
                 tag=passes.INTEGRATION_PASS, label="the integration pass",
-                cancel=cancel)
+                cancel=cancel, review_id=rec.get("id"))
             run_duration_sec = round(sum(
                 float(a.get("duration_sec") or 0.0)
                 for a in integration_sub.attempts if isinstance(a, dict)
@@ -4262,15 +4276,25 @@ def _with_provenance(rec: dict, name: str, provenance: dict) -> dict:
     return out
 
 
+def _merge_named_pass(rec: dict, name: str, extra, reason: str) -> dict:
+    """Security demotes. A skeptic failure keeps the finder's trust axes."""
+    if name == "skeptic":
+        return passes.merge_skeptic_pass(rec, extra, reason)
+    if extra is None:
+        return passes.merge_failed_extra_pass(rec, name, reason)
+    return passes.merge_extra_pass(rec, extra, name)
+
+
 def _failed_pass(rec: dict, name: str, reason: str, note: str) -> dict:
     """Merge a pass that produced nothing, with explicit null provenance.
 
     Every no-process-start outcome ends here — a prompt that would not build,
     an exception out of the chain — and each one records `provider`/`model`/
     `effort` as explicit `None` plus a `note` saying why, so nothing reads as
-    "the pass ran on the finder's model".
+    "the pass ran on the finder's model". Security still demotes. A skeptic
+    failure records the note and leaves finder trust alone.
     """
-    merged = passes.merge_failed_extra_pass(rec, name, reason)
+    merged = _merge_named_pass(rec, name, None, reason)
     return _with_provenance(merged, name, {
         "provider": None, "model": None, "effort": None, "note": note})
 
@@ -4318,19 +4342,19 @@ def _required_followup(checkpoint_run, scheduled, rec, name, build_prompt,
     sub = _checkpointed_sub(checkpoint_run, identity, reviewer=reviewer, cfg=cfg, d=d,
         prompt=prompt, root=cwd, store=store, scratch=scratch, tag=name,
         label=f"extra pass {name}", cancel=cancel, binding_hash=binding_hash,
-        preparation_failure=preparation_failure)
+        preparation_failure=preparation_failure, review_id=rec.get("id"))
     if not sub.parse_ok:
         reason = sub.failure_reason or passes.failed_pass_reason(name)
         if not reason.startswith('extra pass'):
             reason = f"extra pass {name}: {reason}"
-        merged = passes.merge_failed_extra_pass(rec, name, reason)
+        merged = _merge_named_pass(rec, name, None, reason)
     else:
         extra = {'id': f"{rec['id']}.{name}", 'parse_ok': sub.parse_ok,
                  'degraded': sub.degraded, 'degraded_reason': sub.degraded_reason,
                  'diff_truncated': sub.diff_truncated, 'stop_reason': sub.stop_reason,
                  'summary': sub.summary, 'findings': sub.findings,
                  'failure_reason': sub.failure_reason}
-        merged = passes.merge_extra_pass(rec, extra, name)
+        merged = _merge_named_pass(rec, name, extra, reason)
     row = next(r for r in store.list_checkpoints(checkpoint_run.orchestration_id) if r['pass_kind'] == name)
     metadata = {**sub.provenance, 'attempts': sub.attempts,
                 'followup_output_hash': checkpoints.canonical_digest(
@@ -4390,7 +4414,8 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
               f"(partial coverage, one-call bound)")
     try:
         outcome = _run_chain(reviewer, cfg, d, prompt.text, cwd, store,
-                             scratch, name, **_cancel_kw(cancel))
+                             scratch, name, review_id=rec.get("id"),
+                             **_cancel_kw(cancel))
     except Exception as e:
         # `Exception`, NEVER `BaseException`. `ReviewCancelled` is outside
         # `Exception` exactly so it passes straight through here: catching it
@@ -4409,7 +4434,7 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
         if not str(reason).startswith("extra pass"):
             reason = f"extra pass {name}: {reason}"
         return _with_provenance(
-            passes.merge_failed_extra_pass(rec, name, reason),
+            _merge_named_pass(rec, name, None, reason),
             name, {**_provenance(outcome), "attempts": list(outcome.attempts)})
     p = outcome.parsed
     extra = {
@@ -4432,7 +4457,7 @@ def _extra_pass(rec: dict, name: str, build_prompt, reviewer: Reviewer,
     # WHICH provider answered this pass is not in the meta schema `passes`
     # owns, and it cannot be inferred from the reviewer that was asked: a pass
     # with its own fallback chain may have been answered by any entry in it.
-    return _with_provenance(passes.merge_extra_pass(rec, extra, name), name,
+    return _with_provenance(_merge_named_pass(rec, name, extra, ""), name,
                             {**_provenance(outcome), "attempts": list(outcome.attempts)})
 
 
@@ -4520,6 +4545,7 @@ def _refuter_pass(rec: dict, finder_findings_total: int, build_prompt,
     try:
         outcome = _run_chain(reviewer, cfg, d, prompt.text, cwd, store, scratch,
                              "refuter", contract=REFUTER_CONTRACT,
+                             review_id=rec.get("id"),
                              **_cancel_kw(cancel))
     except Exception as e:
         # `Exception`, NEVER `BaseException` -- see `_extra_pass`. This clause is

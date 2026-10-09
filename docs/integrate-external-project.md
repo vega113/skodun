@@ -105,7 +105,7 @@ Minimal shape (edit models to what your CLIs actually serve):
 [[reviewers]]
 name = "finder"
 provider = "xai"          # or openai | openai-api | google | junie
-model = "grok-4.20-0309-reasoning"
+model = "grok-4.7"
 role = "finder"
 effort = "medium"
 ```
@@ -130,7 +130,7 @@ Codex subscription CLI. Full fragment:
 [[reviewers]]
 name     = "finder-openai-api"
 provider = "openai-api"
-model    = "gpt-5.6-luna"
+model    = "gpt-6-luna"
 effort   = "medium"
 role     = "finder"
 ```

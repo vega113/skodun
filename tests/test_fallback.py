@@ -1401,8 +1401,9 @@ role = "security"
 def test_a_broken_extra_pass_prompt_records_null_provenance_and_a_note(
         tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SKODUN_SKEPTIC_PASS", "1")
+    monkeypatch.setenv("SKODUN_SECURITY_PASS", "0")
     _fake_cli(tmp_path, "grok", _emit(CLEAN))
-    repo = _repo(tmp_path, CFG_XAI_ONLY)
+    repo = _risky(_repo(tmp_path, CFG_XAI_ONLY))
 
     def boom(*a, **kw):
         raise ValueError("cannot render")

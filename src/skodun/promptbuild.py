@@ -74,7 +74,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 # --- ORACLE TEXT BEGIN ---
 #: Reviewer instructions, verbatim from the oracle's `write_prompt`.
-_INTRO = (
+_INTRO_ORACLE = (
     b'You are a senior code reviewer reviewing a pull request BEFORE it is pushed.\n'
     b'Review ONLY the unified diff below. Report real, concrete problems:\n'
     b'bugs, security issues, broken error handling, concurrency hazards, data\n'
@@ -83,6 +83,15 @@ _INTRO = (
     b'Additionally check the diff against the repo rules below; cite the rule id\n'
     b'in the finding title when one is violated (e.g. "[no-blocking-handler] ...").\n'
 )
+
+#: Finder-only severity rule. Not part of the oracle header. `budget` counts
+#: it because `_INTRO` includes it. Strip this exact blob before an oracle
+#: byte-compare.
+SEVERITY_GUIDANCE = (
+    b'Reserve severity "high" for behavior that can ship broken or unsafe.\n'
+    b'Style or scope notes are severity "medium" or "low".\n'
+)
+_INTRO = _INTRO_ORACLE + SEVERITY_GUIDANCE
 
 #: Emitted only when context packing is on (oracle: `_ctx_on = 1`).
 _CONTEXT_INSTRUCTIONS = (
