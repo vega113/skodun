@@ -628,9 +628,12 @@ def recovery_terminal_class(rec: dict) -> str | None:
     prompt-size skip stays in that list and does not relabel a later
     unparseable result. On the ending row, ``quota_or_billing`` and
     ``prompt_too_large`` win over ``unparseable``: a quota body can also say
-    the response did not parse. A cancelled review and a tree that moved are
-    not one of the three classes. ``parse_ok is False`` with no ending class
-    is ``unparseable``. A degraded review that still parsed is not.
+    the response did not parse. An ending hop whose kind is ``unavailable``
+    and is neither of those two classes is not ``unparseable``: a missing
+    binary and an authentication failure are different deaths and may retry.
+    A cancelled review and a tree that moved are not one of the three
+    classes. ``parse_ok is False`` with no ending class is ``unparseable``.
+    A degraded review that still parsed is not.
     """
     if not isinstance(rec, dict) or rec.get("trustworthy") is True:
         return None
@@ -648,6 +651,10 @@ def recovery_terminal_class(rec: dict) -> str | None:
         ending = _attempt_terminal_class(attempts[-1])
         if ending:
             return ending
+        classification = attempts[-1].get("classification")
+        if (isinstance(classification, dict)
+                and classification.get("kind") == "unavailable"):
+            return None
     elif ("prompt_size" in blob or "prompt_too_large" in blob
             or "prompt too large" in blob):
         return "prompt_too_large"
