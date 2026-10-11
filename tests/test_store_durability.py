@@ -1247,9 +1247,15 @@ def test_recovery_preserves_daily_spend_total(tmp_path, monkeypatch):
     'future_holder', 'backward_admission', 'backward_start',
 ])
 def test_recovery_rejects_invalid_capacity_holder(tmp_path, monkeypatch, damage):
+    from skodun import capacity
     import skodun.store as mod
     source = tmp_path / 'source.db'
     _write_review(source, 'kept')
+    # Pin the holder's birth identity: whether the host happens to run a pid 123 must not
+    # decide if the row carries owner_start or if recovery shells out to observe it.
+    token = 'Mon Sep 07 07:00:00 2026'
+    monkeypatch.setattr(capacity, 'process_birth_token', lambda pid: token)
+    monkeypatch.setattr(capacity, 'process_observation', lambda pid: capacity.ProcessObservation(token))
     with Store.open(source) as store:
         store.capacity_enqueue(admission_id='ticket', resource_class='review-machine', scope='*', pid=123)
         assert store.capacity_try_admit('ticket', capacity=1)
