@@ -211,22 +211,27 @@ def _stale_cli_hint() -> str:
     getting one means spawning the CLI, and `classify` stays side-effect free.
     """
     binary = resolve_codex_bin()
-    # The child was looked up from the REVIEW's cwd, not this process's, so a
-    # relative PATH entry may have named an install this lookup cannot see.
-    # Only the absolute entries ahead of the first relative one resolve the
-    # same way in both places; past that the honest answer is "not known".
-    certain: list[str] = []
-    cwd_dependent = False
-    for entry in os.get_exec_path():
-        if not os.path.isabs(entry):
-            cwd_dependent = True
-            break
-        certain.append(entry)
-    path = shutil.which(binary, path=os.pathsep.join(certain))
-    if path is None:
-        path = binary + (
-            " (PATH has a relative entry, so the install depends on the "
-            "review cwd)" if cwd_dependent and os.sep not in binary else "")
+    # The child was launched from the REVIEW's cwd, not this process's, so
+    # anything relative may have named an install this lookup cannot see. A
+    # path is reported as fact only where it resolves the same way from any
+    # directory; past that the honest answer is "not known".
+    if os.path.dirname(binary):
+        path = binary if os.path.isabs(binary) else (
+            f"{binary} (relative to the review cwd)")
+    else:
+        # Only the absolute entries ahead of the first relative one qualify.
+        certain: list[str] = []
+        cwd_dependent = False
+        for entry in os.get_exec_path():
+            if not os.path.isabs(entry):
+                cwd_dependent = True
+                break
+            certain.append(entry)
+        path = shutil.which(binary, path=os.pathsep.join(certain))
+        if path is None:
+            path = binary + (
+                " (PATH has a relative entry, so the install depends on the "
+                "review cwd)" if cwd_dependent else "")
     # The override is operator-typed and this text is persisted in attempt
     # artifacts, so it gets the same redaction as the provider's own words.
     path = _CONTROL_RE.sub(" ", path)

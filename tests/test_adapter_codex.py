@@ -664,6 +664,17 @@ def test_an_absolute_hit_ahead_of_a_relative_entry_is_still_named(
     assert f"binary: {first};" in res.detail
 
 
+def test_a_relative_override_is_labelled_as_cwd_dependent(
+        monkeypatch, tmp_path):
+    """`bin/codex` is a different file in every worktree that is reviewed."""
+    _fake_codex(tmp_path / "here" / "bin")
+    monkeypatch.chdir(tmp_path / "here")
+    monkeypatch.setenv("SKODUN_CODEX_BIN", os.path.join("bin", "codex"))
+    res = CodexAdapter().classify(1, b"", b"unknown model\n", REVIEW_CONTRACT)
+    assert ("binary: " + os.path.join("bin", "codex")
+            + " (relative to the review cwd);") in res.detail
+
+
 def test_only_a_model_rejection_carries_the_binary_hint():
     err = b"ERROR codex_api: 429 Too Many Requests: rate limit exceeded\n"
     res = CodexAdapter().classify(1, b"", err, REVIEW_CONTRACT)
