@@ -211,7 +211,10 @@ def _stale_cli_hint() -> str:
     getting one means spawning the CLI, and `classify` stays side-effect free.
     """
     binary = resolve_codex_bin()
+    # The override is operator-typed and this text is persisted in attempt
+    # artifacts, so it gets the same redaction as the provider's own words.
     path = _CONTROL_RE.sub(" ", shutil.which(binary) or binary)
+    path = " ".join(_SECRET_RE.sub(r"\1<redacted>", path).split())
     if len(path) > _BINARY_HINT_PATH_LIMIT:
         path = "..." + path[-(_BINARY_HINT_PATH_LIMIT - 3):]
     return (f" [binary: {path}; an outdated codex CLI rejects newer model "

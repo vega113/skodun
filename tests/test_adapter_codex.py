@@ -617,6 +617,16 @@ def test_an_unpinned_binary_is_named_by_its_path_lookup(monkeypatch, tmp_path):
     assert f"binary: {exe}" in res.detail
 
 
+def test_the_binary_hint_is_redacted_like_the_rest_of_the_diagnostic(
+        monkeypatch):
+    """An operator-typed override must not carry a secret into an artifact."""
+    monkeypatch.setenv("SKODUN_CODEX_BIN", "/opt/wrap token=s3cr3t-value\n/codex")
+    res = CodexAdapter().classify(1, b"", b"unknown model\n", REVIEW_CONTRACT)
+    assert res.category == "model"
+    assert "s3cr3t-value" not in res.detail
+    assert "binary: /opt/wrap token=<redacted> /codex;" in res.detail
+
+
 def test_only_a_model_rejection_carries_the_binary_hint():
     err = b"ERROR codex_api: 429 Too Many Requests: rate limit exceeded\n"
     res = CodexAdapter().classify(1, b"", err, REVIEW_CONTRACT)
