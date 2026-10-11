@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Callable
@@ -178,6 +179,9 @@ _TRANSPORT_SIGNALS: tuple[bytes, ...] = (
 )
 _DIAGNOSTIC_LIMIT = 400
 _VERSION_PROBE_TIMEOUT_SEC = 10
+# Leaves room inside `_DIAGNOSTIC_LIMIT` for the provider's own words next to
+# the stale-CLI hint; the tail is kept because it is what names the install.
+_BINARY_HINT_PATH_LIMIT = 160
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\x80-\x9f]+")
 _SECRET_RE = re.compile(
     r"(?i)(bearer\s+|api[_ -]?key\s*[:=]\s*|token\s*[:=]\s*)[^\s,;]+")
@@ -193,6 +197,25 @@ def _sanitized_diagnostic(raw: bytes, *, rc: int) -> str:
     detail = " ".join(detail.split())
     prefix = f"codex exited rc={rc} without a usable review payload: "
     return (prefix + detail)[:_DIAGNOSTIC_LIMIT]
+
+
+def _stale_cli_hint() -> str:
+    """Name the binary THIS process ran, for a `model` rejection.
+
+    An outdated codex CLI rejects a model id the account does serve, in the
+    provider's own words ("model is not supported"), so the failure reads as a
+    wrong config entry. `skodun doctor` cannot settle it from a shell: a
+    long-lived `skodun mcp` keeps the `SKODUN_CODEX_BIN` it was started with,
+    and that can be an older install than the one on the shell's PATH. Only
+    the path resolved here separates the two. No version is reported because
+    getting one means spawning the CLI, and `classify` stays side-effect free.
+    """
+    binary = resolve_codex_bin()
+    path = _CONTROL_RE.sub(" ", shutil.which(binary) or binary)
+    if len(path) > _BINARY_HINT_PATH_LIMIT:
+        path = "..." + path[-(_BINARY_HINT_PATH_LIMIT - 3):]
+    return (f" [binary: {path}; an outdated codex CLI rejects newer model "
+            "ids, check its --version]")
 
 
 def _first_output_line(raw: bytes) -> str:
@@ -516,11 +539,16 @@ class CodexAdapter:
                                       ("quota", _QUOTA_SIGNALS)):
                 for sig in signals:
                     if sig in diagnostics:
+                        suffix = f" [{category}: {sig.decode()}]"
+                        if category == "model":
+                            suffix += _stale_cli_hint()
+                        # The suffix is the actionable part, so the provider
+                        # text is what gives way at the limit.
+                        room = max(_DIAGNOSTIC_LIMIT - len(suffix), 0)
                         return ClassifyResult(
                             "unavailable", category,
-                            (_sanitized_diagnostic(
-                                diagnostics, rc=rc) + f" [{category}: "
-                                f"{sig.decode()}]")[:_DIAGNOSTIC_LIMIT])
+                            (_sanitized_diagnostic(diagnostics, rc=rc)[:room]
+                             + suffix)[:_DIAGNOSTIC_LIMIT])
             if rc != 0 and not events and not stdout:
                 for category, signals in (
                         ("invocation", _INVOCATION_SIGNALS),

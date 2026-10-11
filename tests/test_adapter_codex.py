@@ -575,6 +575,55 @@ def test_model_capture_is_unavailable_model_from_the_stream_alone():
     assert res.kind == "unavailable" and res.category == "model"
 
 
+def test_a_model_rejection_names_the_binary_that_was_run(monkeypatch, tmp_path):
+    """A stale CLI rejects a valid model id in the provider's own words.
+
+    The rejection reads as a bad config entry, and `skodun doctor` from a shell
+    can report a different, newer binary than the one a long-lived MCP server
+    was pinned to. The path this process resolved is the only thing that tells
+    the two apart.
+    """
+    pinned = tmp_path / "old" / "codex"
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(pinned))
+    f = fx("unavailable_model")
+    res = CodexAdapter().classify(f.rc, f.stdout, f.stderr, REVIEW_CONTRACT)
+    assert res.category == "model"
+    assert f"binary: {pinned}" in res.detail
+    assert "outdated codex CLI" in res.detail
+
+
+def test_the_binary_hint_survives_a_diagnostic_that_fills_the_limit(
+        monkeypatch, tmp_path):
+    """The hint is the actionable part, so the provider text yields to it."""
+    pinned = tmp_path / "old" / "codex"
+    monkeypatch.setenv("SKODUN_CODEX_BIN", str(pinned))
+    err = b"ERROR: " + b"x" * 2000 + b" unknown model\n"
+    res = CodexAdapter().classify(1, b"", err, REVIEW_CONTRACT)
+    assert res.category == "model"
+    assert len(res.detail) <= 400
+    assert res.detail.endswith("check its --version]")
+    assert f"binary: {pinned}" in res.detail
+
+
+def test_an_unpinned_binary_is_named_by_its_path_lookup(monkeypatch, tmp_path):
+    """Bare `codex` says nothing about WHICH install answered."""
+    exe = tmp_path / "bin" / "codex"
+    exe.parent.mkdir()
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    monkeypatch.delenv("SKODUN_CODEX_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(exe.parent))
+    res = CodexAdapter().classify(1, b"", b"unknown model\n", REVIEW_CONTRACT)
+    assert f"binary: {exe}" in res.detail
+
+
+def test_only_a_model_rejection_carries_the_binary_hint():
+    err = b"ERROR codex_api: 429 Too Many Requests: rate limit exceeded\n"
+    res = CodexAdapter().classify(1, b"", err, REVIEW_CONTRACT)
+    assert res.category == "quota"
+    assert "binary:" not in res.detail
+
+
 def test_quota_wording_is_unavailable_quota():
     err = b"ERROR codex_api: 429 Too Many Requests: rate limit exceeded\n"
     res = CodexAdapter().classify(1, b"", err, REVIEW_CONTRACT)
