@@ -23,6 +23,7 @@ provenance is recorded in that directory's README.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -625,6 +626,42 @@ def test_the_binary_hint_is_redacted_like_the_rest_of_the_diagnostic(
     assert res.category == "model"
     assert "s3cr3t-value" not in res.detail
     assert "binary: /opt/wrap token=<redacted> /codex;" in res.detail
+
+
+def _fake_codex(directory):
+    directory.mkdir(parents=True)
+    exe = directory / "codex"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    return exe
+
+
+def test_a_relative_path_entry_is_not_resolved_from_this_process(
+        monkeypatch, tmp_path):
+    """The child is looked up from the review's cwd, not from here.
+
+    A `codex` reachable through a relative PATH entry in THIS directory says
+    nothing about what the review ran, and neither does an absolute one that
+    the relative entry shadows. Naming either would be a confident wrong
+    answer, which is worse than the bare name.
+    """
+    here = _fake_codex(tmp_path / "here" / "bin")
+    later = _fake_codex(tmp_path / "later")
+    monkeypatch.chdir(tmp_path / "here")
+    monkeypatch.delenv("SKODUN_CODEX_BIN", raising=False)
+    monkeypatch.setenv("PATH", os.pathsep.join(["bin", str(later.parent)]))
+    res = CodexAdapter().classify(1, b"", b"unknown model\n", REVIEW_CONTRACT)
+    assert str(here) not in res.detail and str(later) not in res.detail
+    assert "binary: codex (PATH has a relative entry" in res.detail
+
+
+def test_an_absolute_hit_ahead_of_a_relative_entry_is_still_named(
+        monkeypatch, tmp_path):
+    first = _fake_codex(tmp_path / "first")
+    monkeypatch.delenv("SKODUN_CODEX_BIN", raising=False)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(first.parent), "bin"]))
+    res = CodexAdapter().classify(1, b"", b"unknown model\n", REVIEW_CONTRACT)
+    assert f"binary: {first};" in res.detail
 
 
 def test_only_a_model_rejection_carries_the_binary_hint():
